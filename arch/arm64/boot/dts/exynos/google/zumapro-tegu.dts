@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Pixel 9a "Tegu" device tree skeleton.
+ *
+ * Hardware values are taken from the downstream dump in
+ * ../../../../../../research/dumped.dts unless another source is named.
+ */
+
+/dts-v1/;
+
+#include "zumapro.dtsi"
+
+/ {
+	/*
+	 * Source: model and downstream compatible strings are from
+	 * research/dumped.dts:6-8.  The lowercase compatible follows the
+	 * upstream Google Tensor naming convention in google.yaml.
+	 */
+	model = "Google Pixel 9a";
+	compatible = "google,zumapro-tegu", "google,zumapro";
+
+	aliases {
+		/*
+		 * Source: downstream debug UART alias is uart0/serial_0 at
+		 * research/dumped.dts:5772 and 19824.
+		 */
+		serial0 = &serial_0;
+	};
+
+	chosen {
+		/*
+		 * Source: downstream bootargs select earlycon/console on
+		 * 0x10870000 and ttySAC0 at research/dumped.dts:14938-14943.
+		 * The empty bootargs property follows GS101 Pixel common DTS because
+		 * Pixel bootloaders expect the property to exist.
+		 */
+		bootargs = "";
+		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * Source: RAM banks are from research/dumped.dts:20-32 and 14934-14937.
+	 */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x80000000>;
+	};
+
+	memory@880000000 {
+		device_type = "memory";
+		reg = <0x8 0x80000000 0x80000000>;
+	};
+
+	memory@900000000 {
+		device_type = "memory";
+		reg = <0x9 0x00000000 0x80000000>;
+	};
+
+	memory@980000000 {
+		device_type = "memory";
+		reg = <0x9 0x80000000 0x80000000>;
+	};
+
+	reserved-memory {
+		/*
+		 * Source: static reserved-memory ranges are copied from
+		 * research/dumped.dts:1292-1517.  Dynamic size-only DMA pools from
+		 * the dump are intentionally omitted for this minimal initramfs tree.
+		 */
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Source: ABL fastboot-boot log from 2026-05-24 shows ABL
+		 * appends pkvm_guest_firmware@8b000000 before Linux starts.
+		 * Keep the downstream range visible here, but do not compile it
+		 * while booting through ABL because it overlaps the bootloader
+		 * supplied node.
+		 */
+#if 0
+		pkvm_guest_firmware: pkvm-guest-firmware@8b000000 {
+			/* Source: research/dumped.dts:1298-1302. */
+			reg = <0x0 0x8b000000 0x100000>;
+			no-map;
+		};
+#endif
+
+		ect_reserved: ect@90000000 {
+			/* Source: research/dumped.dts:1319-1322. */
+			reg = <0x0 0x90000000 0x60000>;
+		};
+
+		gsa_reserved: gsa@90200000 {
+			/* Source: research/dumped.dts:1325-1328. */
+			reg = <0x0 0x90200000 0x3ff000>;
+			no-map;
+		};
+
+		gsa_reserved_2: gsa@905ff000 {
+			/* Source: research/dumped.dts:1331-1334. */
+			reg = <0x0 0x905ff000 0x1000>;
+			no-map;
+		};
+
+		gxp_scratchpad_reserved: gxp-scratchpad@91300000 {
+			/* Source: research/dumped.dts:1337-1340. */
+			reg = <0x0 0x91300000 0x60000>;
+			no-map;
+		};
+
+		iif_wait_table_reserved: iif-wait-table@91360000 {
+			/* Source: research/dumped.dts:1343-1346. */
+			reg = <0x0 0x91360000 0x20000>;
+			no-map;
+		};
+
+		iif_signal_table_reserved: iif-signal-table@91380000 {
+			/* Source: research/dumped.dts:1349-1352. */
+			reg = <0x0 0x91380000 0x20000>;
+			no-map;
+		};
+
+		gxp_secure_data_reserved: gxp-secure-data@91400000 {
+			/* Source: research/dumped.dts:1355-1358. */
+			reg = <0x0 0x91400000 0x900000>;
+			no-map;
+		};
+
+		gxp_fw_reserved: gxp-fw@91d00000 {
+			/* Source: research/dumped.dts:1361-1364. */
+			reg = <0x0 0x91d00000 0x300000>;
+			no-map;
+		};
+
+		gxp_mcu_fw_reserved: gxp-mcu-fw@92000000 {
+			/* Source: research/dumped.dts:1367-1370. */
+			reg = <0x0 0x92000000 0x400000>;
+			no-map;
+		};
+
+		tpu_fw_reserved: tpu-fw@92e00000 {
+			/* Source: research/dumped.dts:1373-1376. */
+			reg = <0x0 0x92e00000 0x1200000>;
+			no-map;
+		};
+
+		aoc_reserved: aoc@94000000 {
+			/* Source: research/dumped.dts:1379-1382. */
+			reg = <0x0 0x94000000 0x3000000>;
+			no-map;
+		};
+
+		xhci_dma_buffer_reserved: xhci-dma-buffer@17bb5000 {
+			/* Source: research/dumped.dts:1508-1512. */
+			reg = <0x0 0x17bb5000 0xb000>;
+			no-map;
+		};
+
+		xhci_dma_reserved: xhci-dma@17bc0000 {
+			/* Source: research/dumped.dts:1515-1519. */
+			reg = <0x0 0x17bc0000 0x40000>;
+			no-map;
+		};
+
+		xhci_dma_dram_reserved: xhci-dma-dram@97000000 {
+			/* Source: research/dumped.dts:1522-1526. */
+			reg = <0x0 0x97000000 0x400000>;
+			no-map;
+		};
+
+		/*
+		 * Source: ABL fastboot-boot log from 2026-05-24 shows ABL
+		 * appends sec_dram@b6200000 before Linux starts.  Keep the
+		 * downstream range visible here, but do not compile it while
+		 * booting through ABL because it overlaps the bootloader supplied
+		 * node.
+		 */
+#if 0
+		sec_dram_reserved: sec-dram@b6200000 {
+			/* Source: research/dumped.dts:1314-1317. */
+			reg = <0x0 0xb6200000 0x9e00000>;
+			no-map;
+		};
+#endif
+
+		seclog_reserved: seclog@c3000000 {
+			/* Source: research/dumped.dts:1502-1505. */
+			reg = <0x0 0xc3000000 0x80000>;
+		};
+
+		header_reserved: header@d8100000 {
+			/* Source: research/dumped.dts:1438-1441. */
+			reg = <0x0 0xd8100000 0x10000>;
+			no-map;
+		};
+
+		log_kevents_reserved: log-kevents@d8110000 {
+			/* Source: research/dumped.dts:1444-1447. */
+			reg = <0x0 0xd8110000 0x700000>;
+			no-map;
+		};
+
+		log_bcm_reserved: log-bcm@dd610000 {
+			/* Source: research/dumped.dts:1450-1454. */
+			reg = <0x0 0xdd610000 0x400000>;
+			no-map;
+		};
+
+		log_s2d_reserved: log-s2d@d8810000 {
+			/* Source: research/dumped.dts:1456-1459. */
+			reg = <0x0 0xd8810000 0x1800000>;
+			no-map;
+		};
+
+		log_array_reset_reserved: log-array-reset@da010000 {
+			/* Source: research/dumped.dts:1462-1465. */
+			reg = <0x0 0xda010000 0xa00000>;
+			no-map;
+		};
+
+		log_array_panic_reserved: log-array-panic@daa10000 {
+			/* Source: research/dumped.dts:1469-1473. */
+			reg = <0x0 0xdaa10000 0xa00000>;
+			no-map;
+		};
+
+		log_slcdump_reserved: log-slcdump@db410000 {
+			/* Source: research/dumped.dts:1476-1480. */
+			reg = <0x0 0xdb410000 0x1100000>;
+			no-map;
+		};
+
+		log_preslcdump_reserved: log-preslcdump@dc510000 {
+			/* Source: research/dumped.dts:1483-1487. */
+			reg = <0x0 0xdc510000 0x1100000>;
+			no-map;
+		};
+
+		log_itmon_reserved: log-itmon@dda10000 {
+			/* Source: research/dumped.dts:1493-1496. */
+			reg = <0x0 0xdda10000 0x10000>;
+			no-map;
+		};
+
+		log_s2d_extract_reserved: log-s2d-extract@dda20000 {
+			/* Source: research/dumped.dts:1499-1502. */
+			reg = <0x0 0xdda20000 0x600000>;
+			no-map;
+		};
+
+		/*
+		 * Source: ABL fastboot-boot log from 2026-05-24 shows ABL
+		 * appends sec_pt@e0000000 before Linux starts.  Keep the
+		 * downstream range visible here, but do not compile it while
+		 * booting through ABL because it overlaps the bootloader supplied
+		 * node.
+		 */
+#if 0
+		sec_pt_reserved: sec-pt@e0000000 {
+			/* Source: research/dumped.dts:1309-1312. */
+			reg = <0x0 0xe0000000 0x3800000>;
+			no-map;
+		};
+#endif
+
+		cp_rmem_1_reserved: cp-rmem-1@e8000000 {
+			/* Source: research/dumped.dts:1424-1428. */
+			reg = <0x0 0xe8000000 0x2000000>;
+		};
+
+		cp_aoc_rmem_reserved: cp-aoc-rmem@197fd000 {
+			/* Source: research/dumped.dts:1431-1435. */
+			reg = <0x0 0x197fd000 0x3000>;
+		};
+
+		cp_rmem_reserved: cp-rmem@ea400000 {
+			/* Source: research/dumped.dts:1410-1414. */
+			reg = <0x0 0xea400000 0xc00000>;
+		};
+
+		cp_msi_rmem_reserved: cp-msi-rmem@f6200000 {
+			/* Source: research/dumped.dts:1417-1421. */
+			reg = <0x0 0xf6200000 0x1000>;
+		};
+
+		abl_reserved: abl@f8800000 {
+			/* Source: research/dumped.dts:1304-1307. */
+			reg = <0x0 0xf8800000 0x1000000>;
+			no-map;
+		};
+
+		dss_log_reserved: dss-log@fd3f0000 {
+			/* Source: research/dumped.dts:1385-1388. */
+			reg = <0x0 0xfd3f0000 0xe000>;
+			no-map;
+		};
+
+		/*
+		 * Source: ABL fastboot-boot log from 2026-05-24 shows ABL
+		 * appends debug_kinfo_reserved@fd3fe000 before Linux starts.
+		 * Keep the downstream range visible here, but do not compile it
+		 * while booting through ABL because it overlaps the bootloader
+		 * supplied node.
+		 */
+#if 0
+		debug_kinfo_reserved: debug-kinfo@fd3fe000 {
+			/* Source: research/dumped.dts:1391-1394. */
+			reg = <0x0 0xfd3fe000 0x1000>;
+			no-map;
+		};
+#endif
+
+		ramoops_reserved: ramoops@fd3ff000 {
+			/* Source: research/dumped.dts:1397-1401. */
+			compatible = "ramoops";
+			reg = <0x0 0xfd3ff000 0x400000>;
+			console-size = <0x200000>;
+			pmsg-size = <0x200000>;
+		};
+
+		bldr_log_reserved: bldr-log@fd800000 {
+			/* Source: research/dumped.dts:1404-1407. */
+			reg = <0x0 0xfd800000 0x100000>;
+			no-map;
+		};
+	};
+};
+
+&watchdog_cl0 {
+	/*
+	 * Source: downstream enables watchdog_cl0 implicitly in
+	 * research/dumped.dts:15248-15257.  Cluster 1 remains disabled until the
+	 * downstream use_multistage_wdt behavior at dumped.dts:15268 is modeled.
+	 */
+	status = "okay";
+};

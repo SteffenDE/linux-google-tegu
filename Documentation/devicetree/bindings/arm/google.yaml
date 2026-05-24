@@ -13,8 +13,8 @@ description: |
   ARM platforms using SoCs designed by Google branded "Tensor" used in Pixel
   devices.
 
-  Currently upstream this is devices using "gs101" SoC which is found in Pixel
-  6, Pixel 6 Pro and Pixel 6a.
+  Currently upstream this includes devices using "gs101" SoC which is found in
+  Pixel 6, Pixel 6 Pro and Pixel 6a.
 
   Google have a few different names for the SoC:
   - Marketing name ("Tensor")
@@ -40,6 +40,10 @@ properties:
               - google,gs101-oriole
               - google,gs101-raven
           - const: google,gs101
+      - description: Google Pixel 9a (Tegu)
+        items:
+          - const: google,zumapro-tegu
+          - const: google,zumapro
 
   # Bootloader requires empty ect node to be present
   ect:

@@ -38,6 +38,7 @@ properties:
       - axis,artpec8-pinctrl
       - axis,artpec9-pinctrl
       - google,gs101-pinctrl
+      - google,zumapro-pinctrl
       - samsung,s3c64xx-pinctrl
       - samsung,s5pv210-pinctrl
       - samsung,exynos2200-pinctrl

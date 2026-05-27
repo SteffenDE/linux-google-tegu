@@ -1,0 +1,19 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Pinctrl binding constants for Google Tensor G4 / Zumapro.
+ */
+
+#ifndef __DTS_ARM64_EXYNOS_GOOGLE_ZUMAPRO_PINCTRL_H__
+#define __DTS_ARM64_EXYNOS_GOOGLE_ZUMAPRO_PINCTRL_H__
+
+#define ZUMAPRO_PIN_PULL_NONE		0
+#define ZUMAPRO_PIN_PULL_DOWN		1
+#define ZUMAPRO_PIN_PULL_UP		3
+
+#define ZUMAPRO_PIN_FUNC_INPUT		0
+#define ZUMAPRO_PIN_FUNC_OUTPUT		1
+#define ZUMAPRO_PIN_FUNC_2		2
+#define ZUMAPRO_PIN_FUNC_3		3
+#define ZUMAPRO_PIN_FUNC_EINT		0xf
+
+#endif /* __DTS_ARM64_EXYNOS_GOOGLE_ZUMAPRO_PINCTRL_H__ */

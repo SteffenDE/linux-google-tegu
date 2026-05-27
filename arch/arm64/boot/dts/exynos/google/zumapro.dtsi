@@ -9,6 +9,7 @@
 #include <dt-bindings/clock/google,zumapro.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/soc/samsung,exynos-usi.h>
 #include "zumapro-pinctrl.h"
 
 / {
@@ -43,6 +44,7 @@
 		pinctrl10 = &pinctrl_hsi2;
 		pinctrl11 = &pinctrl_peric0;
 		pinctrl12 = &pinctrl_peric1;
+		i2c6 = &hsi2c_6;
 	};
 
 	/*
@@ -383,6 +385,41 @@
 		};
 
 		/*
+		 * Source: downstream hsi2c_6 and USI6 pinmux data are from
+		 * zumapro-usi.dtsi and zumapro-pinctrl.dtsi.  Only the bare
+		 * controller is enabled for now; consumers stay out until the
+		 * bus is validated on hardware.
+		 */
+		usi6: usi@108d00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x108d00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI6_USI_PCLK>,
+				 <&cmu_peric0 CLK_DOUT_PERIC0_USI6_USI>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_peric0 0x14>;
+			samsung,mode = <USI_MODE_I2C>;
+			status = "okay";
+
+			hsi2c_6: i2c@108d0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x108d0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric0 CLK_DOUT_PERIC0_USI6_USI>,
+					 <&cmu_peric0 CLK_GOUT_PERIC0_USI6_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 647 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c6_bus>;
+				status = "okay";
+			};
+		};
+
+		/*
 		 * Source: pinctrl controller addresses/IRQs are from:
 		 *  - peric0: research/dumped.dts:3393-3397
 		 *  - peric1: research/dumped.dts:4139-4143
@@ -536,6 +573,13 @@
 				samsung,pins = "gpp1-2", "gpp1-3";
 				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+			};
+
+			hsi2c6_bus: hsi2c6-bus-pins {
+				samsung,pins = "gpp12-0", "gpp12-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 			};
 		};
 

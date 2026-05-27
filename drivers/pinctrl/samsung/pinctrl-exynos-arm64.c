@@ -2100,6 +2100,87 @@ const struct samsung_pinctrl_of_match_data gs101_of_data __initconst = {
 	.num_ctrl	= ARRAY_SIZE(gs101_pin_ctrl),
 };
 
+/*
+ * Zumapro wakeup EINT numbers are sparse across ALIVE, CUSTOM_ALIVE, and
+ * FAR_ALIVE.  Keep the downstream numbering so wake-mask programming uses the
+ * same bit positions as the vendor tree.
+ */
+#define ZUMAPRO_PIN_BANK_EINTW(pins, reg, id, offs, fltcon_offs, eint_nr) \
+	{								\
+		.type			= &exynos850_bank_type_alive,	\
+		.pctl_offset		= reg,				\
+		.nr_pins		= pins,				\
+		.eint_type		= EINT_TYPE_WKUP,		\
+		.eint_offset		= offs,				\
+		.eint_num		= eint_nr,			\
+		.eint_fltcon_offset	= fltcon_offs,			\
+		.name			= id				\
+	}
+
+#define ZUMAPRO_PIN_BANK_EINTG_ALIVE(pins, reg, id, offs, fltcon_offs) \
+	{								\
+		.type			= &exynos850_bank_type_alive,	\
+		.pctl_offset		= reg,				\
+		.nr_pins		= pins,				\
+		.eint_type		= EINT_TYPE_GPIO,		\
+		.eint_offset		= offs,				\
+		.eint_fltcon_offset	= fltcon_offs,			\
+		.name			= id				\
+	}
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (ALIVE) */
+static const struct samsung_pin_bank_data zumapro_pin_alive[] = {
+	ZUMAPRO_PIN_BANK_EINTW(4, 0x0, "gpa0", 0x00, 0x00, 0),
+	ZUMAPRO_PIN_BANK_EINTW(6, 0x20, "gpa1", 0x04, 0x04, 4),
+	ZUMAPRO_PIN_BANK_EINTW(4, 0x40, "gpa2", 0x08, 0x0c, 10),
+	ZUMAPRO_PIN_BANK_EINTW(4, 0x60, "gpa3", 0x0c, 0x10, 14),
+	ZUMAPRO_PIN_BANK_EINTW(2, 0x80, "gpa4", 0x10, 0x14, 18),
+	ZUMAPRO_PIN_BANK_EINTW(6, 0xa0, "gpa6", 0x14, 0x18, 20),
+	ZUMAPRO_PIN_BANK_EINTW(8, 0xc0, "gpa7", 0x18, 0x20, 26),
+	ZUMAPRO_PIN_BANK_EINTW(4, 0xe0, "gpa8", 0x1c, 0x28, 34),
+	ZUMAPRO_PIN_BANK_EINTW(7, 0x100, "gpa9", 0x20, 0x2c, 38),
+	ZUMAPRO_PIN_BANK_EINTW(5, 0x120, "gpa10", 0x24, 0x34, 45),
+	ZUMAPRO_PIN_BANK_EINTG_ALIVE(1, 0x140, "gpa11", 0x28, 0x3c),
+	ZUMAPRO_PIN_BANK_EINTG_ALIVE(2, 0x160, "gpa12", 0x2c, 0x40),
+};
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (CUSTOM_ALIVE) */
+static const struct samsung_pin_bank_data zumapro_pin_custom_alive[] = {
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x0, "gpn0", 0x00, 0x00, 0xc0),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x20, "gpn1", 0x04, 0x04, 0xc1),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x40, "gpn2", 0x08, 0x08, 0xc2),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x60, "gpn3", 0x0c, 0x0c, 0xc3),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x80, "gpn4", 0x10, 0x10, 0xc4),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0xa0, "gpn5", 0x14, 0x14, 0xc5),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0xc0, "gpn6", 0x18, 0x18, 0xc6),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0xe0, "gpn7", 0x1c, 0x1c, 0xc7),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x100, "gpn8", 0x20, 0x20, 0xc8),
+	ZUMAPRO_PIN_BANK_EINTW(1, 0x120, "gpn9", 0x24, 0x24, 0xc9),
+};
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (FAR_ALIVE) */
+static const struct samsung_pin_bank_data zumapro_pin_far_alive[] = {
+	ZUMAPRO_PIN_BANK_EINTW(8, 0x0, "gpa5", 0x00, 0x00, 50),
+};
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (HSI1) */
+static const struct samsung_pin_bank_data zumapro_pin_hsi1[] = {
+	GS101_PIN_BANK_EINTG(4, 0x0, "gph0", 0x00, 0x00),
+	GS101_PIN_BANK_EINTG(8, 0x20, "gph1", 0x04, 0x04),
+	GS101_PIN_BANK_EINTG(4, 0x40, "gph2", 0x08, 0x0c),
+};
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (HSI2) */
+static const struct samsung_pin_bank_data zumapro_pin_hsi2[] = {
+	GS101_PIN_BANK_EINTG(6, 0x0, "gph3", 0x00, 0x00),
+	GS101_PIN_BANK_EINTG(7, 0x20, "gph4", 0x04, 0x08),
+};
+
+/* pin banks of Tensor G4 / Zumapro pin-controller (HSI2UFS) */
+static const struct samsung_pin_bank_data zumapro_pin_hsi2ufs[] = {
+	GS101_PIN_BANK_EINTG(2, 0x0, "gph5", 0x00, 0x00),
+};
+
 /* pin banks of Tensor G4 / Zumapro pin-controller (PERIC0) */
 static const struct samsung_pin_bank_data zumapro_pin_peric0[] = {
 	GS101_PIN_BANK_EINTG(5, 0x0, "gpp0", 0x00, 0x00),
@@ -2122,15 +2203,73 @@ static const struct samsung_pin_bank_data zumapro_pin_peric0[] = {
 	GS101_PIN_BANK_EINTG(4, 0x220, "gpp16", 0x44, 0x48),
 };
 
+/* pin banks of Tensor G4 / Zumapro pin-controller (PERIC1) */
+static const struct samsung_pin_bank_data zumapro_pin_peric1[] = {
+	GS101_PIN_BANK_EINTG(8, 0x0, "gpp19", 0x00, 0x00),
+	GS101_PIN_BANK_EINTG(4, 0x20, "gpp20", 0x04, 0x08),
+	GS101_PIN_BANK_EINTG(8, 0x40, "gpp21", 0x08, 0x0c),
+	GS101_PIN_BANK_EINTG(4, 0x60, "gpp24", 0x0c, 0x14),
+	GS101_PIN_BANK_EINTG(4, 0x80, "gpp22", 0x10, 0x18),
+	GS101_PIN_BANK_EINTG(4, 0xa0, "gpp23", 0x14, 0x1c),
+};
+
 /*
  * Keep the array indexed exactly like the /aliases pinctrlN entries in
- * zumapro.dtsi.  Only PERIC0 is populated for now; the GSA-owned controllers
- * must stay disabled from the non-secure kernel.
+ * zumapro.dtsi.  The GSA-owned controllers must stay disabled from the
+ * non-secure kernel.
  */
+#define ZUMAPRO_PINCTRL_ALIVE		0
+#define ZUMAPRO_PINCTRL_CUSTOM_ALIVE	1
+#define ZUMAPRO_PINCTRL_FAR_ALIVE	2
+#define ZUMAPRO_PINCTRL_HSI1		8
+#define ZUMAPRO_PINCTRL_HSI2		9
+#define ZUMAPRO_PINCTRL_HSI2UFS		10
 #define ZUMAPRO_PINCTRL_PERIC0	11
 #define ZUMAPRO_PINCTRL_PERIC1	12
 
 static const struct samsung_pin_ctrl zumapro_pin_ctrl[] __initconst = {
+	[ZUMAPRO_PINCTRL_ALIVE] = {
+		.pin_banks	= zumapro_pin_alive,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_alive),
+		.eint_wkup_init = exynos_eint_wkup_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_CUSTOM_ALIVE] = {
+		.pin_banks	= zumapro_pin_custom_alive,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_custom_alive),
+		.eint_wkup_init = exynos_eint_wkup_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_FAR_ALIVE] = {
+		.pin_banks	= zumapro_pin_far_alive,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_far_alive),
+		.eint_wkup_init = exynos_eint_wkup_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_HSI1] = {
+		.pin_banks	= zumapro_pin_hsi1,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi1),
+		.eint_gpio_init = exynos_eint_gpio_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_HSI2] = {
+		.pin_banks	= zumapro_pin_hsi2,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi2),
+		.eint_gpio_init = exynos_eint_gpio_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_HSI2UFS] = {
+		.pin_banks	= zumapro_pin_hsi2ufs,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi2ufs),
+		.eint_gpio_init = exynos_eint_gpio_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
 	[ZUMAPRO_PINCTRL_PERIC0] = {
 		.pin_banks	= zumapro_pin_peric0,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_peric0),
@@ -2138,7 +2277,13 @@ static const struct samsung_pin_ctrl zumapro_pin_ctrl[] __initconst = {
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
-	[ZUMAPRO_PINCTRL_PERIC1] = { },
+	[ZUMAPRO_PINCTRL_PERIC1] = {
+		.pin_banks	= zumapro_pin_peric1,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_peric1),
+		.eint_gpio_init = exynos_eint_gpio_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
 };
 
 const struct samsung_pinctrl_of_match_data zumapro_of_data __initconst = {

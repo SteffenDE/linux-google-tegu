@@ -675,6 +675,8 @@ static const struct exynos_irq_chip gs101_wkup_irq_chip __initconst = {
 
 /* list of external wakeup controllers supported */
 static const struct of_device_id exynos_wkup_irq_ids[] = {
+	{ .compatible = "google,zumapro-wakeup-eint",
+			.data = &gs101_wkup_irq_chip },
 	{ .compatible = "google,gs101-wakeup-eint",
 			.data = &gs101_wkup_irq_chip },
 	{ .compatible = "samsung,s5pv210-wakeup-eint",
@@ -774,6 +776,7 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
 	struct exynos_muxed_weint_data *muxed_data;
 	const struct exynos_irq_chip *irq_chip;
 	unsigned int muxed_banks = 0;
+	bool explicit_eint_num;
 	unsigned int i;
 	int idx, irq;
 
@@ -790,6 +793,8 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
 	if (!wkup_np)
 		return -ENODEV;
 
+	explicit_eint_num = of_device_is_compatible(dev->of_node,
+						    "google,zumapro-pinctrl");
 	bank = d->pin_banks;
 	for (i = 0; i < d->nr_banks; ++i, ++bank) {
 		if (bank->eint_type != EINT_TYPE_WKUP)
@@ -808,8 +813,9 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
 			return -ENXIO;
 		}
 
-		bank->eint_num = eint_num;
-		eint_num = eint_num + bank->nr_pins;
+		if (!explicit_eint_num && !bank->eint_num)
+			bank->eint_num = eint_num;
+		eint_num = bank->eint_num + bank->nr_pins;
 
 		if (!fwnode_property_present(bank->fwnode, "interrupts")) {
 			bank->eint_type = EINT_TYPE_WKUP_MUX;

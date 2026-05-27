@@ -6,6 +6,7 @@
  * ../../../../../../research/dumped.dts unless another source is named.
  */
 
+#include <dt-bindings/clock/google,zumapro.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include "zumapro-pinctrl.h"
@@ -244,13 +245,6 @@
 		clock-output-names = "ext-24_5m";
 	};
 
-	ext_200m: clock-200000000 {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <200000000>;
-		clock-output-names = "ext-200m";
-	};
-
 	ext_26m: clock-26000000 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -284,6 +278,20 @@
 		 * downstream dump.
 		 */
 		ranges = <0x0 0x0 0x0 0x40000000>;
+
+		/*
+		 * Source: downstream CMU_TOP block base/size and PERIC0 parent
+		 * registers are from the Zuma cmucal-sfr.c tables.  This first
+		 * upstream clock slice only exposes the PERIC0 feeds used by the
+		 * already-working debug UART.
+		 */
+		cmu_top: clock-controller@26040000 {
+			compatible = "google,zumapro-cmu-top";
+			reg = <0x26040000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>;
+			clock-names = "oscclk";
+		};
 
 		/*
 		 * Source: MCT address, clocks, and interrupt map are from
@@ -335,14 +343,37 @@
 		};
 
 		/*
-		 * Source: debug UART address, IRQ, FIFO size, and 200 MHz clock source
-		 * are from research/dumped.dts:15121-15136.  The compatible and
-		 * clock-name spelling use the upstream GS101 UART binding/driver.
+		 * Source: downstream CMU_PERIC0 block base/size is from
+		 * cmucal-sfr.c.  The sysreg range is from the downstream
+		 * zumapro-usi.dtsi sysreg_peric0 node.
+		 */
+		cmu_peric0: clock-controller@10800000 {
+			compatible = "google,zumapro-cmu-peric0";
+			reg = <0x10800000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_PERIC0_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			clock-names = "oscclk", "bus", "ip";
+			samsung,sysreg = <&sysreg_peric0>;
+		};
+
+		sysreg_peric0: syscon@10821000 {
+			compatible = "google,zumapro-peric0-sysreg", "syscon";
+			reg = <0x10821000 0x1000>;
+		};
+
+		/*
+		 * Source: debug UART address, IRQ, FIFO size, and CMU_PERIC0
+		 * clock path are from research/dumped.dts:15121-15136 and the
+		 * downstream Zuma cmucal data.  The compatible and clock-name
+		 * spelling use the upstream GS101 UART binding/driver.
 		 */
 		serial_0: serial@10870000 {
 			compatible = "google,gs101-uart";
 			reg = <0x10870000 0x100>;
-			clocks = <&ext_200m>, <&ext_200m>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI0_UART_PCLK>,
+				 <&cmu_peric0 CLK_GOUT_PERIC0_USI0_UART_IPCLK>;
 			clock-names = "uart", "clk_uart_baud0";
 			interrupts = <GIC_SPI 641 IRQ_TYPE_LEVEL_HIGH 0>;
 			pinctrl-names = "default";

@@ -2100,6 +2100,52 @@ const struct samsung_pinctrl_of_match_data gs101_of_data __initconst = {
 	.num_ctrl	= ARRAY_SIZE(gs101_pin_ctrl),
 };
 
+/* pin banks of Tensor G4 / Zumapro pin-controller (PERIC0) */
+static const struct samsung_pin_bank_data zumapro_pin_peric0[] = {
+	GS101_PIN_BANK_EINTG(5, 0x0, "gpp0", 0x00, 0x00),
+	GS101_PIN_BANK_EINTG(4, 0x20, "gpp1", 0x04, 0x08),
+	GS101_PIN_BANK_EINTG(4, 0x40, "gpp2", 0x08, 0x0c),
+	GS101_PIN_BANK_EINTG(2, 0x60, "gpp3", 0x0c, 0x10),
+	GS101_PIN_BANK_EINTG(4, 0x80, "gpp4", 0x10, 0x14),
+	GS101_PIN_BANK_EINTG(2, 0xa0, "gpp5", 0x14, 0x18),
+	GS101_PIN_BANK_EINTG(4, 0xc0, "gpp6", 0x18, 0x1c),
+	GS101_PIN_BANK_EINTG(2, 0xe0, "gpp7", 0x1c, 0x20),
+	GS101_PIN_BANK_EINTG(4, 0x100, "gpp8", 0x20, 0x24),
+	GS101_PIN_BANK_EINTG(2, 0x120, "gpp9", 0x24, 0x28),
+	GS101_PIN_BANK_EINTG(4, 0x140, "gpp10", 0x28, 0x2c),
+	GS101_PIN_BANK_EINTG(2, 0x160, "gpp11", 0x2c, 0x30),
+	GS101_PIN_BANK_EINTG(4, 0x180, "gpp12", 0x30, 0x34),
+	GS101_PIN_BANK_EINTG(2, 0x1a0, "gpp13", 0x34, 0x38),
+	GS101_PIN_BANK_EINTG(2, 0x1c0, "gpp14", 0x38, 0x3c),
+	GS101_PIN_BANK_EINTG(2, 0x1e0, "gpp15", 0x3c, 0x40),
+	GS101_PIN_BANK_EINTG(2, 0x200, "gpp17", 0x40, 0x44),
+	GS101_PIN_BANK_EINTG(4, 0x220, "gpp16", 0x44, 0x48),
+};
+
+/*
+ * Keep the array indexed exactly like the /aliases pinctrlN entries in
+ * zumapro.dtsi.  Only PERIC0 is populated for now; the GSA-owned controllers
+ * must stay disabled from the non-secure kernel.
+ */
+#define ZUMAPRO_PINCTRL_PERIC0	11
+#define ZUMAPRO_PINCTRL_PERIC1	12
+
+static const struct samsung_pin_ctrl zumapro_pin_ctrl[] __initconst = {
+	[ZUMAPRO_PINCTRL_PERIC0] = {
+		.pin_banks	= zumapro_pin_peric0,
+		.nr_banks	= ARRAY_SIZE(zumapro_pin_peric0),
+		.eint_gpio_init = exynos_eint_gpio_init,
+		.suspend	= gs101_pinctrl_suspend,
+		.resume		= gs101_pinctrl_resume,
+	},
+	[ZUMAPRO_PINCTRL_PERIC1] = { },
+};
+
+const struct samsung_pinctrl_of_match_data zumapro_of_data __initconst = {
+	.ctrl		= zumapro_pin_ctrl,
+	.num_ctrl	= ARRAY_SIZE(zumapro_pin_ctrl),
+};
+
 /* pin banks of artpec8 pin-controller (FSYS0) */
 static const struct samsung_pin_bank_data artpec8_pin_banks0[] __initconst = {
 	ARTPEC_PIN_BANK_EINTG(5, 0x000, "gpf0", 0x00),

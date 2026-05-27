@@ -8,6 +8,7 @@
 
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include "zumapro-pinctrl.h"
 
 / {
 	/*
@@ -344,6 +345,8 @@
 			clocks = <&ext_200m>, <&ext_200m>;
 			clock-names = "uart", "clk_uart_baud0";
 			interrupts = <GIC_SPI 641 IRQ_TYPE_LEVEL_HIGH 0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_bus>;
 			samsung,uart-fifosize = <256>;
 			status = "okay";
 		};
@@ -360,14 +363,150 @@
 		 *  - far:    research/dumped.dts:5182-5186
 		 *  - gsacore blocks: research/dumped.dts:5257-5316
 		 *
-		 * These stay disabled until google,zumapro-pinctrl bank data exists
-		 * upstream; do not fall back to GS101 because the bank layout differs.
+		 * PERIC0 is enabled first to re-apply the debug UART pins the
+		 * bootloader already selected.  The other controllers stay disabled
+		 * until their Zumapro bank data and first safe consumers are added.
+		 * In particular, do not enable the GSA-owned banks from the
+		 * non-secure kernel.
 		 */
 		pinctrl_peric0: pinctrl@10840000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x10840000 0x1000>;
 			interrupts = <GIC_SPI 634 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gpp0: gpp0-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp1: gpp1-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp2: gpp2-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp3: gpp3-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp4: gpp4-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp5: gpp5-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp6: gpp6-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp7: gpp7-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp8: gpp8-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp9: gpp9-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp10: gpp10-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp11: gpp11-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp12: gpp12-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp13: gpp13-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp14: gpp14-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp15: gpp15-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp17: gpp17-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp16: gpp16-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			/* USI_PERIC0_UART_DBG */
+			uart0_bus: uart0-bus-pins {
+				samsung,pins = "gpp1-2", "gpp1-3";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+			};
 		};
 
 		pinctrl_peric1: pinctrl@10c40000 {

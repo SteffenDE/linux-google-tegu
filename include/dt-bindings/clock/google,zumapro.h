@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/*
+ * Device Tree binding constants for Google Zumapro clock controllers.
+ */
+
+#ifndef _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H
+#define _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H
+
+/* CMU_TOP fixed PLL-derived parents */
+#define CLK_FOUT_SHARED0_D4			1
+#define CLK_FOUT_SHARED2_D2			2
+#define CLK_FOUT_SHARED3_D2			3
+#define CLK_FOUT_SPARE_PLL			4
+
+/* CMU_TOP muxes */
+#define CLK_MOUT_CMU_PERIC0_NOC		5
+#define CLK_MOUT_CMU_PERIC0_IP			6
+
+/* CMU_TOP gates */
+#define CLK_GOUT_CMU_PERIC0_NOC		7
+#define CLK_GOUT_CMU_PERIC0_IP			8
+
+/* CMU_TOP dividers */
+#define CLK_DOUT_CMU_PERIC0_NOC		9
+#define CLK_DOUT_CMU_PERIC0_IP			10
+
+/* CMU_PERIC0 muxes */
+#define CLK_MOUT_PERIC0_NOC_USER		1
+#define CLK_MOUT_PERIC0_USI0_UART_USER		2
+
+/* CMU_PERIC0 dividers */
+#define CLK_DOUT_PERIC0_USI0_UART		3
+
+/* CMU_PERIC0 gates */
+#define CLK_GOUT_PERIC0_GPIO_PERIC0_PCLK	4
+#define CLK_GOUT_PERIC0_SYSREG_PERIC0_PCLK	5
+#define CLK_GOUT_PERIC0_CMU_PERIC0_PCLK		6
+#define CLK_GOUT_PERIC0_USI0_UART_IPCLK		7
+#define CLK_GOUT_PERIC0_USI0_UART_PCLK		8
+#define CLK_GOUT_PERIC0_USI0_UART_CLK		9
+
+#endif /* _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H */

@@ -46,6 +46,7 @@ properties:
           - const: samsung,exynos7-wakeup-eint
       - items:
           - enum:
+              - google,zumapro-wakeup-eint
               - google,gs101-wakeup-eint
               - samsung,exynos2200-wakeup-eint
               - samsung,exynos9610-wakeup-eint

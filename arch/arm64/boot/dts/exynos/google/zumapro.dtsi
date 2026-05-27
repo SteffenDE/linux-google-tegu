@@ -363,11 +363,10 @@
 		 *  - far:    research/dumped.dts:5182-5186
 		 *  - gsacore blocks: research/dumped.dts:5257-5316
 		 *
-		 * PERIC0 is enabled first to re-apply the debug UART pins the
-		 * bootloader already selected.  The other controllers stay disabled
-		 * until their Zumapro bank data and first safe consumers are added.
-		 * In particular, do not enable the GSA-owned banks from the
-		 * non-secure kernel.
+		 * Enable only the non-GSA pinctrl banks needed for current bring-up.
+		 * HSI0/HSI1 stay disabled until their PCIe-side consumers are added.
+		 * The GSA-owned banks below stay disabled because they belong to the
+		 * secure GSA domain.
 		 */
 		pinctrl_peric0: pinctrl@10840000 {
 			compatible = "google,zumapro-pinctrl";
@@ -513,7 +512,49 @@
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x10c40000 0x1000>;
 			interrupts = <GIC_SPI 649 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gpp19: gpp19-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp20: gpp20-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp21: gpp21-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp24: gpp24-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp22: gpp22-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gpp23: gpp23-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
 		};
 
 		pinctrl_hsi0: pinctrl@12040000 {
@@ -521,6 +562,27 @@
 			reg = <0x12040000 0x1000>;
 			interrupts = <GIC_SPI 413 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "disabled";
+
+			gph0: gph0-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gph1: gph1-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gph2: gph2-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
 		};
 
 		pinctrl_hsi1: pinctrl@13040000 {
@@ -528,98 +590,316 @@
 			reg = <0x13040000 0x1000>;
 			interrupts = <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "disabled";
+
+			gph3: gph3-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+
+			gph4: gph4-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
 		};
 
 		pinctrl_hsi2: pinctrl@13060000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x13060000 0x1000>;
 			interrupts = <GIC_SPI 433 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gph5: gph5-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
 		};
 
 		pinctrl_eint: pinctrl@15060000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x15060000 0x1000>;
-			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gpn0: gpn0-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn1: gpn1-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn2: gpn2-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn3: gpn3-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn4: gpn4-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn5: gpn5-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn6: gpn6-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn7: gpn7-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn8: gpn8-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpn9: gpn9-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			wakeup-interrupt-controller {
+				compatible = "google,zumapro-wakeup-eint",
+					     "samsung,exynos850-wakeup-eint",
+					     "samsung,exynos7-wakeup-eint";
+			};
 		};
 
 		pinctrl_alive: pinctrl@154d0000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x154d0000 0x1000>;
-			interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 24 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 31 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 37 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 45 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 52 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 53 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 55 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gpa0: gpa0-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa1: gpa1-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa2: gpa2-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa3: gpa3-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 24 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa4: gpa4-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa6: gpa6-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 31 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa7: gpa7-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 37 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa8: gpa8-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 45 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa9: gpa9-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 52 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 53 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa10: gpa10-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 55 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			gpa11: gpa11-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			gpa12: gpa12-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			wakeup-interrupt-controller {
+				compatible = "google,zumapro-wakeup-eint",
+					     "samsung,exynos850-wakeup-eint",
+					     "samsung,exynos7-wakeup-eint";
+			};
 		};
 
 		pinctrl_far_alive: pinctrl@154e0000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x154e0000 0x1000>;
-			interrupts = <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
+			status = "okay";
+
+			gpa5: gpa5-gpio-bank {
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH 0>,
+					     <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH 0>;
+			};
+
+			wakeup-interrupt-controller {
+				compatible = "google,zumapro-wakeup-eint",
+					     "samsung,exynos850-wakeup-eint",
+					     "samsung,exynos7-wakeup-eint";
+			};
 		};
 
 		/*

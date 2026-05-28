@@ -21,6 +21,8 @@ properties:
               - google,gs101-misc-sysreg
               - google,gs101-peric0-sysreg
               - google,gs101-peric1-sysreg
+              - google,zumapro-peric0-sysreg
+              - google,zumapro-peric1-sysreg
               - samsung,exynos2200-cmgp-sysreg
               - samsung,exynos2200-peric0-sysreg
               - samsung,exynos2200-peric1-sysreg

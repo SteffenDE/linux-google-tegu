@@ -7,6 +7,7 @@
  */
 
 #include <dt-bindings/clock/google,zumapro.h>
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
@@ -27,8 +28,7 @@
 
 	/*
 	 * Source: downstream aliases in research/dumped.dts:5759-5772.
-	 * The pinctrl controller nodes are placeholders until a Zumapro bank
-	 * description exists in the upstream Samsung pinctrl driver.
+	 * Keep the pinctrl aliases aligned with downstream controller numbering.
 	 */
 	aliases {
 		pinctrl0 = &pinctrl_alive;
@@ -46,6 +46,7 @@
 		pinctrl12 = &pinctrl_peric1;
 		i2c6 = &hsi2c_6;
 		i2c10 = &hsi2c_10;
+		ufs0 = &ufs_0;
 	};
 
 	/*
@@ -54,6 +55,19 @@
 	 * downstream tree also has ECT reserved memory at dumped.dts:1320.
 	 */
 	ect {
+	};
+
+	/*
+	 * Source: dumped.dts:7858-7863. The pre-guest m1n1 readout shows
+	 * gpp0-1 is an output but low at handoff, so Linux must assert this
+	 * fixed-regulator GPIO before UFS link startup.
+	 */
+	ufs_0_fixed_vcc_reg: regulator-ufs-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "ufs-vcc";
+		gpio = <&gpp0 1 GPIO_ACTIVE_HIGH>;
+		regulator-boot-on;
+		enable-active-high;
 	};
 
 	cpus {
@@ -479,6 +493,70 @@
 		};
 
 		/*
+		 * Source: CMU_HSI2 UFS-related registers are from downstream
+		 * Zuma cmucal-sfr.c/cmucal-node.c.  The node shape follows
+		 * upstream GS101, with the Zumapro base address from
+		 * research/dumped.dts:4753 and downstream zuma-ufs.dtsi.
+		 */
+		cmu_hsi2: clock-controller@13000000 {
+			compatible = "google,zumapro-cmu-hsi2";
+			reg = <0x13000000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_HSI2_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_HSI2_PCIE>,
+				 <&cmu_top CLK_DOUT_CMU_HSI2_UFS_EMBD>,
+				 <&cmu_top CLK_DOUT_CMU_HSI2_MMC_CARD>;
+			clock-names = "oscclk", "bus", "pcie", "ufs", "mmc";
+			samsung,sysreg = <&sysreg_hsi2>;
+		};
+
+		sysreg_hsi2: syscon@13020000 {
+			compatible = "google,zumapro-hsi2-sysreg", "syscon";
+			reg = <0x13020000 0x1000>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_SYSREG_HSI2_PCLK>;
+		};
+
+		ufs_0: ufs@13200000 {
+			compatible = "google,zumapro-ufs";
+			reg = <0x13200000 0x200>,
+			      <0x13201100 0x200>,
+			      <0x13280000 0xa000>,
+			      <0x132a0000 0x100>;
+			reg-names = "hci", "vs_hci", "unipro", "ufsp";
+			interrupts = <GIC_SPI 466 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_UFS_EMBD_I_ACLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_UFS_EMBD_I_CLK_UNIPRO>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_UFS_EMBD_I_FMP_CLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_ACLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_SYSREG_HSI2_PCLK>;
+			clock-names = "core_clk", "sclk_unipro_main", "fmp",
+				      "aclk", "pclk", "sysreg";
+			dma-coherent;
+			freq-table-hz = <0 0>, <0 0>, <0 0>,
+					<0 0>, <0 0>, <0 0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
+			phys = <&ufs_0_phy>;
+			phy-names = "ufs-phy";
+			samsung,sysreg = <&sysreg_hsi2 0x710>;
+			vcc-supply = <&ufs_0_fixed_vcc_reg>;
+			status = "okay";
+		};
+
+		ufs_0_phy: phy@13204000 {
+			compatible = "google,zumapro-ufs-phy";
+			reg = <0x13204000 0x4000>;
+			reg-names = "phy-pma";
+			#phy-cells = <0>;
+			clocks = <&ext_24_5m>;
+			clock-names = "ref_clk";
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ec0>;
+			status = "okay";
+		};
+
+		/*
 		 * Source: pinctrl controller addresses/IRQs are from:
 		 *  - peric0: research/dumped.dts:3393-3397
 		 *  - peric1: research/dumped.dts:4139-4143
@@ -750,6 +828,8 @@
 		pinctrl_hsi2: pinctrl@13060000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x13060000 0x1000>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_GPIO_HSI2UFS_PCLK>;
+			clock-names = "pclk";
 			interrupts = <GIC_SPI 433 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "okay";
 
@@ -758,6 +838,23 @@
 				#gpio-cells = <2>;
 				interrupt-controller;
 				#interrupt-cells = <2>;
+			};
+
+			ufs_rst_n: ufs-rst-n-pins {
+				samsung,pins = "gph5-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_OUTPUT_HIGH>;
+				samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_NONE>;
+			};
+
+			ufs_refclk_out: ufs-refclk-out-pins {
+				samsung,pins = "gph5-0";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_OUTPUT_HIGH>;
+				samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
 			};
 		};
 

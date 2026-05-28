@@ -38,6 +38,7 @@ properties:
       - google,gs101-cmu-peric1
       - google,zumapro-cmu-top
       - google,zumapro-cmu-peric0
+      - google,zumapro-cmu-peric1
 
   clocks:
     minItems: 1
@@ -180,6 +181,7 @@ allOf:
               - google,gs101-cmu-peric0
               - google,gs101-cmu-peric1
               - google,zumapro-cmu-peric0
+              - google,zumapro-cmu-peric1
 
     then:
       properties:

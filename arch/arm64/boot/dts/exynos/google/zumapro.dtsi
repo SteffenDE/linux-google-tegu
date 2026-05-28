@@ -45,6 +45,7 @@
 		pinctrl11 = &pinctrl_peric0;
 		pinctrl12 = &pinctrl_peric1;
 		i2c6 = &hsi2c_6;
+		i2c10 = &hsi2c_10;
 	};
 
 	/*
@@ -420,6 +421,64 @@
 		};
 
 		/*
+		 * Source: downstream CMU_PERIC1 block base/size is from
+		 * cmucal-sfr.c.  The sysreg range, USI10 address, IRQ,
+		 * mode offset, pinmux, and EEPROM child are from
+		 * research/dumped.dts and downstream zumapro-usi.dtsi.
+		 */
+		cmu_peric1: clock-controller@10c00000 {
+			compatible = "google,zumapro-cmu-peric1";
+			reg = <0x10c00000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_PERIC1_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_PERIC1_IP>;
+			clock-names = "oscclk", "bus", "ip";
+			samsung,sysreg = <&sysreg_peric1>;
+		};
+
+		sysreg_peric1: syscon@10c21000 {
+			compatible = "google,zumapro-peric1-sysreg", "syscon";
+			reg = <0x10c21000 0x1000>;
+		};
+
+		usi10: usi@10ca00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x10ca00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric1 CLK_GOUT_PERIC1_USI10_USI_PCLK>,
+				 <&cmu_peric1 CLK_DOUT_PERIC1_USI10_USI>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_peric1 0x08>;
+			samsung,mode = <USI_MODE_I2C>;
+			status = "okay";
+
+			hsi2c_10: i2c@10ca0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x10ca0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric1 CLK_DOUT_PERIC1_USI10_USI>,
+					 <&cmu_peric1 CLK_GOUT_PERIC1_USI10_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 658 IRQ_TYPE_LEVEL_HIGH 0>;
+				clock-frequency = <400000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c10_bus>;
+				status = "okay";
+
+				battery_pack_eeprom: eeprom@50 {
+					compatible = "atmel,24c08";
+					reg = <0x50>;
+					read-only;
+				};
+			};
+		};
+
+		/*
 		 * Source: pinctrl controller addresses/IRQs are from:
 		 *  - peric0: research/dumped.dts:3393-3397
 		 *  - peric1: research/dumped.dts:4139-4143
@@ -629,6 +688,13 @@
 				#gpio-cells = <2>;
 				interrupt-controller;
 				#interrupt-cells = <2>;
+			};
+
+			hsi2c10_bus: hsi2c10-bus-pins {
+				samsung,pins = "gpp20-0", "gpp20-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 			};
 		};
 

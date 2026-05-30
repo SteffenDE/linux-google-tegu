@@ -70,6 +70,23 @@
 		enable-active-high;
 	};
 
+	/*
+	 * Placeholder supply for rails that are real but not yet driver-managed,
+	 * mirroring the gs101 reg_placeholder approach.  The USB controller/PHY
+	 * rails (downstream m_ldo8/m_ldo9/m_ldo19 under sub_pd_hsi0, left enabled
+	 * by the bootloader) are wired here so the mainline drivers'
+	 * regulator_get() calls resolve to a real fixed supply rather than an
+	 * implicit dummy.
+	 *
+	 * TODO: replace with the real s2mpg14/15 PMIC rails once that driver
+	 * exists.  Expected mapping: vdd -> m_ldo8, vdda12 -> m_ldo9, and
+	 * vdd33 (plus the eUSB repeater) -> m_ldo19.
+	 */
+	reg_placeholder: regulator-placeholder {
+		compatible = "regulator-fixed";
+		regulator-name = "placeholder_reg";
+	};
+
 	cpus {
 		/*
 		 * Source: CPU address/size cells match research/dumped.dts:3065-3066.
@@ -571,6 +588,122 @@
 			clock-names = "ref_clk";
 			samsung,pmu-syscon = <&pmu_system_controller 0x3ec0>;
 			status = "okay";
+		};
+
+		/*
+		 * USB2 high-speed peripheral path (Pixel 9a boots over fastboot, so
+		 * USB is live at handoff).  Structural template: the in-tree
+		 * exynos2200.dtsi USB block; all addresses/clocks/IRQs are zumapro's
+		 * own, from research/dumped.dts and the hardware MMIO trace
+		 * (research/NEEDS-HARDWARE.md H1/H2/H3, decisions/0004).
+		 *
+		 * The combo USB32DRD PHY's "phy" reg (0x11100000) holds the DRD
+		 * link-control registers the driver writes (LINKCTRL 0x04, CLKRST
+		 * 0x0c, UTMI 0x10, HSP_MISC 0x114 — trace-confirmed).  Only this
+		 * single region is mapped: the SuperSpeed combo PCS (0x11130000) /
+		 * PMA (0x11140000) are intentionally left out for first high-speed
+		 * bring-up so the heavily-accessed SuperSpeed path is not touched.
+		 * The HS init is delegated to the Synopsys eUSB2 "hs" phy below.
+		 *
+		 * The combo PHY itself takes no regulator supply (its driver data has
+		 * none); the eUSB2 PHY and the DWC3 wrapper draw vdd/vdda12 and
+		 * vdd33/vdd10 from the fixed reg_placeholder, since the real rails are
+		 * PMIC-managed and left on by the bootloader.  The reused exynos2200
+		 * PHY ops do drive the PMU USB2.0 isolation bit (offset 0x3eb0) via the
+		 * pmu-syscon regmap on init/exit; on this live-at-handoff path the init
+		 * de-isolation is effectively a no-op because it is already enabled.
+		 */
+		usb32drd: phy@11100000 {
+			compatible = "google,zumapro-usb32drd-phy";
+			reg = <0x11100000 0x200>;
+
+			clocks = <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>;
+			clock-names = "phy";
+
+			#phy-cells = <1>;
+			phys = <&usb_hsphy>;
+			phy-names = "hs";
+
+			samsung,pmu-syscon = <&pmu_system_controller>;
+
+			status = "okay";
+		};
+
+		/*
+		 * Synopsys eUSB2 HS PHY.  The EUSBCON control block is a separate
+		 * MMIO resource at 0x11110000 (downstream reg index 1); its register
+		 * offsets (RST 0x0, COMMON 0x4, PLLCFG0 0x8, PLLCFG1 0xc, TX 0x14,
+		 * TESTSE 0x20) match the mainline phy-snps-eusb2 Exynos variant and
+		 * the downstream eusb-con-reg.h exactly (decisions/0004).  "ref" is
+		 * the 19.2 MHz USB reference (PLL_USB/32, trace-confirmed), which
+		 * selects the eUSB2 PLL config (fb_div 0x170, ref_div 0 — matches
+		 * downstream).
+		 */
+		usb_hsphy: phy@11110000 {
+			compatible = "google,zumapro-eusb2-phy";
+			reg = <0x11110000 0x200>;
+
+			clocks = <&cmu_hsi0 CLK_DOUT_HSI0_USB>,
+				 <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>,
+				 <&cmu_hsi0 CLK_DOUT_HSI0_EUSB>;
+			clock-names = "ref", "bus", "ctrl";
+
+			/* Placeholder rails until s2mpg14/15 PMIC support lands. */
+			vdd-supply = <&reg_placeholder>;
+			vdda12-supply = <&reg_placeholder>;
+
+			#phy-cells = <0>;
+
+			status = "okay";
+		};
+
+		/*
+		 * DWC3 wrapper + core.  Wrapper IRQ 402 (0x192) and the snps quirks
+		 * are from research/dumped.dts.  dr_mode = peripheral and
+		 * maximum-speed = high-speed for first bring-up: the live DT requests
+		 * super-speed with force_gen1, but mainline's exynos2200-style combo
+		 * PHY ops drive only the HS (UTMI/eUSB2) path, so SuperSpeed is
+		 * deferred until the combo PCS/PMA path is brought up and validated.
+		 */
+		usb: usb@11210000 {
+			compatible = "google,zumapro-dwusb3";
+			ranges = <0x0 0x11210000 0x10000>;
+
+			clocks = <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>;
+			clock-names = "link_aclk";
+
+			/* Placeholder rails until s2mpg14/15 PMIC support lands. */
+			vdd33-supply = <&reg_placeholder>;
+			vdd10-supply = <&reg_placeholder>;
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			status = "okay";
+
+			usb_dwc3: usb@0 {
+				compatible = "snps,dwc3";
+				reg = <0x0 0x10000>;
+
+				clocks = <&cmu_hsi0 CLK_DOUT_HSI0_USB>;
+				clock-names = "ref";
+
+				interrupts = <GIC_SPI 402 IRQ_TYPE_LEVEL_HIGH 0>;
+
+				phys = <&usb32drd 0>;
+				phy-names = "usb2-phy";
+
+				dr_mode = "peripheral";
+				maximum-speed = "high-speed";
+
+				snps,quirk-frame-length-adjustment = <0x20>;
+				snps,has-lpm-erratum;
+				snps,lpm-nyet-threshold = /bits/ 8 <0>;
+				snps,usb2-gadget-lpm-disable;
+				snps,dis-u2-freeclk-exists-quirk;
+				snps,dis-u1-entry-quirk;
+				snps,dis-u2-entry-quirk;
+			};
 		};
 
 		/*

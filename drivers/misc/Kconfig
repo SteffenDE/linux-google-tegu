@@ -57,6 +57,17 @@ config DUMMY_IRQ
 	  The sole purpose of this module is to help with debugging of systems on
 	  which spurious IRQs would happen on disabled IRQ vector.
 
+config MMIO_INIT_HELPER
+	bool "MMIO init helper"
+	depends on OF && HAS_IOMEM
+	help
+	  Say Y here to enable a small built-in platform driver that maps one
+	  32-bit MMIO register from Device Tree and writes a fixed value at
+	  subsys_initcall time. It can optionally perform a masked
+	  read-modify-write.
+
+	  This helper is intended for temporary hardware bring-up only.
+
 config IBM_ASM
 	tristate "Device driver for IBM RSA service processor"
 	depends on X86 && PCI && INPUT

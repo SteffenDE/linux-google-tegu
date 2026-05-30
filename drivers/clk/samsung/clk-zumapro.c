@@ -18,10 +18,11 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI2_UFS_EMBD + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI0_NOC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK + 1)
+#define CLKS_NR_HSI0		(CLK_FOUT_USB + 1)
 
 /* ---- CMU_TOP ------------------------------------------------------------ */
 
@@ -50,6 +51,9 @@
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC0_NOC	0x2114
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP	0x2118
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC	0x211c
+#define CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC		0x1094
+#define CLK_CON_DIV_CLKCMU_HSI0_NOC		0x188c
+#define CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC	0x20bc
 
 static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD,
@@ -76,6 +80,9 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_GAT_GATE_CLKCMU_PERIC0_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP,
 	CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC,
+	CLK_CON_DIV_CLKCMU_HSI0_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
 };
 
 /*
@@ -110,6 +117,11 @@ PNAME(mout_cmu_hsi2_pcie_p) = { "oscclk", "fout_shared2_d2" };
 PNAME(mout_cmu_hsi2_ufs_embd_p) = {
 	"oscclk", "fout_shared0_d4", "fout_shared2_d2", "fout_spare_pll",
 };
+PNAME(mout_cmu_hsi0_noc_p) = {
+	"fout_shared0_d4", "fout_shared1_d4",
+	"fout_shared2_d2", "fout_shared3_d2",
+	"fout_spare_pll", "oscclk", "oscclk", "oscclk",
+};
 
 static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	MUX(CLK_MOUT_CMU_HSI2_MMC_CARD, "mout_cmu_hsi2_mmc_card",
@@ -130,6 +142,8 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_pericx_p, CLK_CON_MUX_MUX_CLKCMU_PERIC1_NOC, 0, 2),
 	MUX(CLK_MOUT_CMU_PERIC1_IP, "mout_cmu_peric1_ip",
 	    mout_cmu_pericx_p, CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP, 0, 2),
+	MUX(CLK_MOUT_CMU_HSI0_NOC, "mout_cmu_hsi0_noc",
+	    mout_cmu_hsi0_noc_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC, 0, 3),
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
@@ -184,6 +198,18 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_CMU_PERIC1_IP, "gout_cmu_peric1_ip",
 	     "mout_cmu_peric1_ip", CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP,
 	     21, 0, 0),
+	/*
+	 * Keep the CMU_TOP HSI0 NOC feed on during bring-up.  USB is already
+	 * live at handoff (the device boots over fastboot), and the HSI0 leaf
+	 * consumers (DWC3 wrapper, USB-DRD/eUSB PHY) come and go across probe.
+	 * As with the HSI2 storage feeds, do not let CCF collapse the shared
+	 * HSI0 fabric root while the kernel still relies on bootloader state
+	 * for the rest of the USB block.  (The USB reference clock is not a
+	 * CMU_TOP feed; it comes from CMU_HSI0's internal PLL_USB.)
+	 */
+	GATE(CLK_GOUT_CMU_HSI0_NOC, "gout_cmu_hsi0_noc",
+	     "mout_cmu_hsi0_noc", CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
+	     21, CLK_IS_CRITICAL, 0),
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
@@ -205,6 +231,8 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_peric1_noc", CLK_CON_DIV_CLKCMU_PERIC1_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_PERIC1_IP, "dout_cmu_peric1_ip",
 	    "gout_cmu_peric1_ip", CLK_CON_DIV_CLKCMU_PERIC1_IP, 0, 4),
+	DIV(CLK_DOUT_CMU_HSI0_NOC, "dout_cmu_hsi0_noc",
+	    "gout_cmu_hsi0_noc", CLK_CON_DIV_CLKCMU_HSI0_NOC, 0, 4),
 };
 
 static const struct samsung_cmu_info top_cmu_info __initconst = {
@@ -539,6 +567,65 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 	.clk_name	= "bus",
 };
 
+/* ---- CMU_HSI0 ----------------------------------------------------------- */
+
+/*
+ * Register offsets for CMU_HSI0 (0x11000000).
+ *
+ * USB is live at handoff and this driver only observes the tree.  Per the
+ * hardware trace (research/NEEDS-HARDWARE.md H1/H3), the USB reference is the
+ * internal PLL_USB / DIV_CLK_HSI0_USB path (19.2 MHz), not the CMU_TOP USB32DRD
+ * USER path; only the NOC USER mux, DIV_CLK_HSI0_USB and DIV_CLK_HSI0_EUSB are
+ * modelled.
+ */
+#define PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER	0x0620
+#define CLK_CON_DIV_DIV_CLK_HSI0_USB		0x1804
+#define CLK_CON_DIV_DIV_CLK_HSI0_EUSB		0x180c
+
+static const unsigned long hsi0_clk_regs[] __initconst = {
+	PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER,
+	CLK_CON_DIV_DIV_CLK_HSI0_USB,
+	CLK_CON_DIV_DIV_CLK_HSI0_EUSB,
+};
+
+/*
+ * PLL_USB is a CMU_HSI0-internal PLL programmed by the bootloader; this driver
+ * never touches it.  The trace shows DIV_CLK_HSI0_USB reads /32 and its output
+ * (the USB reference) is 19.2 MHz, so PLL_USB runs at 614.4 MHz.  Model it as a
+ * fixed rate, like the shared PLLs in CMU_TOP.
+ */
+static const struct samsung_fixed_rate_clock hsi0_fixed_clks[] __initconst = {
+	FRATE(CLK_FOUT_USB, "fout_usb", NULL, 0, 614400000),
+};
+
+PNAME(mout_hsi0_noc_user_p) = { "oscclk", "dout_cmu_hsi0_noc" };
+
+static const struct samsung_mux_clock hsi0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_HSI0_NOC_USER, "mout_hsi0_noc_user",
+	    mout_hsi0_noc_user_p, PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
+	/* USB reference (eUSB2 PHY + DWC3 core "ref"): 614.4 MHz / 32 = 19.2 MHz */
+	DIV(CLK_DOUT_HSI0_USB, "dout_hsi0_usb", "fout_usb",
+	    CLK_CON_DIV_DIV_CLK_HSI0_USB, 0, 6),
+	DIV(CLK_DOUT_HSI0_EUSB, "dout_hsi0_eusb", "mout_hsi0_noc_user",
+	    CLK_CON_DIV_DIV_CLK_HSI0_EUSB, 0, 2),
+};
+
+static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
+	.fixed_clks	= hsi0_fixed_clks,
+	.nr_fixed_clks	= ARRAY_SIZE(hsi0_fixed_clks),
+	.mux_clks	= hsi0_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(hsi0_mux_clks),
+	.div_clks	= hsi0_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(hsi0_div_clks),
+	.nr_clk_ids	= CLKS_NR_HSI0,
+	.clk_regs	= hsi0_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(hsi0_clk_regs),
+	.clk_name	= "noc",
+};
+
 /* ---- platform_driver ---------------------------------------------------- */
 
 static int __init zumapro_cmu_probe(struct platform_device *pdev)
@@ -562,6 +649,9 @@ static const struct of_device_id zumapro_cmu_of_match[] = {
 	}, {
 		.compatible = "google,zumapro-cmu-hsi2",
 		.data = &hsi2_cmu_info,
+	}, {
+		.compatible = "google,zumapro-cmu-hsi0",
+		.data = &hsi0_cmu_info,
 	}, {
 	},
 };

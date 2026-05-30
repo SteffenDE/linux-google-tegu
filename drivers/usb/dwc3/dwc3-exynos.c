@@ -151,6 +151,22 @@ static const struct dwc3_exynos_driverdata exynos2200_drvdata = {
 	.suspend_clk_idx = -1,
 };
 
+/*
+ * Google Tensor G4 (zumapro / Pixel 9a). Same DWC3 wrapper shape as Exynos
+ * 2200: a single link/fabric (NOC) clock gates the DWC3 link, and USB is live
+ * at fastboot handoff so no PMU/regulator programming is needed here (the
+ * vdd33/vdd10 supplies resolve to dummy regulators, as on other Exynos parts).
+ * The downstream wrapper additionally lists "sclk" (USB ref) and "bus" clocks,
+ * but for first high-speed bring-up only the link clock is required; the ref
+ * clock is consumed by the eUSB2/combo PHYs. suspend_clk_idx = -1 (no separate
+ * wrapper suspend clock), matching exynos2200.
+ */
+static const struct dwc3_exynos_driverdata zumapro_drvdata = {
+	.clk_names = { "link_aclk" },
+	.num_clks = 1,
+	.suspend_clk_idx = -1,
+};
+
 static const struct dwc3_exynos_driverdata exynos5250_drvdata = {
 	.clk_names = { "usbdrd30" },
 	.num_clks = 1,
@@ -197,6 +213,9 @@ static const struct of_device_id exynos_dwc3_match[] = {
 	{
 		.compatible = "samsung,exynos2200-dwusb3",
 		.data = &exynos2200_drvdata,
+	}, {
+		.compatible = "google,zumapro-dwusb3",
+		.data = &zumapro_drvdata,
 	}, {
 		.compatible = "samsung,exynos5250-dwusb3",
 		.data = &exynos5250_drvdata,

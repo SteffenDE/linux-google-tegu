@@ -614,6 +614,15 @@ static const struct of_device_id snps_eusb2_hsphy_of_match_table[] = {
 		.compatible = "samsung,exynos2200-eusb2-phy",
 		.data = &exynos2200_snps_eusb2_phy,
 	}, {
+		/*
+		 * Tensor G4 (zumapro) uses the same 4nm Synopsys eUSB2 HS PHY as
+		 * Exynos 2200: identical register layout, init sequence and 19.2
+		 * MHz 4nm PLL config (phy_eusb_version 0x701).  Reuse the
+		 * exynos2200 driver data verbatim.
+		 */
+		.compatible = "google,zumapro-eusb2-phy",
+		.data = &exynos2200_snps_eusb2_phy,
+	}, {
 		/* sentinel */
 	}
 };

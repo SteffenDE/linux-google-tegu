@@ -311,6 +311,23 @@
 		};
 
 		/*
+		 * CMU_HSI0 feeds the USB block (DWC3 + USB-DRD/eUSB PHY).  The
+		 * base and the CMU_TOP NOC feed come from research/dumped.dts and
+		 * the downstream zuma cmucal tables.  The USB reference clock is
+		 * not a CMU_TOP feed; it is derived from the CMU_HSI0-internal
+		 * PLL_USB (see clk-zumapro.c and research/NEEDS-HARDWARE.md).
+		 * USB is already running at fastboot handoff.
+		 */
+		cmu_hsi0: clock-controller@11000000 {
+			compatible = "google,zumapro-cmu-hsi0";
+			reg = <0x11000000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>;
+			clock-names = "oscclk", "noc";
+		};
+
+		/*
 		 * Source: MCT address, clocks, and interrupt map are from
 		 * research/dumped.dts:15079-15097.  It is disabled for now because
 		 * the architectural timer below is enough for first boot.

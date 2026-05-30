@@ -16,6 +16,7 @@ description:
 properties:
   compatible:
     enum:
+      - google,zumapro-eusb2-phy
       - samsung,exynos2200-eusb2-phy
 
   reg:

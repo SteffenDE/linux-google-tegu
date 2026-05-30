@@ -301,6 +301,50 @@
 		method = "smc";
 	};
 
+	/*
+	 * Display PM domains.  Source: downstream zumapro-pm-domains.dtsi and
+	 * research/dumped.dts:2721-2754.  Keep disabled until the display clock,
+	 * SysMMU, DSIM, and DECON drivers can consume them together; enabling
+	 * these too early could hand genpd control of the bootloader splash path.
+	 */
+	pd_dpub: power-domain@15461d00 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461d00 0x20>,
+		      <0x0 0x19400800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x19410204>;
+		samsung,always-on;
+		#power-domain-cells = <0>;
+		label = "DPUB";
+		status = "disabled";
+	};
+
+	pd_dpuf0: power-domain@15461d80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461d80 0x20>,
+		      <0x0 0x19800800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x19810204>;
+		samsung,always-on;
+		#power-domain-cells = <0>;
+		power-domains = <&pd_dpub>;
+		label = "DPUF0";
+		status = "disabled";
+	};
+
+	pd_dpuf1: power-domain@15461e00 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461e00 0x20>,
+		      <0x0 0x19c00800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x19c10204>;
+		samsung,always-on;
+		#power-domain-cells = <0>;
+		power-domains = <&pd_dpub>;
+		label = "DPUF1";
+		status = "disabled";
+	};
+
 	soc: soc@0 {
 		compatible = "simple-bus";
 		#address-cells = <1>;

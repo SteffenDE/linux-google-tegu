@@ -36,6 +36,35 @@
 		 */
 		bootargs = "";
 		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer-0 {
+			/*
+			 * Experimental bootloader framebuffer handoff. Tegu keeps
+			 * the bootloader logo lit into Linux, and GS101 Pixel DTSes
+			 * use 0xfac00000 for continuous splash simplefb.
+			 */
+			compatible = "simple-framebuffer";
+			memory-region = <&cont_splash_mem>;
+			width = <1080>;
+			height = <2424>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+			status = "okay";
+		};
+	};
+
+	decon_autorefresh_bit: mmio-init@19470030 {
+		/*
+		 * Experimental simplefb refresh kick. Tegu's bootloader leaves
+		 * DPUF0 L0 scanning 0xfac00000, but DECON0 TRIG_CON was observed
+		 * as 0x3070 with HW_TRIG_MASK_DECON set. Clearing that mask and
+		 * setting HW_TRIG_EN gives 0x3061, matching the Pixel 9 Pro caiman
+		 * bring-up tree and making fbcon visible.
+		 */
+		compatible = "linux,mmio-init-helper";
+		reg = <0x0 0x19470030 0x4>;
+		mask = <0x11>;
+		value = <0x01>;
 	};
 
 	/*
@@ -148,6 +177,16 @@
 		aoc_reserved: aoc@94000000 {
 			/* Source: research/dumped.dts:1379-1382. */
 			reg = <0x0 0x94000000 0x3000000>;
+			no-map;
+		};
+
+		cont_splash_mem: splash@fac00000 {
+			/*
+			 * Experimental simplefb backing store. 0xfac00000 matches
+			 * the GS101 continuous-splash address; no explicit Tegu
+			 * downstream reserved-memory node exists in dumped.dts.
+			 */
+			reg = <0x0 0xfac00000 (1080 * 2424 * 4)>;
 			no-map;
 		};
 

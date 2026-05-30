@@ -9,6 +9,8 @@
 // conjunction with runtime-pm. Support for both device-tree and non-device-tree
 // based power domain support is included.
 
+#include <linux/arm-smccc.h>
+#include <linux/bits.h>
 #include <linux/io.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
@@ -29,9 +31,34 @@ struct exynos_pm_domain_config {
  */
 struct exynos_pm_domain {
 	void __iomem *base;
+	void __iomem *cmu_option;
 	struct generic_pm_domain pd;
 	u32 local_pwr_cfg;
+	u32 secure_pwr_id;
 };
+
+#define EXYNOS_PD_SMC_CMD		0x82000410
+#define EXYNOS_PD_SMC_SAVE		0
+#define EXYNOS_PD_SMC_RESTORE		1
+#define EXYNOS_PD_SMC_TZPC_GROUP	2
+#define EXYNOS_PD_CMU_RESET_DISABLE	BIT(24)
+
+static void exynos_pd_secure_control(struct exynos_pm_domain *pd, bool power_on)
+{
+	struct arm_smccc_res res;
+
+	if (!pd->secure_pwr_id)
+		return;
+
+	arm_smccc_smc(EXYNOS_PD_SMC_CMD,
+		      power_on ? EXYNOS_PD_SMC_RESTORE : EXYNOS_PD_SMC_SAVE,
+		      pd->secure_pwr_id, EXYNOS_PD_SMC_TZPC_GROUP,
+		      0, 0, 0, 0, &res);
+
+	if (res.a0)
+		pr_warn("Power domain %s secure %s returned %lu\n",
+			pd->pd.name, power_on ? "restore" : "save", res.a0);
+}
 
 static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 {
@@ -42,6 +69,15 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 
 	pd = container_of(domain, struct exynos_pm_domain, pd);
 	base = pd->base;
+
+	if (!power_on) {
+		exynos_pd_secure_control(pd, false);
+
+		if (pd->cmu_option)
+			writel_relaxed(readl_relaxed(pd->cmu_option) &
+				       ~EXYNOS_PD_CMU_RESET_DISABLE,
+				       pd->cmu_option);
+	}
 
 	pwr = power_on ? pd->local_pwr_cfg : 0;
 	writel_relaxed(pwr, base);
@@ -59,6 +95,9 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 		cpu_relax();
 		usleep_range(80, 100);
 	}
+
+	if (power_on)
+		exynos_pd_secure_control(pd, true);
 
 	return 0;
 }
@@ -81,6 +120,10 @@ static const struct exynos_pm_domain_config exynos5433_cfg = {
 	.local_pwr_cfg		= 0xf,
 };
 
+static const struct exynos_pm_domain_config zumapro_cfg = {
+	.local_pwr_cfg		= BIT(0),
+};
+
 static const struct of_device_id exynos_pm_domain_of_match[] = {
 	{
 		.compatible = "samsung,exynos4210-pd",
@@ -88,6 +131,9 @@ static const struct of_device_id exynos_pm_domain_of_match[] = {
 	}, {
 		.compatible = "samsung,exynos5433-pd",
 		.data = &exynos5433_cfg,
+	}, {
+		.compatible = "google,zumapro-pd",
+		.data = &zumapro_cfg,
 	},
 	{ },
 };
@@ -107,6 +153,7 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	const struct exynos_pm_domain_config *pm_domain_cfg;
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
+	struct resource *res;
 	struct of_phandle_args child, parent;
 	struct exynos_pm_domain *pd;
 	int on, ret;
@@ -120,13 +167,24 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	if (!pd->pd.name)
 		return -ENOMEM;
 
-	pd->base = of_iomap(np, 0);
-	if (!pd->base)
-		return -ENODEV;
+	pd->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(pd->base))
+		return PTR_ERR(pd->base);
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cmu");
+	if (res) {
+		pd->cmu_option = devm_ioremap_resource(dev, res);
+		if (IS_ERR(pd->cmu_option))
+			return PTR_ERR(pd->cmu_option);
+	}
+
+	of_property_read_u32(np, "samsung,secure-pd-id", &pd->secure_pwr_id);
 
 	pd->pd.power_off = exynos_pd_power_off;
 	pd->pd.power_on = exynos_pd_power_on;
 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
+	if (of_property_read_bool(np, "samsung,always-on"))
+		pd->pd.flags |= GENPD_FLAG_ALWAYS_ON;
 
 	/*
 	 * Some Samsung platforms with bootloaders turning on the splash-screen
@@ -139,7 +197,10 @@ static int exynos_pd_probe(struct platform_device *pdev)
 
 	on = readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg;
 
-	pm_genpd_init(&pd->pd, NULL, !on);
+	ret = pm_genpd_init(&pd->pd, NULL, !on);
+	if (ret)
+		return ret;
+
 	ret = of_genpd_add_provider_simple(np, &pd->pd);
 
 	if (ret == 0 && of_parse_phandle_with_args(np, "power-domains",

@@ -45,6 +45,14 @@
 #define CLK_DOUT_CMU_HSI2_PCIE			30
 #define CLK_DOUT_CMU_HSI2_UFS_EMBD		31
 
+/* CMU_TOP HSI0 (USB) feeds.  Only the NOC feed is used: the USB reference is
+ * derived from CMU_HSI0's internal PLL_USB, not a CMU_TOP USB32DRD feed (see
+ * the CMU_HSI0 block below and the hardware trace in research/NEEDS-HARDWARE.md).
+ */
+#define CLK_MOUT_CMU_HSI0_NOC			32
+#define CLK_GOUT_CMU_HSI0_NOC			34
+#define CLK_DOUT_CMU_HSI0_NOC			36
+
 /* CMU_PERIC0 muxes */
 #define CLK_MOUT_PERIC0_NOC_USER		1
 #define CLK_MOUT_PERIC0_USI0_UART_USER		2
@@ -96,5 +104,26 @@
 #define CLK_GOUT_HSI2_UFS_EMBD_I_FMP_CLK	10
 #define CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_ACLK	11
 #define CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK	12
+
+/*
+ * CMU_HSI0 (USB) clocks.
+ *
+ * USB is already running at handoff (the device boots over fastboot), so this
+ * driver observes the bootloader-programmed tree rather than reprogramming it.
+ *
+ * A hardware trace (research/NEEDS-HARDWARE.md H1/H3) showed the USB reference
+ * does NOT come from the CMU_TOP USB32DRD USER path (that reads 26 MHz and is
+ * unused); the internal MUX_CLK_HSI0_USB32DRD selects DIV_CLK_HSI0_USB off the
+ * CMU_HSI0-internal PLL_USB (614.4 MHz / 32 = 19.2 MHz).  The eUSB2 PHY "ref"
+ * and the DWC3 core "ref" both run at this 19.2 MHz; modelling the wrong rate
+ * would make phy-snps-eusb2 program the wrong PLL config and break USB HS.
+ *
+ * So expose: the NOC USER mux (fabric / link_aclk / phy), DIV_CLK_HSI0_USB (the
+ * 19.2 MHz reference), and DIV_CLK_HSI0_EUSB (eUSB control, NOC/2).
+ */
+#define CLK_MOUT_HSI0_NOC_USER			1
+#define CLK_DOUT_HSI0_USB			2
+#define CLK_DOUT_HSI0_EUSB			3
+#define CLK_FOUT_USB				4
 
 #endif /* _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H */

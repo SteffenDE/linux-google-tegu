@@ -2004,6 +2004,32 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
 	.n_regulators		= 0,
 };
 
+/*
+ * Google Tensor G4 (zumapro). Same 4nm USB32DRD combo PHY shape as Exynos 2200:
+ * the combo "phy" reg holds the DRD link-control registers (LINKCTRL 0x04,
+ * CLKRST 0x0c, UTMI 0x10, HSP_MISC 0x114) and HS is delegated to an external
+ * Synopsys eUSB2 "hs" phy (phy-snps-eusb2), so the exynos2200 ops/phy_cfg are
+ * reused verbatim (hardware trace confirmed these DRD offsets at 0x11100000 —
+ * research/NEEDS-HARDWARE.md H2, decisions/0004).
+ *
+ * The only delta is the PMU USB2.0 isolation/enable offset: zumapro uses the
+ * same offset as gs101 (0x3eb0), NOT exynos2200's 0x72c (hardware trace +
+ * dumped.dts pmu_offset = 0x3eb0). On this device the bootloader leaves the PMU
+ * bit enabled (USB is live at fastboot handoff), so the isol "ungate" here is a
+ * harmless re-assert and we program no other PMU/regulator state.
+ */
+static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
+	.phy_cfg		= phy_cfg_exynos2200,
+	.phy_ops		= &exynos2200_usbdrd_phy_ops,
+	.pmu_offset_usbdrd0_phy	= GS101_PHY_CTRL_USB20,
+	.clk_names		= exynos5_clk_names,
+	.n_clks			= ARRAY_SIZE(exynos5_clk_names),
+	.core_clk_names		= NULL,
+	.n_core_clks		= 0,
+	.regulator_names	= NULL,
+	.n_regulators		= 0,
+};
+
 static const struct exynos5_usbdrd_phy_drvdata exynos5420_usbdrd_phy = {
 	.phy_cfg		= phy_cfg_exynos5,
 	.phy_ops		= &exynos5_usbdrd_phy_ops,
@@ -2882,6 +2908,9 @@ static const struct of_device_id exynos5_usbdrd_phy_of_match[] = {
 	}, {
 		.compatible = "samsung,exynos2200-usb32drd-phy",
 		.data = &exynos2200_usb32drd_phy,
+	}, {
+		.compatible = "google,zumapro-usb32drd-phy",
+		.data = &zumapro_usb32drd_phy,
 	}, {
 		.compatible = "samsung,exynos5250-usbdrd-phy",
 		.data = &exynos5250_usbdrd_phy

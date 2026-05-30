@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/linux,mmio-init-helper.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Linux MMIO Init Helper
+
+maintainers:
+  - Steffen Deuchler <steffen@deusch.me>
+
+description:
+  Temporary helper for early platform bring-up. The helper maps one 32-bit
+  MMIO register and writes a fixed value once when the platform device probes.
+  If mask is present, the helper performs a read-modify-write using
+  (old & ~mask) | (value & mask).
+
+properties:
+  compatible:
+    const: linux,mmio-init-helper
+
+  reg:
+    maxItems: 1
+
+  value:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Value to write to the MMIO register, or masked value.
+
+  mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Optional bit mask for read-modify-write updates.
+
+required:
+  - compatible
+  - reg
+  - value
+
+additionalProperties: false
+
+examples:
+  - |
+    / {
+        #address-cells = <2>;
+        #size-cells = <1>;
+
+        mmio-init@19470030 {
+            compatible = "linux,mmio-init-helper";
+            reg = <0x0 0x19470030 0x4>;
+            value = <0x3061>;
+        };
+
+        mmio-init@19470034 {
+            compatible = "linux,mmio-init-helper";
+            reg = <0x0 0x19470034 0x4>;
+            mask = <0x11>;
+            value = <0x01>;
+        };
+    };
+
+...

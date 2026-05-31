@@ -1064,6 +1064,41 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 	return 0;
 }
 
+static int samsung_dsim_configure_external_phy(struct samsung_dsim *dsi)
+{
+	union phy_configure_opts phy_opts = { };
+	int ret;
+
+	if (!dsi->driver_data->uses_external_dphy_pll)
+		return 0;
+
+	if (!dsi->phy)
+		return dev_err_probe(dsi->dev, -ENODEV,
+				     "external D-PHY is required\n");
+
+	phy_opts.mipi_dphy.hs_clk_rate = dsi->hs_clock;
+	phy_opts.mipi_dphy.lp_clk_rate = dsi->esc_clk_rate;
+	phy_opts.mipi_dphy.lanes = dsi->lanes;
+
+	ret = phy_init(dsi->phy);
+	if (ret)
+		return ret;
+
+	ret = phy_configure(dsi->phy, &phy_opts);
+	if (ret)
+		goto err_exit_phy;
+
+	ret = phy_power_on(dsi->phy);
+	if (ret)
+		goto err_exit_phy;
+
+	return 0;
+
+err_exit_phy:
+	phy_exit(dsi->phy);
+	return ret;
+}
+
 static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 {
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
@@ -1965,13 +2000,22 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	if (ret)
 		return ret;
 
+	ret = samsung_dsim_configure_external_phy(dsi);
+	if (ret)
+		return ret;
+
 	if (driver_data->wait_for_reset)
 		samsung_dsim_wait_for_reset(dsi);
 	samsung_dsim_set_phy_ctrl(dsi);
 
 	ret = samsung_dsim_init_link(dsi);
-	if (ret)
+	if (ret) {
+		if (driver_data->uses_external_dphy_pll) {
+			phy_power_off(dsi->phy);
+			phy_exit(dsi->phy);
+		}
 		return ret;
+	}
 
 	dsi->state |= DSIM_STATE_INITIALIZED;
 
@@ -2575,11 +2619,12 @@ static int samsung_dsim_suspend(struct device *dev)
 {
 	struct samsung_dsim *dsi = dev_get_drvdata(dev);
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
+	bool was_initialized = dsi->state & DSIM_STATE_INITIALIZED;
 	int ret;
 
 	usleep_range(10000, 20000);
 
-	if (dsi->state & DSIM_STATE_INITIALIZED) {
+	if (was_initialized) {
 		dsi->state &= ~DSIM_STATE_INITIALIZED;
 
 		samsung_dsim_disable_clock(dsi);
@@ -2589,7 +2634,10 @@ static int samsung_dsim_suspend(struct device *dev)
 
 	dsi->state &= ~DSIM_STATE_CMD_LPM;
 
-	phy_power_off(dsi->phy);
+	if (!driver_data->uses_external_dphy_pll || was_initialized)
+		phy_power_off(dsi->phy);
+	if (driver_data->uses_external_dphy_pll && was_initialized)
+		phy_exit(dsi->phy);
 
 	clk_bulk_disable_unprepare(driver_data->num_clks, driver_data->clk_data);
 
@@ -2616,10 +2664,12 @@ static int samsung_dsim_resume(struct device *dev)
 	if (ret < 0)
 		goto err_clk;
 
-	ret = phy_power_on(dsi->phy);
-	if (ret < 0) {
-		dev_err(dsi->dev, "cannot enable phy %d\n", ret);
-		goto err_clk;
+	if (!driver_data->uses_external_dphy_pll) {
+		ret = phy_power_on(dsi->phy);
+		if (ret < 0) {
+			dev_err(dsi->dev, "cannot enable phy %d\n", ret);
+			goto err_clk;
+		}
 	}
 
 	return 0;

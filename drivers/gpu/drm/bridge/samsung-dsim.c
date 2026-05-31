@@ -250,6 +250,7 @@
 #define DSIM_ZUMAPRO_CMD_TE_TIMEOUT(x)		(((x) & 0xffff) << 0)
 #define DSIM_ZUMAPRO_OPT_TE_ON_CMD_ALLOW	BIT(10)
 #define DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL		BIT(26)
+#define DSIM_ZUMAPRO_SHADOW_REG_READ_EN	BIT(1)
 
 #define DSIM_ZUMAPRO_STABLE_VFP_DSC_PERCENT	2
 #define DSIM_ZUMAPRO_TE_IDLE_US		1000
@@ -1422,7 +1423,8 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 	samsung_dsim_write(dsi, DSIM_TIMEOUT_REG, reg);
 
 	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
-	reg |= DSIM_SFR_CTRL_SHADOW_EN;
+	reg |= DSIM_SFR_CTRL_SHADOW_EN |
+	       DSIM_ZUMAPRO_SHADOW_REG_READ_EN;
 	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
 
 	return samsung_dsim_zumapro_set_command_mode(dsi);

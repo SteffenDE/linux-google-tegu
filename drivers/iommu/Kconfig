@@ -289,6 +289,20 @@ config SAMSUNG_SYSMMU_GROUP
 	  This is needed by newer Samsung/Google display blocks where a single
 	  DECON device is backed by multiple DPUF System MMUs.
 
+config SAMSUNG_SYSMMU_V9
+	bool "Samsung System MMU v9 support"
+	depends on OF && (ARCH_EXYNOS || COMPILE_TEST)
+	depends on ARM64 || COMPILE_TEST
+	depends on !CPU_BIG_ENDIAN
+	select IOMMU_API
+	select SAMSUNG_SYSMMU_GROUP
+	help
+	  Support Samsung System MMU v9 controllers used by newer Exynos and
+	  Google Tensor display and multimedia blocks.
+
+	  This initial driver supports a single VM0 translation context, shared
+	  groups, and PMMU stream-table programming for early display bring-up.
+
 config IPMMU_VMSA
 	bool "Renesas VMSA-compatible IPMMU"
 	depends on ARCH_RENESAS || COMPILE_TEST

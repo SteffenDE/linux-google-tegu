@@ -132,14 +132,39 @@ static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
 static int zumapro_read_u32_compat(struct device *dev, const char *name,
 				   const char *legacy_name, u32 *value)
 {
-	if (!of_property_read_u32(dev->of_node, name, value))
-		return 0;
+	int ret;
 
-	if (legacy_name &&
-	    !of_property_read_u32(dev->of_node, legacy_name, value)) {
+	ret = of_property_count_u32_elems(dev->of_node, name);
+	if (ret == 1 && !of_property_read_u32(dev->of_node, name, value))
+		return 0;
+	if (ret > 1)
+		return dev_err_probe(dev, -EINVAL,
+				     "DT property %s must contain one u32\n",
+				     name);
+
+	if (legacy_name) {
+		ret = of_property_count_u32_elems(dev->of_node, legacy_name);
+		if (ret == 1 &&
+		    !of_property_read_u32(dev->of_node, legacy_name, value)) {
+			dev_warn(dev, "using legacy DT property %s; prefer %s\n",
+				 legacy_name, name);
+			return 0;
+		}
+		if (ret > 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "DT property %s must contain one u32\n",
+					     legacy_name);
+	}
+
+	if (of_property_present(dev->of_node, name))
+		return dev_err_probe(dev, -EINVAL,
+				     "malformed DT property %s\n", name);
+
+	if (legacy_name && of_property_present(dev->of_node, legacy_name)) {
 		dev_warn(dev, "using legacy DT property %s; prefer %s\n",
 			 legacy_name, name);
-		return 0;
+		return dev_err_probe(dev, -EINVAL,
+				     "malformed DT property %s\n", legacy_name);
 	}
 
 	return dev_err_probe(dev, -EINVAL, "missing DT property %s\n", name);
@@ -153,21 +178,25 @@ static int zumapro_read_u32_optional_compat(struct device *dev,
 	int ret;
 
 	if (of_property_present(dev->of_node, name)) {
-		ret = of_property_read_u32(dev->of_node, name, value);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "malformed DT property %s\n",
+		ret = of_property_count_u32_elems(dev->of_node, name);
+		if (ret != 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "DT property %s must contain one u32\n",
 					     name);
+		of_property_read_u32(dev->of_node, name, value);
 		return 0;
 	}
 
 	if (!legacy_name || !of_property_present(dev->of_node, legacy_name))
 		return 0;
 
-	ret = of_property_read_u32(dev->of_node, legacy_name, value);
-	if (ret)
-		return dev_err_probe(dev, ret, "malformed DT property %s\n",
+	ret = of_property_count_u32_elems(dev->of_node, legacy_name);
+	if (ret != 1)
+		return dev_err_probe(dev, -EINVAL,
+				     "DT property %s must contain one u32\n",
 				     legacy_name);
+
+	of_property_read_u32(dev->of_node, legacy_name, value);
 
 	if (legacy_name)
 		dev_warn(dev, "using legacy DT property %s; prefer %s\n",

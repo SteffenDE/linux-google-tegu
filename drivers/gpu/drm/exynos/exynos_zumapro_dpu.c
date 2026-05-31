@@ -280,11 +280,9 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 				     decon->id);
 
 	if (desc->has_cgc_dma) {
-		ret = zumapro_read_u32_compat(dev, "google,cgc-dma-id",
-					      "cgc-dma,id",
-					      &decon->cgc_dma_id);
-		if (ret)
-			return ret;
+		zumapro_read_u32_optional_compat(dev, "google,cgc-dma-id",
+						 "cgc-dma,id",
+						 &decon->cgc_dma_id);
 	}
 
 	zumapro_read_u32_optional_compat(dev, "google,max-windows",
@@ -302,7 +300,9 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 
 	decon->dpp_count = of_count_phandle_with_args(dev->of_node, "dpps",
 						      NULL);
-	if (decon->dpp_count < 0)
+	if (decon->dpp_count == -ENOENT)
+		decon->dpp_count = 0;
+	else if (decon->dpp_count < 0)
 		return dev_err_probe(dev, decon->dpp_count,
 				     "failed to parse dpps\n");
 

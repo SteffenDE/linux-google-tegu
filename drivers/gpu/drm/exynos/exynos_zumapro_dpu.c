@@ -7,7 +7,6 @@
  * before the first MMIO write is allowed.
  */
 
-#include <linux/component.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -21,6 +20,7 @@ struct zumapro_dpp {
 	u32 axi_port;
 	u32 scale_down;
 	u32 scale_up;
+	bool video_formats;
 };
 
 struct zumapro_decon {
@@ -29,6 +29,15 @@ struct zumapro_decon {
 	u32 cgc_dma_id;
 	u32 max_windows;
 	int dpp_count;
+};
+
+struct zumapro_decon_desc {
+	u32 id;
+	const char * const *reg_names;
+	unsigned int num_reg_names;
+	const char * const *irq_names;
+	unsigned int num_irq_names;
+	bool has_cgc_dma;
 };
 
 static const char * const zumapro_dpp_reg_names[] = {
@@ -64,6 +73,61 @@ static const char * const zumapro_decon0_irq_names[] = {
 	"cgc-dma",
 };
 
+static const char * const zumapro_decon1_irq_names[] = {
+	"frame_start",
+	"frame_done",
+	"extra",
+	"cgc-dma",
+};
+
+static const char * const zumapro_decon2_reg_names[] = {
+	"main",
+	"win",
+	"sub",
+	"wincon",
+};
+
+static const char * const zumapro_decon2_irq_names[] = {
+	"frame_start",
+	"frame_done",
+	"extra",
+};
+
+static const struct zumapro_decon_desc zumapro_decon_descs[] = {
+	{
+		.id = 0,
+		.reg_names = zumapro_decon_reg_names,
+		.num_reg_names = ARRAY_SIZE(zumapro_decon_reg_names),
+		.irq_names = zumapro_decon0_irq_names,
+		.num_irq_names = ARRAY_SIZE(zumapro_decon0_irq_names),
+		.has_cgc_dma = true,
+	}, {
+		.id = 1,
+		.reg_names = zumapro_decon_reg_names,
+		.num_reg_names = ARRAY_SIZE(zumapro_decon_reg_names),
+		.irq_names = zumapro_decon1_irq_names,
+		.num_irq_names = ARRAY_SIZE(zumapro_decon1_irq_names),
+		.has_cgc_dma = true,
+	}, {
+		.id = 2,
+		.reg_names = zumapro_decon2_reg_names,
+		.num_reg_names = ARRAY_SIZE(zumapro_decon2_reg_names),
+		.irq_names = zumapro_decon2_irq_names,
+		.num_irq_names = ARRAY_SIZE(zumapro_decon2_irq_names),
+	},
+};
+
+static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zumapro_decon_descs); i++)
+		if (zumapro_decon_descs[i].id == id)
+			return &zumapro_decon_descs[i];
+
+	return NULL;
+}
+
 static int zumapro_read_u32_compat(struct device *dev, const char *name,
 				   const char *legacy_name, u32 *value)
 {
@@ -78,6 +142,20 @@ static int zumapro_read_u32_compat(struct device *dev, const char *name,
 	}
 
 	return dev_err_probe(dev, -EINVAL, "missing DT property %s\n", name);
+}
+
+static void zumapro_read_u32_optional_compat(struct device *dev,
+					     const char *name,
+					     const char *legacy_name,
+					     u32 *value)
+{
+	if (!of_property_read_u32(dev->of_node, name, value))
+		return;
+
+	if (legacy_name &&
+	    !of_property_read_u32(dev->of_node, legacy_name, value))
+		dev_warn(dev, "using legacy DT property %s; prefer %s\n",
+			 legacy_name, name);
 }
 
 static int zumapro_check_reg_names(struct platform_device *pdev,
@@ -136,25 +214,17 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 				     "DPP%u is not a normal fetch DPP\n",
 				     dpp->id);
 
-	ret = zumapro_read_u32_compat(dev, "google,dpp-attributes", "attr",
-				      &dpp->attributes);
-	if (ret)
-		return ret;
-
-	ret = zumapro_read_u32_compat(dev, "google,axi-port", "port",
-				      &dpp->axi_port);
-	if (ret)
-		return ret;
-
-	ret = zumapro_read_u32_compat(dev, "google,scale-down", "scale_down",
-				      &dpp->scale_down);
-	if (ret)
-		return ret;
-
-	ret = zumapro_read_u32_compat(dev, "google,scale-up", "scale_up",
-				      &dpp->scale_up);
-	if (ret)
-		return ret;
+	zumapro_read_u32_optional_compat(dev, "google,dpp-attributes", "attr",
+					 &dpp->attributes);
+	zumapro_read_u32_optional_compat(dev, "google,axi-port", "port",
+					 &dpp->axi_port);
+	zumapro_read_u32_optional_compat(dev, "google,scale-down",
+					 "scale_down", &dpp->scale_down);
+	zumapro_read_u32_optional_compat(dev, "google,scale-up", "scale_up",
+					 &dpp->scale_up);
+	dpp->video_formats = of_property_read_bool(dev->of_node,
+						   "google,video-formats") ||
+			     of_property_read_bool(dev->of_node, "dpp,video");
 
 	ret = zumapro_check_reg_names(pdev, zumapro_dpp_reg_names,
 				      ARRAY_SIZE(zumapro_dpp_reg_names));
@@ -186,26 +256,10 @@ struct platform_driver zumapro_dpp_driver = {
 	},
 };
 
-static int zumapro_decon_bind(struct device *dev, struct device *master,
-			      void *data)
-{
-	return dev_err_probe(dev, -EOPNOTSUPP,
-			     "Zumapro DECON register programming is not implemented\n");
-}
-
-static void zumapro_decon_unbind(struct device *dev, struct device *master,
-				 void *data)
-{
-}
-
-static const struct component_ops zumapro_decon_component_ops = {
-	.bind = zumapro_decon_bind,
-	.unbind = zumapro_decon_unbind,
-};
-
 static int zumapro_decon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct zumapro_decon_desc *desc;
 	struct zumapro_decon *decon;
 	int ret;
 
@@ -220,27 +274,29 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (decon->id)
-		return dev_err_probe(dev, -EOPNOTSUPP,
-				     "only DECON0 is scaffolded\n");
+	desc = zumapro_decon_desc_by_id(decon->id);
+	if (!desc)
+		return dev_err_probe(dev, -EINVAL, "unsupported DECON%u\n",
+				     decon->id);
 
-	ret = zumapro_read_u32_compat(dev, "google,cgc-dma-id", "cgc-dma,id",
-				      &decon->cgc_dma_id);
+	if (desc->has_cgc_dma) {
+		ret = zumapro_read_u32_compat(dev, "google,cgc-dma-id",
+					      "cgc-dma,id",
+					      &decon->cgc_dma_id);
+		if (ret)
+			return ret;
+	}
+
+	zumapro_read_u32_optional_compat(dev, "google,max-windows",
+					 "max_win", &decon->max_windows);
+
+	ret = zumapro_check_reg_names(pdev, desc->reg_names,
+				      desc->num_reg_names);
 	if (ret)
 		return ret;
 
-	ret = zumapro_read_u32_compat(dev, "google,max-windows", "max_win",
-				      &decon->max_windows);
-	if (ret)
-		return ret;
-
-	ret = zumapro_check_reg_names(pdev, zumapro_decon_reg_names,
-				      ARRAY_SIZE(zumapro_decon_reg_names));
-	if (ret)
-		return ret;
-
-	ret = zumapro_check_irq_names(pdev, zumapro_decon0_irq_names,
-				      ARRAY_SIZE(zumapro_decon0_irq_names));
+	ret = zumapro_check_irq_names(pdev, desc->irq_names,
+				      desc->num_irq_names);
 	if (ret)
 		return ret;
 
@@ -251,12 +307,8 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 				     "failed to parse dpps\n");
 
 	platform_set_drvdata(pdev, decon);
-
-	ret = component_add(dev, &zumapro_decon_component_ops);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to add component\n");
-
-	dev_dbg(dev, "registered passive DECON%u topology with %d DPPs\n",
+	dev_info(dev,
+		 "registered passive DECON%u topology with %d DPPs; DRM bind disabled\n",
 		decon->id, decon->dpp_count);
 
 	return 0;
@@ -264,7 +316,6 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 
 static void zumapro_decon_remove(struct platform_device *pdev)
 {
-	component_del(&pdev->dev, &zumapro_decon_component_ops);
 }
 
 static const struct of_device_id zumapro_decon_of_match[] = {

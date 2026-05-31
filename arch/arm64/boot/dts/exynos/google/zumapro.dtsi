@@ -276,7 +276,7 @@
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
 		clock-frequency = <24576000>;
-		clock-output-names = "ext-24_5m";
+		clock-output-names = "oscclk";
 	};
 
 	ext_26m: clock-26000000 {

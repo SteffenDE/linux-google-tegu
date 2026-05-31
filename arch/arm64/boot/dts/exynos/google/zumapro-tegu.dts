@@ -386,3 +386,15 @@
 &pd_dpuf1 {
 	status = "okay";
 };
+
+&cmu_dpub {
+	status = "okay";
+};
+
+&cmu_dpuf0 {
+	status = "okay";
+};
+
+&cmu_dpuf1 {
+	status = "okay";
+};

@@ -22,6 +22,7 @@ struct samsung_dsim;
 #define DSIM_STATE_INITIALIZED		BIT(1)
 #define DSIM_STATE_CMD_LPM		BIT(2)
 #define DSIM_STATE_VIDOUT_AVAILABLE	BIT(3)
+#define DSIM_STATE_PRE_ENABLE_FAILED	BIT(4)
 
 enum samsung_dsim_type {
 	DSIM_TYPE_EXYNOS3250,

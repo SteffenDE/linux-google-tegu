@@ -2180,9 +2180,11 @@ static void samsung_dsim_atomic_pre_enable(struct drm_bridge *bridge,
 	ret = pm_runtime_resume_and_get(dsi->dev);
 	if (ret < 0) {
 		dev_err(dsi->dev, "failed to enable DSI device.\n");
+		dsi->state |= DSIM_STATE_PRE_ENABLE_FAILED;
 		return;
 	}
 
+	dsi->state &= ~DSIM_STATE_PRE_ENABLE_FAILED;
 	dsi->state |= DSIM_STATE_ENABLED;
 
 	/*
@@ -2192,8 +2194,7 @@ static void samsung_dsim_atomic_pre_enable(struct drm_bridge *bridge,
 	if (!samsung_dsim_init_on_transfer(dsi->plat_data->hw_type)) {
 		ret = samsung_dsim_init(dsi);
 		if (ret) {
-			dsi->state &= ~DSIM_STATE_ENABLED;
-			pm_runtime_put_sync(dsi->dev);
+			dsi->state |= DSIM_STATE_PRE_ENABLE_FAILED;
 			return;
 		}
 	}
@@ -2203,6 +2204,9 @@ static void samsung_dsim_atomic_enable(struct drm_bridge *bridge,
 				       struct drm_atomic_state *state)
 {
 	struct samsung_dsim *dsi = bridge_to_dsi(bridge);
+
+	if (dsi->state & DSIM_STATE_PRE_ENABLE_FAILED)
+		return;
 
 	samsung_dsim_set_display_mode(dsi);
 	samsung_dsim_set_display_enable(dsi, true);
@@ -2215,7 +2219,8 @@ static void samsung_dsim_atomic_disable(struct drm_bridge *bridge,
 {
 	struct samsung_dsim *dsi = bridge_to_dsi(bridge);
 
-	if (!(dsi->state & DSIM_STATE_ENABLED))
+	if ((dsi->state & DSIM_STATE_PRE_ENABLE_FAILED) ||
+	    !(dsi->state & DSIM_STATE_ENABLED))
 		return;
 
 	samsung_dsim_set_display_enable(dsi, false);
@@ -2227,6 +2232,12 @@ static void samsung_dsim_atomic_post_disable(struct drm_bridge *bridge,
 {
 	struct samsung_dsim *dsi = bridge_to_dsi(bridge);
 
+	if (!(dsi->state & DSIM_STATE_ENABLED)) {
+		dsi->state &= ~DSIM_STATE_PRE_ENABLE_FAILED;
+		return;
+	}
+
+	dsi->state &= ~DSIM_STATE_PRE_ENABLE_FAILED;
 	dsi->state &= ~DSIM_STATE_ENABLED;
 	pm_runtime_put_sync(dsi->dev);
 }

@@ -25,6 +25,7 @@
 #include <video/mipi_display.h>
 
 #include <drm/bridge/samsung-dsim.h>
+#include <drm/display/drm_dsc.h>
 #include <drm/drm_panel.h>
 #include <drm/drm_print.h>
 
@@ -212,6 +213,36 @@
 #define DSIM_PHYTIMING2_HS_ZERO(x)	((x) << 8)
 #define DSIM_PHYTIMING2_HS_TRAIL(x)	((x) << 0)
 
+/* Zumapro DSIM registers keep the PLL/timing controls in the external M4M4 D-PHY. */
+#define DSIM_ZUMAPRO_NUM_OF_TRANSFER		0x0030
+#define DSIM_ZUMAPRO_UNDERRUN_CTRL		0x0034
+#define DSIM_ZUMAPRO_THRESHOLD			0x0038
+#define DSIM_ZUMAPRO_CPRS_CTRL			0x0074
+#define DSIM_ZUMAPRO_SLICE01			0x0078
+#define DSIM_ZUMAPRO_SLICE23			0x007c
+#define DSIM_ZUMAPRO_VPORCH			0x0104
+#define DSIM_ZUMAPRO_VFP_DETAIL		0x0108
+
+#define DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE	BIT(25)
+#define DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_EN(x)	(((x) & 0x1f) << 8)
+#define DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_MASK	(0x1f << 8)
+#define DSIM_ZUMAPRO_CLKCTRL_ESC_PRESCALER_MASK	(0xff << 0)
+
+#define DSIM_ZUMAPRO_CONFIG_CPRS_EN		BIT(19)
+#define DSIM_ZUMAPRO_CONFIG_VIDEO_MODE		BIT(18)
+#define DSIM_ZUMAPRO_CONFIG_RGB24		(0x3e << 9)
+#define DSIM_ZUMAPRO_CONFIG_EOTP_EN		BIT(7)
+#define DSIM_ZUMAPRO_CONFIG_DATA_LANE_NUM(x)	(((x) & 0x3) << 5)
+#define DSIM_ZUMAPRO_CONFIG_LANES_EN(x)		(((x) & 0x1f) << 0)
+
+#define DSIM_ZUMAPRO_CPRS_MULTI_SLICE		BIT(3)
+#define DSIM_ZUMAPRO_CPRS_NUM_OF_SLICE(x)	(((x) & 0x7) << 0)
+#define DSIM_ZUMAPRO_SLICE_SIZE1(x)		(((x) & 0x1fff) << 16)
+#define DSIM_ZUMAPRO_SLICE_SIZE0(x)		(((x) & 0x1fff) << 0)
+#define DSIM_ZUMAPRO_VFP_CMD_ALLOW(x)		(((x) & 0xffff) << 16)
+#define DSIM_ZUMAPRO_STABLE_VFP(x)		(((x) & 0xffff) << 0)
+#define DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL		BIT(26)
+
 #define DSI_MAX_BUS_WIDTH		4
 #define DSI_NUM_VIRTUAL_CHANNELS	4
 #define DSI_TX_FIFO_SIZE		2048
@@ -249,6 +280,11 @@ static struct clk_bulk_data exynos7870_clk_bulk_data[] = {
 	{ .id = "pll" },
 	{ .id = "byte" },
 	{ .id = "esc" },
+};
+
+static struct clk_bulk_data zumapro_clk_bulk_data[] = {
+	{ .id = "bus" },
+	{ .id = "osc" },
 };
 
 enum reg_idx {
@@ -353,6 +389,26 @@ static const unsigned int exynos7870_reg_ofs[] = {
 	[DSIM_PHYTIMING2_REG] = 0xBC,
 };
 
+static const unsigned int zumapro_reg_ofs[] = {
+	[DSIM_LINK_STATUS_REG] = 0x14,
+	[DSIM_DPHY_STATUS_REG] = 0x1c,
+	[DSIM_SWRST_REG] = 0x04,
+	[DSIM_CLKCTRL_REG] = 0x20,
+	[DSIM_TIMEOUT_REG] = 0x28,
+	[DSIM_ESCMODE_REG] = 0x2c,
+	[DSIM_MDRESOL_REG] = 0x3c,
+	[DSIM_MHPORCH_REG] = 0x44,
+	[DSIM_MSYNC_REG] = 0x48,
+	[DSIM_CONFIG_REG] = 0x4c,
+	[DSIM_INTSRC_REG] = 0x50,
+	[DSIM_INTMSK_REG] = 0x54,
+	[DSIM_PKTHDR_REG] = 0x58,
+	[DSIM_PAYLOAD_REG] = 0x5c,
+	[DSIM_RXFIFO_REG] = 0x60,
+	[DSIM_SFRCTRL_REG] = 0x64,
+	[DSIM_FIFOCTRL_REG] = 0x68,
+};
+
 enum reg_value_idx {
 	RESET_TYPE,
 	PLL_TIMER,
@@ -441,6 +497,11 @@ static const unsigned int exynos7870_reg_values[] = {
 	[PHYTIMING_HS_PREPARE] = DSIM_PHYTIMING2_HS_PREPARE(0x09),
 	[PHYTIMING_HS_ZERO] = DSIM_PHYTIMING2_HS_ZERO(0x0f),
 	[PHYTIMING_HS_TRAIL] = DSIM_PHYTIMING2_HS_TRAIL(0x0c),
+};
+
+static const unsigned int zumapro_reg_values[] = {
+	[RESET_TYPE] = DSIM_SWRST,
+	[STOP_STATE_CNT] = 0xa,
 };
 
 static const unsigned int imx8mm_dsim_reg_values[] = {
@@ -644,6 +705,26 @@ static const struct samsung_dsim_driver_data exynos7870_dsi_driver_data = {
 	.min_freq = 500,
 };
 
+static const struct samsung_dsim_driver_data zumapro_dsi_driver_data = {
+	.reg_ofs = zumapro_reg_ofs,
+	.clk_data = zumapro_clk_bulk_data,
+	.num_clks = ARRAY_SIZE(zumapro_clk_bulk_data),
+	.wait_for_hdr_fifo = 0,
+	.wait_for_reset = 0,
+	.num_bits_resol = 13,
+	.video_mode_bit = 18,
+	.pll_stable_bit = 0,
+	.esc_clken_bit = 16,
+	.byte_clken_bit = 17,
+	.tx_req_hsclk_bit = 20,
+	.lane_esc_clk_bit = 8,
+	.lane_esc_data_offset = 9,
+	.main_vsa_offset = 16,
+	.reg_values = zumapro_reg_values,
+	.has_zumapro_regs = 1,
+	.uses_external_dphy_pll = 1,
+};
+
 static const struct samsung_dsim_driver_data imx8mm_dsi_driver_data = {
 	.reg_ofs = exynos5433_reg_ofs,
 	.plltmr_reg = 0xa0,
@@ -686,6 +767,7 @@ samsung_dsim_types[DSIM_TYPE_COUNT] = {
 	[DSIM_TYPE_EXYNOS5422] = &exynos5422_dsi_driver_data,
 	[DSIM_TYPE_EXYNOS5433] = &exynos5433_dsi_driver_data,
 	[DSIM_TYPE_EXYNOS7870] = &exynos7870_dsi_driver_data,
+	[DSIM_TYPE_ZUMAPRO] = &zumapro_dsi_driver_data,
 	[DSIM_TYPE_IMX8MM] = &imx8mm_dsi_driver_data,
 	[DSIM_TYPE_IMX8MP] = &imx8mm_dsi_driver_data,
 };
@@ -711,6 +793,17 @@ static inline u32 samsung_dsim_read(struct samsung_dsim *dsi, enum reg_idx idx)
 	return readl(dsi->reg_base + dsi->driver_data->reg_ofs[idx]);
 }
 
+static inline void samsung_dsim_write_offset(struct samsung_dsim *dsi,
+					     u32 offset, u32 val)
+{
+	writel(val, dsi->reg_base + offset);
+}
+
+static inline bool samsung_dsim_init_on_transfer(enum samsung_dsim_type hw)
+{
+	return samsung_dsim_hw_is_exynos(hw) || hw == DSIM_TYPE_ZUMAPRO;
+}
+
 static void samsung_dsim_wait_for_reset(struct samsung_dsim *dsi)
 {
 	if (wait_for_completion_timeout(&dsi->completed, msecs_to_jiffies(300)))
@@ -722,6 +815,22 @@ static void samsung_dsim_wait_for_reset(struct samsung_dsim *dsi)
 static void samsung_dsim_reset(struct samsung_dsim *dsi)
 {
 	u32 reset_val = dsi->driver_data->reg_values[RESET_TYPE];
+	int timeout;
+
+	if (dsi->driver_data->has_zumapro_regs) {
+		samsung_dsim_write(dsi, DSIM_SWRST_REG, reset_val);
+
+		timeout = 200;
+		do {
+			if (!(samsung_dsim_read(dsi, DSIM_SWRST_REG) & reset_val))
+				return;
+
+			udelay(10);
+		} while (--timeout);
+
+		dev_err(dsi->dev, "timeout waiting for Zumapro reset\n");
+		return;
+	}
 
 	reinit_completion(&dsi->completed);
 	samsung_dsim_write(dsi, DSIM_SWRST_REG, reset_val);
@@ -882,9 +991,14 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 
 	/* Use burst_clk_rate if available, otherwise use the pix_clk */
 	if (dsi->burst_clk_rate)
-		hs_clk = samsung_dsim_set_pll(dsi, dsi->burst_clk_rate);
+		hs_clk = dsi->burst_clk_rate;
 	else
-		hs_clk = samsung_dsim_set_pll(dsi, DIV_ROUND_UP(pix_clk * bpp, dsi->lanes));
+		hs_clk = DIV_ROUND_UP(pix_clk * bpp, dsi->lanes);
+
+	if (driver_data->uses_external_dphy_pll)
+		dsi->hs_clock = hs_clk;
+	else
+		hs_clk = samsung_dsim_set_pll(dsi, hs_clk);
 
 	if (!hs_clk) {
 		dev_err(dsi->dev, "failed to configure DSI PLL\n");
@@ -902,6 +1016,36 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 
 	dev_dbg(dsi->dev, "hs_clk = %lu, byte_clk = %lu, esc_clk = %lu\n",
 		hs_clk, byte_clk, esc_clk);
+
+	if (driver_data->has_zumapro_regs) {
+		u32 lanes_mask = BIT(dsi->lanes + 1) - 1;
+
+		if (esc_div > 0xff) {
+			dev_err(dsi->dev, "escape clock divider is too large\n");
+			return -EINVAL;
+		}
+
+		reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+		reg &= ~(DSIM_ZUMAPRO_CLKCTRL_ESC_PRESCALER_MASK |
+			 DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_MASK |
+			 BIT(driver_data->esc_clken_bit) |
+			 BIT(driver_data->byte_clken_bit) |
+			 BIT(driver_data->tx_req_hsclk_bit) |
+			 DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE |
+			 DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL);
+		reg |= DSIM_ESC_PRESCALER(esc_div) |
+		       DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_EN(lanes_mask) |
+		       BIT(driver_data->esc_clken_bit) |
+		       BIT(driver_data->byte_clken_bit) |
+		       BIT(driver_data->tx_req_hsclk_bit) |
+		       DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL;
+
+		if (dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS)
+			reg |= DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE;
+
+		samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+		return 0;
+	}
 
 	reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
 	reg &= ~(DSIM_ESC_PRESCALER_MASK | BIT(driver_data->lane_esc_clk_bit)
@@ -930,7 +1074,7 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	int hs_exit, hs_prepare, hs_zero, hs_trail;
 	unsigned long long byte_clock = dsi->hs_clock / 8;
 
-	if (driver_data->has_freqband)
+	if (driver_data->has_freqband || driver_data->uses_external_dphy_pll)
 		return;
 
 	phy_mipi_dphy_get_default_config_for_hsclk(dsi->hs_clock,
@@ -1021,6 +1165,18 @@ static void samsung_dsim_disable_clock(struct samsung_dsim *dsi)
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
 	u32 reg;
 
+	if (driver_data->has_zumapro_regs) {
+		reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+		reg &= ~(DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_MASK |
+			 BIT(driver_data->esc_clken_bit) |
+			 BIT(driver_data->byte_clken_bit) |
+			 BIT(driver_data->tx_req_hsclk_bit) |
+			 DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE |
+			 DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL);
+		samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+		return;
+	}
+
 	reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
 	reg &= ~(BIT(driver_data->lane_esc_clk_bit)
 		| DSIM_LANE_ESC_CLK_EN_DATA_MASK(driver_data->lane_esc_data_offset)
@@ -1028,9 +1184,11 @@ static void samsung_dsim_disable_clock(struct samsung_dsim *dsi)
 		| BIT(driver_data->byte_clken_bit));
 	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
 
-	reg = samsung_dsim_read(dsi, DSIM_PLLCTRL_REG);
-	reg &= ~DSIM_PLL_EN;
-	samsung_dsim_write(dsi, DSIM_PLLCTRL_REG, reg);
+	if (!driver_data->uses_external_dphy_pll) {
+		reg = samsung_dsim_read(dsi, DSIM_PLLCTRL_REG);
+		reg &= ~DSIM_PLL_EN;
+		samsung_dsim_write(dsi, DSIM_PLLCTRL_REG, reg);
+	}
 }
 
 static void samsung_dsim_enable_lane(struct samsung_dsim *dsi, u32 lane)
@@ -1042,12 +1200,71 @@ static void samsung_dsim_enable_lane(struct samsung_dsim *dsi, u32 lane)
 	samsung_dsim_write(dsi, DSIM_CONFIG_REG, reg);
 }
 
+static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
+{
+	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
+	u32 data_lanes_mask = BIT(dsi->lanes) - 1;
+	u32 lanes_mask = BIT(dsi->lanes + 1) - 1;
+	int timeout;
+	u32 reg;
+
+	if (dsi->format != MIPI_DSI_FMT_RGB888) {
+		dev_err(dsi->dev, "unsupported Zumapro pixel format\n");
+		return -EINVAL;
+	}
+
+	reg = DSIM_ZUMAPRO_CONFIG_RGB24 |
+	      DSIM_ZUMAPRO_CONFIG_DATA_LANE_NUM(dsi->lanes - 1) |
+	      DSIM_ZUMAPRO_CONFIG_LANES_EN(lanes_mask);
+
+	if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO)
+		reg |= DSIM_ZUMAPRO_CONFIG_VIDEO_MODE;
+
+	if (!(dsi->mode_flags & MIPI_DSI_MODE_NO_EOT_PACKET))
+		reg |= DSIM_ZUMAPRO_CONFIG_EOTP_EN;
+
+	if (dsi->dsc)
+		reg |= DSIM_ZUMAPRO_CONFIG_CPRS_EN;
+
+	samsung_dsim_write(dsi, DSIM_CONFIG_REG, reg);
+
+	timeout = 100;
+	do {
+		if (timeout-- == 0) {
+			dev_err(dsi->dev, "waiting for Zumapro bus lanes timed out\n");
+			return -EFAULT;
+		}
+
+		reg = samsung_dsim_read(dsi, DSIM_DPHY_STATUS_REG);
+		if ((reg & DSIM_STOP_STATE_DAT(data_lanes_mask)) !=
+		    DSIM_STOP_STATE_DAT(data_lanes_mask))
+			continue;
+	} while (!(reg & (DSIM_STOP_STATE_CLK | DSIM_TX_READY_HS_CLK)));
+
+	reg = samsung_dsim_read(dsi, DSIM_ESCMODE_REG);
+	reg &= ~DSIM_STOP_STATE_CNT_MASK;
+	reg |= DSIM_STOP_STATE_CNT(driver_data->reg_values[STOP_STATE_CNT]);
+	samsung_dsim_write(dsi, DSIM_ESCMODE_REG, reg);
+
+	reg = DSIM_BTA_TIMEOUT(0xff) | DSIM_LPDR_TIMEOUT(0xffff);
+	samsung_dsim_write(dsi, DSIM_TIMEOUT_REG, reg);
+
+	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
+	reg |= DSIM_SFR_CTRL_SHADOW_EN;
+	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
+
+	return 0;
+}
+
 static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 {
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
 	int timeout;
 	u32 reg;
 	u32 lanes_mask;
+
+	if (driver_data->has_zumapro_regs)
+		return samsung_dsim_zumapro_init_link(dsi);
 
 	/* Initialize FIFO pointers */
 	reg = samsung_dsim_read(dsi, DSIM_FIFOCTRL_REG);
@@ -1160,12 +1377,124 @@ static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 	return 0;
 }
 
+static u32 samsung_dsim_zumapro_dsc_width(const struct drm_dsc_config *dsc)
+{
+	return ALIGN(DIV_ROUND_UP(dsc->slice_width, 3), 4) * dsc->slice_count;
+}
+
+static void samsung_dsim_zumapro_config_dsc(struct samsung_dsim *dsi)
+{
+	const struct drm_dsc_config *dsc = dsi->dsc;
+	u32 slice = dsc->slice_width;
+	u32 val;
+
+	val = DSIM_ZUMAPRO_CPRS_NUM_OF_SLICE(dsc->slice_count);
+	if (dsc->slice_count > 1)
+		val |= DSIM_ZUMAPRO_CPRS_MULTI_SLICE;
+	samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_CPRS_CTRL, val);
+
+	if (dsc->slice_count == 4) {
+		val = DSIM_ZUMAPRO_SLICE_SIZE1(slice) |
+		      DSIM_ZUMAPRO_SLICE_SIZE0(slice);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_SLICE01, val);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_SLICE23, val);
+	} else if (dsc->slice_count == 2) {
+		val = DSIM_ZUMAPRO_SLICE_SIZE1(slice) |
+		      DSIM_ZUMAPRO_SLICE_SIZE0(slice);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_SLICE01, val);
+	} else if (dsc->slice_count == 1) {
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_SLICE01,
+					  DSIM_ZUMAPRO_SLICE_SIZE0(slice));
+	} else {
+		dev_warn(dsi->dev, "unsupported DSC slice count %u\n",
+			 dsc->slice_count);
+	}
+}
+
+static void samsung_dsim_zumapro_set_display_mode(struct samsung_dsim *dsi)
+{
+	struct drm_display_mode *m = &dsi->mode;
+	unsigned int num_bits_resol = dsi->driver_data->num_bits_resol;
+	unsigned int main_vsa_offset = dsi->driver_data->main_vsa_offset;
+	u32 width = m->hdisplay;
+	u32 threshold = width;
+	u32 num_of_transfer;
+	u32 reg;
+
+	if (dsi->dsc) {
+		width = samsung_dsim_zumapro_dsc_width(dsi->dsc);
+		threshold = width;
+	}
+
+	reg = DSIM_MAIN_HRESOL(width, num_bits_resol) |
+	      DSIM_MAIN_VRESOL(m->vdisplay, num_bits_resol);
+	samsung_dsim_write(dsi, DSIM_MDRESOL_REG, reg);
+
+	samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_THRESHOLD, threshold);
+
+	if (!(dsi->mode_flags & MIPI_DSI_MODE_VIDEO)) {
+		if (dsi->dsc)
+			num_of_transfer = m->vdisplay;
+		else
+			num_of_transfer = DIV_ROUND_UP(m->hdisplay * m->vdisplay,
+						       threshold);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_NUM_OF_TRANSFER,
+					  num_of_transfer);
+	} else {
+		u64 byte_clk = dsi->hs_clock / 8;
+		u64 pix_clk = m->clock * 1000;
+		int hfp, hbp, hsa;
+
+		num_of_transfer = DIV_ROUND_UP(m->hdisplay * m->vdisplay,
+					       threshold);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_NUM_OF_TRANSFER,
+					  num_of_transfer);
+
+		reg = DSIM_ZUMAPRO_VFP_CMD_ALLOW(4) |
+		      DSIM_ZUMAPRO_STABLE_VFP(2);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_VFP_DETAIL, reg);
+
+		reg = DSIM_STABLE_VFP(m->vsync_start - m->vdisplay) |
+		      DSIM_MAIN_VBP(m->vtotal - m->vsync_end);
+		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_VPORCH, reg);
+
+		hfp = DIV64_U64_ROUND_UP((m->hsync_start - m->hdisplay) * byte_clk,
+					 pix_clk);
+		hbp = DIV64_U64_ROUND_UP((m->htotal - m->hsync_end) * byte_clk,
+					 pix_clk);
+		hsa = DIV64_U64_ROUND_UP((m->hsync_end - m->hsync_start) * byte_clk,
+					 pix_clk);
+
+		hfp = max(hfp - 6, 0);
+		hbp = max(hbp - 6, 0);
+		hsa = max(hsa - 6, 0);
+
+		reg = DSIM_MAIN_HFP(hfp) | DSIM_MAIN_HBP(hbp);
+		samsung_dsim_write(dsi, DSIM_MHPORCH_REG, reg);
+
+		reg = DSIM_MAIN_VSA(m->vsync_end - m->vsync_start, main_vsa_offset) |
+		      DSIM_MAIN_HSA(hsa);
+		samsung_dsim_write(dsi, DSIM_MSYNC_REG, reg);
+	}
+
+	if (dsi->dsc)
+		samsung_dsim_zumapro_config_dsc(dsi);
+
+	dev_dbg(dsi->dev, "Zumapro LCD size = %ux%u, DSIM width = %u\n",
+		m->hdisplay, m->vdisplay, width);
+}
+
 static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 {
 	struct drm_display_mode *m = &dsi->mode;
 	unsigned int num_bits_resol = dsi->driver_data->num_bits_resol;
 	unsigned int main_vsa_offset = dsi->driver_data->main_vsa_offset;
 	u32 reg;
+
+	if (dsi->driver_data->has_zumapro_regs) {
+		samsung_dsim_zumapro_set_display_mode(dsi);
+		return;
+	}
 
 	if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO) {
 		u64 byte_clk = dsi->hs_clock / 8;
@@ -1207,6 +1536,9 @@ static void samsung_dsim_set_display_enable(struct samsung_dsim *dsi, bool enabl
 {
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
 	u32 reg;
+
+	if (driver_data->has_zumapro_regs)
+		return;
 
 	reg = samsung_dsim_read(dsi, DSIM_MDRESOL_REG);
 	if (enable)
@@ -1618,6 +1950,7 @@ static void samsung_dsim_disable_irq(struct samsung_dsim *dsi)
 static int samsung_dsim_init(struct samsung_dsim *dsi)
 {
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
+	int ret;
 
 	if (dsi->state & DSIM_STATE_INITIALIZED)
 		return 0;
@@ -1628,11 +1961,17 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	if (driver_data->reg_values[RESET_TYPE] == DSIM_FUNCRST)
 		samsung_dsim_enable_lane(dsi, BIT(dsi->lanes) - 1);
 
-	samsung_dsim_enable_clock(dsi);
+	ret = samsung_dsim_enable_clock(dsi);
+	if (ret)
+		return ret;
+
 	if (driver_data->wait_for_reset)
 		samsung_dsim_wait_for_reset(dsi);
 	samsung_dsim_set_phy_ctrl(dsi);
-	samsung_dsim_init_link(dsi);
+
+	ret = samsung_dsim_init_link(dsi);
+	if (ret)
+		return ret;
 
 	dsi->state |= DSIM_STATE_INITIALIZED;
 
@@ -1660,7 +1999,7 @@ static void samsung_dsim_atomic_pre_enable(struct drm_bridge *bridge,
 	 * For Exynos-DSIM the downstream bridge, or panel are expecting
 	 * the host initialization during DSI transfer.
 	 */
-	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+	if (!samsung_dsim_init_on_transfer(dsi->plat_data->hw_type)) {
 		ret = samsung_dsim_init(dsi);
 		if (ret)
 			return;
@@ -1984,6 +2323,7 @@ of_find_panel_or_bridge:
 	dsi->lanes = device->lanes;
 	dsi->format = device->format;
 	dsi->mode_flags = device->mode_flags;
+	dsi->dsc = device->dsc;
 
 	return 0;
 

@@ -50,6 +50,7 @@ static int exynos_dsi_host_attach(struct samsung_dsim *dsim,
 	dsim->lanes = device->lanes;
 	dsim->format = device->format;
 	dsim->mode_flags = device->mode_flags;
+	dsim->dsc = device->dsc;
 	exynos_drm_crtc_get_by_type(drm, EXYNOS_DISPLAY_TYPE_LCD)->i80_mode =
 			!(dsim->mode_flags & MIPI_DSI_MODE_VIDEO);
 
@@ -159,6 +160,11 @@ static const struct samsung_dsim_plat_data exynos7870_dsi_pdata = {
 	.host_ops = &exynos_dsi_exynos_host_ops,
 };
 
+static const struct samsung_dsim_plat_data zumapro_dsi_pdata = {
+	.hw_type = DSIM_TYPE_ZUMAPRO,
+	.host_ops = &exynos_dsi_exynos_host_ops,
+};
+
 static const struct of_device_id exynos_dsi_of_match[] = {
 	{
 		.compatible = "samsung,exynos3250-mipi-dsi",
@@ -183,6 +189,10 @@ static const struct of_device_id exynos_dsi_of_match[] = {
 	{
 		.compatible = "samsung,exynos7870-mipi-dsi",
 		.data = &exynos7870_dsi_pdata,
+	},
+	{
+		.compatible = "google,zumapro-mipi-dsi",
+		.data = &zumapro_dsi_pdata,
 	},
 	{ /* sentinel. */ }
 };

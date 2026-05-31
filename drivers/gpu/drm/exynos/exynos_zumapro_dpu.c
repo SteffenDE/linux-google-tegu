@@ -7,6 +7,8 @@
  * before the first MMIO write is allowed.
  */
 
+#include <drm/drm_fourcc.h>
+
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -22,6 +24,8 @@ struct zumapro_dpp {
 	u32 scale_down;
 	u32 scale_up;
 	bool video_formats;
+	const u32 *pixel_formats;
+	unsigned int num_pixel_formats;
 };
 
 struct zumapro_decon {
@@ -117,6 +121,148 @@ static const struct zumapro_decon_desc zumapro_decon_descs[] = {
 		.num_irq_names = ARRAY_SIZE(zumapro_decon2_irq_names),
 	},
 };
+
+struct zumapro_dpp_format {
+	u32 drm_format;
+	enum zumapro_dpu_dma_format dma_format;
+	enum zumapro_dpu_dpp_format dpp_format;
+};
+
+static const u32 zumapro_dpp_graphics_formats[] = {
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGBA8888,
+	DRM_FORMAT_BGRA8888,
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_BGRX8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_ABGR2101010,
+	DRM_FORMAT_RGBA1010102,
+	DRM_FORMAT_BGRA1010102,
+	DRM_FORMAT_ARGB16161616F,
+	DRM_FORMAT_ABGR16161616F,
+};
+
+static const u32 zumapro_dpp_video_formats[] = {
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGBA8888,
+	DRM_FORMAT_BGRA8888,
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_BGRX8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_ABGR2101010,
+	DRM_FORMAT_RGBA1010102,
+	DRM_FORMAT_BGRA1010102,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV21,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV61,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_YUV420_8BIT,
+	DRM_FORMAT_YUV420_10BIT,
+	DRM_FORMAT_ARGB16161616F,
+	DRM_FORMAT_ABGR16161616F,
+};
+
+static const struct zumapro_dpp_format zumapro_dpp_formats[] = {
+	{ DRM_FORMAT_ARGB8888, ZUMAPRO_DMA_FORMAT_ARGB8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_ABGR8888, ZUMAPRO_DMA_FORMAT_ABGR8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_RGBA8888, ZUMAPRO_DMA_FORMAT_RGBA8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_BGRA8888, ZUMAPRO_DMA_FORMAT_BGRA8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_XRGB8888, ZUMAPRO_DMA_FORMAT_XRGB8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_XBGR8888, ZUMAPRO_DMA_FORMAT_XBGR8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_RGBX8888, ZUMAPRO_DMA_FORMAT_RGBX8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_BGRX8888, ZUMAPRO_DMA_FORMAT_BGRX8888,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_RGB565, ZUMAPRO_DMA_FORMAT_RGB565,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_BGR565, ZUMAPRO_DMA_FORMAT_BGR565,
+	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
+	{ DRM_FORMAT_ARGB2101010, ZUMAPRO_DMA_FORMAT_ARGB2101010,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+	{ DRM_FORMAT_ABGR2101010, ZUMAPRO_DMA_FORMAT_ABGR2101010,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+	{ DRM_FORMAT_RGBA1010102, ZUMAPRO_DMA_FORMAT_RGBA1010102,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+	{ DRM_FORMAT_BGRA1010102, ZUMAPRO_DMA_FORMAT_BGRA1010102,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+	{ DRM_FORMAT_NV12, ZUMAPRO_DMA_FORMAT_NV12,
+	  ZUMAPRO_DPP_FORMAT_YUV420_8P },
+	{ DRM_FORMAT_NV21, ZUMAPRO_DMA_FORMAT_NV21,
+	  ZUMAPRO_DPP_FORMAT_YUV420_8P },
+	{ DRM_FORMAT_NV16, ZUMAPRO_DMA_FORMAT_NV16,
+	  ZUMAPRO_DPP_FORMAT_YUV422_8P },
+	{ DRM_FORMAT_NV61, ZUMAPRO_DMA_FORMAT_NV61,
+	  ZUMAPRO_DPP_FORMAT_YUV422_8P },
+	{ DRM_FORMAT_P010, ZUMAPRO_DMA_FORMAT_YUV420_P010,
+	  ZUMAPRO_DPP_FORMAT_YUV420_P010 },
+	{ DRM_FORMAT_YUV420_8BIT, ZUMAPRO_DMA_FORMAT_NV12,
+	  ZUMAPRO_DPP_FORMAT_YUV420_8P },
+	{ DRM_FORMAT_YUV420_10BIT, ZUMAPRO_DMA_FORMAT_YUV420_P010,
+	  ZUMAPRO_DPP_FORMAT_YUV420_P010 },
+	{ DRM_FORMAT_ARGB16161616F, ZUMAPRO_DMA_FORMAT_ARGB_FP16,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+	{ DRM_FORMAT_ABGR16161616F, ZUMAPRO_DMA_FORMAT_ABGR_FP16,
+	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+};
+
+static const struct zumapro_dpp_format *
+zumapro_dpp_find_format(u32 drm_format)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zumapro_dpp_formats); i++)
+		if (zumapro_dpp_formats[i].drm_format == drm_format)
+			return &zumapro_dpp_formats[i];
+
+	return NULL;
+}
+
+static int zumapro_dpp_validate_formats(struct device *dev,
+					const u32 *formats,
+					unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		if (!zumapro_dpp_find_format(formats[i]))
+			return dev_err_probe(dev, -EINVAL,
+					     "missing hardware mapping for DRM format %#x\n",
+					     formats[i]);
+	}
+
+	return 0;
+}
+
+static int zumapro_dpp_select_formats(struct zumapro_dpp *dpp)
+{
+	if (dpp->video_formats) {
+		dpp->pixel_formats = zumapro_dpp_video_formats;
+		dpp->num_pixel_formats = ARRAY_SIZE(zumapro_dpp_video_formats);
+	} else {
+		dpp->pixel_formats = zumapro_dpp_graphics_formats;
+		dpp->num_pixel_formats = ARRAY_SIZE(zumapro_dpp_graphics_formats);
+	}
+
+	return zumapro_dpp_validate_formats(dpp->dev, dpp->pixel_formats,
+					    dpp->num_pixel_formats);
+}
 
 static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
 {
@@ -285,6 +431,10 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 	dpp->video_formats = of_property_read_bool(dev->of_node,
 						   "google,video-formats") ||
 			     of_property_read_bool(dev->of_node, "dpp,video");
+
+	ret = zumapro_dpp_select_formats(dpp);
+	if (ret)
+		return ret;
 
 	ret = zumapro_check_reg_names(pdev, zumapro_dpp_reg_names,
 				      ARRAY_SIZE(zumapro_dpp_reg_names));

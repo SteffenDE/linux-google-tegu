@@ -644,6 +644,5 @@ static struct platform_driver zumapro_mipi_dphy_driver = {
 };
 module_platform_driver(zumapro_mipi_dphy_driver);
 
-MODULE_AUTHOR("OpenAI");
 MODULE_DESCRIPTION("Google Tensor G4 Zumapro M4M4 MIPI D-PHY driver");
 MODULE_LICENSE("GPL");

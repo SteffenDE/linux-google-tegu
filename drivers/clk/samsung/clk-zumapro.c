@@ -18,11 +18,14 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI0_NOC + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_DPUF1_NOC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK + 1)
 #define CLKS_NR_HSI0		(CLK_FOUT_USB + 1)
+#define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
+#define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
+#define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
 
 /* ---- CMU_TOP ------------------------------------------------------------ */
 
@@ -54,8 +57,24 @@
 #define CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC		0x1094
 #define CLK_CON_DIV_CLKCMU_HSI0_NOC		0x188c
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC	0x20bc
+#define CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM	0x1050
+#define CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC		0x1054
+#define CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC	0x1058
+#define CLK_CON_MUX_MUX_CLKCMU_DPUF1_NOC	0x105c
+#define CLK_CON_DIV_CLKCMU_DPUB_DSIM		0x1848
+#define CLK_CON_DIV_CLKCMU_DPUB_NOC		0x184c
+#define CLK_CON_DIV_CLKCMU_DPUF0_NOC		0x1850
+#define CLK_CON_DIV_CLKCMU_DPUF1_NOC		0x1854
+#define CLK_CON_GAT_GATE_CLKCMU_DPUB_DSIM	0x2078
+#define CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC	0x207c
+#define CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC	0x2080
+#define CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC	0x2084
 
 static const unsigned long top_clk_regs[] __initconst = {
+	CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM,
+	CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_DPUF1_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_PCIE,
@@ -72,6 +91,14 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_DIV_CLKCMU_PERIC0_NOC,
 	CLK_CON_DIV_CLKCMU_PERIC1_IP,
 	CLK_CON_DIV_CLKCMU_PERIC1_NOC,
+	CLK_CON_DIV_CLKCMU_DPUB_DSIM,
+	CLK_CON_DIV_CLKCMU_DPUB_NOC,
+	CLK_CON_DIV_CLKCMU_DPUF0_NOC,
+	CLK_CON_DIV_CLKCMU_DPUF1_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_DPUB_DSIM,
+	CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_PCIE,
@@ -91,7 +118,9 @@ static const unsigned long top_clk_regs[] __initconst = {
  * tree without programming PLLs.
  */
 static const struct samsung_fixed_rate_clock top_fixed_clks[] __initconst = {
+	FRATE(CLK_FOUT_SHARED0_D3, "fout_shared0_d3", NULL, 0, 711000000),
 	FRATE(CLK_FOUT_SHARED0_D4, "fout_shared0_d4", NULL, 0, 533249984),
+	FRATE(CLK_FOUT_SHARED1_D3, "fout_shared1_d3", NULL, 0, 622000000),
 	FRATE(CLK_FOUT_SHARED1_D4, "fout_shared1_d4", NULL, 0, 466500000),
 	FRATE(CLK_FOUT_SHARED2_D1, "fout_shared2_d1", NULL, 0, 800000000),
 	FRATE(CLK_FOUT_SHARED2_D2, "fout_shared2_d2", NULL, 0, 400000000),
@@ -122,8 +151,23 @@ PNAME(mout_cmu_hsi0_noc_p) = {
 	"fout_shared2_d2", "fout_shared3_d2",
 	"fout_spare_pll", "oscclk", "oscclk", "oscclk",
 };
+PNAME(mout_cmu_dpu_noc_p) = {
+	"fout_shared0_d3", "fout_shared3_d1",
+	"fout_shared1_d3", "fout_shared0_d4",
+	"fout_shared1_d4", "fout_shared2_d2",
+	"fout_spare_pll", "oscclk",
+};
+PNAME(mout_cmu_dpub_dsim_p) = { "fout_shared0_d4", "fout_shared2_d2" };
 
 static const struct samsung_mux_clock top_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_CMU_DPUB_DSIM, "mout_cmu_dpub_dsim",
+	    mout_cmu_dpub_dsim_p, CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM, 0, 1),
+	MUX(CLK_MOUT_CMU_DPUB_NOC, "mout_cmu_dpub_noc",
+	    mout_cmu_dpu_noc_p, CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC, 0, 3),
+	MUX(CLK_MOUT_CMU_DPUF0_NOC, "mout_cmu_dpuf0_noc",
+	    mout_cmu_dpu_noc_p, CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC, 0, 3),
+	MUX(CLK_MOUT_CMU_DPUF1_NOC, "mout_cmu_dpuf1_noc",
+	    mout_cmu_dpu_noc_p, CLK_CON_MUX_MUX_CLKCMU_DPUF1_NOC, 0, 3),
 	MUX(CLK_MOUT_CMU_HSI2_MMC_CARD, "mout_cmu_hsi2_mmc_card",
 	    mout_cmu_hsi2_mmc_card_p, CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD,
 	    0, 2),
@@ -147,6 +191,24 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
+	/*
+	 * TRACE NEEDED: these display roots come from downstream Zuma CMUCAL
+	 * offsets and match the bootloader-owned simplefb path observed on Tegu.
+	 * Keep them out of clk_disable_unused while DECON/DSIM/DPUF consumers are
+	 * still missing, otherwise CCF can blank the handoff framebuffer.
+	 */
+	GATE(CLK_GOUT_CMU_DPUB_DSIM, "gout_cmu_dpub_dsim",
+	     "mout_cmu_dpub_dsim", CLK_CON_GAT_GATE_CLKCMU_DPUB_DSIM,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_CMU_DPUB_NOC, "gout_cmu_dpub_noc",
+	     "mout_cmu_dpub_noc", CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_CMU_DPUF0_NOC, "gout_cmu_dpuf0_noc",
+	     "mout_cmu_dpuf0_noc", CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_CMU_DPUF1_NOC, "gout_cmu_dpuf1_noc",
+	     "mout_cmu_dpuf1_noc", CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC,
+	     21, CLK_IGNORE_UNUSED, 0),
 	GATE(CLK_GOUT_CMU_HSI2_MMC_CARD, "gout_cmu_hsi2_mmc_card",
 	     "mout_cmu_hsi2_mmc_card", CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD,
 	     21, 0, 0),
@@ -213,6 +275,14 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
+	DIV(CLK_DOUT_CMU_DPUB_DSIM, "dout_cmu_dpub_dsim",
+	    "gout_cmu_dpub_dsim", CLK_CON_DIV_CLKCMU_DPUB_DSIM, 0, 4),
+	DIV(CLK_DOUT_CMU_DPUB_NOC, "dout_cmu_dpub_noc",
+	    "gout_cmu_dpub_noc", CLK_CON_DIV_CLKCMU_DPUB_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_DPUF0_NOC, "dout_cmu_dpuf0_noc",
+	    "gout_cmu_dpuf0_noc", CLK_CON_DIV_CLKCMU_DPUF0_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_DPUF1_NOC, "dout_cmu_dpuf1_noc",
+	    "gout_cmu_dpuf1_noc", CLK_CON_DIV_CLKCMU_DPUF1_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_HSI2_MMC_CARD, "dout_cmu_hsi2_mmc_card",
 	    "gout_cmu_hsi2_mmc_card", CLK_CON_DIV_CLKCMU_HSI2_MMC_CARD,
 	    0, 9),
@@ -626,6 +696,305 @@ static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
 	.clk_name	= "noc",
 };
 
+/* ---- CMU_DPUB ----------------------------------------------------------- */
+
+/*
+ * Register offsets for CMU_DPUB (0x19400000).
+ *
+ * Source: downstream Zuma CMUCAL and the dumped Tegu DT power-domain cmu_id.
+ * TRACE NEEDED: validate the bootloader-selected parent indices/rates on Tegu
+ * before allowing the real DRM stack to reparent or change these rates.
+ */
+#define PLL_CON0_MUX_CLKCMU_DPUB_DSIM_USER	0x0600
+#define PLL_CON0_MUX_CLKCMU_DPUB_NOC_USER	0x0610
+#define CLK_CON_DIV_DIV_CLK_DPUB_NOCP		0x1800
+#define CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_CMU_DPUB_IPCLKPORT_PCLK \
+							0x2004
+#define CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_ALVCLK_DSIM0 \
+							0x2008
+#define CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_OSCCLK_DSIM0 \
+							0x2010
+#define CLK_CON_GAT_GOUT_BLK_DPUB_UID_AD_APB_DECON_MAIN_IPCLKPORT_PCLKM \
+							0x2028
+#define CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON \
+							0x202c
+#define CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK \
+							0x2044
+
+static const unsigned long dpub_clk_regs[] __initconst = {
+	PLL_CON0_MUX_CLKCMU_DPUB_DSIM_USER,
+	PLL_CON0_MUX_CLKCMU_DPUB_NOC_USER,
+	CLK_CON_DIV_DIV_CLK_DPUB_NOCP,
+	CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_CMU_DPUB_IPCLKPORT_PCLK,
+	CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_ALVCLK_DSIM0,
+	CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_OSCCLK_DSIM0,
+	CLK_CON_GAT_GOUT_BLK_DPUB_UID_AD_APB_DECON_MAIN_IPCLKPORT_PCLKM,
+	CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON,
+	CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
+};
+
+PNAME(mout_dpub_dsim_user_p) = { "oscclk", "dout_cmu_dpub_dsim" };
+PNAME(mout_dpub_noc_user_p) = { "oscclk", "dout_cmu_dpub_noc" };
+
+static const struct samsung_mux_clock dpub_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_DPUB_DSIM_USER, "mout_dpub_dsim_user",
+	    mout_dpub_dsim_user_p, PLL_CON0_MUX_CLKCMU_DPUB_DSIM_USER, 4, 1),
+	MUX(CLK_MOUT_DPUB_NOC_USER, "mout_dpub_noc_user",
+	    mout_dpub_noc_user_p, PLL_CON0_MUX_CLKCMU_DPUB_NOC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock dpub_div_clks[] __initconst = {
+	DIV(CLK_DOUT_DPUB_NOCP, "dout_dpub_nocp", "mout_dpub_noc_user",
+	    CLK_CON_DIV_DIV_CLK_DPUB_NOCP, 0, 3),
+};
+
+static const struct samsung_gate_clock dpub_gate_clks[] __initconst = {
+	/*
+	 * TRACE NEEDED: these gates are the minimum downstream DPUB subset for
+	 * DECON/DSIM0 handoff.  Keep them out of clk_disable_unused until the
+	 * matching DECON and DSIM consumers own the clocks.
+	 */
+	GATE(CLK_GOUT_DPUB_CMU_DPUB_PCLK, "gout_dpub_cmu_dpub_pclk",
+	     "dout_dpub_nocp",
+	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_CMU_DPUB_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUB_DECON_PCLK, "gout_dpub_decon_pclk",
+	     "mout_dpub_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_AD_APB_DECON_MAIN_IPCLKPORT_PCLKM,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUB_DECON_ACLK, "gout_dpub_decon_aclk",
+	     "mout_dpub_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUB_SYSREG_PCLK, "gout_dpub_sysreg_pclk",
+	     "dout_dpub_nocp",
+	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUB_DSIM0_ALVCLK, "gout_dpub_dsim0_alvclk",
+	     "mout_dpub_dsim_user",
+	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_ALVCLK_DSIM0,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUB_DSIM0_OSCCLK, "gout_dpub_dsim0_oscclk",
+	     "oscclk",
+	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_OSCCLK_DSIM0,
+	     21, CLK_IGNORE_UNUSED, 0),
+};
+
+static const struct samsung_cmu_info dpub_cmu_info __initconst = {
+	.mux_clks	= dpub_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(dpub_mux_clks),
+	.div_clks	= dpub_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(dpub_div_clks),
+	.gate_clks	= dpub_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(dpub_gate_clks),
+	.nr_clk_ids	= CLKS_NR_DPUB,
+	.clk_regs	= dpub_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(dpub_clk_regs),
+	.clk_name	= "bus",
+};
+
+/* ---- CMU_DPUF0 ---------------------------------------------------------- */
+
+/*
+ * Register offsets for CMU_DPUF0 (0x19800000).
+ *
+ * Source: downstream Zuma CMUCAL and dumped.dts pd-dpuf0 cmu_id.
+ * TRACE NEEDED: the gate subset follows downstream naming, but the first real
+ * DRM test should confirm which DPUF0 clocks toggle around layer fetch.
+ */
+#define PLL_CON0_MUX_CLKCMU_DPUF0_NOC_USER	0x0600
+#define CLK_CON_DIV_DIV_CLK_DPUF0_NOCP		0x1800
+#define CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_CMU_DPUF0_IPCLKPORT_PCLK \
+							0x2004
+#define CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK_SRAMC \
+							0x2008
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU1_DPUF0_IPCLKPORT_CLK \
+							0x2060
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM \
+							0x206c
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK \
+							0x2070
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_DPUF0_IPCLKPORT_CLK \
+							0x20a4
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU0_DPUF0_IPCLKPORT_CLK \
+							0x20a8
+#define CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSREG_DPUF0_IPCLKPORT_PCLK \
+							0x20ac
+
+static const unsigned long dpuf0_clk_regs[] __initconst = {
+	PLL_CON0_MUX_CLKCMU_DPUF0_NOC_USER,
+	CLK_CON_DIV_DIV_CLK_DPUF0_NOCP,
+	CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_CMU_DPUF0_IPCLKPORT_PCLK,
+	CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK_SRAMC,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU1_DPUF0_IPCLKPORT_CLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_DPUF0_IPCLKPORT_CLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU0_DPUF0_IPCLKPORT_CLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSREG_DPUF0_IPCLKPORT_PCLK,
+};
+
+PNAME(mout_dpuf0_noc_user_p) = { "oscclk", "dout_cmu_dpuf0_noc" };
+
+static const struct samsung_mux_clock dpuf0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_DPUF0_NOC_USER, "mout_dpuf0_noc_user",
+	    mout_dpuf0_noc_user_p, PLL_CON0_MUX_CLKCMU_DPUF0_NOC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock dpuf0_div_clks[] __initconst = {
+	DIV(CLK_DOUT_DPUF0_NOCP, "dout_dpuf0_nocp", "mout_dpuf0_noc_user",
+	    CLK_CON_DIV_DIV_CLK_DPUF0_NOCP, 0, 3),
+};
+
+static const struct samsung_gate_clock dpuf0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_DPUF0_CMU_DPUF0_PCLK, "gout_dpuf0_cmu_dpuf0_pclk",
+	     "dout_dpuf0_nocp",
+	     CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_CMU_DPUF0_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_DPUF_ACLK, "gout_dpuf0_dpuf_aclk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_DPUF_DMA_PCLK, "gout_dpuf0_dpuf_dma_pclk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_SYSREG_PCLK, "gout_dpuf0_sysreg_pclk",
+	     "dout_dpuf0_nocp",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSREG_DPUF0_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_SYSMMU_S0_CLK, "gout_dpuf0_sysmmu_s0_clk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_DPUF0_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_SYSMMU_PMMU0_CLK, "gout_dpuf0_sysmmu_pmmu0_clk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU0_DPUF0_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_SYSMMU_PMMU1_CLK, "gout_dpuf0_sysmmu_pmmu1_clk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF0_UID_SYSMMU_S0_PMMU1_DPUF0_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF0_SRAMC_ACLK, "gout_dpuf0_sramc_aclk",
+	     "mout_dpuf0_noc_user",
+	     CLK_CON_GAT_CLK_BLK_DPUF0_UID_DPUF0_IPCLKPORT_ACLK_SRAMC,
+	     21, CLK_IGNORE_UNUSED, 0),
+};
+
+static const struct samsung_cmu_info dpuf0_cmu_info __initconst = {
+	.mux_clks	= dpuf0_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(dpuf0_mux_clks),
+	.div_clks	= dpuf0_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(dpuf0_div_clks),
+	.gate_clks	= dpuf0_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(dpuf0_gate_clks),
+	.nr_clk_ids	= CLKS_NR_DPUF0,
+	.clk_regs	= dpuf0_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(dpuf0_clk_regs),
+	.clk_name	= "bus",
+};
+
+/* ---- CMU_DPUF1 ---------------------------------------------------------- */
+
+/*
+ * Register offsets for CMU_DPUF1 (0x19c00000).
+ *
+ * Source: downstream Zuma CMUCAL and dumped.dts pd-dpuf1 cmu_id.
+ * TRACE NEEDED: same as DPUF0; validate the DPUF1 fetch path once a real
+ * composition requires the second fetch domain.
+ */
+#define PLL_CON0_MUX_CLKCMU_DPUF1_NOC_USER	0x0600
+#define CLK_CON_DIV_DIV_CLK_DPUF1_NOCP		0x1800
+#define CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_CMU_DPUF1_IPCLKPORT_PCLK \
+							0x2004
+#define CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK_SRAMC \
+							0x2008
+#define CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_DPUF1_IPCLKPORT_CLK \
+							0x2058
+#define CLK_CON_GAT_CLK_BLK_DPUF1_UID_SYSMMU_S0_PMMU1_DPUF1_IPCLKPORT_CLK \
+							0x205c
+#define CLK_CON_GAT_GOUT_BLK_DPUF1_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM \
+							0x2064
+#define CLK_CON_GAT_GOUT_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK \
+							0x2068
+#define CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_PMMU0_DPUF1_IPCLKPORT_CLK \
+							0x2098
+#define CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSREG_DPUF1_IPCLKPORT_PCLK \
+							0x209c
+
+static const unsigned long dpuf1_clk_regs[] __initconst = {
+	PLL_CON0_MUX_CLKCMU_DPUF1_NOC_USER,
+	CLK_CON_DIV_DIV_CLK_DPUF1_NOCP,
+	CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_CMU_DPUF1_IPCLKPORT_PCLK,
+	CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK_SRAMC,
+	CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_DPUF1_IPCLKPORT_CLK,
+	CLK_CON_GAT_CLK_BLK_DPUF1_UID_SYSMMU_S0_PMMU1_DPUF1_IPCLKPORT_CLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF1_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM,
+	CLK_CON_GAT_GOUT_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_PMMU0_DPUF1_IPCLKPORT_CLK,
+	CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSREG_DPUF1_IPCLKPORT_PCLK,
+};
+
+PNAME(mout_dpuf1_noc_user_p) = { "oscclk", "dout_cmu_dpuf1_noc" };
+
+static const struct samsung_mux_clock dpuf1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_DPUF1_NOC_USER, "mout_dpuf1_noc_user",
+	    mout_dpuf1_noc_user_p, PLL_CON0_MUX_CLKCMU_DPUF1_NOC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock dpuf1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_DPUF1_NOCP, "dout_dpuf1_nocp", "mout_dpuf1_noc_user",
+	    CLK_CON_DIV_DIV_CLK_DPUF1_NOCP, 0, 3),
+};
+
+static const struct samsung_gate_clock dpuf1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_DPUF1_CMU_DPUF1_PCLK, "gout_dpuf1_cmu_dpuf1_pclk",
+	     "dout_dpuf1_nocp",
+	     CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_CMU_DPUF1_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_DPUF_ACLK, "gout_dpuf1_dpuf_aclk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_DPUF_DMA_PCLK, "gout_dpuf1_dpuf_dma_pclk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF1_UID_AD_APB_DPU_DMA_IPCLKPORT_PCLKM,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_SYSREG_PCLK, "gout_dpuf1_sysreg_pclk",
+	     "dout_dpuf1_nocp",
+	     CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSREG_DPUF1_IPCLKPORT_PCLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_SYSMMU_S0_CLK, "gout_dpuf1_sysmmu_s0_clk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_DPUF1_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_SYSMMU_PMMU0_CLK, "gout_dpuf1_sysmmu_pmmu0_clk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_DPUF1_UID_SYSMMU_S0_PMMU0_DPUF1_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_SYSMMU_PMMU1_CLK, "gout_dpuf1_sysmmu_pmmu1_clk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_CLK_BLK_DPUF1_UID_SYSMMU_S0_PMMU1_DPUF1_IPCLKPORT_CLK,
+	     21, CLK_IGNORE_UNUSED, 0),
+	GATE(CLK_GOUT_DPUF1_SRAMC_ACLK, "gout_dpuf1_sramc_aclk",
+	     "mout_dpuf1_noc_user",
+	     CLK_CON_GAT_CLK_BLK_DPUF1_UID_DPUF1_IPCLKPORT_ACLK_SRAMC,
+	     21, CLK_IGNORE_UNUSED, 0),
+};
+
+static const struct samsung_cmu_info dpuf1_cmu_info __initconst = {
+	.mux_clks	= dpuf1_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(dpuf1_mux_clks),
+	.div_clks	= dpuf1_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(dpuf1_div_clks),
+	.gate_clks	= dpuf1_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(dpuf1_gate_clks),
+	.nr_clk_ids	= CLKS_NR_DPUF1,
+	.clk_regs	= dpuf1_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(dpuf1_clk_regs),
+	.clk_name	= "bus",
+};
+
 /* ---- platform_driver ---------------------------------------------------- */
 
 static int __init zumapro_cmu_probe(struct platform_device *pdev)
@@ -652,6 +1021,15 @@ static const struct of_device_id zumapro_cmu_of_match[] = {
 	}, {
 		.compatible = "google,zumapro-cmu-hsi0",
 		.data = &hsi0_cmu_info,
+	}, {
+		.compatible = "google,zumapro-cmu-dpub",
+		.data = &dpub_cmu_info,
+	}, {
+		.compatible = "google,zumapro-cmu-dpuf0",
+		.data = &dpuf0_cmu_info,
+	}, {
+		.compatible = "google,zumapro-cmu-dpuf1",
+		.data = &dpuf1_cmu_info,
 	}, {
 	},
 };

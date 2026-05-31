@@ -50,6 +50,17 @@
 	};
 
 	/*
+	 * Source: downstream iommu_group_dpu in zumapro-sysmmu.dtsi and
+	 * research/dumped.dts:762.  TRACE NEEDED: validate how the downstream
+	 * v9 group driver maps DECON0's two DPUF System MMUs before wiring a
+	 * mainline DECON node to this group.
+	 */
+	iommu_group_dpu: iommu-group-dpu {
+		compatible = "samsung,sysmmu-group";
+		status = "disabled";
+	};
+
+	/*
 	 * Source: GS101 upstream binding requires an empty ect node
 	 * (Documentation/devicetree/bindings/arm/google.yaml).  The Zumapro
 	 * downstream tree also has ECT reserved memory at dumped.dts:1320.
@@ -426,6 +437,46 @@
 				 <&cmu_top CLK_DOUT_CMU_DPUF1_NOC>;
 			clock-names = "oscclk", "bus";
 			power-domains = <&pd_dpuf1>;
+			status = "disabled";
+		};
+
+		/*
+		 * Source: downstream sysmmu_dpuf0/sysmmu_dpuf1 in
+		 * zumapro-sysmmu.dtsi and research/dumped.dts:882-916.  These
+		 * are Samsung System MMU v9 blocks, not compatible with the
+		 * legacy mainline Exynos System MMU driver.  Keep them disabled
+		 * until the v9 driver can program the PMMU stream tables and
+		 * secure fault registers.
+		 */
+		sysmmu_dpuf0: iommu@19840000 {
+			compatible = "samsung,sysmmu-v9";
+			reg = <0x19840000 0x10000>;
+			interrupts = <GIC_SPI 277 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 278 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_dpuf0>;
+			samsung,qos = <15>;
+			samsung,secure-irq;
+			samsung,secure-base = <0x19850000>;
+			samsung,port-name = "DPU F0";
+			samsung,pmmu0-default-stream = <0x600014a>;
+			samsung,pmmu1-default-stream = <0x800014a>;
+			#iommu-cells = <0>;
+			status = "disabled";
+		};
+
+		sysmmu_dpuf1: iommu@19c40000 {
+			compatible = "samsung,sysmmu-v9";
+			reg = <0x19c40000 0x10000>;
+			interrupts = <GIC_SPI 304 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 305 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_dpuf1>;
+			samsung,qos = <15>;
+			samsung,secure-irq;
+			samsung,secure-base = <0x19c50000>;
+			samsung,port-name = "DPU F1";
+			samsung,pmmu0-default-stream = <0x600014a>;
+			samsung,pmmu1-default-stream = <0x800014a>;
+			#iommu-cells = <0>;
 			status = "disabled";
 		};
 

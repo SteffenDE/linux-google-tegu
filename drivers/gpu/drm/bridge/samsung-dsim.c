@@ -1288,7 +1288,8 @@ static int samsung_dsim_zumapro_refresh_rate(struct samsung_dsim *dsi)
 	return refresh > 0 ? refresh : 60;
 }
 
-static u32 samsung_dsim_zumapro_calc_underrun(struct samsung_dsim *dsi)
+static int samsung_dsim_zumapro_calc_underrun(struct samsung_dsim *dsi,
+					      u32 *underrun)
 {
 	struct drm_display_mode *m = &dsi->mode;
 	u32 width = samsung_dsim_zumapro_display_width(dsi);
@@ -1302,7 +1303,7 @@ static u32 samsung_dsim_zumapro_calc_underrun(struct samsung_dsim *dsi)
 	s64 max_lp_ns;
 
 	if (!dsi->lanes || !wclk || bpp <= 0)
-		return 0;
+		return -EINVAL;
 
 	max_frame_ns = div_u64((u64)NSEC_PER_SEC * 100,
 			       refresh * (100 + DSIM_ZUMAPRO_TE_VAR_PERCENT));
@@ -1314,33 +1315,40 @@ static u32 samsung_dsim_zumapro_calc_underrun(struct samsung_dsim *dsi)
 			      2 * dsi->lanes * wclk);
 	max_lp_ns = max_frame_ns - transfer_ns;
 	if (max_lp_ns <= 0) {
-		dev_warn(dsi->dev, "Zumapro command underrun budget is negative\n");
-		return 0;
+		dev_err(dsi->dev, "Zumapro command underrun budget is negative\n");
+		return -EINVAL;
 	}
 
-	return DIV64_U64_ROUND_UP((u64)max_lp_ns * wclk,
-				  (u64)NSEC_PER_SEC * 100);
+	*underrun = DIV64_U64_ROUND_UP((u64)max_lp_ns * wclk,
+				       (u64)NSEC_PER_SEC * 100);
+	return 0;
 }
 
-static void samsung_dsim_zumapro_set_command_mode(struct samsung_dsim *dsi)
+static int samsung_dsim_zumapro_set_command_mode(struct samsung_dsim *dsi)
 {
 	struct drm_display_mode *m = &dsi->mode;
 	u32 hs_clk_mhz = DIV_ROUND_CLOSEST_ULL(dsi->hs_clock, HZ_PER_MHZ);
 	u32 refresh = samsung_dsim_zumapro_refresh_rate(dsi);
+	u32 underrun;
 	u32 stable_vfp;
 	u32 te_protect;
 	u32 te_timeout;
 	u32 reg;
+	int ret;
 
 	if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO)
-		return;
+		return 0;
 
 	/*
 	 * Downstream uses panel-provided TE idle/variance for the underrun
 	 * budget. TG4C currently matches the default 1000us/1% values; trace
 	 * this when panel timing data is plumbed into mainline.
 	 */
-	reg = DSIM_ZUMAPRO_UNDERRUN_LP_REF(samsung_dsim_zumapro_calc_underrun(dsi));
+	ret = samsung_dsim_zumapro_calc_underrun(dsi, &underrun);
+	if (ret)
+		return ret;
+
+	reg = DSIM_ZUMAPRO_UNDERRUN_LP_REF(underrun);
 	samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_UNDERRUN_CTRL, reg);
 
 	if (dsi->dsc)
@@ -1360,6 +1368,8 @@ static void samsung_dsim_zumapro_set_command_mode(struct samsung_dsim *dsi)
 	reg = samsung_dsim_read_offset(dsi, DSIM_ZUMAPRO_OPTION_SUITE);
 	reg |= DSIM_ZUMAPRO_OPT_TE_ON_CMD_ALLOW;
 	samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_OPTION_SUITE, reg);
+
+	return 0;
 }
 
 static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
@@ -1415,9 +1425,7 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 	reg |= DSIM_SFR_CTRL_SHADOW_EN;
 	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
 
-	samsung_dsim_zumapro_set_command_mode(dsi);
-
-	return 0;
+	return samsung_dsim_zumapro_set_command_mode(dsi);
 }
 
 static int samsung_dsim_init_link(struct samsung_dsim *dsi)
@@ -1579,6 +1587,7 @@ static void samsung_dsim_zumapro_set_display_mode(struct samsung_dsim *dsi)
 	u32 threshold = width;
 	u32 num_of_transfer;
 	u32 reg;
+	int ret;
 
 	if (dsi->dsc) {
 		width = samsung_dsim_zumapro_display_width(dsi);
@@ -1599,7 +1608,11 @@ static void samsung_dsim_zumapro_set_display_mode(struct samsung_dsim *dsi)
 						       threshold);
 		samsung_dsim_write_offset(dsi, DSIM_ZUMAPRO_NUM_OF_TRANSFER,
 					  num_of_transfer);
-		samsung_dsim_zumapro_set_command_mode(dsi);
+		ret = samsung_dsim_zumapro_set_command_mode(dsi);
+		if (ret)
+			dev_warn(dsi->dev,
+				 "failed to configure Zumapro command mode: %d\n",
+				 ret);
 	} else {
 		u64 byte_clk = dsi->hs_clock / 8;
 		u64 pix_clk = m->clock * 1000;

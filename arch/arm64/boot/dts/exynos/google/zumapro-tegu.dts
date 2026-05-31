@@ -374,3 +374,15 @@
 	 */
 	status = "okay";
 };
+
+&pd_dpub {
+	status = "okay";
+};
+
+&pd_dpuf0 {
+	status = "okay";
+};
+
+&pd_dpuf1 {
+	status = "okay";
+};

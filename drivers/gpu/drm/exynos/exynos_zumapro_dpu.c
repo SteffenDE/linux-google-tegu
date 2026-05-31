@@ -27,6 +27,7 @@ struct zumapro_dpp {
 	bool video_formats;
 	const u32 *pixel_formats;
 	unsigned int num_pixel_formats;
+	const struct zumapro_dpp_restrictions *restrictions;
 };
 
 struct zumapro_decon {
@@ -128,6 +129,35 @@ struct zumapro_dpp_format {
 	u32 drm_format;
 	enum zumapro_dpu_dma_format dma_format;
 	enum zumapro_dpu_dpp_format dpp_format;
+};
+
+struct zumapro_dpp_size_range {
+	u32 min;
+	u32 max;
+	u32 align;
+};
+
+struct zumapro_dpp_restrictions {
+	struct zumapro_dpp_size_range src_f_w;
+	struct zumapro_dpp_size_range src_f_h;
+	struct zumapro_dpp_size_range src_w;
+	struct zumapro_dpp_size_range src_h;
+	u32 src_x_align;
+	u32 src_y_align;
+
+	struct zumapro_dpp_size_range dst_f_w;
+	struct zumapro_dpp_size_range dst_f_h;
+	struct zumapro_dpp_size_range dst_w;
+	struct zumapro_dpp_size_range dst_h;
+	u32 dst_x_align;
+	u32 dst_y_align;
+
+	struct zumapro_dpp_size_range blk_w;
+	struct zumapro_dpp_size_range blk_h;
+	u32 blk_x_align;
+	u32 blk_y_align;
+
+	u32 src_h_rot_max;
 };
 
 struct zumapro_panel_mode {
@@ -259,6 +289,29 @@ static const struct zumapro_dpp_format zumapro_dpp_formats[] = {
 	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
 	{ DRM_FORMAT_ABGR16161616F, ZUMAPRO_DMA_FORMAT_ABGR_FP16,
 	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
+};
+
+static const struct zumapro_dpp_restrictions zumapro_dpp_restrictions = {
+	.src_f_w = { 16, 65534, 1 },
+	.src_f_h = { 16, 8190, 1 },
+	.src_w = { 16, 4096, 1 },
+	.src_h = { 16, 4096, 1 },
+	.src_x_align = 1,
+	.src_y_align = 1,
+
+	.dst_f_w = { 16, 8190, 1 },
+	.dst_f_h = { 16, 8190, 1 },
+	.dst_w = { 16, 4096, 1 },
+	.dst_h = { 16, 4096, 1 },
+	.dst_x_align = 1,
+	.dst_y_align = 1,
+
+	.blk_w = { 4, 4096, 1 },
+	.blk_h = { 4, 4096, 1 },
+	.blk_x_align = 1,
+	.blk_y_align = 1,
+
+	.src_h_rot_max = 2160,
 };
 
 static const struct zumapro_dpp_format *
@@ -607,6 +660,7 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 	ret = zumapro_dpp_select_formats(dpp);
 	if (ret)
 		return ret;
+	dpp->restrictions = &zumapro_dpp_restrictions;
 
 	ret = zumapro_check_reg_names(pdev, zumapro_dpp_reg_names,
 				      ARRAY_SIZE(zumapro_dpp_reg_names));

@@ -629,6 +629,77 @@
 		};
 
 		/*
+		 * Source: downstream drmdpp0/drmdecon0 in
+		 * research/dumped.dts:222-235 and 585-628.  These are
+		 * topology-only for now; keep disabled until the passive
+		 * scaffold has been followed by trace-validated register access.
+		 */
+		dpp0: dpp@19900000 {
+			compatible = "google,zumapro-dpp";
+			reg = <0x19900000 0x1000>,
+			      <0x19930000 0x1000>,
+			      <0x19940000 0x4000>,
+			      <0x19950000 0x1000>,
+			      <0x19960000 0x1000>,
+			      <0x19980000 0x1000>;
+			reg-names = "dma", "dpp", "scl_coef", "sramc",
+				    "hdr_comm", "hdr";
+			interrupts = <GIC_SPI 256 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 265 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "dma", "dpp";
+			google,dpp-attributes = <0x6d0867>; /* downstream attr */
+			google,axi-port = <0>; /* downstream port */
+			google,scale-down = <4>; /* downstream scale_down */
+			google,scale-up = <8>; /* downstream scale_up */
+			google,dpp-id = <0>; /* downstream dpp,id */
+			status = "disabled";
+		};
+
+		decon0: display-controller@19470000 {
+			compatible = "google,zumapro-decon";
+			reg = <0x19470000 0x6000>,
+			      <0x19480000 0xe000>,
+			      <0x19490000 0x10000>,
+			      <0x194a0000 0xe000>,
+			      <0x194d0000 0xf000>,
+			      <0x194f0000 0x10000>,
+			      <0x1990e000 0x1000>;
+			reg-names = "main", "win", "sub", "wincon", "dqe",
+				    "dqe-cgc", "cgc-dma";
+			interrupts = <GIC_SPI 243 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 239 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 255 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "frame_start", "frame_done", "extra",
+					  "dimming_start", "dimming_end",
+					  "cgc-dma";
+			google,decon-id = <0>; /* downstream decon,id */
+			google,cgc-dma-id = <18>; /* downstream cgc-dma,id */
+			iommus = <&sysmmu_dpuf0>, <&sysmmu_dpuf1>;
+			samsung,iommu-group = <&iommu_group_dpu>;
+			samsung,tzmp;
+			power-domains = <&pd_dpuf0>, <&pd_dpuf1>;
+			google,max-windows = <14>; /* downstream max_win */
+			dpps = <&dpp0>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					decon0_out: endpoint {
+						remote-endpoint = <&dsi0_in>;
+					};
+				};
+			};
+		};
+
+		/*
 		 * Source: downstream disp_ss@19421000 in research/dumped.dts:476.
 		 * The D-PHY driver uses offset 0x8 to hand DPHY reset ownership to
 		 * software and release M_RESETN_M0.  TRACE NEEDED: validate those
@@ -708,6 +779,14 @@
 			ports {
 				#address-cells = <1>;
 				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					dsi0_in: endpoint {
+						remote-endpoint = <&decon0_out>;
+					};
+				};
 
 				port@1 {
 					reg = <1>;

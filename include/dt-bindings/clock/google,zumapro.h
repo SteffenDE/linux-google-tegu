@@ -14,6 +14,8 @@
 #define CLK_FOUT_SHARED1_D4			17
 #define CLK_FOUT_SHARED2_D1			18
 #define CLK_FOUT_SHARED3_D1			19
+#define CLK_FOUT_SHARED0_D3			37
+#define CLK_FOUT_SHARED1_D3			38
 
 /* CMU_TOP muxes */
 #define CLK_MOUT_CMU_PERIC0_NOC		5
@@ -52,6 +54,24 @@
 #define CLK_MOUT_CMU_HSI0_NOC			32
 #define CLK_GOUT_CMU_HSI0_NOC			34
 #define CLK_DOUT_CMU_HSI0_NOC			36
+
+/*
+ * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
+ * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
+ * brought up.
+ */
+#define CLK_MOUT_CMU_DPUB_DSIM			39
+#define CLK_MOUT_CMU_DPUB_NOC			40
+#define CLK_MOUT_CMU_DPUF0_NOC			41
+#define CLK_MOUT_CMU_DPUF1_NOC			42
+#define CLK_GOUT_CMU_DPUB_DSIM			43
+#define CLK_GOUT_CMU_DPUB_NOC			44
+#define CLK_GOUT_CMU_DPUF0_NOC			45
+#define CLK_GOUT_CMU_DPUF1_NOC			46
+#define CLK_DOUT_CMU_DPUB_DSIM			47
+#define CLK_DOUT_CMU_DPUB_NOC			48
+#define CLK_DOUT_CMU_DPUF0_NOC			49
+#define CLK_DOUT_CMU_DPUF1_NOC			50
 
 /* CMU_PERIC0 muxes */
 #define CLK_MOUT_PERIC0_NOC_USER		1
@@ -125,5 +145,40 @@
 #define CLK_DOUT_HSI0_USB			2
 #define CLK_DOUT_HSI0_EUSB			3
 #define CLK_FOUT_USB				4
+
+/* CMU_DPUB display backbone clocks */
+#define CLK_MOUT_DPUB_DSIM_USER		1
+#define CLK_MOUT_DPUB_NOC_USER			2
+#define CLK_DOUT_DPUB_NOCP			3
+#define CLK_GOUT_DPUB_CMU_DPUB_PCLK		4
+#define CLK_GOUT_DPUB_DECON_PCLK		5
+#define CLK_GOUT_DPUB_DECON_ACLK		6
+#define CLK_GOUT_DPUB_SYSREG_PCLK		7
+#define CLK_GOUT_DPUB_DSIM0_ALVCLK		8
+#define CLK_GOUT_DPUB_DSIM0_OSCCLK		9
+
+/* CMU_DPUF0 display fetch clocks */
+#define CLK_MOUT_DPUF0_NOC_USER		1
+#define CLK_DOUT_DPUF0_NOCP			2
+#define CLK_GOUT_DPUF0_CMU_DPUF0_PCLK		3
+#define CLK_GOUT_DPUF0_DPUF_ACLK		4
+#define CLK_GOUT_DPUF0_DPUF_DMA_PCLK		5
+#define CLK_GOUT_DPUF0_SYSREG_PCLK		6
+#define CLK_GOUT_DPUF0_SYSMMU_S0_CLK		7
+#define CLK_GOUT_DPUF0_SYSMMU_PMMU0_CLK		8
+#define CLK_GOUT_DPUF0_SYSMMU_PMMU1_CLK		9
+#define CLK_GOUT_DPUF0_SRAMC_ACLK		10
+
+/* CMU_DPUF1 display fetch clocks */
+#define CLK_MOUT_DPUF1_NOC_USER		1
+#define CLK_DOUT_DPUF1_NOCP			2
+#define CLK_GOUT_DPUF1_CMU_DPUF1_PCLK		3
+#define CLK_GOUT_DPUF1_DPUF_ACLK		4
+#define CLK_GOUT_DPUF1_DPUF_DMA_PCLK		5
+#define CLK_GOUT_DPUF1_SYSREG_PCLK		6
+#define CLK_GOUT_DPUF1_SYSMMU_S0_CLK		7
+#define CLK_GOUT_DPUF1_SYSMMU_PMMU0_CLK		8
+#define CLK_GOUT_DPUF1_SYSMMU_PMMU1_CLK		9
+#define CLK_GOUT_DPUF1_SRAMC_ACLK		10
 
 #endif /* _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H */

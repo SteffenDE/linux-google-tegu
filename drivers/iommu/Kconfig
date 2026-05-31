@@ -279,6 +279,16 @@ config EXYNOS_IOMMU_DEBUG
 
 	  Say N unless you need kernel log message for IOMMU debugging.
 
+config SAMSUNG_SYSMMU_GROUP
+	bool "Samsung System MMU group support"
+	depends on OF && IOMMU_API
+	help
+	  Support Samsung System MMU group nodes used to share one IOMMU
+	  translation domain across multiple System MMU controllers.
+
+	  This is needed by newer Samsung/Google display blocks where a single
+	  DECON device is backed by multiple DPUF System MMUs.
+
 config IPMMU_VMSA
 	bool "Renesas VMSA-compatible IPMMU"
 	depends on ARCH_RENESAS || COMPILE_TEST

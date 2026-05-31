@@ -25,6 +25,7 @@ properties:
           - samsung,exynos5422-mipi-dsi
           - samsung,exynos5433-mipi-dsi
           - samsung,exynos7870-mipi-dsi
+          - google,zumapro-mipi-dsi
           - fsl,imx8mm-mipi-dsim
           - fsl,imx8mp-mipi-dsim
       - items:
@@ -170,6 +171,31 @@ allOf:
 
       required:
         - ports
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: google,zumapro-mipi-dsi
+
+    then:
+      properties:
+        clocks:
+          minItems: 2
+          maxItems: 2
+
+        clock-names:
+          items:
+            - const: bus
+            - const: osc
+
+      required:
+        - phys
+        - phy-names
+        - power-domains
+        - samsung,burst-clock-frequency
+        - vddcore-supply
+        - vddio-supply
 
   - if:
       properties:

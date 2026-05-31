@@ -430,6 +430,98 @@
 		};
 
 		/*
+		 * Source: downstream disp_ss@19421000 in research/dumped.dts:476.
+		 * The D-PHY driver uses offset 0x8 to hand DPHY reset ownership to
+		 * software and release M_RESETN_M0.  TRACE NEEDED: validate those
+		 * sysreg writes during the first DSIM enable/disable experiment.
+		 */
+		sysreg_dpub: syscon@19421000 {
+			compatible = "google,zumapro-disp-sysreg", "syscon";
+			reg = <0x19421000 0x10>;
+			clocks = <&cmu_dpub CLK_GOUT_DPUB_SYSREG_PCLK>;
+			power-domains = <&pd_dpub>;
+			status = "disabled";
+		};
+
+		/*
+		 * Source: downstream dphy_m4s4_dsim0@19460000 plus the DSIM-owned
+		 * "dphy-extra" and "dphy" ranges in research/dumped.dts:483-494.
+		 * Mainline keeps the DSIM register window separate and gives these
+		 * PHY windows to the PHY provider to avoid overlapping resources.
+		 */
+		mipi_phy_dsim0: phy@19460000 {
+			compatible = "google,zumapro-mipi-dphy";
+			reg = <0x19460000 0x100>,
+			      <0x19460100 0x700>;
+			reg-names = "bias", "dphy";
+			#phy-cells = <1>;
+			clocks = <&ext_24_5m>;
+			clock-names = "ref";
+			samsung,sysreg = <&sysreg_dpub>;
+			samsung,id = <0>;
+			power-domains = <&pd_dpub>;
+			status = "disabled";
+		};
+
+		/*
+		 * Source: downstream drmdsim@19440000 in research/dumped.dts:491.
+		 * The downstream binding uses phy-names = "dsim_dphy"; the mainline
+		 * binding uses the common "dsim" name while the driver keeps a
+		 * downstream-compatible fallback.
+		 */
+		dsi0: dsi@19440000 {
+			compatible = "google,zumapro-mipi-dsi";
+			reg = <0x19440000 0x300>;
+			interrupts = <GIC_SPI 252 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_dpub CLK_GOUT_DPUB_DSIM0_ALVCLK>,
+				 <&cmu_dpub CLK_GOUT_DPUB_DSIM0_OSCCLK>;
+			clock-names = "bus", "osc";
+			power-domains = <&pd_dpub>;
+			phys = <&mipi_phy_dsim0 0>;
+			phy-names = "dsim";
+			samsung,burst-clock-frequency = <1102000000>;
+			samsung,esc-clock-frequency = <20000000>;
+			vddcore-supply = <&reg_placeholder>;
+			vddio-supply = <&reg_placeholder>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			panel@0 {
+				compatible = "google,gs-tg4c";
+				reg = <0>;
+				reset-gpios = <&gpp0 0 GPIO_ACTIVE_HIGH>;
+				te-gpios = <&gpp0 3 GPIO_ACTIVE_HIGH>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&disp_te_pri_on>;
+				vci-supply = <&reg_placeholder>;
+				vddi-supply = <&reg_placeholder>;
+				vddd-supply = <&reg_placeholder>;
+				status = "disabled";
+
+				port {
+					panel_in: endpoint {
+						remote-endpoint = <&dsi0_out>;
+					};
+				};
+			};
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@1 {
+					reg = <1>;
+
+					dsi0_out: endpoint {
+						data-lanes = <1 2 3 4>;
+						remote-endpoint = <&panel_in>;
+					};
+				};
+			};
+		};
+
+		/*
 		 * Source: MCT address, clocks, and interrupt map are from
 		 * research/dumped.dts:15079-15097.  It is disabled for now because
 		 * the architectural timer below is enough for first boot.
@@ -952,6 +1044,17 @@
 				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
 				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			/* Source: research/dumped.dts:3550-3561. */
+			disp_te_pri_on: disp-te-pri-on-pins {
+				samsung,pins = "gpp0-3";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+			};
+
+			disp_te_pri_off: disp-te-pri-off-pins {
+				samsung,pins = "gpp0-3";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_INPUT>;
 			};
 		};
 

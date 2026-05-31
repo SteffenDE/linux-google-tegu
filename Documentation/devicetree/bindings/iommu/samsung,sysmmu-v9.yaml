@@ -53,6 +53,14 @@ patternProperties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Default stream configuration word for one PMMU instance.
 
+  "^samsung,pmmu[0-7]-stream-property$":
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: |
+      Stream table entries for one PMMU instance.  Each entry is five cells:
+      stream table index, stream configuration, match configuration, stream ID
+      value, and stream ID mask.
+    minItems: 5
+
 required:
   - compatible
   - reg
@@ -70,7 +78,6 @@ examples:
         reg = <0x19840000 0x10000>;
         interrupts = <GIC_SPI 277 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 278 IRQ_TYPE_LEVEL_HIGH 0>;
-        power-domains = <&pd_dpuf0>;
         samsung,qos = <15>;
         samsung,secure-irq;
         samsung,secure-base = <0x19850000>;

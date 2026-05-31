@@ -40,13 +40,24 @@ struct google_tg4c {
 	struct regulator_bulk_data *supplies;
 };
 
+enum google_tg4c_supply {
+	TG4C_SUPPLY_VDDI,
+	TG4C_SUPPLY_VCI,
+	TG4C_SUPPLY_VDDD,
+};
+
 /*
  * Supplies, transcribed from the DT panel@2 node (google,gs-tg4c):
  *   vci-supply, vddi-supply, vddd-supply.
  * Downstream reg_ctrl ordering (tg4c_reg_ctrl_desc):
  *   enable : VDDI, VCI, VDDD(+11ms)
  *   disable: VDDD, VCI, VDDI(+1ms)
- * regulator_bulk_enable() powers the array in order, so keep VDDI first.
+ *
+ * Keep this array in downstream enable order. The driver still toggles each
+ * rail explicitly because regulator_bulk_enable() cannot interleave the
+ * 11ms post-VDDD wait that downstream programs. Whether the panel actually
+ * requires that delay is unverified; revisit once we can probe on hardware
+ * and possibly drop or shorten it.
  */
 static const struct regulator_bulk_data google_tg4c_supplies[] = {
 	{ .supply = "vddi" },
@@ -59,10 +70,61 @@ static inline struct google_tg4c *to_google_tg4c(struct drm_panel *panel)
 	return container_of(panel, struct google_tg4c, panel);
 }
 
+static int google_tg4c_enable_supplies(struct google_tg4c *ctx)
+{
+	int ret;
+
+	ret = regulator_enable(ctx->supplies[TG4C_SUPPLY_VDDI].consumer);
+	if (ret)
+		return ret;
+
+	ret = regulator_enable(ctx->supplies[TG4C_SUPPLY_VCI].consumer);
+	if (ret)
+		goto disable_vddi;
+
+	ret = regulator_enable(ctx->supplies[TG4C_SUPPLY_VDDD].consumer);
+	if (ret)
+		goto disable_vci;
+
+	usleep_range(11000, 12000);
+
+	return 0;
+
+disable_vci:
+	regulator_disable(ctx->supplies[TG4C_SUPPLY_VCI].consumer);
+disable_vddi:
+	regulator_disable(ctx->supplies[TG4C_SUPPLY_VDDI].consumer);
+	usleep_range(1000, 2000);
+
+	return ret;
+}
+
+static int google_tg4c_disable_supplies(struct google_tg4c *ctx)
+{
+	int ret;
+	int first_ret = 0;
+
+	ret = regulator_disable(ctx->supplies[TG4C_SUPPLY_VDDD].consumer);
+	if (ret && !first_ret)
+		first_ret = ret;
+
+	ret = regulator_disable(ctx->supplies[TG4C_SUPPLY_VCI].consumer);
+	if (ret && !first_ret)
+		first_ret = ret;
+
+	ret = regulator_disable(ctx->supplies[TG4C_SUPPLY_VDDI].consumer);
+	if (ret && !first_ret)
+		first_ret = ret;
+
+	usleep_range(1000, 2000);
+
+	return first_ret;
+}
+
 /*
  * Reset timing, transcribed from downstream .reset_timing_ms = {1, 1, 20}
- * (low pulse 1ms, high settle... ) combined with the gs_panel reset helper:
- * drive high, low for the pulse, then high and wait for the panel to settle.
+ * combined with the gs_panel reset helper:
+ * drive high for 1ms, low for 1ms, then high and wait 20ms for init.
  */
 static void google_tg4c_reset(struct google_tg4c *ctx)
 {
@@ -71,8 +133,6 @@ static void google_tg4c_reset(struct google_tg4c *ctx)
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	usleep_range(1000, 2000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	usleep_range(1000, 2000);
-	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	msleep(20);
 }
 
@@ -272,7 +332,7 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	struct drm_dsc_picture_parameter_set pps;
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(google_tg4c_supplies), ctx->supplies);
+	ret = google_tg4c_enable_supplies(ctx);
 	if (ret < 0)
 		return ret;
 
@@ -293,8 +353,8 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 
 	return 0;
 err:
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(google_tg4c_supplies), ctx->supplies);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	google_tg4c_disable_supplies(ctx);
 	return ret;
 }
 
@@ -309,10 +369,9 @@ static int google_tg4c_unprepare(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
 
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(google_tg4c_supplies), ctx->supplies);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 
-	return 0;
+	return google_tg4c_disable_supplies(ctx);
 }
 
 /*

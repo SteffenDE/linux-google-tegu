@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/google,zumapro-mipi-dphy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor G4 Zumapro MIPI M4M4 D-PHY
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  MIPI D-PHY block used by the Zumapro DSIM display controller.  Downstream
+  models these MMIO ranges as extra resources on the DSIM node; the mainline
+  binding gives ownership of the PHY bias and lane/PLL register windows to the
+  PHY provider instead.
+
+properties:
+  compatible:
+    enum:
+      - google,zumapro-mipi-dphy
+      - samsung,mipi-phy-m4m4
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: bias
+      - const: dphy
+
+  "#phy-cells":
+    const: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    items:
+      - const: ref
+
+  samsung,sysreg:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Display SYSREG phandle. The PHY driver uses it to select hardware reset
+      ownership and release the D-PHY master reset.
+
+  samsung,id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 1
+    description: D-PHY instance index.
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - "#phy-cells"
+  - clocks
+  - clock-names
+  - samsung,sysreg
+
+additionalProperties: false
+
+examples:
+  - |
+    oscclk: clock-24576000 {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24576000>;
+    };
+
+    sysreg_dpub: syscon@19421000 {
+        compatible = "google,zumapro-disp-sysreg", "syscon";
+        reg = <0x19421000 0x10>;
+    };
+
+    phy@19460000 {
+        compatible = "google,zumapro-mipi-dphy";
+        reg = <0x19460000 0x100>,
+              <0x19460100 0x700>;
+        reg-names = "bias", "dphy";
+        #phy-cells = <1>;
+        clocks = <&oscclk>;
+        clock-names = "ref";
+        samsung,sysreg = <&sysreg_dpub>;
+        samsung,id = <0>;
+    };
+
+...

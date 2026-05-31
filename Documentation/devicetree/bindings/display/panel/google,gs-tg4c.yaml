@@ -25,7 +25,10 @@ properties:
 
   reset-gpios:
     maxItems: 1
-    description: Active-high panel reset GPIO.
+    description:
+      Panel reset GPIO. Driven high for normal operation and low to hold the
+      panel in reset; mark it GPIO_ACTIVE_HIGH in the consumer node so the
+      driver's gpiod values map to those physical levels.
 
   vci-supply:
     description: Analog panel supply.

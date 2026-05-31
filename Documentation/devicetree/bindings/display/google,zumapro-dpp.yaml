@@ -19,11 +19,10 @@ properties:
     const: google,zumapro-dpp
 
   reg:
-    minItems: 2
+    minItems: 6
     maxItems: 6
 
   reg-names:
-    minItems: 2
     items:
       - const: dma
       - const: dpp
@@ -33,37 +32,38 @@ properties:
       - const: hdr
 
   interrupts:
-    minItems: 1
+    minItems: 2
     maxItems: 2
 
   interrupt-names:
-    minItems: 1
     items:
       - const: dma
       - const: dpp
 
-  dpp,id:
+  google,dpp-id:
     $ref: /schemas/types.yaml#/definitions/uint32
-    maximum: 17
-    description: Downstream DPP instance ID.
+    maximum: 13
+    description: DPP instance ID, translated from downstream dpp,id.
 
-  dpp,video:
+  google,video-formats:
     type: boolean
     description: The DPP can fetch video formats in addition to RGB formats.
 
-  attr:
+  google,dpp-attributes:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Downstream DPP attribute bitmask.
+    description: DPP attribute bitmask, translated from downstream attr.
 
-  port:
+  google,axi-port:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Downstream DPUF AXI port index.
+    description: DPUF AXI port index, translated from downstream port.
 
-  scale_down:
+  google,scale-down:
     $ref: /schemas/types.yaml#/definitions/uint32
+    description: Maximum scale-down factor, translated from downstream scale_down.
 
-  scale_up:
+  google,scale-up:
     $ref: /schemas/types.yaml#/definitions/uint32
+    description: Maximum scale-up factor, translated from downstream scale_up.
 
 required:
   - compatible
@@ -71,7 +71,7 @@ required:
   - reg-names
   - interrupts
   - interrupt-names
-  - dpp,id
+  - google,dpp-id
 
 additionalProperties: false
 
@@ -91,9 +91,9 @@ examples:
         interrupts = <GIC_SPI 256 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 265 IRQ_TYPE_LEVEL_HIGH 0>;
         interrupt-names = "dma", "dpp";
-        attr = <0x6d0867>;
-        port = <0>;
-        scale_down = <4>;
-        scale_up = <8>;
-        dpp,id = <0>;
+        google,dpp-attributes = <0x6d0867>;
+        google,axi-port = <0>;
+        google,scale-down = <4>;
+        google,scale-up = <8>;
+        google,dpp-id = <0>;
     };

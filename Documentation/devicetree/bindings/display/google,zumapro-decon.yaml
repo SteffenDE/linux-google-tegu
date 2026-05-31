@@ -19,11 +19,11 @@ properties:
     const: google,zumapro-decon
 
   reg:
-    minItems: 1
+    minItems: 4
     maxItems: 7
 
   reg-names:
-    minItems: 1
+    minItems: 4
     items:
       - const: main
       - const: win
@@ -34,31 +34,43 @@ properties:
       - const: cgc-dma
 
   interrupts:
-    minItems: 1
+    minItems: 3
     maxItems: 6
 
   interrupt-names:
-    minItems: 1
-    items:
-      - const: frame_start
-      - const: frame_done
-      - const: extra
-      - const: dimming_start
-      - const: dimming_end
-      - const: cgc-dma
+    minItems: 3
+    maxItems: 6
+    oneOf:
+      - items:
+          - const: frame_start
+          - const: frame_done
+          - const: extra
+      - items:
+          - const: frame_start
+          - const: frame_done
+          - const: extra
+          - const: cgc-dma
+      - items:
+          - const: frame_start
+          - const: frame_done
+          - const: extra
+          - const: dimming_start
+          - const: dimming_end
+          - const: cgc-dma
 
-  decon,id:
+  google,decon-id:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 2
-    description: Downstream DECON instance ID.
+    description: DECON instance ID, translated from downstream decon,id.
 
-  cgc-dma,id:
+  google,cgc-dma-id:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Downstream CGC DMA DPP ID.
+    description: CGC DMA DPP ID, translated from downstream cgc-dma,id.
 
-  max_win:
+  google,max-windows:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 14
+    description: Maximum hardware windows, translated from downstream max_win.
 
   iommus:
     minItems: 1
@@ -78,6 +90,8 @@ properties:
 
   dpps:
     $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      maxItems: 1
     maxItems: 14
     description: DPP blocks available to this DECON.
 
@@ -91,8 +105,7 @@ required:
   - reg-names
   - interrupts
   - interrupt-names
-  - decon,id
-  - ports
+  - google,decon-id
 
 additionalProperties: false
 
@@ -119,9 +132,9 @@ examples:
                      <GIC_SPI 255 IRQ_TYPE_LEVEL_HIGH 0>;
         interrupt-names = "frame_start", "frame_done", "extra",
                           "dimming_start", "dimming_end", "cgc-dma";
-        decon,id = <0>;
-        cgc-dma,id = <18>;
-        max_win = <14>;
+        google,decon-id = <0>;
+        google,cgc-dma-id = <18>;
+        google,max-windows = <14>;
 
         ports {
             #address-cells = <1>;

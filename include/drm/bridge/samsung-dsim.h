@@ -30,6 +30,7 @@ enum samsung_dsim_type {
 	DSIM_TYPE_EXYNOS5422,
 	DSIM_TYPE_EXYNOS5433,
 	DSIM_TYPE_EXYNOS7870,
+	DSIM_TYPE_ZUMAPRO,
 	DSIM_TYPE_IMX8MM,
 	DSIM_TYPE_IMX8MP,
 	DSIM_TYPE_COUNT,
@@ -59,6 +60,8 @@ struct samsung_dsim_driver_data {
 	unsigned int has_clklane_stop:1;
 	unsigned int has_broken_fifoctrl_emptyhdr:1;
 	unsigned int has_sfrctrl:1;
+	unsigned int has_zumapro_regs:1;
+	unsigned int uses_external_dphy_pll:1;
 	struct clk_bulk_data *clk_data;
 	unsigned int num_clks;
 	unsigned int min_freq;
@@ -117,6 +120,7 @@ struct samsung_dsim {
 	u32 lanes;
 	u32 mode_flags;
 	u32 format;
+	struct drm_dsc_config *dsc;
 
 	bool swap_dn_dp_clk;
 	bool swap_dn_dp_data;

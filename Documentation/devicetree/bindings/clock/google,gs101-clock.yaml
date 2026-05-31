@@ -36,6 +36,10 @@ properties:
       - google,gs101-cmu-misc
       - google,gs101-cmu-peric0
       - google,gs101-cmu-peric1
+      - google,zumapro-cmu-dpub
+      - google,zumapro-cmu-dpuf0
+      - google,zumapro-cmu-dpuf1
+      - google,zumapro-cmu-hsi0
       - google,zumapro-cmu-top
       - google,zumapro-cmu-hsi2
       - google,zumapro-cmu-peric0
@@ -111,6 +115,46 @@ allOf:
       properties:
         compatible:
           contains:
+            const: google,zumapro-cmu-dpub
+
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock
+            - description: DPUB bus clock (from CMU_TOP)
+            - description: DPUB DSIM clock (from CMU_TOP)
+
+        clock-names:
+          items:
+            - const: oscclk
+            - const: bus
+            - const: dsim
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - google,zumapro-cmu-dpuf0
+              - google,zumapro-cmu-dpuf1
+
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock
+            - description: DPUF bus clock (from CMU_TOP)
+
+        clock-names:
+          items:
+            - const: oscclk
+            - const: bus
+
+  - if:
+      properties:
+        compatible:
+          contains:
             const: google,gs101-cmu-hsi0
 
     then:
@@ -130,6 +174,24 @@ allOf:
             - const: dpgtc
             - const: usb31drd
             - const: usbdpdbg
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: google,zumapro-cmu-hsi0
+
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock (24.576 MHz)
+            - description: High Speed Interface 0 NOC clock (from CMU_TOP)
+
+        clock-names:
+          items:
+            - const: oscclk
+            - const: noc
 
   - if:
       properties:
@@ -205,6 +267,10 @@ allOf:
           contains:
             enum:
               - google,gs101-cmu-top
+              - google,zumapro-cmu-dpub
+              - google,zumapro-cmu-dpuf0
+              - google,zumapro-cmu-dpuf1
+              - google,zumapro-cmu-hsi0
               - google,zumapro-cmu-top
     then:
       properties:

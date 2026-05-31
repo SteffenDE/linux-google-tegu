@@ -7,6 +7,7 @@
  * before the first MMIO write is allowed.
  */
 
+#include <drm/display/drm_dsc.h>
 #include <drm/drm_fourcc.h>
 
 #include <linux/mod_devicetable.h>
@@ -33,6 +34,7 @@ struct zumapro_decon {
 	u32 id;
 	u32 cgc_dma_id;
 	u32 max_windows;
+	const struct zumapro_panel_pipeline *pipeline;
 	int dpp_count;
 };
 
@@ -126,6 +128,43 @@ struct zumapro_dpp_format {
 	u32 drm_format;
 	enum zumapro_dpu_dma_format dma_format;
 	enum zumapro_dpu_dpp_format dpp_format;
+};
+
+struct zumapro_panel_mode {
+	const char *name;
+	u32 clock_khz;
+	u16 hdisplay;
+	u16 hsync_start;
+	u16 hsync_end;
+	u16 htotal;
+	u16 vdisplay;
+	u16 vsync_start;
+	u16 vsync_end;
+	u16 vtotal;
+	u16 width_mm;
+	u16 height_mm;
+	u16 vblank_usec;
+	u16 te_usec;
+	u8 refresh_hz;
+	bool preferred;
+	bool lp_mode;
+};
+
+struct zumapro_panel_pipeline {
+	const struct zumapro_panel_mode *modes;
+	unsigned int num_modes;
+	const struct drm_dsc_config *dsc;
+	u32 data_path;
+	u32 out_type;
+	enum zumapro_decon_fifo dsimif_fifo;
+	u8 dsimif;
+	u8 dsc_count;
+	u8 data_lanes;
+	u16 default_hs_clk_mbps;
+	u16 alternate_hs_clk_mbps;
+	u16 esc_clk_mhz;
+	u32 pmsk[4];
+	bool non_continuous_clock;
 };
 
 static const u32 zumapro_dpp_graphics_formats[] = {
@@ -263,6 +302,139 @@ static int zumapro_dpp_select_formats(struct zumapro_dpp *dpp)
 	return zumapro_dpp_validate_formats(dpp->dev, dpp->pixel_formats,
 					    dpp->num_pixel_formats);
 }
+
+#define ZUMAPRO_DSC_6BIT_SIGNED(_v)	((_v) & 0x3f)
+
+static const struct drm_dsc_config zumapro_tg4c_dsc = {
+	.dsc_version_major = 1,
+	.dsc_version_minor = 2,
+	.line_buf_depth = 9,
+	.bits_per_component = 8,
+	.convert_rgb = true,
+	.slice_count = 2,
+	.slice_width = 540,
+	.slice_height = 24,
+	.simple_422 = false,
+	.pic_width = 1080,
+	.pic_height = 2424,
+	.rc_tgt_offset_high = 3,
+	.rc_tgt_offset_low = 3,
+	.bits_per_pixel = 128,
+	.rc_edge_factor = 6,
+	.rc_quant_incr_limit1 = 11,
+	.rc_quant_incr_limit0 = 11,
+	.initial_xmit_delay = 512,
+	.block_pred_enable = true,
+	.first_line_bpg_offset = 12,
+	.initial_offset = 6144,
+	.rc_buf_thresh = {
+		14, 28, 42, 56, 70, 84, 98, 105,
+		112, 119, 121, 123, 125, 126,
+	},
+	.rc_range_params = {
+		{ 0, 4, ZUMAPRO_DSC_6BIT_SIGNED(2) },
+		{ 0, 4, ZUMAPRO_DSC_6BIT_SIGNED(0) },
+		{ 1, 5, ZUMAPRO_DSC_6BIT_SIGNED(0) },
+		{ 1, 6, ZUMAPRO_DSC_6BIT_SIGNED(-2) },
+		{ 3, 7, ZUMAPRO_DSC_6BIT_SIGNED(-4) },
+		{ 3, 7, ZUMAPRO_DSC_6BIT_SIGNED(-6) },
+		{ 3, 7, ZUMAPRO_DSC_6BIT_SIGNED(-8) },
+		{ 3, 8, ZUMAPRO_DSC_6BIT_SIGNED(-8) },
+		{ 3, 9, ZUMAPRO_DSC_6BIT_SIGNED(-8) },
+		{ 3, 10, ZUMAPRO_DSC_6BIT_SIGNED(-10) },
+		{ 5, 10, ZUMAPRO_DSC_6BIT_SIGNED(-10) },
+		{ 5, 11, ZUMAPRO_DSC_6BIT_SIGNED(-12) },
+		{ 5, 11, ZUMAPRO_DSC_6BIT_SIGNED(-12) },
+		{ 9, 12, ZUMAPRO_DSC_6BIT_SIGNED(-12) },
+		{ 12, 13, ZUMAPRO_DSC_6BIT_SIGNED(-12) },
+	},
+	.rc_model_size = 8192,
+	.flatness_min_qp = 3,
+	.flatness_max_qp = 12,
+	.initial_scale_value = 32,
+	.scale_decrement_interval = 7,
+	.scale_increment_interval = 588,
+	.nfl_bpg_offset = 1069,
+	.slice_bpg_offset = 1085,
+	.final_offset = 4336,
+	.vbr_enable = false,
+	.slice_chunk_size = 540,
+	.native_422 = false,
+	.native_420 = false,
+	.second_line_bpg_offset = 0,
+	.nsl_bpg_offset = 0,
+	.second_line_offset_adj = 0,
+};
+
+static const struct zumapro_panel_mode zumapro_tg4c_modes[] = {
+	{
+		.name = "1080x2424@60:60",
+		.clock_khz = 167922,
+		.hdisplay = 1080,
+		.hsync_start = 1112,
+		.hsync_end = 1124,
+		.htotal = 1140,
+		.vdisplay = 2424,
+		.vsync_start = 2436,
+		.vsync_end = 2440,
+		.vtotal = 2455,
+		.width_mm = 64,
+		.height_mm = 145,
+		.vblank_usec = 120,
+		.te_usec = 8450,
+		.refresh_hz = 60,
+		.preferred = true,
+	}, {
+		.name = "1080x2424@120:120",
+		.clock_khz = 335844,
+		.hdisplay = 1080,
+		.hsync_start = 1112,
+		.hsync_end = 1124,
+		.htotal = 1140,
+		.vdisplay = 2424,
+		.vsync_start = 2436,
+		.vsync_end = 2440,
+		.vtotal = 2455,
+		.width_mm = 64,
+		.height_mm = 145,
+		.vblank_usec = 120,
+		.te_usec = 276,
+		.refresh_hz = 120,
+	}, {
+		.name = "1080x2424@30:30",
+		.clock_khz = 83961,
+		.hdisplay = 1080,
+		.hsync_start = 1112,
+		.hsync_end = 1124,
+		.htotal = 1140,
+		.vdisplay = 2424,
+		.vsync_start = 2436,
+		.vsync_end = 2440,
+		.vtotal = 2455,
+		.width_mm = 64,
+		.height_mm = 145,
+		.vblank_usec = 120,
+		.refresh_hz = 30,
+		.lp_mode = true,
+	},
+};
+
+static const struct zumapro_panel_pipeline zumapro_decon0_tg4c_pipeline = {
+	.modes = zumapro_tg4c_modes,
+	.num_modes = ARRAY_SIZE(zumapro_tg4c_modes),
+	.dsc = &zumapro_tg4c_dsc,
+	.data_path = ZUMAPRO_DPATH_DSCC_DSCENC01_OUTFIFO01_DSIMIF0,
+	.out_type = ZUMAPRO_DECON_OUT_DSI0,
+	.dsimif_fifo = ZUMAPRO_DECON0_OFIFO0,
+	.dsimif = 0,
+	.dsc_count = 2,
+	.data_lanes = 4,
+	.default_hs_clk_mbps = 1102,
+	.alternate_hs_clk_mbps = 1000,
+	.esc_clk_mhz = 20,
+	.pmsk = { 0x02, 0xb3, 0x02, 0x5cab },
+	.non_continuous_clock = true,
+};
 
 static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
 {
@@ -488,6 +660,9 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	if (!desc)
 		return dev_err_probe(dev, -EINVAL, "unsupported DECON%u\n",
 				     decon->id);
+
+	if (decon->id == 0)
+		decon->pipeline = &zumapro_decon0_tg4c_pipeline;
 
 	if (desc->has_cgc_dma) {
 		ret = zumapro_read_u32_optional_compat(dev,

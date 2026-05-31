@@ -12,6 +12,7 @@
 #include <linux/platform_device.h>
 
 #include "exynos_drm_drv.h"
+#include "regs-zumapro-dpu.h"
 
 struct zumapro_dpp {
 	struct device *dev;
@@ -209,7 +210,7 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (dpp->id > 13)
+	if (dpp->id >= ZUMAPRO_DPU_FETCH_DPP_COUNT)
 		return dev_err_probe(dev, -EINVAL,
 				     "DPP%u is not a normal fetch DPP\n",
 				     dpp->id);

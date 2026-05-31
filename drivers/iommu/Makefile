@@ -29,6 +29,7 @@ obj-$(CONFIG_SUN50I_IOMMU) += sun50i-iommu.o
 obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
 obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
 obj-$(CONFIG_SAMSUNG_SYSMMU_GROUP) += samsung-sysmmu-group.o
+obj-$(CONFIG_SAMSUNG_SYSMMU_V9) += samsung-sysmmu-v9.o
 obj-$(CONFIG_FSL_PAMU) += fsl_pamu.o fsl_pamu_domain.o
 obj-$(CONFIG_S390_IOMMU) += s390-iommu.o
 obj-$(CONFIG_HYPERV_IOMMU) += hyperv-iommu.o

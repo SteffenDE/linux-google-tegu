@@ -389,6 +389,47 @@
 		};
 
 		/*
+		 * Source: display CMU bases come from dumped.dts pd-dpub,
+		 * pd-dpuf0, and pd-dpuf1 cmu_id values; register offsets come
+		 * from downstream Zuma CMUCAL.  TRACE NEEDED: validate selected
+		 * display mux parents/rates under Linux before allowing DRM to
+		 * program those clocks.
+		 */
+		cmu_dpub: clock-controller@19400000 {
+			compatible = "google,zumapro-cmu-dpub";
+			reg = <0x19400000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_DPUB_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_DPUB_DSIM>;
+			clock-names = "oscclk", "bus", "dsim";
+			power-domains = <&pd_dpub>;
+			status = "disabled";
+		};
+
+		cmu_dpuf0: clock-controller@19800000 {
+			compatible = "google,zumapro-cmu-dpuf0";
+			reg = <0x19800000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_DPUF0_NOC>;
+			clock-names = "oscclk", "bus";
+			power-domains = <&pd_dpuf0>;
+			status = "disabled";
+		};
+
+		cmu_dpuf1: clock-controller@19c00000 {
+			compatible = "google,zumapro-cmu-dpuf1";
+			reg = <0x19c00000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_DPUF1_NOC>;
+			clock-names = "oscclk", "bus";
+			power-domains = <&pd_dpuf1>;
+			status = "disabled";
+		};
+
+		/*
 		 * Source: MCT address, clocks, and interrupt map are from
 		 * research/dumped.dts:15079-15097.  It is disabled for now because
 		 * the architectural timer below is enough for first boot.

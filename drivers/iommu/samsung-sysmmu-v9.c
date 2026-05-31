@@ -258,6 +258,28 @@ static void samsung_sysmmu_v9_invalidate_range(struct samsung_sysmmu_v9_drvdata 
 		       data->sfrbase + REG_MMU_RANGE_INV_END_VPN_AND_TRIG_VM);
 }
 
+static void samsung_sysmmu_v9_sync_range(struct samsung_sysmmu_v9_domain *domain,
+					 dma_addr_t start, dma_addr_t end)
+{
+	struct samsung_sysmmu_v9_drvdata *data;
+	struct list_head *group_list;
+	unsigned long flags;
+
+	if (!domain->group || start > end)
+		return;
+
+	group_list = iommu_group_get_iommudata(domain->group);
+	if (!group_list)
+		return;
+
+	list_for_each_entry(data, group_list, domain_node) {
+		spin_lock_irqsave(&data->lock, flags);
+		if (data->attached_count && data->rpm_active)
+			samsung_sysmmu_v9_invalidate_range(data, start, end);
+		spin_unlock_irqrestore(&data->lock, flags);
+	}
+}
+
 static void samsung_sysmmu_v9_set_stream(struct samsung_sysmmu_v9_drvdata *data,
 					 unsigned int pmmu_id)
 {
@@ -587,8 +609,11 @@ retry:
 
 		if (new_lv2 && !new_lv2_used)
 			iommu_pages_free_incoherent(new_lv2, domain->dma_dev);
-		if (lv2_to_free)
+		if (lv2_to_free) {
+			samsung_sysmmu_v9_sync_range(domain, iova + done,
+						     iova + done + pgsize - 1);
 			iommu_pages_free_incoherent(lv2_to_free, domain->dma_dev);
+		}
 		if (ret)
 			break;
 		done += pgsize;
@@ -826,24 +851,11 @@ static void samsung_sysmmu_v9_iotlb_sync(struct iommu_domain *iommu_domain,
 {
 	struct samsung_sysmmu_v9_domain *domain =
 		to_samsung_sysmmu_v9_domain(iommu_domain);
-	struct samsung_sysmmu_v9_drvdata *data;
-	struct list_head *group_list;
-	unsigned long flags;
 
-	if (!domain->group || gather->start >= gather->end)
+	if (gather->start > gather->end)
 		return;
 
-	group_list = iommu_group_get_iommudata(domain->group);
-	if (!group_list)
-		return;
-
-	list_for_each_entry(data, group_list, domain_node) {
-		spin_lock_irqsave(&data->lock, flags);
-		if (data->attached_count && data->rpm_active)
-			samsung_sysmmu_v9_invalidate_range(data, gather->start,
-							   gather->end);
-		spin_unlock_irqrestore(&data->lock, flags);
-	}
+	samsung_sysmmu_v9_sync_range(domain, gather->start, gather->end);
 }
 
 static struct iommu_device *samsung_sysmmu_v9_probe_device(struct device *dev)

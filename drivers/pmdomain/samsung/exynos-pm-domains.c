@@ -24,6 +24,7 @@
 struct exynos_pm_domain_config {
 	/* Value for LOCAL_PWR_CFG and STATUS fields for each domain */
 	u32 local_pwr_cfg;
+	bool secure_pmu;
 };
 
 /*
@@ -32,15 +33,19 @@ struct exynos_pm_domain_config {
 struct exynos_pm_domain {
 	void __iomem *base;
 	void __iomem *cmu_option;
+	phys_addr_t base_addr;
 	struct generic_pm_domain pd;
 	u32 local_pwr_cfg;
 	u32 secure_pwr_id;
+	bool secure_pmu;
 };
 
 #define EXYNOS_PD_SMC_CMD		0x82000410
 #define EXYNOS_PD_SMC_SAVE		0
 #define EXYNOS_PD_SMC_RESTORE		1
 #define EXYNOS_PD_SMC_TZPC_GROUP	2
+#define EXYNOS_PRIV_REG_SMC_CMD		0x82000504
+#define EXYNOS_PRIV_REG_WRITE		1
 #define EXYNOS_PD_CMU_RESET_DISABLE	BIT(24)
 
 static void exynos_pd_secure_control(struct exynos_pm_domain *pd, bool power_on)
@@ -60,12 +65,34 @@ static void exynos_pd_secure_control(struct exynos_pm_domain *pd, bool power_on)
 			pd->pd.name, power_on ? "restore" : "save", res.a0);
 }
 
+static int exynos_pd_write_pmu(struct exynos_pm_domain *pd, u32 value)
+{
+	struct arm_smccc_res res;
+
+	if (!pd->secure_pmu) {
+		writel_relaxed(value, pd->base);
+		return 0;
+	}
+
+	arm_smccc_smc(EXYNOS_PRIV_REG_SMC_CMD, pd->base_addr,
+		      EXYNOS_PRIV_REG_WRITE, value, 0, 0, 0, 0, &res);
+
+	if (res.a0) {
+		pr_err("Power domain %s secure PMU write returned %lu\n",
+		       pd->pd.name, res.a0);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 {
 	struct exynos_pm_domain *pd;
 	void __iomem *base;
 	u32 timeout, pwr;
 	char *op;
+	int ret;
 
 	pd = container_of(domain, struct exynos_pm_domain, pd);
 	base = pd->base;
@@ -80,7 +107,9 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 	}
 
 	pwr = power_on ? pd->local_pwr_cfg : 0;
-	writel_relaxed(pwr, base);
+	ret = exynos_pd_write_pmu(pd, pwr);
+	if (ret)
+		return ret;
 
 	/* Wait max 1ms */
 	timeout = 10;
@@ -122,6 +151,7 @@ static const struct exynos_pm_domain_config exynos5433_cfg = {
 
 static const struct exynos_pm_domain_config zumapro_cfg = {
 	.local_pwr_cfg		= BIT(0),
+	.secure_pmu		= true,
 };
 
 static const struct of_device_id exynos_pm_domain_of_match[] = {
@@ -171,6 +201,11 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	if (IS_ERR(pd->base))
 		return PTR_ERR(pd->base);
 
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -EINVAL;
+	pd->base_addr = res->start;
+
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cmu");
 	if (res) {
 		pd->cmu_option = devm_ioremap_resource(dev, res);
@@ -183,6 +218,7 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	pd->pd.power_off = exynos_pd_power_off;
 	pd->pd.power_on = exynos_pd_power_on;
 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
+	pd->secure_pmu = pm_domain_cfg->secure_pmu;
 	if (of_property_read_bool(np, "samsung,always-on"))
 		pd->pd.flags |= GENPD_FLAG_ALWAYS_ON;
 

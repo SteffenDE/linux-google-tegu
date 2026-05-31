@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iommu/samsung,sysmmu-v9.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung System MMU v9
+
+maintainers:
+  - Marek Szyprowski <m.szyprowski@samsung.com>
+
+description:
+  Samsung System MMU v9 is the IOMMU generation used by later Exynos and Google
+  Tensor display, multimedia, and accelerator blocks.  It is not register
+  compatible with the older samsung,exynos-sysmmu controller.
+
+properties:
+  compatible:
+    const: samsung,sysmmu-v9
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    minItems: 1
+    maxItems: 2
+
+  "#iommu-cells":
+    const: 0
+
+  power-domains:
+    maxItems: 1
+
+  samsung,qos:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Downstream QoS priority programmed by the v9 driver.
+    maximum: 15
+
+  samsung,secure-irq:
+    type: boolean
+    description: The controller has a second interrupt for secure faults.
+
+  samsung,secure-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Secure fault register base used by the downstream v9 driver.
+
+  samsung,port-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Human-readable hardware port name used in fault reports.
+
+patternProperties:
+  "^samsung,pmmu[0-7]-default-stream$":
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Default stream configuration word for one PMMU instance.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - "#iommu-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    iommu@19840000 {
+        compatible = "samsung,sysmmu-v9";
+        reg = <0x19840000 0x10000>;
+        interrupts = <GIC_SPI 277 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 278 IRQ_TYPE_LEVEL_HIGH 0>;
+        power-domains = <&pd_dpuf0>;
+        samsung,qos = <15>;
+        samsung,secure-irq;
+        samsung,secure-base = <0x19850000>;
+        samsung,port-name = "DPU F0";
+        samsung,pmmu0-default-stream = <0x600014a>;
+        samsung,pmmu1-default-stream = <0x800014a>;
+        #iommu-cells = <0>;
+    };

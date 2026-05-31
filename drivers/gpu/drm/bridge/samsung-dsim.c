@@ -2123,28 +2123,36 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 
 	ret = samsung_dsim_enable_clock(dsi);
 	if (ret)
-		return ret;
+		goto err_disable_irq;
 
 	ret = samsung_dsim_configure_external_phy(dsi);
 	if (ret)
-		return ret;
+		goto err_disable_clock;
 
 	if (driver_data->wait_for_reset)
 		samsung_dsim_wait_for_reset(dsi);
 	samsung_dsim_set_phy_ctrl(dsi);
 
 	ret = samsung_dsim_init_link(dsi);
-	if (ret) {
-		if (driver_data->uses_external_dphy_pll) {
-			phy_power_off(dsi->phy);
-			phy_exit(dsi->phy);
-		}
-		return ret;
-	}
+	if (ret)
+		goto err_disable_phy;
 
 	dsi->state |= DSIM_STATE_INITIALIZED;
 
 	return 0;
+
+err_disable_phy:
+	if (driver_data->uses_external_dphy_pll) {
+		samsung_dsim_zumapro_select_word_clock(dsi, false);
+		phy_power_off(dsi->phy);
+		phy_exit(dsi->phy);
+	}
+err_disable_clock:
+	samsung_dsim_disable_clock(dsi);
+err_disable_irq:
+	samsung_dsim_disable_irq(dsi);
+
+	return ret;
 }
 
 static void samsung_dsim_atomic_pre_enable(struct drm_bridge *bridge,

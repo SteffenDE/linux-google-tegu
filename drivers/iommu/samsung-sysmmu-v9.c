@@ -163,6 +163,12 @@ struct samsung_sysmmu_v9_domain {
 static const struct iommu_ops samsung_sysmmu_v9_ops;
 static struct device *samsung_sysmmu_v9_dma_dev;
 
+static void samsung_sysmmu_v9_clear_dma_dev(struct device *dev)
+{
+	if (samsung_sysmmu_v9_dma_dev == dev)
+		samsung_sysmmu_v9_dma_dev = NULL;
+}
+
 static inline struct samsung_sysmmu_v9_domain *
 to_samsung_sysmmu_v9_domain(struct iommu_domain *domain)
 {
@@ -1263,6 +1269,7 @@ static int samsung_sysmmu_v9_probe(struct platform_device *pdev)
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&data->iommu);
 err_pm_disable:
+	samsung_sysmmu_v9_clear_dma_dev(dev);
 	pm_runtime_disable(dev);
 	return ret;
 }
@@ -1273,6 +1280,7 @@ static void samsung_sysmmu_v9_remove(struct platform_device *pdev)
 
 	iommu_device_unregister(&data->iommu);
 	iommu_device_sysfs_remove(&data->iommu);
+	samsung_sysmmu_v9_clear_dma_dev(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 }
 

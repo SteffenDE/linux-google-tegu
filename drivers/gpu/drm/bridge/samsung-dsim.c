@@ -2565,7 +2565,8 @@ static ssize_t samsung_dsim_host_transfer(struct mipi_dsi_host *host,
 	struct samsung_dsim_transfer xfer;
 	int ret;
 
-	if (!(dsi->state & DSIM_STATE_ENABLED))
+	if ((dsi->state & DSIM_STATE_PRE_ENABLE_FAILED) ||
+	    !(dsi->state & DSIM_STATE_ENABLED))
 		return -EINVAL;
 
 	ret = samsung_dsim_init(dsi);

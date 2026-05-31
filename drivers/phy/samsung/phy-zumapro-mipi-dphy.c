@@ -271,6 +271,23 @@ static int zumapro_dphy_get_timing(struct zumapro_mipi_dphy *dphy,
 	return 0;
 }
 
+static u32 zumapro_dphy_adjust_esc_clk(u32 hs_mhz, u32 req_esc_mhz)
+{
+	u32 word_mhz = hs_mhz / 16;
+	u32 esc_div;
+
+	if (!req_esc_mhz || !word_mhz)
+		return 0;
+
+	esc_div = word_mhz / req_esc_mhz;
+	if (!esc_div)
+		esc_div = 1;
+	if (word_mhz / esc_div > req_esc_mhz)
+		esc_div++;
+
+	return word_mhz / esc_div;
+}
+
 static void zumapro_dphy_set_pll_freq(struct zumapro_mipi_dphy *dphy)
 {
 	writel(DSIM_PHY_PMS_K(dphy->k), dphy->dphy + DSIM_PHY_PLL_CON1);
@@ -441,6 +458,7 @@ static int zumapro_mipi_dphy_configure(struct phy *phy,
 	hs_mhz = DIV_ROUND_CLOSEST_ULL(cfg->hs_clk_rate, HZ_PER_MHZ);
 	esc_mhz = cfg->lp_clk_rate ?
 		  DIV_ROUND_CLOSEST_ULL(cfg->lp_clk_rate, HZ_PER_MHZ) : 20;
+	esc_mhz = zumapro_dphy_adjust_esc_clk(hs_mhz, esc_mhz);
 
 	ret = zumapro_dphy_calc_pmsk(dphy, ref_rate, hs_mhz);
 	if (ret)

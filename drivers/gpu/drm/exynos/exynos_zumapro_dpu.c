@@ -145,18 +145,35 @@ static int zumapro_read_u32_compat(struct device *dev, const char *name,
 	return dev_err_probe(dev, -EINVAL, "missing DT property %s\n", name);
 }
 
-static void zumapro_read_u32_optional_compat(struct device *dev,
-					     const char *name,
-					     const char *legacy_name,
-					     u32 *value)
+static int zumapro_read_u32_optional_compat(struct device *dev,
+					    const char *name,
+					    const char *legacy_name,
+					    u32 *value)
 {
-	if (!of_property_read_u32(dev->of_node, name, value))
-		return;
+	int ret;
 
-	if (legacy_name &&
-	    !of_property_read_u32(dev->of_node, legacy_name, value))
+	if (of_property_present(dev->of_node, name)) {
+		ret = of_property_read_u32(dev->of_node, name, value);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "malformed DT property %s\n",
+					     name);
+		return 0;
+	}
+
+	if (!legacy_name || !of_property_present(dev->of_node, legacy_name))
+		return 0;
+
+	ret = of_property_read_u32(dev->of_node, legacy_name, value);
+	if (ret)
+		return dev_err_probe(dev, ret, "malformed DT property %s\n",
+				     legacy_name);
+
+	if (legacy_name)
 		dev_warn(dev, "using legacy DT property %s; prefer %s\n",
 			 legacy_name, name);
+
+	return 0;
 }
 
 static int zumapro_check_reg_names(struct platform_device *pdev,
@@ -215,14 +232,26 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 				     "DPP%u is not a normal fetch DPP\n",
 				     dpp->id);
 
-	zumapro_read_u32_optional_compat(dev, "google,dpp-attributes", "attr",
-					 &dpp->attributes);
-	zumapro_read_u32_optional_compat(dev, "google,axi-port", "port",
-					 &dpp->axi_port);
-	zumapro_read_u32_optional_compat(dev, "google,scale-down",
-					 "scale_down", &dpp->scale_down);
-	zumapro_read_u32_optional_compat(dev, "google,scale-up", "scale_up",
-					 &dpp->scale_up);
+	ret = zumapro_read_u32_optional_compat(dev, "google,dpp-attributes",
+					       "attr", &dpp->attributes);
+	if (ret)
+		return ret;
+
+	ret = zumapro_read_u32_optional_compat(dev, "google,axi-port",
+					       "port", &dpp->axi_port);
+	if (ret)
+		return ret;
+
+	ret = zumapro_read_u32_optional_compat(dev, "google,scale-down",
+					       "scale_down", &dpp->scale_down);
+	if (ret)
+		return ret;
+
+	ret = zumapro_read_u32_optional_compat(dev, "google,scale-up",
+					       "scale_up", &dpp->scale_up);
+	if (ret)
+		return ret;
+
 	dpp->video_formats = of_property_read_bool(dev->of_node,
 						   "google,video-formats") ||
 			     of_property_read_bool(dev->of_node, "dpp,video");
@@ -281,13 +310,18 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 				     decon->id);
 
 	if (desc->has_cgc_dma) {
-		zumapro_read_u32_optional_compat(dev, "google,cgc-dma-id",
-						 "cgc-dma,id",
-						 &decon->cgc_dma_id);
+		ret = zumapro_read_u32_optional_compat(dev,
+						       "google,cgc-dma-id",
+						       "cgc-dma,id",
+						       &decon->cgc_dma_id);
+		if (ret)
+			return ret;
 	}
 
-	zumapro_read_u32_optional_compat(dev, "google,max-windows",
-					 "max_win", &decon->max_windows);
+	ret = zumapro_read_u32_optional_compat(dev, "google,max-windows",
+					       "max_win", &decon->max_windows);
+	if (ret)
+		return ret;
 
 	ret = zumapro_check_reg_names(pdev, desc->reg_names,
 				      desc->num_reg_names);

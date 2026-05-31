@@ -407,18 +407,11 @@ static void samsung_sysmmu_v9_domain_free(struct iommu_domain *iommu_domain)
 }
 
 static sysmmu_pte_t *
-samsung_sysmmu_v9_alloc_lv2entry(struct samsung_sysmmu_v9_domain *domain,
-				 sysmmu_pte_t *sent, sysmmu_iova_t iova,
-				 int *pgcounter, gfp_t gfp)
+samsung_sysmmu_v9_alloc_lv2table(struct samsung_sysmmu_v9_domain *domain,
+				 gfp_t gfp)
 {
 	sysmmu_pte_t *pent;
 	int ret;
-
-	if (lv1ent_section(sent))
-		return ERR_PTR(-EADDRINUSE);
-
-	if (!lv1ent_unmapped(sent))
-		return page_entry(sent, iova);
 
 	pent = iommu_alloc_pages_sz(gfp, LV2TABLE_SIZE);
 	if (!pent)
@@ -430,9 +423,29 @@ samsung_sysmmu_v9_alloc_lv2entry(struct samsung_sysmmu_v9_domain *domain,
 		return ERR_PTR(ret);
 	}
 
-	*sent = make_sysmmu_pte(virt_to_phys(pent), SLPD_FLAG, 0);
-	*pgcounter = 0;
 	samsung_sysmmu_v9_flush_pgtable(domain, pent, LV2TABLE_SIZE);
+
+	return pent;
+}
+
+static sysmmu_pte_t *
+samsung_sysmmu_v9_lv2entry_locked(struct samsung_sysmmu_v9_domain *domain,
+				  sysmmu_pte_t *sent, sysmmu_iova_t iova,
+				  int *pgcounter, sysmmu_pte_t *new_lv2,
+				  bool *new_lv2_used)
+{
+	if (lv1ent_section(sent))
+		return ERR_PTR(-EADDRINUSE);
+
+	if (!lv1ent_unmapped(sent))
+		return page_entry(sent, iova);
+
+	if (!new_lv2)
+		return ERR_PTR(-EAGAIN);
+
+	*sent = make_sysmmu_pte(virt_to_phys(new_lv2), SLPD_FLAG, 0);
+	*pgcounter = 0;
+	*new_lv2_used = true;
 	samsung_sysmmu_v9_flush_pgtable(domain, sent, sizeof(*sent));
 
 	return page_entry(sent, iova);
@@ -441,7 +454,8 @@ samsung_sysmmu_v9_alloc_lv2entry(struct samsung_sysmmu_v9_domain *domain,
 static int samsung_sysmmu_v9_lv1set_section(struct samsung_sysmmu_v9_domain *domain,
 					    sysmmu_pte_t *sent, sysmmu_iova_t iova,
 					    phys_addr_t paddr, int prot,
-					    int *pgcounter)
+					    int *pgcounter,
+					    sysmmu_pte_t **lv2_to_free)
 {
 	int attr = (prot & IOMMU_CACHE) ? FLPD_SHAREABLE : 0;
 
@@ -452,8 +466,7 @@ static int samsung_sysmmu_v9_lv1set_section(struct samsung_sysmmu_v9_domain *dom
 		if (*pgcounter)
 			return -EADDRINUSE;
 
-		iommu_pages_free_incoherent(phys_to_virt(lv2table_base(sent)),
-					    domain->dma_dev);
+		*lv2_to_free = phys_to_virt(lv2table_base(sent));
 	}
 
 	if (prot & IOMMU_READ)
@@ -507,9 +520,12 @@ static int samsung_sysmmu_v9_lv2set_page(struct samsung_sysmmu_v9_domain *domain
 	return 0;
 }
 
-static int samsung_sysmmu_v9_map_one(struct samsung_sysmmu_v9_domain *domain,
-				     sysmmu_iova_t iova, phys_addr_t paddr,
-				     size_t size, int prot, gfp_t gfp)
+static int samsung_sysmmu_v9_map_one_locked(struct samsung_sysmmu_v9_domain *domain,
+					    sysmmu_iova_t iova, phys_addr_t paddr,
+					    size_t size, int prot,
+					    sysmmu_pte_t *new_lv2,
+					    bool *new_lv2_used,
+					    sysmmu_pte_t **lv2_to_free)
 {
 	int *lv2entcnt = &domain->lv2entcnt[lv1ent_offset(iova)];
 	sysmmu_pte_t *entry;
@@ -520,10 +536,12 @@ static int samsung_sysmmu_v9_map_one(struct samsung_sysmmu_v9_domain *domain,
 	entry = section_entry(domain->pgtable, iova);
 	if (size == SECT_SIZE)
 		return samsung_sysmmu_v9_lv1set_section(domain, entry, iova,
-							paddr, prot, lv2entcnt);
+							paddr, prot, lv2entcnt,
+							lv2_to_free);
 
-	entry = samsung_sysmmu_v9_alloc_lv2entry(domain, entry, iova,
-						 lv2entcnt, gfp);
+	entry = samsung_sysmmu_v9_lv2entry_locked(domain, entry, iova,
+						  lv2entcnt, new_lv2,
+						  new_lv2_used);
 	if (IS_ERR(entry))
 		return PTR_ERR(entry);
 
@@ -545,15 +563,36 @@ static int samsung_sysmmu_v9_map_pages(struct iommu_domain *iommu_domain,
 
 	prot &= IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 
-	spin_lock_irqsave(&domain->pgtablelock, flags);
 	while (pgcount--) {
-		ret = samsung_sysmmu_v9_map_one(domain, iova + done,
-						paddr + done, pgsize, prot, gfp);
+		sysmmu_pte_t *lv2_to_free = NULL;
+		sysmmu_pte_t *new_lv2 = NULL;
+		bool new_lv2_used = false;
+
+retry:
+		spin_lock_irqsave(&domain->pgtablelock, flags);
+		ret = samsung_sysmmu_v9_map_one_locked(domain, iova + done,
+						       paddr + done, pgsize, prot,
+						       new_lv2, &new_lv2_used,
+						       &lv2_to_free);
+		spin_unlock_irqrestore(&domain->pgtablelock, flags);
+
+		if (ret == -EAGAIN) {
+			new_lv2 = samsung_sysmmu_v9_alloc_lv2table(domain, gfp);
+			if (IS_ERR(new_lv2)) {
+				ret = PTR_ERR(new_lv2);
+				break;
+			}
+			goto retry;
+		}
+
+		if (new_lv2 && !new_lv2_used)
+			iommu_pages_free_incoherent(new_lv2, domain->dma_dev);
+		if (lv2_to_free)
+			iommu_pages_free_incoherent(lv2_to_free, domain->dma_dev);
 		if (ret)
 			break;
 		done += pgsize;
 	}
-	spin_unlock_irqrestore(&domain->pgtablelock, flags);
 
 	*mapped = done;
 	return ret;

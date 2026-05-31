@@ -30,6 +30,9 @@ properties:
       panel in reset; mark it GPIO_ACTIVE_HIGH in the consumer node so the
       driver's gpiod values map to those physical levels.
 
+  te-gpios:
+    maxItems: 1
+
   vci-supply:
     description: Analog panel supply.
 
@@ -65,6 +68,7 @@ examples:
             reg = <0>;
 
             reset-gpios = <&gpp0 0 GPIO_ACTIVE_HIGH>;
+            te-gpios = <&gpp0 3 GPIO_ACTIVE_HIGH>;
             vci-supply = <&m_ldo14_reg>;
             vddi-supply = <&s_bucka_reg>;
             vddd-supply = <&disp_vddd>;

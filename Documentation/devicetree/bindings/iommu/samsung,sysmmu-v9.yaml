@@ -60,6 +60,7 @@ patternProperties:
       stream table index, stream configuration, match configuration, stream ID
       value, and stream ID mask.
     minItems: 5
+    maxItems: 512
 
 required:
   - compatible

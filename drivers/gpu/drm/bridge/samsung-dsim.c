@@ -817,6 +817,19 @@ static inline u32 samsung_dsim_read_offset(struct samsung_dsim *dsi, u32 offset)
 	return readl(dsi->reg_base + offset);
 }
 
+static void samsung_dsim_zumapro_select_word_clock(struct samsung_dsim *dsi,
+						   bool enable)
+{
+	u32 reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+
+	if (enable)
+		reg |= DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL;
+	else
+		reg &= ~DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL;
+
+	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+}
+
 static inline bool samsung_dsim_init_on_transfer(enum samsung_dsim_type hw)
 {
 	return samsung_dsim_hw_is_exynos(hw) || hw == DSIM_TYPE_ZUMAPRO;
@@ -1023,14 +1036,15 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 		return -EFAULT;
 	}
 
-	byte_clk = hs_clk / 8;
+	byte_clk = driver_data->has_zumapro_regs ? hs_clk / 16 : hs_clk / 8;
 	esc_div = DIV_ROUND_UP(byte_clk, dsi->esc_clk_rate);
 	esc_clk = byte_clk / esc_div;
 
-	if (esc_clk > 20 * HZ_PER_MHZ) {
+	if (!driver_data->has_zumapro_regs && esc_clk > 20 * HZ_PER_MHZ) {
 		++esc_div;
 		esc_clk = byte_clk / esc_div;
 	}
+	dsi->esc_clock = esc_clk;
 
 	dev_dbg(dsi->dev, "hs_clk = %lu, byte_clk = %lu, esc_clk = %lu\n",
 		hs_clk, byte_clk, esc_clk);
@@ -1055,8 +1069,7 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 		       DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_EN(lanes_mask) |
 		       BIT(driver_data->esc_clken_bit) |
 		       BIT(driver_data->byte_clken_bit) |
-		       BIT(driver_data->tx_req_hsclk_bit) |
-		       DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL;
+		       BIT(driver_data->tx_req_hsclk_bit);
 
 		if (dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS)
 			reg |= DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE;
@@ -1095,7 +1108,7 @@ static int samsung_dsim_configure_external_phy(struct samsung_dsim *dsi)
 				     "external D-PHY is required\n");
 
 	phy_opts.mipi_dphy.hs_clk_rate = dsi->hs_clock;
-	phy_opts.mipi_dphy.lp_clk_rate = dsi->esc_clk_rate;
+	phy_opts.mipi_dphy.lp_clk_rate = dsi->esc_clock;
 	phy_opts.mipi_dphy.lanes = dsi->lanes;
 
 	ret = phy_init(dsi->phy);
@@ -1109,6 +1122,8 @@ static int samsung_dsim_configure_external_phy(struct samsung_dsim *dsi)
 	ret = phy_power_on(dsi->phy);
 	if (ret)
 		goto err_exit_phy;
+
+	samsung_dsim_zumapro_select_word_clock(dsi, true);
 
 	return 0;
 
@@ -2664,6 +2679,8 @@ int samsung_dsim_probe(struct platform_device *pdev)
 		return PTR_ERR(dsi->reg_base);
 
 	dsi->phy = devm_phy_optional_get(dev, "dsim");
+	if (!dsi->phy && dsi->driver_data->uses_external_dphy_pll)
+		dsi->phy = devm_phy_optional_get(dev, "dsim_dphy");
 	if (IS_ERR(dsi->phy)) {
 		dev_info(dev, "failed to get dsim phy\n");
 		return PTR_ERR(dsi->phy);
@@ -2737,17 +2754,20 @@ static int samsung_dsim_suspend(struct device *dev)
 	if (was_initialized) {
 		dsi->state &= ~DSIM_STATE_INITIALIZED;
 
-		samsung_dsim_disable_clock(dsi);
+		if (driver_data->uses_external_dphy_pll) {
+			samsung_dsim_zumapro_select_word_clock(dsi, false);
+			phy_power_off(dsi->phy);
+			phy_exit(dsi->phy);
+		}
 
+		samsung_dsim_disable_clock(dsi);
 		samsung_dsim_disable_irq(dsi);
 	}
 
 	dsi->state &= ~DSIM_STATE_CMD_LPM;
 
-	if (!driver_data->uses_external_dphy_pll || was_initialized)
+	if (!driver_data->uses_external_dphy_pll)
 		phy_power_off(dsi->phy);
-	if (driver_data->uses_external_dphy_pll && was_initialized)
-		phy_exit(dsi->phy);
 
 	clk_bulk_disable_unprepare(driver_data->num_clks, driver_data->clk_data);
 

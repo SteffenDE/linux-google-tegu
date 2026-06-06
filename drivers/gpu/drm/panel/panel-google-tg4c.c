@@ -23,7 +23,6 @@
 #include <video/mipi_display.h>
 
 #include <drm/display/drm_dsc.h>
-#include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
@@ -328,8 +327,6 @@ static int google_tg4c_off(struct google_tg4c *ctx)
 static int google_tg4c_prepare(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
-	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
-	struct drm_dsc_picture_parameter_set pps;
 	int ret;
 
 	ret = google_tg4c_enable_supplies(ctx);
@@ -341,15 +338,6 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	ret = google_tg4c_on(ctx);
 	if (ret < 0)
 		goto err;
-
-	/* Program the DSC PPS and enable compression. */
-	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
-	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
-	mipi_dsi_compression_mode_ext_multi(&dsi_ctx, true, MIPI_DSI_COMPRESSION_DSC, 0);
-	if (dsi_ctx.accum_err < 0) {
-		ret = dsi_ctx.accum_err;
-		goto err;
-	}
 
 	return 0;
 err:

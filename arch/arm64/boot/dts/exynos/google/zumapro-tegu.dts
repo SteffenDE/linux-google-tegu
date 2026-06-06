@@ -398,3 +398,36 @@
 &cmu_dpuf1 {
 	status = "okay";
 };
+
+/*
+ * Passive DPU topology probe.  The Zumapro DPP/DECON scaffold only validates
+ * DT resources and does not map or program display registers yet.
+ */
+&dpp0 {
+	status = "okay";
+};
+
+&decon0 {
+	status = "okay";
+};
+
+/*
+ * Transmit-side probe.  Keep this before enabling real scanout: DSIM/DPHY/panel
+ * may bind and attach, but link/PHY programming should remain gated on DRM
+ * bridge enable or host transfers.
+ */
+&sysreg_dpub {
+	status = "okay";
+};
+
+&mipi_phy_dsim0 {
+	status = "okay";
+};
+
+&dsi0 {
+	status = "okay";
+
+	panel@0 {
+		status = "okay";
+	};
+};

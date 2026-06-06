@@ -749,6 +749,7 @@
 			power-domains = <&pd_dpub>;
 			phys = <&mipi_phy_dsim0 0>;
 			phy-names = "dsim";
+			samsung,pll-clock-frequency = <24576000>;
 			samsung,burst-clock-frequency = <1102000000>;
 			samsung,esc-clock-frequency = <20000000>;
 			vddcore-supply = <&reg_placeholder>;

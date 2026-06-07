@@ -1,21 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Passive Google Tensor G4 Zumapro DPU scaffold.
+ * Google Tensor G4 Zumapro DPU bring-up scaffold.
  *
- * This driver intentionally validates DT topology without programming display
- * registers.  The real DECON/DPP enable path needs downstream trace parity
- * before the first MMIO write is allowed.
+ * DECON0 exposes an opt-in, trace-shaped color-map CRTC path for first
+ * hardware-on validation.  It intentionally avoids DPP/RDMA programming.
  */
 
+#include <linux/component.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <drm/display/drm_dsc.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_vblank.h>
 
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
+#include "exynos_drm_crtc.h"
 #include "exynos_drm_drv.h"
+#include "exynos_drm_plane.h"
 #include "regs-zumapro-dpu.h"
+
+static bool zumapro_enable_unsafe_modeset;
+module_param_named(zumapro_enable_unsafe_modeset,
+		   zumapro_enable_unsafe_modeset, bool, 0644);
+MODULE_PARM_DESC(zumapro_enable_unsafe_modeset,
+		 "Allow Zumapro DECON0 to touch display hardware on CRTC enable");
 
 struct zumapro_dpp {
 	struct device *dev;
@@ -32,11 +45,20 @@ struct zumapro_dpp {
 
 struct zumapro_decon {
 	struct device *dev;
+	struct drm_device *drm_dev;
+	struct exynos_drm_crtc *crtc;
+	struct exynos_drm_plane plane;
+	struct exynos_drm_plane_config plane_config;
+	void __iomem *main_regs;
+	void __iomem *win_regs;
+	void __iomem *sub_regs;
+	void __iomem *wincon_regs;
 	u32 id;
 	u32 cgc_dma_id;
 	u32 max_windows;
 	const struct zumapro_panel_pipeline *pipeline;
 	int dpp_count;
+	bool enabled;
 };
 
 struct zumapro_decon_desc {
@@ -500,6 +522,380 @@ static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
 	return NULL;
 }
 
+static void zumapro_decon_update_bits(void __iomem *regs, u32 offset, u32 mask,
+				      u32 val)
+{
+	u32 tmp;
+
+	tmp = readl(regs + offset);
+	tmp &= ~mask;
+	tmp |= val & mask;
+	writel(tmp, regs + offset);
+}
+
+struct zumapro_decon_pps_word {
+	u32 offset;
+	u32 value;
+};
+
+/*
+ * Final PPS register values from the downstream TG4C wake trace.  Downstream
+ * reaches some of these by RMW, but the milestone-1 comparison is final state.
+ */
+static const struct zumapro_decon_pps_word zumapro_tg4c_dsc_pps[] = {
+	{ 0x40, 0x12000089 },
+	{ 0x44, 0x30800978 },
+	{ 0x48, 0x04380018 },
+	{ 0x4c, 0x021c021c },
+	{ 0x50, 0x0200020e },
+	{ 0x54, 0x0020024c },
+	{ 0x58, 0x0007000c },
+	{ 0x5c, 0x042d043d },
+	{ 0x60, 0x180010f0 },
+	{ 0x64, 0x030c2000 },
+	{ 0x68, 0x060b0b33 },
+	{ 0x6c, 0x0e1c2a38 },
+	{ 0x70, 0x46546269 },
+	{ 0x78, 0x7d7e0102 },
+	{ 0x7c, 0x01000940 },
+	{ 0x80, 0x09be19fc },
+	{ 0x84, 0x19fa19f8 },
+	{ 0x88, 0x1a381a78 },
+	{ 0x8c, 0x1ab62ab6 },
+	{ 0x90, 0x2af42af4 },
+	{ 0x94, 0x4b346374 },
+};
+
+static void zumapro_decon_write_dsc_pps(struct zumapro_decon *decon, u8 dsc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zumapro_tg4c_dsc_pps); i++)
+		writel(zumapro_tg4c_dsc_pps[i].value,
+		       decon->sub_regs + ZUMAPRO_DSC_OFFSET(dsc) +
+		       zumapro_tg4c_dsc_pps[i].offset);
+}
+
+static void zumapro_decon_program_dsc(struct zumapro_decon *decon,
+				      const struct drm_display_mode *mode)
+{
+	const struct zumapro_panel_pipeline *pipeline = decon->pipeline;
+	const struct drm_dsc_config *dsc = pipeline->dsc;
+	u32 outfifo_width;
+	u8 i;
+
+	for (i = 0; i < pipeline->dsc_count; i++) {
+		writel(0x222, decon->sub_regs + ZUMAPRO_DSC_CONTROL1(i));
+		writel(0x30b4, decon->sub_regs + ZUMAPRO_DSC_CONTROL3(i));
+		zumapro_decon_write_dsc_pps(decon, i);
+	}
+
+	outfifo_width = DIV_ROUND_UP(dsc->slice_width, 3);
+	writel(ZUMAPRO_DECON_OF_HEIGHT(mode->vdisplay) |
+	       ZUMAPRO_DECON_OF_WIDTH(outfifo_width),
+	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_0);
+	writel(ZUMAPRO_DECON_OF_WIDTH(outfifo_width),
+	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_1);
+	writel(ZUMAPRO_DECON_OF_HEIGHT(dsc->slice_height) |
+	       ZUMAPRO_DECON_OF_WIDTH(outfifo_width),
+	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_2);
+}
+
+static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
+				      const struct drm_display_mode *mode)
+{
+	const struct zumapro_panel_pipeline *pipeline = decon->pipeline;
+
+	writel(ZUMAPRO_DECON_OF_HEIGHT(mode->vdisplay) |
+	       ZUMAPRO_DECON_OF_WIDTH(mode->hdisplay),
+	       decon->main_regs + ZUMAPRO_DECON_BLD_BG_IMG_SIZE_PRI);
+
+	writel(ZUMAPRO_DSIMIF_SEL_DSIM(pipeline->dsimif_fifo),
+	       decon->sub_regs + ZUMAPRO_DSIMIF_SEL(pipeline->dsimif));
+	writel(pipeline->data_path,
+	       decon->main_regs + ZUMAPRO_DECON_DATA_PATH_CON_0);
+
+	zumapro_decon_program_dsc(decon, mode);
+
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				  ZUMAPRO_DECON_GLOBAL_CON_CMD_MODE,
+				  ZUMAPRO_DECON_GLOBAL_CON_CMD_MODE);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				  ZUMAPRO_DECON_GLOBAL_CON_EN_F, 0);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				  ZUMAPRO_DECON_HW_TRIG_SEL_MASK |
+				  ZUMAPRO_DECON_HW_TRIG_EN |
+				  ZUMAPRO_DECON_HW_TRIG_MASK,
+				  ZUMAPRO_DECON_HW_TRIG_SEL_DDI0 |
+				  ZUMAPRO_DECON_HW_TRIG_EN |
+				  ZUMAPRO_DECON_HW_TRIG_MASK);
+}
+
+static void zumapro_decon_program_colormap_window(struct zumapro_decon *decon,
+						 const struct drm_display_mode *mode)
+{
+	u32 blend_func;
+	u32 blend_coeff;
+	u32 end_pos;
+
+	blend_func = ZUMAPRO_DECON_WIN_FUNC(ZUMAPRO_DECON_WIN_FUNC_USER_DEFINED) |
+		     ZUMAPRO_DECON_WIN_ALPHA_MULT_SRC_SEL(
+				ZUMAPRO_DECON_WIN_ALPHA_MULT_SRC_AF);
+	blend_coeff =
+		ZUMAPRO_DECON_WIN_FG_ALPHA_D_SEL(ZUMAPRO_DECON_WIN_BND_COEF_ONE) |
+		ZUMAPRO_DECON_WIN_BG_ALPHA_D_SEL(ZUMAPRO_DECON_WIN_BND_COEF_ZERO) |
+		ZUMAPRO_DECON_WIN_FG_ALPHA_A_SEL(ZUMAPRO_DECON_WIN_BND_COEF_ONE) |
+		ZUMAPRO_DECON_WIN_BG_ALPHA_A_SEL(ZUMAPRO_DECON_WIN_BND_COEF_ZERO);
+	end_pos = ZUMAPRO_DECON_WIN_POS_Y(mode->vdisplay - 1) |
+		  ZUMAPRO_DECON_WIN_POS_X(mode->hdisplay - 1);
+
+	writel(blend_func, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_0(0));
+	writel(blend_coeff, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_1(0));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_POSITION(0));
+	writel(end_pos, decon->win_regs + ZUMAPRO_DECON_WIN_END_POSITION(0));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_TIME_CON(0));
+	writel(ZUMAPRO_DECON_WIN_MAPCOLOR_EN,
+	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_0(0));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_1(0));
+	writel(ZUMAPRO_DECON_WIN_MAPCOLOR_EN | ZUMAPRO_DECON_WIN_EN,
+	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
+}
+
+static int zumapro_decon_wait_run(struct zumapro_decon *decon)
+{
+	u32 val;
+
+	return readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_GLOBAL_CON,
+				  val, val & ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS,
+				  10, 2000);
+}
+
+static void zumapro_decon_start(struct zumapro_decon *decon)
+{
+	int ret;
+
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				  ZUMAPRO_DECON_SHD_ALL_WINDOWS,
+				  ZUMAPRO_DECON_SHD_ALL_WINDOWS);
+
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				  ZUMAPRO_DECON_GLOBAL_CON_EN |
+				  ZUMAPRO_DECON_GLOBAL_CON_EN_F,
+				  ZUMAPRO_DECON_GLOBAL_CON_EN |
+				  ZUMAPRO_DECON_GLOBAL_CON_EN_F);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				  ZUMAPRO_DECON_SHD_GLOBAL |
+				  ZUMAPRO_DECON_SHD_CMP,
+				  ZUMAPRO_DECON_SHD_GLOBAL |
+				  ZUMAPRO_DECON_SHD_CMP);
+
+	ret = zumapro_decon_wait_run(decon);
+	if (ret)
+		dev_warn(decon->dev, "DECON%u did not enter run state: %d\n",
+			 decon->id, ret);
+
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				  ZUMAPRO_DECON_HW_TRIG_EN |
+				  ZUMAPRO_DECON_HW_TRIG_MASK,
+				  ZUMAPRO_DECON_HW_TRIG_EN);
+}
+
+static void zumapro_decon_stop(struct zumapro_decon *decon)
+{
+	u32 val;
+	u32 win_count;
+	u32 win;
+	int ret;
+
+	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
+	for (win = 0; win < win_count; win++)
+		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
+
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				  ZUMAPRO_DECON_HW_TRIG_EN |
+				  ZUMAPRO_DECON_HW_TRIG_MASK,
+				  ZUMAPRO_DECON_HW_TRIG_MASK);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				  ZUMAPRO_DECON_GLOBAL_CON_EN_F, 0);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				  ZUMAPRO_DECON_SHD_GLOBAL |
+				  ZUMAPRO_DECON_SHD_CMP,
+				  ZUMAPRO_DECON_SHD_GLOBAL |
+				  ZUMAPRO_DECON_SHD_CMP);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				  ZUMAPRO_DECON_GLOBAL_CON_SRESET,
+				  ZUMAPRO_DECON_GLOBAL_CON_SRESET);
+
+	ret = readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_GLOBAL_CON,
+				 val, !(val & ZUMAPRO_DECON_GLOBAL_CON_SRESET),
+				 10, 2000);
+	if (ret)
+		dev_warn(decon->dev, "DECON%u reset did not complete: %d\n",
+			 decon->id, ret);
+}
+
+static enum drm_mode_status
+zumapro_decon_mode_valid(struct exynos_drm_crtc *crtc,
+			 const struct drm_display_mode *mode)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+	const struct zumapro_panel_pipeline *pipeline = decon->pipeline;
+	unsigned int i;
+
+	for (i = 0; i < pipeline->num_modes; i++) {
+		const struct zumapro_panel_mode *panel_mode = &pipeline->modes[i];
+
+		if (mode->clock == panel_mode->clock_khz &&
+		    mode->hdisplay == panel_mode->hdisplay &&
+		    mode->hsync_start == panel_mode->hsync_start &&
+		    mode->hsync_end == panel_mode->hsync_end &&
+		    mode->htotal == panel_mode->htotal &&
+		    mode->vdisplay == panel_mode->vdisplay &&
+		    mode->vsync_start == panel_mode->vsync_start &&
+		    mode->vsync_end == panel_mode->vsync_end &&
+		    mode->vtotal == panel_mode->vtotal)
+			return MODE_OK;
+	}
+
+	return MODE_BAD;
+}
+
+static int zumapro_decon_atomic_check(struct exynos_drm_crtc *crtc,
+				      struct drm_crtc_state *state)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+
+	state->no_vblank = true;
+
+	if (!state->active)
+		return 0;
+
+	if (!zumapro_enable_unsafe_modeset) {
+		dev_warn_once(decon->dev,
+			      "rejecting DECON%u modeset; pass exynosdrm.zumapro_enable_unsafe_modeset=1 for traced hardware-on validation\n",
+			      decon->id);
+		return -EPERM;
+	}
+
+	return 0;
+}
+
+static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+	const struct drm_display_mode *mode = &crtc->base.state->adjusted_mode;
+	int ret;
+
+	if (decon->enabled)
+		return;
+
+	if (!mode->hdisplay || !mode->vdisplay)
+		return;
+
+	ret = pm_runtime_resume_and_get(decon->dev);
+	if (ret < 0) {
+		dev_err(decon->dev, "failed to resume DECON%u: %d\n",
+			decon->id, ret);
+		return;
+	}
+
+	zumapro_decon_program_lcd(decon, mode);
+	zumapro_decon_program_colormap_window(decon, mode);
+	zumapro_decon_start(decon);
+	decon->enabled = true;
+}
+
+static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+
+	if (!decon->enabled)
+		return;
+
+	zumapro_decon_stop(decon);
+	decon->enabled = false;
+	pm_runtime_put_sync(decon->dev);
+}
+
+static int zumapro_decon_enable_vblank(struct exynos_drm_crtc *crtc)
+{
+	return -EINVAL;
+}
+
+static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
+{
+}
+
+static void zumapro_decon_update_plane(struct exynos_drm_crtc *crtc,
+				       struct exynos_drm_plane *plane)
+{
+}
+
+static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
+					struct exynos_drm_plane *plane)
+{
+}
+
+static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
+	.atomic_enable = zumapro_decon_atomic_enable,
+	.atomic_disable = zumapro_decon_atomic_disable,
+	.enable_vblank = zumapro_decon_enable_vblank,
+	.disable_vblank = zumapro_decon_disable_vblank,
+	.mode_valid = zumapro_decon_mode_valid,
+	.atomic_check = zumapro_decon_atomic_check,
+	.update_plane = zumapro_decon_update_plane,
+	.disable_plane = zumapro_decon_disable_plane,
+};
+
+static int zumapro_decon_bind(struct device *dev, struct device *master,
+			      void *data)
+{
+	struct zumapro_decon *decon = dev_get_drvdata(dev);
+	struct drm_device *drm_dev = data;
+	int ret;
+
+	if (!decon->pipeline)
+		return dev_err_probe(dev, -ENODEV,
+				     "DECON%u has no validated panel pipeline\n",
+				     decon->id);
+
+	decon->drm_dev = drm_dev;
+	decon->plane_config.pixel_formats = zumapro_dpp_graphics_formats;
+	decon->plane_config.num_pixel_formats =
+		ARRAY_SIZE(zumapro_dpp_graphics_formats);
+	decon->plane_config.zpos = 0;
+	decon->plane_config.type = DRM_PLANE_TYPE_PRIMARY;
+
+	ret = exynos_plane_init(drm_dev, &decon->plane, 0,
+				&decon->plane_config);
+	if (ret)
+		return ret;
+
+	decon->crtc = exynos_drm_crtc_create(drm_dev, &decon->plane.base,
+					     EXYNOS_DISPLAY_TYPE_LCD,
+					     &zumapro_decon_crtc_ops,
+					     decon);
+	if (IS_ERR(decon->crtc))
+		return PTR_ERR(decon->crtc);
+
+	return 0;
+}
+
+static void zumapro_decon_unbind(struct device *dev, struct device *master,
+				 void *data)
+{
+	struct zumapro_decon *decon = dev_get_drvdata(dev);
+
+	if (decon->crtc)
+		zumapro_decon_atomic_disable(decon->crtc);
+}
+
+static const struct component_ops zumapro_decon_component_ops = {
+	.bind = zumapro_decon_bind,
+	.unbind = zumapro_decon_unbind,
+};
+
 static int zumapro_read_u32_compat(struct device *dev, const char *name,
 				   const char *legacy_name, u32 *value)
 {
@@ -742,6 +1138,23 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	decon->main_regs = devm_platform_ioremap_resource_byname(pdev, "main");
+	if (IS_ERR(decon->main_regs))
+		return PTR_ERR(decon->main_regs);
+
+	decon->win_regs = devm_platform_ioremap_resource_byname(pdev, "win");
+	if (IS_ERR(decon->win_regs))
+		return PTR_ERR(decon->win_regs);
+
+	decon->sub_regs = devm_platform_ioremap_resource_byname(pdev, "sub");
+	if (IS_ERR(decon->sub_regs))
+		return PTR_ERR(decon->sub_regs);
+
+	decon->wincon_regs =
+		devm_platform_ioremap_resource_byname(pdev, "wincon");
+	if (IS_ERR(decon->wincon_regs))
+		return PTR_ERR(decon->wincon_regs);
+
 	decon->dpp_count = of_count_phandle_with_args(dev->of_node, "dpps",
 						      NULL);
 	if (decon->dpp_count == -ENOENT)
@@ -751,15 +1164,27 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 				     "failed to parse dpps\n");
 
 	platform_set_drvdata(pdev, decon);
+	pm_runtime_enable(dev);
+
+	ret = component_add(dev, &zumapro_decon_component_ops);
+	if (ret) {
+		pm_runtime_disable(dev);
+		return ret;
+	}
+
 	dev_info(dev,
-		 "registered passive DECON%u topology with %d DPPs; DRM bind disabled\n",
-		decon->id, decon->dpp_count);
+		 "registered DECON%u color-map CRTC with %d passive DPPs; modeset gated\n",
+		 decon->id, decon->dpp_count);
 
 	return 0;
 }
 
 static void zumapro_decon_remove(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
+
+	component_del(dev, &zumapro_decon_component_ops);
+	pm_runtime_disable(dev);
 }
 
 static const struct of_device_id zumapro_decon_of_match[] = {
@@ -777,5 +1202,5 @@ struct platform_driver zumapro_decon_driver = {
 	},
 };
 
-MODULE_DESCRIPTION("Passive Google Tensor G4 Zumapro DPU scaffold");
+MODULE_DESCRIPTION("Google Tensor G4 Zumapro DPU bring-up scaffold");
 MODULE_LICENSE("GPL");

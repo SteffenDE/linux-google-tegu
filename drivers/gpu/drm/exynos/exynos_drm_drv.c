@@ -173,7 +173,7 @@ static struct exynos_drm_driver_info exynos_drm_drivers[] = {
 		0
 	}, {
 		DRV_PTR(zumapro_decon_driver, CONFIG_DRM_EXYNOS_ZUMAPRO_DPU),
-		0
+		DRM_COMPONENT_DRIVER
 	}, {
 		DRV_PTR(mixer_driver, CONFIG_DRM_EXYNOS_MIXER),
 		DRM_COMPONENT_DRIVER

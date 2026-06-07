@@ -43,8 +43,9 @@ config DRM_EXYNOS_ZUMAPRO_DPU
 	  Choose this option if you want to build the Google Tensor G4
 	  Zumapro DECON/DPP display pipeline support.
 
-	  This is currently a passive bring-up scaffold.  It validates the
-	  Device Tree topology without programming display registers.
+	  This is currently a bring-up scaffold.  It validates the Device
+	  Tree topology and exposes an opt-in DECON0 color-map CRTC path for
+	  trace comparison; DPP/RDMA fetch is not programmed.
 
 config DRM_EXYNOS_MIXER
 	bool "Mixer"

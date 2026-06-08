@@ -26,10 +26,17 @@ static int exynos_drm_gem_mmap(struct drm_gem_object *obj, struct vm_area_struct
 static int exynos_drm_alloc_buf(struct exynos_drm_gem *exynos_gem, bool kvmap)
 {
 	struct drm_device *dev = exynos_gem->base.dev;
+	struct device *dma_dev = to_dma_dev(dev);
 	unsigned long attr = 0;
 
+	if (!dma_dev) {
+		DRM_DEV_ERROR(dev->dev,
+			      "cannot allocate GEM buffer without DMA device\n");
+		return -ENODEV;
+	}
+
 	if (exynos_gem->dma_addr) {
-		DRM_DEV_DEBUG_KMS(to_dma_dev(dev), "already allocated.\n");
+		DRM_DEV_DEBUG_KMS(dma_dev, "already allocated.\n");
 		return 0;
 	}
 
@@ -54,18 +61,18 @@ static int exynos_drm_alloc_buf(struct exynos_drm_gem *exynos_gem, bool kvmap)
 		attr |= DMA_ATTR_NO_KERNEL_MAPPING;
 
 	exynos_gem->dma_attrs = attr;
-	exynos_gem->cookie = dma_alloc_attrs(to_dma_dev(dev), exynos_gem->size,
+	exynos_gem->cookie = dma_alloc_attrs(dma_dev, exynos_gem->size,
 					     &exynos_gem->dma_addr, GFP_KERNEL,
 					     exynos_gem->dma_attrs);
 	if (!exynos_gem->cookie) {
-		DRM_DEV_ERROR(to_dma_dev(dev), "failed to allocate buffer.\n");
+		DRM_DEV_ERROR(dma_dev, "failed to allocate buffer.\n");
 		return -ENOMEM;
 	}
 
 	if (kvmap)
 		exynos_gem->kvaddr = exynos_gem->cookie;
 
-	DRM_DEV_DEBUG_KMS(to_dma_dev(dev), "dma_addr(0x%lx), size(0x%lx)\n",
+	DRM_DEV_DEBUG_KMS(dma_dev, "dma_addr(0x%lx), size(0x%lx)\n",
 			(unsigned long)exynos_gem->dma_addr, exynos_gem->size);
 	return 0;
 }

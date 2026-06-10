@@ -940,16 +940,27 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	int ret;
 
 	/*
-	 * Enable the interrupt master; the frame_start source is unmasked by
+	 * Enable the interrupt master, the frame_done source (which re-masks
+	 * the trigger after each transferred frame) and the extra source
+	 * (resource conflict/timeout diagnostics); frame_start is unmasked by
 	 * enable_vblank.  Stale pending bits would fire as soon as the master
 	 * bit is set, so clear them first.
 	 */
 	spin_lock_irqsave(&decon->slock, flags);
-	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
+	       ZUMAPRO_DECON_INT_EXTRA,
 	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	writel(ZUMAPRO_DECON_INT_RESOURCE_CONFLICT | ZUMAPRO_DECON_INT_TIMEOUT,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
+	writel(ZUMAPRO_DECON_INT_RESOURCE_CONFLICT | ZUMAPRO_DECON_INT_TIMEOUT,
+	       decon->main_regs + ZUMAPRO_DECON_INT_EN_EXTRA);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
-				ZUMAPRO_DECON_INT_MASTER,
-				ZUMAPRO_DECON_INT_MASTER);
+				ZUMAPRO_DECON_INT_MASTER |
+				ZUMAPRO_DECON_INT_FRAME_DONE |
+				ZUMAPRO_DECON_INT_EXTRA,
+				ZUMAPRO_DECON_INT_MASTER |
+				ZUMAPRO_DECON_INT_FRAME_DONE |
+				ZUMAPRO_DECON_INT_EXTRA);
 	spin_unlock_irqrestore(&decon->slock, flags);
 
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
@@ -975,10 +986,16 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 		dev_warn(decon->dev, "DECON%u did not enter run state: %d\n",
 			 decon->id, ret);
 
+	/*
+	 * Unmask the trigger for the first frame; the frame_done handler
+	 * re-masks it.
+	 */
+	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
 				  ZUMAPRO_DECON_HW_TRIG_EN |
 				  ZUMAPRO_DECON_HW_TRIG_MASK,
 				  ZUMAPRO_DECON_HW_TRIG_EN);
+	spin_unlock_irqrestore(&decon->slock, flags);
 }
 
 static void zumapro_decon_stop(struct zumapro_decon *decon)
@@ -991,18 +1008,23 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 
 	spin_lock_irqsave(&decon->slock, flags);
 	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
-	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
+	       ZUMAPRO_DECON_INT_EXTRA,
 	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	writel(ZUMAPRO_DECON_INT_RESOURCE_CONFLICT | ZUMAPRO_DECON_INT_TIMEOUT,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
 	spin_unlock_irqrestore(&decon->slock, flags);
 
 	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
 	for (win = 0; win < win_count; win++)
 		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
 
+	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
 				  ZUMAPRO_DECON_HW_TRIG_EN |
 				  ZUMAPRO_DECON_HW_TRIG_MASK,
 				  ZUMAPRO_DECON_HW_TRIG_MASK);
+	spin_unlock_irqrestore(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
 				  ZUMAPRO_DECON_GLOBAL_CON_EN_F, 0);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
@@ -1040,10 +1062,16 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 					 val,
 					 !(val & ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS),
 					 10, 50000);
+		/*
+		 * Expected when the link is already down (the bridge chain
+		 * disables before the CRTC, so a frame caught in flight has
+		 * nowhere to drain); the soft reset below recovers and warns
+		 * if it does not complete.
+		 */
 		if (ret)
-			dev_warn(decon->dev,
-				 "DECON%u did not stop scanout: %d\n",
-				 decon->id, ret);
+			dev_dbg(decon->dev,
+				"DECON%u still running after stop, relying on reset\n",
+				decon->id);
 	}
 
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
@@ -1155,9 +1183,37 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	pm_runtime_put_sync(decon->dev);
 }
 
+static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+	u32 val;
+	int ret;
+
+	if (!decon->enabled)
+		return;
+
+	/*
+	 * Plane, window and DPP registers may only change while the trigger
+	 * is masked; the frame_done handler re-masks it once the previous
+	 * commit's transfer has finished.  Wait for that before any
+	 * programming.  (Trigger disabled altogether means a freshly reset
+	 * DECON - nothing in flight either.)
+	 */
+	ret = readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_TRIG_CON,
+				 val,
+				 !(val & ZUMAPRO_DECON_HW_TRIG_EN) ||
+				 (val & ZUMAPRO_DECON_HW_TRIG_MASK),
+				 100, 50000);
+	if (ret)
+		dev_warn(decon->dev,
+			 "DECON%u previous frame transfer did not finish: %d\n",
+			 decon->id, ret);
+}
+
 static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
 
 	if (!decon->enabled)
 		return;
@@ -1168,14 +1224,19 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 		decon->win_dirty = false;
 	} else if (decon->win_dirty) {
 		/*
-		 * The DECON is already running with the HW trigger unmasked; a
-		 * window shadow-update request makes the new window and DPP
-		 * configuration latch on the next TE.
+		 * Latch the new window and DPP configuration on the next TE:
+		 * request the window shadow update and unmask the trigger for
+		 * one frame (the frame_done handler re-masks it).
 		 */
 		zumapro_dpu_update_bits(decon->main_regs,
 					ZUMAPRO_DECON_SHD_REG_UP_REQ,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS);
+		spin_lock_irqsave(&decon->slock, flags);
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_TRIG_CON,
+					ZUMAPRO_DECON_HW_TRIG_MASK, 0);
+		spin_unlock_irqrestore(&decon->slock, flags);
 		decon->win_dirty = false;
 	}
 
@@ -1209,9 +1270,9 @@ static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
 }
 
 /*
- * With the HW trigger left unmasked the DECON transfers a frame on every
- * panel TE, so in command mode frame_start fires once per displayed frame
- * and serves as the vblank source.
+ * Command-mode frame transfers begin on a panel TE with the trigger
+ * unmasked, so frame_start fires once per transferred frame and serves as
+ * the vblank source.
  */
 static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 {
@@ -1230,6 +1291,62 @@ static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 
 	if (decon->crtc)
 		drm_crtc_handle_vblank(&decon->crtc->base);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t zumapro_decon_frame_done_irq(int irq, void *dev_id)
+{
+	struct zumapro_decon *decon = dev_id;
+	u32 pend;
+
+	spin_lock(&decon->slock);
+	pend = readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND) &
+	       ZUMAPRO_DECON_INT_FRAME_DONE;
+	if (pend) {
+		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+		/*
+		 * One update, one frame: re-mask the trigger so the hardware
+		 * idles (command-mode panels self-refresh from their own RAM)
+		 * and the next commit can program registers without a TE
+		 * latching half-written state.
+		 */
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_TRIG_CON,
+					ZUMAPRO_DECON_HW_TRIG_MASK,
+					ZUMAPRO_DECON_HW_TRIG_MASK);
+	}
+	spin_unlock(&decon->slock);
+
+	return pend ? IRQ_HANDLED : IRQ_NONE;
+}
+
+static irqreturn_t zumapro_decon_extra_irq(int irq, void *dev_id)
+{
+	struct zumapro_decon *decon = dev_id;
+	u32 pend;
+	u32 extra = 0;
+
+	spin_lock(&decon->slock);
+	pend = readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND) &
+	       ZUMAPRO_DECON_INT_EXTRA;
+	if (pend) {
+		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+		extra = readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
+		writel(extra, decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
+	}
+	spin_unlock(&decon->slock);
+
+	if (!pend)
+		return IRQ_NONE;
+
+	dev_err_ratelimited(decon->dev,
+			    "DECON%u %s%s(extra interrupt %#x)\n", decon->id,
+			    extra & ZUMAPRO_DECON_INT_RESOURCE_CONFLICT ?
+				"resource conflict " : "",
+			    extra & ZUMAPRO_DECON_INT_TIMEOUT ?
+				"timeout " : "",
+			    extra);
 
 	return IRQ_HANDLED;
 }
@@ -1303,6 +1420,7 @@ static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
 static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
 	.atomic_enable = zumapro_decon_atomic_enable,
 	.atomic_disable = zumapro_decon_atomic_disable,
+	.atomic_begin = zumapro_decon_atomic_begin,
 	.atomic_flush = zumapro_decon_atomic_flush,
 	.enable_vblank = zumapro_decon_enable_vblank,
 	.disable_vblank = zumapro_decon_disable_vblank,
@@ -1571,6 +1689,26 @@ struct platform_driver zumapro_dpp_driver = {
 	},
 };
 
+static int zumapro_decon_request_irq(struct platform_device *pdev,
+				     struct zumapro_decon *decon,
+				     const char *name, irq_handler_t handler)
+{
+	struct device *dev = &pdev->dev;
+	int irq;
+	int ret;
+
+	irq = platform_get_irq_byname(pdev, name);
+	if (irq < 0)
+		return irq;
+
+	ret = devm_request_irq(dev, irq, handler, 0, dev_name(dev), decon);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request %s IRQ\n",
+				     name);
+
+	return 0;
+}
+
 static int zumapro_decon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1685,18 +1823,27 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	 * handler.
 	 */
 	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
-	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN_EXTRA);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
+	       ZUMAPRO_DECON_INT_EXTRA,
 	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	writel(ZUMAPRO_DECON_INT_RESOURCE_CONFLICT | ZUMAPRO_DECON_INT_TIMEOUT,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
 
-	ret = platform_get_irq_byname(pdev, "frame_start");
-	if (ret < 0)
+	ret = zumapro_decon_request_irq(pdev, decon, "frame_start",
+					zumapro_decon_frame_start_irq);
+	if (ret)
 		return ret;
 
-	ret = devm_request_irq(dev, ret, zumapro_decon_frame_start_irq, 0,
-			       dev_name(dev), decon);
+	ret = zumapro_decon_request_irq(pdev, decon, "frame_done",
+					zumapro_decon_frame_done_irq);
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to request frame_start IRQ\n");
+		return ret;
+
+	ret = zumapro_decon_request_irq(pdev, decon, "extra",
+					zumapro_decon_extra_irq);
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, decon);
 	pm_runtime_enable(dev);

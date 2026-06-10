@@ -1125,6 +1125,20 @@ static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
 	}
 
 	/*
+	 * Downstream decon_reg_init() disables the DECON-internal automatic
+	 * clock gating and the dynamic QACTIVE Q-channel handshake before
+	 * touching anything else ("clock gating is disabled during initial
+	 * bringup").  Left in the handed-off dynamic mode, the hardware can
+	 * signal idle to the QCH mid-reconfiguration and the next register
+	 * access into the gated domain stalls the interconnect.
+	 */
+	zumapro_dpu_update_bits(decon->main_regs,
+				ZUMAPRO_DECON_CLOCK_CON(decon->id),
+				ZUMAPRO_DECON_CLOCK_CON_AUTO_CG_MASK |
+				ZUMAPRO_DECON_CLOCK_CON_QACTIVE |
+				ZUMAPRO_DECON_CLOCK_CON_QACTIVE_PLL, 0);
+
+	/*
 	 * The bootloader hands off a live, scanning DECON; downstream always
 	 * stops and soft-resets the block before reprogramming it.
 	 */

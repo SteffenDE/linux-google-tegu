@@ -50,6 +50,15 @@
 #define ZUMAPRO_DECON_GLOBAL_CON_EN		BIT(1)
 #define ZUMAPRO_DECON_GLOBAL_CON_EN_F		BIT(0)
 
+/*
+ * Clock gating control.  Shared block: DECON(n)'s register sits at
+ * 0x5000 - 0x1000 * n from that DECON's base.
+ */
+#define ZUMAPRO_DECON_CLOCK_CON(_id)		(0x5000 - 0x1000 * (_id))
+#define ZUMAPRO_DECON_CLOCK_CON_QACTIVE_PLL	BIT(28)
+#define ZUMAPRO_DECON_CLOCK_CON_QACTIVE		BIT(24)
+#define ZUMAPRO_DECON_CLOCK_CON_AUTO_CG_MASK	(0x11111 << 0)
+
 #define ZUMAPRO_DECON_TRIG_CON			0x0030
 #define ZUMAPRO_DECON_HW_TRIG_SEL(_v)		((_v) << 24)
 #define ZUMAPRO_DECON_HW_TRIG_SEL_MASK		GENMASK(25, 24)

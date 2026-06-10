@@ -1401,11 +1401,15 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 		return -EINVAL;
 	}
 
+	dev_info(dsi->dev, "trace: init_link: reading config\n");
+
 	reg = samsung_dsim_read(dsi, DSIM_CONFIG_REG);
 	reg &= ~DSIM_ZUMAPRO_CONFIG_OWNED_MASK;
 	reg |= DSIM_ZUMAPRO_CONFIG_RGB24 |
 	       DSIM_ZUMAPRO_CONFIG_DATA_LANE_NUM(dsi->lanes - 1) |
 	       DSIM_ZUMAPRO_CONFIG_LANES_EN(lanes_mask);
+
+	dev_info(dsi->dev, "trace: init_link: writing config (lanes)\n");
 
 	if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO)
 		reg |= DSIM_ZUMAPRO_CONFIG_VIDEO_MODE;
@@ -1420,6 +1424,8 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 
 	samsung_dsim_write(dsi, DSIM_CONFIG_REG, reg);
 
+	dev_info(dsi->dev, "trace: init_link: polling lane stop state\n");
+
 	timeout = 100;
 	do {
 		if (timeout-- == 0) {
@@ -1432,6 +1438,8 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 		    DSIM_STOP_STATE_DAT(data_lanes_mask))
 			continue;
 	} while (!(reg & (DSIM_STOP_STATE_CLK | DSIM_TX_READY_HS_CLK)));
+
+	dev_info(dsi->dev, "trace: init_link: lanes in stop state\n");
 
 	reg = samsung_dsim_read(dsi, DSIM_ESCMODE_REG);
 	reg &= ~DSIM_STOP_STATE_CNT_MASK;
@@ -1446,9 +1454,13 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 	 * programmed into the operating registers; the shadow bank is
 	 * enabled at the end of samsung_dsim_zumapro_set_display_mode().
 	 */
+	dev_info(dsi->dev, "trace: init_link: enabling shadow reads\n");
+
 	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
 	reg |= DSIM_ZUMAPRO_SHADOW_REG_READ_EN;
 	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
+
+	dev_info(dsi->dev, "trace: init_link: setting command mode\n");
 
 	return samsung_dsim_zumapro_set_command_mode(dsi);
 }
@@ -2163,6 +2175,18 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 		return 0;
 
 	dev_info(dsi->dev, "trace: init\n");
+
+	/*
+	 * Run the link on the OSC clock while the D-PHY is reset and
+	 * reprogrammed below.  A cold-booting bootloader hands the DSIM off
+	 * with the word clock selected; resetting the PHY then kills the
+	 * selected link clock mid-sequence and the next access to a register
+	 * in that clock domain stalls the interconnect.  Downstream's
+	 * dsim_reg_init() selects the OSC clock first for the same reason;
+	 * the word clock is selected again once the PHY PLL is running.
+	 */
+	if (driver_data->uses_external_dphy_pll)
+		samsung_dsim_zumapro_select_word_clock(dsi, false);
 
 	samsung_dsim_reset(dsi);
 	samsung_dsim_enable_irq(dsi);

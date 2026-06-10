@@ -350,9 +350,27 @@ static int google_tg4c_get_modes(struct drm_panel *panel,
 	int count = 0;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(google_tg4c_modes); i++)
-		count += drm_connector_helper_get_modes_fixed(connector,
-							      &google_tg4c_modes[i]);
+	/*
+	 * Added by hand instead of via drm_connector_helper_get_modes_fixed(),
+	 * which would mark every mode preferred; only the bootloader-aligned
+	 * 60Hz mode carries DRM_MODE_TYPE_PREFERRED so mode sorting lists it
+	 * first.
+	 */
+	for (i = 0; i < ARRAY_SIZE(google_tg4c_modes); i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev,
+					  &google_tg4c_modes[i]);
+		if (!mode)
+			return count;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	connector->display_info.width_mm = google_tg4c_modes[0].width_mm;
+	connector->display_info.height_mm = google_tg4c_modes[0].height_mm;
 
 	return count;
 }

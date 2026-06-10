@@ -260,7 +260,10 @@ static int google_tg4c_off(struct google_tg4c *ctx)
 static int google_tg4c_prepare(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
+	struct device *dev = &ctx->dsi->dev;
 	int ret;
+
+	dev_info(dev, "trace: prepare\n");
 
 	ret = google_tg4c_enable_supplies(ctx);
 	if (ret < 0)
@@ -268,9 +271,13 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 
 	google_tg4c_reset(ctx);
 
+	dev_info(dev, "trace: prepare: reset released\n");
+
 	ret = google_tg4c_on(ctx);
 	if (ret < 0)
 		goto err;
+
+	dev_info(dev, "trace: prepare: done\n");
 
 	return 0;
 err:
@@ -283,12 +290,16 @@ static int google_tg4c_disable(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
 
+	dev_info(&ctx->dsi->dev, "trace: panel disable\n");
+
 	return google_tg4c_off(ctx);
 }
 
 static int google_tg4c_unprepare(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
+
+	dev_info(&ctx->dsi->dev, "trace: unprepare\n");
 
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 

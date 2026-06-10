@@ -476,11 +476,15 @@ static int zumapro_mipi_dphy_init(struct phy *phy)
 	struct zumapro_mipi_dphy *dphy = phy_get_drvdata(phy);
 	int ret;
 
+	dev_info(dphy->dev, "trace: init\n");
+
 	ret = clk_prepare_enable(dphy->ref_clk);
 	if (ret)
 		return ret;
 
 	zumapro_dphy_sysreg_update(dphy, SEL_RESET_DPHY_MASK(dphy->id), 0);
+
+	dev_info(dphy->dev, "trace: init: done\n");
 
 	return 0;
 }
@@ -488,6 +492,8 @@ static int zumapro_mipi_dphy_init(struct phy *phy)
 static int zumapro_mipi_dphy_exit(struct phy *phy)
 {
 	struct zumapro_mipi_dphy *dphy = phy_get_drvdata(phy);
+
+	dev_info(dphy->dev, "trace: exit\n");
 
 	clk_disable_unprepare(dphy->ref_clk);
 
@@ -503,8 +509,12 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 	if (!dphy->hs_clk_mhz || !dphy->lanes)
 		return -EINVAL;
 
+	dev_info(dphy->dev, "trace: power_on\n");
+
 	zumapro_dphy_sysreg_update(dphy, reset_mask, 0);
 	zumapro_dphy_write_defaults(dphy);
+
+	dev_info(dphy->dev, "trace: power_on: defaults written\n");
 
 	if ((dphy->hs_clk_mhz << dphy->s) < 3000)
 		zumapro_dphy_update_bits(dphy->dphy, DSIM_PHY_PLL_CON5,
@@ -523,11 +533,15 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 	if (ret)
 		return ret;
 
+	dev_info(dphy->dev, "trace: power_on: pll locked\n");
+
 	ret = zumapro_dphy_enable_lanes(dphy, true);
 	if (ret)
 		goto err_disable_pll;
 
 	zumapro_dphy_sysreg_update(dphy, reset_mask, reset_mask);
+
+	dev_info(dphy->dev, "trace: power_on: done\n");
 
 	dev_dbg(dphy->dev, "configured HS=%u MHz ESC=%u MHz lanes=%u PMSK=%u,%u,%u,0x%x\n",
 		dphy->hs_clk_mhz, dphy->esc_clk_mhz, dphy->lanes,
@@ -545,9 +559,13 @@ static int zumapro_mipi_dphy_power_off(struct phy *phy)
 	struct zumapro_mipi_dphy *dphy = phy_get_drvdata(phy);
 	u32 reset_mask = dphy->id ? M_RESETN_M1_MASK : M_RESETN_M0_MASK;
 
+	dev_info(dphy->dev, "trace: power_off\n");
+
 	zumapro_dphy_sysreg_update(dphy, reset_mask, 0);
 	zumapro_dphy_enable_lanes(dphy, false);
 	zumapro_dphy_set_pll(dphy, false);
+
+	dev_info(dphy->dev, "trace: power_off: done\n");
 
 	return 0;
 }

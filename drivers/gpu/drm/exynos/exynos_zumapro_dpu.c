@@ -519,9 +519,17 @@ static void zumapro_dpp_update(struct zumapro_dpp *dpp,
 				ZUMAPRO_COMM_IMG_FORMAT_MASK,
 				ZUMAPRO_COMM_IMG_FORMAT(format->dpp_format));
 
-	/* No compression; the bootloader leaves AFBC enabled on handoff. */
+	/*
+	 * No rotation, no block crop, no compression.  These must be written
+	 * explicitly: the fetch inherits whatever the bootloader left in
+	 * IN_CTRL_0, and leftover rot/block/compression bits spatially remap
+	 * the fetched image.
+	 */
 	zumapro_dpu_update_bits(dpp->dma_regs, ZUMAPRO_RDMA_IN_CTRL_0,
-				ZUMAPRO_RDMA_AFBC_EN | ZUMAPRO_RDMA_SBWC_EN, 0);
+				ZUMAPRO_RDMA_ROT_MASK |
+				ZUMAPRO_RDMA_AFBC_EN | ZUMAPRO_RDMA_SBWC_EN |
+				ZUMAPRO_RDMA_SAJC_EN | ZUMAPRO_RDMA_BLOCK_EN,
+				0);
 	zumapro_dpu_update_bits(dpp->dma_regs, ZUMAPRO_RDMA_RECOVERY_CTRL,
 				ZUMAPRO_RDMA_RECOVERY_EN, 0);
 	zumapro_dpu_update_bits(dpp->dma_regs, ZUMAPRO_RDMA_RECOVERY_CTRL,

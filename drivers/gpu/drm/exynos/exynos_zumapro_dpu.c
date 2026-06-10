@@ -9,8 +9,10 @@
 
 #include <linux/bitops.h>
 #include <linux/component.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/spinlock.h>
 #include <drm/display/drm_dsc.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -71,6 +73,8 @@ struct zumapro_decon {
 	struct zumapro_dpp *dpp;
 	int dpp_count;
 	void *dma_priv;
+	/* serializes INT_EN/INT_PEND between commits, vblank ops and the IRQ */
+	spinlock_t slock;
 	bool enabled;
 	bool start_pending;
 	bool win_dirty;
@@ -932,7 +936,21 @@ static int zumapro_decon_wait_run(struct zumapro_decon *decon)
 
 static void zumapro_decon_start(struct zumapro_decon *decon)
 {
+	unsigned long flags;
 	int ret;
+
+	/*
+	 * Enable the interrupt master; the frame_start source is unmasked by
+	 * enable_vblank.  Stale pending bits would fire as soon as the master
+	 * bit is set, so clear them first.
+	 */
+	spin_lock_irqsave(&decon->slock, flags);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
+				ZUMAPRO_DECON_INT_MASTER,
+				ZUMAPRO_DECON_INT_MASTER);
+	spin_unlock_irqrestore(&decon->slock, flags);
 
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
 				  ZUMAPRO_DECON_SHD_DQE,
@@ -965,10 +983,17 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 
 static void zumapro_decon_stop(struct zumapro_decon *decon)
 {
+	unsigned long flags;
 	u32 val;
 	u32 win_count;
 	u32 win;
 	int ret;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	spin_unlock_irqrestore(&decon->slock, flags);
 
 	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
 	for (win = 0; win < win_count; win++)
@@ -1037,8 +1062,6 @@ static int zumapro_decon_atomic_check(struct exynos_drm_crtc *crtc,
 				      struct drm_crtc_state *state)
 {
 	struct zumapro_decon *decon = crtc->ctx;
-
-	state->no_vblank = true;
 
 	if (!state->active)
 		return 0;
@@ -1117,30 +1140,72 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 		zumapro_decon_start(decon);
 		decon->start_pending = false;
 		decon->win_dirty = false;
-		return;
-	}
-
-	/*
-	 * The DECON is already running with the HW trigger unmasked; a window
-	 * shadow-update request makes the new window and DPP configuration
-	 * latch on the next TE.
-	 */
-	if (decon->win_dirty) {
+	} else if (decon->win_dirty) {
+		/*
+		 * The DECON is already running with the HW trigger unmasked; a
+		 * window shadow-update request makes the new window and DPP
+		 * configuration latch on the next TE.
+		 */
 		zumapro_dpu_update_bits(decon->main_regs,
 					ZUMAPRO_DECON_SHD_REG_UP_REQ,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS);
 		decon->win_dirty = false;
 	}
+
+	/* Arm the commit's flip event for delivery on the next frame_start. */
+	exynos_crtc_handle_event(crtc);
 }
 
 static int zumapro_decon_enable_vblank(struct exynos_drm_crtc *crtc)
 {
-	return -EINVAL;
+	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
+				ZUMAPRO_DECON_INT_FRAME_START,
+				ZUMAPRO_DECON_INT_FRAME_START);
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	return 0;
 }
 
 static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
 {
+	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
+				ZUMAPRO_DECON_INT_FRAME_START, 0);
+	spin_unlock_irqrestore(&decon->slock, flags);
+}
+
+/*
+ * With the HW trigger left unmasked the DECON transfers a frame on every
+ * panel TE, so in command mode frame_start fires once per displayed frame
+ * and serves as the vblank source.
+ */
+static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
+{
+	struct zumapro_decon *decon = dev_id;
+	u32 pend;
+
+	spin_lock(&decon->slock);
+	pend = readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND) &
+	       ZUMAPRO_DECON_INT_FRAME_START;
+	if (pend)
+		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	spin_unlock(&decon->slock);
+
+	if (!pend)
+		return IRQ_NONE;
+
+	if (decon->crtc)
+		drm_crtc_handle_vblank(&decon->crtc->base);
+
+	return IRQ_HANDLED;
 }
 
 static void zumapro_decon_update_plane(struct exynos_drm_crtc *crtc,
@@ -1584,6 +1649,28 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 		if (!decon->dpp)
 			return -EPROBE_DEFER;
 	}
+
+	spin_lock_init(&decon->slock);
+
+	/*
+	 * The DPU power domains are always on, so the registers are reachable
+	 * here.  The bootloader hands off a live DECON that may have interrupt
+	 * sources enabled and latched; quiesce them before the line has a
+	 * handler.
+	 */
+	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+
+	ret = platform_get_irq_byname(pdev, "frame_start");
+	if (ret < 0)
+		return ret;
+
+	ret = devm_request_irq(dev, ret, zumapro_decon_frame_start_irq, 0,
+			       dev_name(dev), decon);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to request frame_start IRQ\n");
 
 	platform_set_drvdata(pdev, decon);
 	pm_runtime_enable(dev);

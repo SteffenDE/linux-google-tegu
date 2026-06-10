@@ -33,12 +33,17 @@ MODULE_PARM_DESC(zumapro_enable_unsafe_modeset,
 
 struct zumapro_dpp {
 	struct device *dev;
+	void __iomem *dma_regs;
+	void __iomem *dpp_regs;
+	void __iomem *sramc_regs;
+	void __iomem *hdr_comm_regs;
 	u32 id;
 	u32 attributes;
 	u32 axi_port;
 	u32 scale_down;
 	u32 scale_up;
 	bool video_formats;
+	bool initialized;
 	const u32 *pixel_formats;
 	unsigned int num_pixel_formats;
 	const struct zumapro_dpp_restrictions *restrictions;
@@ -1208,8 +1213,25 @@ static int zumapro_dpp_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	dpp->dma_regs = devm_platform_ioremap_resource_byname(pdev, "dma");
+	if (IS_ERR(dpp->dma_regs))
+		return PTR_ERR(dpp->dma_regs);
+
+	dpp->dpp_regs = devm_platform_ioremap_resource_byname(pdev, "dpp");
+	if (IS_ERR(dpp->dpp_regs))
+		return PTR_ERR(dpp->dpp_regs);
+
+	dpp->sramc_regs = devm_platform_ioremap_resource_byname(pdev, "sramc");
+	if (IS_ERR(dpp->sramc_regs))
+		return PTR_ERR(dpp->sramc_regs);
+
+	dpp->hdr_comm_regs =
+		devm_platform_ioremap_resource_byname(pdev, "hdr_comm");
+	if (IS_ERR(dpp->hdr_comm_regs))
+		return PTR_ERR(dpp->hdr_comm_regs);
+
 	platform_set_drvdata(pdev, dpp);
-	dev_dbg(dev, "registered passive DPP%u topology\n", dpp->id);
+	dev_dbg(dev, "registered DPP%u topology\n", dpp->id);
 
 	return 0;
 }

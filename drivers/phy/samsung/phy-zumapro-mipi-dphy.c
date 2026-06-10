@@ -503,6 +503,17 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 	if (!dphy->hs_clk_mhz || !dphy->lanes)
 		return -EINVAL;
 
+	/*
+	 * A cold-booting bootloader hands the PHY off with the PLL locked
+	 * and the link live under the splash scanout.  Resetting and
+	 * reprogramming it would kill the link clock the scanout runs on;
+	 * adopt the running PLL instead, like downstream dsim_reg_init()
+	 * does when "DPHY PLL is already stable".  After a real power_off
+	 * the PLL is unlocked and the full programming below runs.
+	 */
+	if (DSIM_PHY_PLL_LOCK_GET(readl(dphy->dphy + DSIM_PHY_PLL_STAT0)))
+		return 0;
+
 	zumapro_dphy_sysreg_update(dphy, reset_mask, 0);
 	zumapro_dphy_write_defaults(dphy);
 

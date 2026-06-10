@@ -400,9 +400,38 @@
 };
 
 /*
- * Passive DPU topology probe.  The Zumapro DPP/DECON scaffold only validates
- * DT resources and does not map or program display registers yet.
+ * DPU fetch path: framebuffer scanout through DPP0 with the DPUF System MMUs
+ * translating.  The always-on display power domains must be enabled so the
+ * SysMMU single-domain auto-attach can find its provider.
+ *
+ * Enabling translation orphans the bootloader splash: its DPP fetch faults
+ * against the empty default domain as soon as DECON probes.  The first
+ * mainline modeset stops and reprograms the pipeline anyway.
  */
+&pd_dpub {
+	status = "okay";
+};
+
+&pd_dpuf0 {
+	status = "okay";
+};
+
+&pd_dpuf1 {
+	status = "okay";
+};
+
+&iommu_group_dpu {
+	status = "okay";
+};
+
+&sysmmu_dpuf0 {
+	status = "okay";
+};
+
+&sysmmu_dpuf1 {
+	status = "okay";
+};
+
 &dpp0 {
 	status = "okay";
 };

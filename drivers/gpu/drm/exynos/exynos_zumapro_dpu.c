@@ -37,6 +37,21 @@ module_param_named(zumapro_enable_unsafe_modeset,
 MODULE_PARM_DESC(zumapro_enable_unsafe_modeset,
 		 "Allow Zumapro DECON0 to touch display hardware on CRTC enable");
 
+/*
+ * Bring-up breadcrumbs: synchronous serial-console prints around every
+ * commit-path step, so a hardware wedge pinpoints the last completed
+ * operation.  Default on while the driver is being validated.
+ */
+static bool zumapro_trace = true;
+module_param_named(zumapro_trace, zumapro_trace, bool, 0644);
+MODULE_PARM_DESC(zumapro_trace, "Trace Zumapro DPU commit-path operations");
+
+#define zumapro_trace_dev(dev, fmt, ...)				\
+	do {								\
+		if (zumapro_trace)					\
+			dev_info(dev, "trace: " fmt, ##__VA_ARGS__);	\
+	} while (0)
+
 struct zumapro_dpp {
 	struct device *dev;
 	void __iomem *dma_regs;
@@ -75,6 +90,8 @@ struct zumapro_decon {
 	void *dma_priv;
 	/* serializes INT_EN/INT_PEND between commits, vblank ops and the IRQ */
 	spinlock_t slock;
+	u32 irq_fs_count;
+	u32 irq_fd_count;
 	bool enabled;
 	bool start_pending;
 	bool win_dirty;
@@ -925,6 +942,21 @@ static void zumapro_decon_program_colormap_window(struct zumapro_decon *decon,
 	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
 }
 
+static void zumapro_decon_trace_state(struct zumapro_decon *decon,
+				      const char *what)
+{
+	if (!zumapro_trace)
+		return;
+
+	dev_info(decon->dev,
+		 "trace: %s: global_con=%#x trig_con=%#x shd_req=%#x int_pend=%#x\n",
+		 what,
+		 readl(decon->main_regs + ZUMAPRO_DECON_GLOBAL_CON),
+		 readl(decon->main_regs + ZUMAPRO_DECON_TRIG_CON),
+		 readl(decon->main_regs + ZUMAPRO_DECON_SHD_REG_UP_REQ),
+		 readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND));
+}
+
 static int zumapro_decon_wait_run(struct zumapro_decon *decon)
 {
 	u32 val;
@@ -938,6 +970,8 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 {
 	unsigned long flags;
 	int ret;
+
+	zumapro_decon_trace_state(decon, "start");
 
 	/*
 	 * Enable the interrupt master, the frame_done source and the extra
@@ -995,6 +1029,8 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 				  ZUMAPRO_DECON_HW_TRIG_MASK,
 				  ZUMAPRO_DECON_HW_TRIG_EN);
 	spin_unlock_irqrestore(&decon->slock, flags);
+
+	zumapro_decon_trace_state(decon, "start: done");
 }
 
 static void zumapro_decon_stop(struct zumapro_decon *decon)
@@ -1004,6 +1040,8 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 	u32 win_count;
 	u32 win;
 	int ret;
+
+	zumapro_decon_trace_state(decon, "stop");
 
 	spin_lock_irqsave(&decon->slock, flags);
 	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
@@ -1083,6 +1121,8 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 	if (ret)
 		dev_warn(decon->dev, "DECON%u reset did not complete: %d\n",
 			 decon->id, ret);
+
+	zumapro_decon_trace_state(decon, "stop: done");
 }
 
 static enum drm_mode_status
@@ -1141,6 +1181,9 @@ static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
 	if (!mode->hdisplay || !mode->vdisplay)
 		return;
 
+	zumapro_trace_dev(decon->dev, "atomic_enable: %ux%u\n",
+			  mode->hdisplay, mode->vdisplay);
+
 	ret = pm_runtime_resume_and_get(decon->dev);
 	if (ret < 0) {
 		dev_err(decon->dev, "failed to resume DECON%u: %d\n",
@@ -1176,6 +1219,8 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	if (!decon->enabled)
 		return;
 
+	zumapro_trace_dev(decon->dev, "atomic_disable\n");
+
 	zumapro_decon_stop(decon);
 	decon->enabled = false;
 	decon->start_pending = false;
@@ -1191,6 +1236,8 @@ static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 
 	if (!decon->enabled)
 		return;
+
+	zumapro_decon_trace_state(decon, "begin");
 
 	/*
 	 * Downstream's decon_reg_wait_update_done_and_mask(): wait until the
@@ -1211,6 +1258,8 @@ static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 				ZUMAPRO_DECON_HW_TRIG_MASK,
 				ZUMAPRO_DECON_HW_TRIG_MASK);
 	spin_unlock_irqrestore(&decon->slock, flags);
+
+	zumapro_decon_trace_state(decon, "begin: masked");
 }
 
 static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
@@ -1220,6 +1269,10 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 
 	if (!decon->enabled)
 		return;
+
+	zumapro_trace_dev(decon->dev, "flush: %s\n",
+			  decon->start_pending ? "start" :
+			  decon->win_dirty ? "kick" : "no-op");
 
 	if (decon->start_pending) {
 		zumapro_decon_start(decon);
@@ -1270,6 +1323,8 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 					ZUMAPRO_DECON_HW_TRIG_MASK, 0);
 		spin_unlock_irqrestore(&decon->slock, flags);
 		decon->win_dirty = false;
+
+		zumapro_decon_trace_state(decon, "flush: kicked");
 	}
 
 	/* Arm the commit's flip event for delivery on the next frame_start. */
@@ -1280,6 +1335,8 @@ static int zumapro_decon_enable_vblank(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
 	unsigned long flags;
+
+	zumapro_trace_dev(decon->dev, "enable_vblank\n");
 
 	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
@@ -1294,6 +1351,8 @@ static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
 	unsigned long flags;
+
+	zumapro_trace_dev(decon->dev, "disable_vblank\n");
 
 	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
@@ -1321,6 +1380,13 @@ static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 	if (!pend)
 		return IRQ_NONE;
 
+	if (zumapro_trace) {
+		u32 n = ++decon->irq_fs_count;
+
+		if (n <= 4 || !(n & 0xff))
+			dev_info(decon->dev, "trace: frame_start #%u\n", n);
+	}
+
 	if (decon->crtc)
 		drm_crtc_handle_vblank(&decon->crtc->base);
 
@@ -1338,6 +1404,13 @@ static irqreturn_t zumapro_decon_frame_done_irq(int irq, void *dev_id)
 	if (pend)
 		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
 	spin_unlock(&decon->slock);
+
+	if (pend && zumapro_trace) {
+		u32 n = ++decon->irq_fd_count;
+
+		if (n <= 4 || !(n & 0xff))
+			dev_info(decon->dev, "trace: frame_done #%u\n", n);
+	}
 
 	return pend ? IRQ_HANDLED : IRQ_NONE;
 }
@@ -1390,6 +1463,16 @@ static void zumapro_decon_update_plane(struct exynos_drm_crtc *crtc,
 	if (!zumapro_dpp_find_format(state->base.fb->format->format))
 		return;
 
+	if (zumapro_trace) {
+		dma_addr_t addr = exynos_drm_fb_dma_addr(state->base.fb, 0);
+
+		dev_info(decon->dev,
+			 "trace: update_plane: win=%u fb=%u addr=%pad %ux%u+%d+%d\n",
+			 win, state->base.fb->base.id, &addr,
+			 state->crtc.w, state->crtc.h,
+			 state->crtc.x, state->crtc.y);
+	}
+
 	if (!dpp->initialized) {
 		zumapro_dpp_init(dpp);
 		dpp->initialized = true;
@@ -1424,6 +1507,8 @@ static void zumapro_decon_update_plane(struct exynos_drm_crtc *crtc,
 	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
 
 	decon->win_dirty = true;
+
+	zumapro_trace_dev(decon->dev, "update_plane: win=%u done\n", win);
 }
 
 static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
@@ -1433,6 +1518,8 @@ static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
 
 	if (!decon->enabled)
 		return;
+
+	zumapro_trace_dev(decon->dev, "disable_plane: win=%u\n", plane->index);
 
 	writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(plane->index));
 	decon->win_dirty = true;

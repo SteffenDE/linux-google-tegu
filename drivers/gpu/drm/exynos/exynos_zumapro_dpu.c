@@ -919,6 +919,40 @@ static void zumapro_decon_program_colormap_window(struct zumapro_decon *decon,
 	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
 }
 
+/*
+ * Downstream _decon_reinit_locked(): adopt a DECON handed over live from
+ * the bootloader instead of stopping and resetting it.  Quiesce the
+ * interrupt state, drop all window enables (shadow-protected, so they
+ * latch together with the first commit's programming) and mask the
+ * trigger so no frame kicks reach the adopted pipeline until that commit.
+ */
+static void zumapro_decon_handover(struct zumapro_decon *decon)
+{
+	unsigned long flags;
+	u32 win_count;
+	u32 win;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	writel(0, decon->main_regs + ZUMAPRO_DECON_INT_EN);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
+	       ZUMAPRO_DECON_INT_EXTRA,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	writel(ZUMAPRO_DECON_INT_RESOURCE_CONFLICT | ZUMAPRO_DECON_INT_TIMEOUT,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
+	for (win = 0; win < win_count; win++)
+		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				ZUMAPRO_DECON_HW_TRIG_EN |
+				ZUMAPRO_DECON_HW_TRIG_MASK,
+				ZUMAPRO_DECON_HW_TRIG_MASK);
+	spin_unlock_irqrestore(&decon->slock, flags);
+}
+
 static int zumapro_decon_wait_run(struct zumapro_decon *decon)
 {
 	u32 val;
@@ -1139,10 +1173,17 @@ static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
 				ZUMAPRO_DECON_CLOCK_CON_QACTIVE_PLL, 0);
 
 	/*
-	 * The bootloader hands off a live, scanning DECON; downstream always
-	 * stops and soft-resets the block before reprogramming it.
+	 * Downstream never resets a pipeline handed over live from the
+	 * bootloader (DECON_STATE_HANDOVER): it drops the window enables
+	 * and reprograms the running block.  Stop and soft-reset only a
+	 * block that is not running (warm boot without display init, or
+	 * re-enable after our own disable).
 	 */
-	zumapro_decon_stop(decon);
+	if (readl(decon->main_regs + ZUMAPRO_DECON_GLOBAL_CON) &
+	    ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS)
+		zumapro_decon_handover(decon);
+	else
+		zumapro_decon_stop(decon);
 	if (decon->dpp)
 		decon->dpp->initialized = false;
 

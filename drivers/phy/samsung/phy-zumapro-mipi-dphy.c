@@ -337,38 +337,61 @@ static void zumapro_dphy_set_timing(struct zumapro_mipi_dphy *dphy)
 	}
 }
 
+/*
+ * Bring-up tracing: announce each register write before issuing it, so a
+ * NoC stall names the exact offending write as the last logged line.
+ */
+static void zumapro_dphy_trace_writel(struct zumapro_mipi_dphy *dphy,
+				      void __iomem *base, const char *space,
+				      u32 offset, u32 val)
+{
+	dev_info(dphy->dev, "trace: write %s+%#x = %#x\n", space, offset, val);
+	writel(val, base + offset);
+}
+
 static void zumapro_dphy_write_defaults(struct zumapro_mipi_dphy *dphy)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(zumapro_dphy_bias_con); i++)
-		writel(zumapro_dphy_bias_con[i],
-		       dphy->bias + DSIM_PHY_BIAS_CON(i));
+		zumapro_dphy_trace_writel(dphy, dphy->bias, "bias",
+					  DSIM_PHY_BIAS_CON(i),
+					  zumapro_dphy_bias_con[i]);
 
 	for (i = 0; i < ARRAY_SIZE(zumapro_dphy_pll_con); i++)
-		writel(zumapro_dphy_pll_con[i], dphy->dphy + DSIM_PHY_PLL_CON(i));
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_PLL_CON(i),
+					  zumapro_dphy_pll_con[i]);
 
 	for (i = 0; i < ARRAY_SIZE(zumapro_dphy_mc_gnr_con); i++)
-		writel(zumapro_dphy_mc_gnr_con[i],
-		       dphy->dphy + DSIM_PHY_MC_GNR_CON(i));
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MC_GNR_CON(i),
+					  zumapro_dphy_mc_gnr_con[i]);
 
 	for (i = 0; i < ARRAY_SIZE(zumapro_dphy_mc_ana_con); i++)
-		writel(zumapro_dphy_mc_ana_con[i],
-		       dphy->dphy + DSIM_PHY_MC_ANA_CON(i));
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MC_ANA_CON(i),
+					  zumapro_dphy_mc_ana_con[i]);
 
 	for (i = 0; i < dphy->lanes; i++) {
-		writel(zumapro_dphy_md_gnr_con[0],
-		       dphy->dphy + DSIM_PHY_MD_GNR_CON0(i));
-		writel(zumapro_dphy_md_gnr_con[1],
-		       dphy->dphy + DSIM_PHY_MD_GNR_CON1(i));
-		writel(zumapro_dphy_md_ana_con[0],
-		       dphy->dphy + DSIM_PHY_MD_ANA_CON0(i));
-		writel(zumapro_dphy_md_ana_con[1],
-		       dphy->dphy + DSIM_PHY_MD_ANA_CON1(i));
-		writel(zumapro_dphy_md_ana_con[2],
-		       dphy->dphy + DSIM_PHY_MD_ANA_CON2(i));
-		writel(zumapro_dphy_md_ana_con[3],
-		       dphy->dphy + DSIM_PHY_MD_ANA_CON3(i));
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_GNR_CON0(i),
+					  zumapro_dphy_md_gnr_con[0]);
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_GNR_CON1(i),
+					  zumapro_dphy_md_gnr_con[1]);
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_ANA_CON0(i),
+					  zumapro_dphy_md_ana_con[0]);
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_ANA_CON1(i),
+					  zumapro_dphy_md_ana_con[1]);
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_ANA_CON2(i),
+					  zumapro_dphy_md_ana_con[2]);
+		zumapro_dphy_trace_writel(dphy, dphy->dphy, "dphy",
+					  DSIM_PHY_MD_ANA_CON3(i),
+					  zumapro_dphy_md_ana_con[3]);
 	}
 }
 
@@ -531,7 +554,10 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 	dev_info(dphy->dev, "trace: power_on\n");
 	zumapro_dphy_canary(dphy, "power_on");
 
+	dev_info(dphy->dev, "trace: power_on: asserting master reset\n");
 	zumapro_dphy_sysreg_update(dphy, reset_mask, 0);
+	dev_info(dphy->dev, "trace: power_on: master reset asserted\n");
+
 	zumapro_dphy_write_defaults(dphy);
 
 	dev_info(dphy->dev, "trace: power_on: defaults written\n");
@@ -542,7 +568,9 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 					 DSIM_PHY_DITHER_SEL_VCO(1));
 
 	zumapro_dphy_set_timing(dphy);
+	dev_info(dphy->dev, "trace: power_on: timing set\n");
 	zumapro_dphy_set_pll_freq(dphy);
+	dev_info(dphy->dev, "trace: power_on: pll programmed\n");
 	zumapro_dphy_update_bits(dphy->dphy, DSIM_PHY_PLL_CON6,
 				 DSIM_PHY_WCLK_BUF_SFT_CNT_MASK,
 				 DSIM_PHY_WCLK_BUF_SFT_CNT(3));

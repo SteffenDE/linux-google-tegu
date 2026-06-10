@@ -31,12 +31,6 @@
 #include "exynos_drm_plane.h"
 #include "regs-zumapro-dpu.h"
 
-static bool zumapro_enable_unsafe_modeset;
-module_param_named(zumapro_enable_unsafe_modeset,
-		   zumapro_enable_unsafe_modeset, bool, 0644);
-MODULE_PARM_DESC(zumapro_enable_unsafe_modeset,
-		 "Allow Zumapro DECON0 to touch display hardware on CRTC enable");
-
 struct zumapro_dpp {
 	struct device *dev;
 	void __iomem *dma_regs;
@@ -1111,24 +1105,6 @@ zumapro_decon_mode_valid(struct exynos_drm_crtc *crtc,
 	return MODE_BAD;
 }
 
-static int zumapro_decon_atomic_check(struct exynos_drm_crtc *crtc,
-				      struct drm_crtc_state *state)
-{
-	struct zumapro_decon *decon = crtc->ctx;
-
-	if (!state->active)
-		return 0;
-
-	if (!zumapro_enable_unsafe_modeset) {
-		dev_warn_once(decon->dev,
-			      "rejecting DECON%u modeset; pass exynosdrm.zumapro_enable_unsafe_modeset=1 for traced hardware-on validation\n",
-			      decon->id);
-		return -EPERM;
-	}
-
-	return 0;
-}
-
 static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
@@ -1446,7 +1422,6 @@ static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
 	.enable_vblank = zumapro_decon_enable_vblank,
 	.disable_vblank = zumapro_decon_disable_vblank,
 	.mode_valid = zumapro_decon_mode_valid,
-	.atomic_check = zumapro_decon_atomic_check,
 	.update_plane = zumapro_decon_update_plane,
 	.disable_plane = zumapro_decon_disable_plane,
 };
@@ -1875,8 +1850,7 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	dev_info(dev,
-		 "registered DECON%u CRTC with %d DPPs; modeset gated\n",
+	dev_info(dev, "registered DECON%u CRTC with %d DPPs\n",
 		 decon->id, decon->dpp_count);
 
 	return 0;

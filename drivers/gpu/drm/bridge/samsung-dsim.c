@@ -1441,9 +1441,13 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 	reg = DSIM_BTA_TIMEOUT(0xff) | DSIM_LPDR_TIMEOUT(0xffff);
 	samsung_dsim_write(dsi, DSIM_TIMEOUT_REG, reg);
 
+	/*
+	 * Shadowed writes stay off until the frame geometry has been
+	 * programmed into the operating registers; the shadow bank is
+	 * enabled at the end of samsung_dsim_zumapro_set_display_mode().
+	 */
 	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
-	reg |= DSIM_SFR_CTRL_SHADOW_EN |
-	       DSIM_ZUMAPRO_SHADOW_REG_READ_EN;
+	reg |= DSIM_ZUMAPRO_SHADOW_REG_READ_EN;
 	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
 
 	return samsung_dsim_zumapro_set_command_mode(dsi);
@@ -1670,6 +1674,15 @@ static void samsung_dsim_zumapro_set_display_mode(struct samsung_dsim *dsi)
 		      DSIM_MAIN_HSA(hsa);
 		samsung_dsim_write(dsi, DSIM_MSYNC_REG, reg);
 	}
+
+	/*
+	 * Downstream programs resolution/threshold/transfer count with the
+	 * shadow bank disabled so they land in the operating registers, and
+	 * only shadows the compression set below.
+	 */
+	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
+	reg |= DSIM_SFR_CTRL_SHADOW_EN;
+	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
 
 	if (dsi->dsc)
 		samsung_dsim_zumapro_config_dsc(dsi);

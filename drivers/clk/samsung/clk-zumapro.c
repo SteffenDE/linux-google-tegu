@@ -770,14 +770,23 @@ static const struct samsung_gate_clock dpub_gate_clks[] __initconst = {
 	     "dout_dpub_nocp",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
 	     21, CLK_IGNORE_UNUSED, 0),
+	/*
+	 * Gating these two from the DSIM suspend path and re-enabling them on
+	 * resume leaves the MIPI DPHY register window (0x1946xxxx) dead: the
+	 * first write of the next phy_power_on() stalls the NoC and freezes
+	 * the SoC (first display re-enable after a cold link teardown).
+	 * Downstream never gates them manually either - the DPUB gates are
+	 * QCH/HWACG-managed there.  Pin them until the QCH protocol is
+	 * modeled.
+	 */
 	GATE(CLK_GOUT_DPUB_DSIM0_ALVCLK, "gout_dpub_dsim0_alvclk",
 	     "mout_dpub_dsim_user",
 	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_ALVCLK_DSIM0,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, CLK_IS_CRITICAL, 0),
 	GATE(CLK_GOUT_DPUB_DSIM0_OSCCLK, "gout_dpub_dsim0_oscclk",
 	     "oscclk",
 	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_OSCCLK_DSIM0,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, CLK_IS_CRITICAL, 0),
 };
 
 static const struct samsung_cmu_info dpub_cmu_info __initconst = {

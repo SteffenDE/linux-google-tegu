@@ -916,6 +916,7 @@ static void samsung_sysmmu_v9_release_device(struct device *dev)
 
 	kfree(client->links);
 	kfree(client->sysmmus);
+	kfree(client);
 	dev_iommu_priv_set(dev, NULL);
 }
 
@@ -989,7 +990,13 @@ static int samsung_sysmmu_v9_of_xlate(struct device *dev,
 
 	client = dev_iommu_priv_get(dev);
 	if (!client) {
-		client = devm_kzalloc(dev, sizeof(*client), GFP_KERNEL);
+		/*
+		 * of_xlate runs before the client device probes; attaching
+		 * devres to it here would make really_probe() fail with
+		 * "Resources present before probing", so allocate plainly
+		 * and free in release_device.
+		 */
+		client = kzalloc(sizeof(*client), GFP_KERNEL);
 		if (!client)
 			return -ENOMEM;
 		dev_iommu_priv_set(dev, client);

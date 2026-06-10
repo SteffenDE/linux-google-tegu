@@ -471,12 +471,31 @@ static int zumapro_mipi_dphy_configure(struct phy *phy,
 	return zumapro_dphy_get_timing(dphy, hs_mhz, esc_mhz);
 }
 
+/*
+ * Bring-up canary: read one register from each DPHY window and report it.
+ * The windows die by stalling the NoC on access, so the breadcrumb BEFORE
+ * the canary marks the last point the window was known alive.
+ */
+static void zumapro_dphy_canary(struct zumapro_mipi_dphy *dphy,
+				const char *what)
+{
+	u32 bias, gnr;
+
+	dev_info(dphy->dev, "trace: canary (%s): reading bias\n", what);
+	bias = readl(dphy->bias + DSIM_PHY_BIAS_CON(0));
+	dev_info(dphy->dev, "trace: canary (%s): reading dphy\n", what);
+	gnr = readl(dphy->dphy + DSIM_PHY_MC_GNR_CON(0));
+	dev_info(dphy->dev, "trace: canary (%s): bias_con0=%#x mc_gnr_con0=%#x\n",
+		 what, bias, gnr);
+}
+
 static int zumapro_mipi_dphy_init(struct phy *phy)
 {
 	struct zumapro_mipi_dphy *dphy = phy_get_drvdata(phy);
 	int ret;
 
 	dev_info(dphy->dev, "trace: init\n");
+	zumapro_dphy_canary(dphy, "init");
 
 	ret = clk_prepare_enable(dphy->ref_clk);
 	if (ret)
@@ -510,6 +529,7 @@ static int zumapro_mipi_dphy_power_on(struct phy *phy)
 		return -EINVAL;
 
 	dev_info(dphy->dev, "trace: power_on\n");
+	zumapro_dphy_canary(dphy, "power_on");
 
 	zumapro_dphy_sysreg_update(dphy, reset_mask, 0);
 	zumapro_dphy_write_defaults(dphy);
@@ -629,6 +649,8 @@ static int zumapro_mipi_dphy_probe(struct platform_device *pdev)
 		dphy->sysreg = NULL;
 
 	of_property_read_u32(dev->of_node, "samsung,id", &dphy->id);
+
+	zumapro_dphy_canary(dphy, "probe");
 
 	dphy->phy = devm_phy_create(dev, NULL, &zumapro_mipi_dphy_ops);
 	if (IS_ERR(dphy->phy))

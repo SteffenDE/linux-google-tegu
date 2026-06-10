@@ -10,6 +10,7 @@
 
 #include <linux/clk.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -1214,6 +1215,16 @@ static int samsung_sysmmu_v9_probe(struct platform_device *pdev)
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+	/*
+	 * The page-table walker takes 36-bit physical addresses (the FLPT
+	 * base register holds a 24-bit PPN); page tables are mapped through
+	 * this device and must not bounce, so the default 32-bit platform
+	 * mask is not enough.
+	 */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(36));
+	if (ret)
+		return ret;
 
 	data->sfrbase = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(data->sfrbase))

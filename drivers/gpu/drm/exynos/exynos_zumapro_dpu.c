@@ -60,6 +60,7 @@ struct zumapro_decon {
 	u32 max_windows;
 	const struct zumapro_panel_pipeline *pipeline;
 	int dpp_count;
+	void *dma_priv;
 	bool enabled;
 	bool start_pending;
 };
@@ -1016,7 +1017,7 @@ static int zumapro_decon_bind(struct device *dev, struct device *master,
 	if (IS_ERR(decon->crtc))
 		return PTR_ERR(decon->crtc);
 
-	return 0;
+	return exynos_drm_register_dma(drm_dev, dev, &decon->dma_priv);
 }
 
 static void zumapro_decon_unbind(struct device *dev, struct device *master,
@@ -1026,6 +1027,8 @@ static void zumapro_decon_unbind(struct device *dev, struct device *master,
 
 	if (decon->crtc)
 		zumapro_decon_atomic_disable(decon->crtc);
+
+	exynos_drm_unregister_dma(decon->drm_dev, dev, &decon->dma_priv);
 }
 
 static const struct component_ops zumapro_decon_component_ops = {

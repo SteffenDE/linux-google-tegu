@@ -53,18 +53,21 @@
 		};
 	};
 
-	decon_autorefresh_bit: mmio-init@19470030 {
+	decon_trigger_mask: mmio-init@19470030 {
 		/*
-		 * Experimental simplefb refresh kick. Tegu's bootloader leaves
-		 * DPUF0 L0 scanning 0xfac00000, but DECON0 TRIG_CON was observed
-		 * as 0x3070 with HW_TRIG_MASK_DECON set. Clearing that mask and
-		 * setting HW_TRIG_EN gives 0x3061, matching the Pixel 9 Pro caiman
-		 * bring-up tree and making fbcon visible.
+		 * Stop the bootloader splash before the DPUF System MMUs
+		 * enable translation: mask DECON0's HW trigger (TRIG_CON
+		 * HW_TRIG_MASK set, HW_TRIG_EN clear) so the orphaned DPP
+		 * fetch goes idle within a frame.  Letting it run into the
+		 * empty default domain leaves a stalled fault on DPUF0's AXI
+		 * port that wedges the interconnect on the next modeset.
+		 * This freezes simplefb/fbcon; mainline owns the panel from
+		 * the first modeset on.
 		 */
 		compatible = "linux,mmio-init-helper";
 		reg = <0x0 0x19470030 0x4>;
 		mask = <0x11>;
-		value = <0x01>;
+		value = <0x10>;
 	};
 
 	/*

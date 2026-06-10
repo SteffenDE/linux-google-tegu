@@ -1016,9 +1016,35 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 				 val,
 				 !(val & ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS),
 				 10, 50000);
-	if (ret)
-		dev_warn(decon->dev, "DECON%u did not stop scanout: %d\n",
-			 decon->id, ret);
+	if (ret) {
+		/*
+		 * The per-frame stop latches on a trigger; with the trigger
+		 * masked (always the case when stopping a bootloader handoff,
+		 * where it has been masked since early boot) it never does.
+		 * Fall back to downstream's instant stop, which clears the
+		 * non-shadowed enable directly.
+		 */
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_GLOBAL_CON,
+					ZUMAPRO_DECON_GLOBAL_CON_EN |
+					ZUMAPRO_DECON_GLOBAL_CON_EN_F, 0);
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_SHD_REG_UP_REQ,
+					ZUMAPRO_DECON_SHD_GLOBAL |
+					ZUMAPRO_DECON_SHD_CMP,
+					ZUMAPRO_DECON_SHD_GLOBAL |
+					ZUMAPRO_DECON_SHD_CMP);
+
+		ret = readl_poll_timeout(decon->main_regs +
+					 ZUMAPRO_DECON_GLOBAL_CON,
+					 val,
+					 !(val & ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS),
+					 10, 50000);
+		if (ret)
+			dev_warn(decon->dev,
+				 "DECON%u did not stop scanout: %d\n",
+				 decon->id, ret);
+	}
 
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
 				  ZUMAPRO_DECON_GLOBAL_CON_SRESET,

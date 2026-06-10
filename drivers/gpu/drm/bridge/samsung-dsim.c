@@ -1024,12 +1024,12 @@ static unsigned long samsung_dsim_set_pll(struct samsung_dsim *dsi,
 	return fout;
 }
 
-static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
+static int samsung_dsim_calc_clocks(struct samsung_dsim *dsi,
+				    unsigned long *ret_esc_div)
 {
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
 	unsigned long hs_clk, byte_clk, esc_clk, pix_clk;
 	unsigned long esc_div;
-	u32 reg;
 	struct drm_display_mode *m = &dsi->mode;
 	int bpp = mipi_dsi_pixel_format_to_bpp(dsi->format);
 
@@ -1064,6 +1064,22 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 
 	dev_dbg(dsi->dev, "hs_clk = %lu, byte_clk = %lu, esc_clk = %lu\n",
 		hs_clk, byte_clk, esc_clk);
+
+	*ret_esc_div = esc_div;
+
+	return 0;
+}
+
+static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
+{
+	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
+	unsigned long esc_div;
+	u32 reg;
+	int ret;
+
+	ret = samsung_dsim_calc_clocks(dsi, &esc_div);
+	if (ret)
+		return ret;
 
 	if (driver_data->has_zumapro_regs) {
 		u32 lanes_mask = BIT(dsi->lanes + 1) - 1;
@@ -2161,6 +2177,42 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 
 	if (dsi->state & DSIM_STATE_INITIALIZED)
 		return 0;
+
+	/*
+	 * A link running on the word clock was handed over live by the
+	 * bootloader, scanning out the splash frame.  Downstream never
+	 * resets it (dsim handover, skip_init): resetting the DSIM or
+	 * reprogramming the D-PHY kills the clock the scanout runs on and
+	 * risks stalling the interconnect.  Adopt the running link instead.
+	 * The PHY calls keep the phy core refcounts balanced; the PHY
+	 * driver itself skips reprogramming a locked PLL.  Our own
+	 * teardown selects the OSC clock back, so this path only triggers
+	 * on a bootloader handover.
+	 */
+	if (driver_data->uses_external_dphy_pll &&
+	    samsung_dsim_read(dsi, DSIM_CLKCTRL_REG) &
+	    DSIM_ZUMAPRO_CLKCTRL_CLOCK_SEL) {
+		unsigned long esc_div;
+
+		/*
+		 * Compute hs/esc clocks for the PHY configuration and the
+		 * command-mode timing, but leave DSIM_CLKCTRL alone: the
+		 * adopted link runs on the bootloader's prescaler and clock
+		 * enables, and rewriting them would glitch the live link.
+		 */
+		ret = samsung_dsim_calc_clocks(dsi, &esc_div);
+		if (ret)
+			return ret;
+
+		ret = samsung_dsim_configure_external_phy(dsi);
+		if (ret)
+			return ret;
+
+		samsung_dsim_enable_irq(dsi);
+		dsi->state |= DSIM_STATE_INITIALIZED;
+
+		return 0;
+	}
 
 	/*
 	 * Run the link on the OSC clock while the D-PHY is reset and

@@ -22,6 +22,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 #include "iommu-pages.h"
 
@@ -51,6 +52,12 @@ typedef u32 sysmmu_pte_t;
 #define REG_MMU_ALL_INV_VM			0x8010
 #define REG_MMU_RANGE_INV_START_VPN_VM		0x8020
 #define REG_MMU_RANGE_INV_END_VPN_AND_TRIG_VM	0x8024
+#define REG_MMU_FAULT_STATUS_VM			0x8060
+#define REG_MMU_FAULT_CLEAR_VM			0x8064
+#define REG_MMU_FAULT_VA_VM			0x8070
+#define REG_MMU_FAULT_INFO0_VM			0x8074
+#define REG_MMU_FAULT_INFO1_VM			0x8078
+#define REG_MMU_FAULT_INFO2_VM			0x807c
 #define REG_MMU_CONTEXT0_CFG_FLPT_BASE_VM	0x8404
 #define REG_MMU_CONTEXT0_CFG_ATTRIBUTE_VM	0x8408
 
@@ -70,6 +77,13 @@ typedef u32 sysmmu_pte_t;
 							 GENMASK(6, 0)))
 #define MMU_STREAM_MATCH_CFG_MASK(reg)		((reg) & (GENMASK(9, 8) | BIT(0)))
 #define MMU_SET_PMMU_INDICATOR(val)		((val) & 0xf)
+
+#define MMU_FAULT_STATUS_MASK			GENMASK(4, 0)
+#define MMU_FAULT_INFO0_WRITE			BIT(20)
+#define MMU_FAULT_INFO0_VA36			BIT(21)
+#define MMU_FAULT_INFO0_VA_HIGH(reg)		((u64)((reg) & GENMASK(25, 22)) << 10)
+#define MMU_FAULT_INFO2_PMMU_ID(reg)		(((reg) >> 24) & 0xff)
+#define MMU_FAULT_INFO2_STREAM_ID(reg)		((reg) & 0xffffff)
 
 #define CFG_USE_AP				BIT(2)
 #define CFG_QOS(n)				(((n) & 0xf) << 7)
@@ -134,6 +148,8 @@ struct samsung_sysmmu_v9_drvdata {
 	struct clk *clk;
 	spinlock_t lock;
 	phys_addr_t pgtable;
+	struct iommu_domain *attached_domain;
+	struct device *master;
 	unsigned int attached_count;
 	bool rpm_active;
 	u32 version;
@@ -746,6 +762,8 @@ static void samsung_sysmmu_v9_detach_data(struct samsung_sysmmu_v9_drvdata *data
 			samsung_sysmmu_v9_disable(data);
 		list_del_init(&data->domain_node);
 		data->pgtable = 0;
+		data->attached_domain = NULL;
+		data->master = NULL;
 	}
 	spin_unlock_irqrestore(&data->lock, flags);
 }
@@ -802,6 +820,8 @@ static int samsung_sysmmu_v9_attach_dev(struct iommu_domain *iommu_domain,
 		spin_lock_irqsave(&data->lock, flags);
 		if (data->attached_count++ == 0) {
 			data->pgtable = pgtable;
+			data->attached_domain = iommu_domain;
+			data->master = dev;
 			list_add_tail(&data->domain_node, group_list);
 			if (data->rpm_active)
 				samsung_sysmmu_v9_enable(data);
@@ -1201,13 +1221,71 @@ out_put:
 	return ret;
 }
 
-static irqreturn_t samsung_sysmmu_v9_irq(int irq, void *dev_id)
+static const char * const samsung_sysmmu_v9_fault_names[] = {
+	"page-table walk access fault",
+	"page fault",
+	"access fault",
+	"context fault",
+	"unknown fault",
+};
+
+static irqreturn_t samsung_sysmmu_v9_irq_thread(int irq, void *dev_id)
 {
 	struct samsung_sysmmu_v9_drvdata *data = dev_id;
+	struct iommu_domain *domain;
+	struct device *master;
+	phys_addr_t pgtable;
+	unsigned long flags;
+	u32 status, info0, info1, info2;
+	u64 va;
+
+	spin_lock_irqsave(&data->lock, flags);
+
+	if (!data->rpm_active) {
+		spin_unlock_irqrestore(&data->lock, flags);
+		return IRQ_NONE;
+	}
+
+	status = readl_relaxed(data->sfrbase + REG_MMU_FAULT_STATUS_VM) &
+		 MMU_FAULT_STATUS_MASK;
+	if (!status) {
+		spin_unlock_irqrestore(&data->lock, flags);
+		dev_err_ratelimited(data->dev, "spurious fault interrupt\n");
+		return IRQ_NONE;
+	}
+
+	va = readl_relaxed(data->sfrbase + REG_MMU_FAULT_VA_VM);
+	info0 = readl_relaxed(data->sfrbase + REG_MMU_FAULT_INFO0_VM);
+	info1 = readl_relaxed(data->sfrbase + REG_MMU_FAULT_INFO1_VM);
+	info2 = readl_relaxed(data->sfrbase + REG_MMU_FAULT_INFO2_VM);
+	if (info0 & MMU_FAULT_INFO0_VA36)
+		va |= MMU_FAULT_INFO0_VA_HIGH(info0);
+
+	/*
+	 * Clearing the fault releases the stalled transaction; with an
+	 * unchanged page table it simply faults again.  Leaving it stalled is
+	 * not an option: a transaction parked on the AXI port deadlocks the
+	 * interconnect as soon as the client block is reset underneath it.
+	 */
+	writel(status, data->sfrbase + REG_MMU_FAULT_CLEAR_VM);
+
+	domain = data->attached_domain;
+	master = data->master;
+	pgtable = data->pgtable;
+
+	spin_unlock_irqrestore(&data->lock, flags);
 
 	dev_err_ratelimited(data->dev,
-			    "System MMU v9 fault IRQ; detailed fault handling is not implemented yet\n");
-	disable_irq_nosync(irq);
+			    "%s %s at %#llx (AXI ID %#x, PMMU %u, stream ID %#x, pgtable %pa)\n",
+			    str_read_write(!(info0 & MMU_FAULT_INFO0_WRITE)),
+			    samsung_sysmmu_v9_fault_names[__ffs(status)], va,
+			    info1, MMU_FAULT_INFO2_PMMU_ID(info2),
+			    MMU_FAULT_INFO2_STREAM_ID(info2), &pgtable);
+
+	if (domain)
+		report_iommu_fault(domain, master, va,
+				   (info0 & MMU_FAULT_INFO0_WRITE) ?
+				   IOMMU_FAULT_WRITE : IOMMU_FAULT_READ);
 
 	return IRQ_HANDLED;
 }
@@ -1241,8 +1319,9 @@ static int samsung_sysmmu_v9_probe(struct platform_device *pdev)
 	if (irq < 0)
 		return irq;
 
-	ret = devm_request_irq(dev, irq, samsung_sysmmu_v9_irq, 0,
-			       dev_name(dev), data);
+	ret = devm_request_threaded_irq(dev, irq, NULL,
+					samsung_sysmmu_v9_irq_thread,
+					IRQF_ONESHOT, dev_name(dev), data);
 	if (ret)
 		return ret;
 

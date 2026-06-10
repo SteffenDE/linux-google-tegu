@@ -940,11 +940,10 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	int ret;
 
 	/*
-	 * Enable the interrupt master, the frame_done source (which re-masks
-	 * the trigger after each transferred frame) and the extra source
-	 * (resource conflict/timeout diagnostics); frame_start is unmasked by
-	 * enable_vblank.  Stale pending bits would fire as soon as the master
-	 * bit is set, so clear them first.
+	 * Enable the interrupt master, the frame_done source and the extra
+	 * source (resource conflict/timeout diagnostics); frame_start is
+	 * unmasked by enable_vblank.  Stale pending bits would fire as soon
+	 * as the master bit is set, so clear them first.
 	 */
 	spin_lock_irqsave(&decon->slock, flags);
 	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
@@ -987,8 +986,8 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 			 decon->id, ret);
 
 	/*
-	 * Unmask the trigger for the first frame; the frame_done handler
-	 * re-masks it.
+	 * Unmask the trigger for the first frame; the next commit's
+	 * atomic_begin re-masks it before reprogramming.
 	 */
 	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
@@ -1186,6 +1185,7 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
 	u32 val;
 	int ret;
 
@@ -1193,21 +1193,24 @@ static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 		return;
 
 	/*
-	 * Plane, window and DPP registers may only change while the trigger
-	 * is masked; the frame_done handler re-masks it once the previous
-	 * commit's transfer has finished.  Wait for that before any
-	 * programming.  (Trigger disabled altogether means a freshly reset
-	 * DECON - nothing in flight either.)
+	 * Downstream's decon_reg_wait_update_done_and_mask(): wait until the
+	 * previous commit's shadow-update requests have been consumed (they
+	 * self-clear when a trigger latches them), then mask the trigger so
+	 * plane, window and DPP registers can be programmed without a TE
+	 * latching half-written state.
 	 */
-	ret = readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_TRIG_CON,
-				 val,
-				 !(val & ZUMAPRO_DECON_HW_TRIG_EN) ||
-				 (val & ZUMAPRO_DECON_HW_TRIG_MASK),
-				 100, 50000);
+	ret = readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				 val, !val, 10, 300000);
 	if (ret)
 		dev_warn(decon->dev,
-			 "DECON%u previous frame transfer did not finish: %d\n",
-			 decon->id, ret);
+			 "DECON%u shadow update not consumed: %#x\n",
+			 decon->id, val);
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				ZUMAPRO_DECON_HW_TRIG_MASK,
+				ZUMAPRO_DECON_HW_TRIG_MASK);
+	spin_unlock_irqrestore(&decon->slock, flags);
 }
 
 static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
@@ -1223,15 +1226,44 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 		decon->start_pending = false;
 		decon->win_dirty = false;
 	} else if (decon->win_dirty) {
+		int ret;
+
 		/*
-		 * Latch the new window and DPP configuration on the next TE:
-		 * request the window shadow update and unmask the trigger for
-		 * one frame (the frame_done handler re-masks it).
+		 * Downstream's per-commit decon_reg_start(): request the
+		 * window shadow updates, re-arm the per-frame enable and the
+		 * global update (in command mode EN_F is consumed by each
+		 * frame), drop a stale frame_start so the next one reflects
+		 * this update, wait for run status, and only then unmask the
+		 * trigger so the prepared frame transfers on the next TE.
 		 */
 		zumapro_dpu_update_bits(decon->main_regs,
 					ZUMAPRO_DECON_SHD_REG_UP_REQ,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS,
 					ZUMAPRO_DECON_SHD_ALL_WINDOWS);
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_GLOBAL_CON,
+					ZUMAPRO_DECON_GLOBAL_CON_EN |
+					ZUMAPRO_DECON_GLOBAL_CON_EN_F,
+					ZUMAPRO_DECON_GLOBAL_CON_EN |
+					ZUMAPRO_DECON_GLOBAL_CON_EN_F);
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_SHD_REG_UP_REQ,
+					ZUMAPRO_DECON_SHD_GLOBAL |
+					ZUMAPRO_DECON_SHD_CMP,
+					ZUMAPRO_DECON_SHD_GLOBAL |
+					ZUMAPRO_DECON_SHD_CMP);
+
+		spin_lock_irqsave(&decon->slock, flags);
+		writel(ZUMAPRO_DECON_INT_FRAME_START,
+		       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+		spin_unlock_irqrestore(&decon->slock, flags);
+
+		ret = zumapro_decon_wait_run(decon);
+		if (ret)
+			dev_warn(decon->dev,
+				 "DECON%u did not enter run state: %d\n",
+				 decon->id, ret);
+
 		spin_lock_irqsave(&decon->slock, flags);
 		zumapro_dpu_update_bits(decon->main_regs,
 					ZUMAPRO_DECON_TRIG_CON,
@@ -1303,19 +1335,8 @@ static irqreturn_t zumapro_decon_frame_done_irq(int irq, void *dev_id)
 	spin_lock(&decon->slock);
 	pend = readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND) &
 	       ZUMAPRO_DECON_INT_FRAME_DONE;
-	if (pend) {
+	if (pend)
 		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
-		/*
-		 * One update, one frame: re-mask the trigger so the hardware
-		 * idles (command-mode panels self-refresh from their own RAM)
-		 * and the next commit can program registers without a TE
-		 * latching half-written state.
-		 */
-		zumapro_dpu_update_bits(decon->main_regs,
-					ZUMAPRO_DECON_TRIG_CON,
-					ZUMAPRO_DECON_HW_TRIG_MASK,
-					ZUMAPRO_DECON_HW_TRIG_MASK);
-	}
 	spin_unlock(&decon->slock);
 
 	return pend ? IRQ_HANDLED : IRQ_NONE;

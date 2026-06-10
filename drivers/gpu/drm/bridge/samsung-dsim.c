@@ -1401,15 +1401,11 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 		return -EINVAL;
 	}
 
-	dev_info(dsi->dev, "trace: init_link: reading config\n");
-
 	reg = samsung_dsim_read(dsi, DSIM_CONFIG_REG);
 	reg &= ~DSIM_ZUMAPRO_CONFIG_OWNED_MASK;
 	reg |= DSIM_ZUMAPRO_CONFIG_RGB24 |
 	       DSIM_ZUMAPRO_CONFIG_DATA_LANE_NUM(dsi->lanes - 1) |
 	       DSIM_ZUMAPRO_CONFIG_LANES_EN(lanes_mask);
-
-	dev_info(dsi->dev, "trace: init_link: writing config (lanes)\n");
 
 	if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO)
 		reg |= DSIM_ZUMAPRO_CONFIG_VIDEO_MODE;
@@ -1424,8 +1420,6 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 
 	samsung_dsim_write(dsi, DSIM_CONFIG_REG, reg);
 
-	dev_info(dsi->dev, "trace: init_link: polling lane stop state\n");
-
 	timeout = 100;
 	do {
 		if (timeout-- == 0) {
@@ -1438,8 +1432,6 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 		    DSIM_STOP_STATE_DAT(data_lanes_mask))
 			continue;
 	} while (!(reg & (DSIM_STOP_STATE_CLK | DSIM_TX_READY_HS_CLK)));
-
-	dev_info(dsi->dev, "trace: init_link: lanes in stop state\n");
 
 	reg = samsung_dsim_read(dsi, DSIM_ESCMODE_REG);
 	reg &= ~DSIM_STOP_STATE_CNT_MASK;
@@ -1454,13 +1446,9 @@ static int samsung_dsim_zumapro_init_link(struct samsung_dsim *dsi)
 	 * programmed into the operating registers; the shadow bank is
 	 * enabled at the end of samsung_dsim_zumapro_set_display_mode().
 	 */
-	dev_info(dsi->dev, "trace: init_link: enabling shadow reads\n");
-
 	reg = samsung_dsim_read(dsi, DSIM_SFRCTRL_REG);
 	reg |= DSIM_ZUMAPRO_SHADOW_REG_READ_EN;
 	samsung_dsim_write(dsi, DSIM_SFRCTRL_REG, reg);
-
-	dev_info(dsi->dev, "trace: init_link: setting command mode\n");
 
 	return samsung_dsim_zumapro_set_command_mode(dsi);
 }
@@ -2174,8 +2162,6 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	if (dsi->state & DSIM_STATE_INITIALIZED)
 		return 0;
 
-	dev_info(dsi->dev, "trace: init\n");
-
 	/*
 	 * Run the link on the OSC clock while the D-PHY is reset and
 	 * reprogrammed below.  A cold-booting bootloader hands the DSIM off
@@ -2191,8 +2177,6 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	samsung_dsim_reset(dsi);
 	samsung_dsim_enable_irq(dsi);
 
-	dev_info(dsi->dev, "trace: init: reset done\n");
-
 	if (driver_data->reg_values[RESET_TYPE] == DSIM_FUNCRST)
 		samsung_dsim_enable_lane(dsi, BIT(dsi->lanes) - 1);
 
@@ -2200,25 +2184,17 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	if (ret)
 		goto err_disable_irq;
 
-	dev_info(dsi->dev, "trace: init: clock enabled\n");
-
 	ret = samsung_dsim_configure_external_phy(dsi);
 	if (ret)
 		goto err_disable_clock;
-
-	dev_info(dsi->dev, "trace: init: phy configured\n");
 
 	if (driver_data->wait_for_reset)
 		samsung_dsim_wait_for_reset(dsi);
 	samsung_dsim_set_phy_ctrl(dsi);
 
-	dev_info(dsi->dev, "trace: init: phy ctrl set\n");
-
 	ret = samsung_dsim_init_link(dsi);
 	if (ret)
 		goto err_disable_phy;
-
-	dev_info(dsi->dev, "trace: init: link done\n");
 
 	dsi->state |= DSIM_STATE_INITIALIZED;
 
@@ -2247,16 +2223,12 @@ static void samsung_dsim_atomic_pre_enable(struct drm_bridge *bridge,
 	if (dsi->state & DSIM_STATE_ENABLED)
 		return;
 
-	dev_info(dsi->dev, "trace: pre_enable\n");
-
 	ret = pm_runtime_resume_and_get(dsi->dev);
 	if (ret < 0) {
 		dev_err(dsi->dev, "failed to enable DSI device.\n");
 		dsi->state |= DSIM_STATE_PRE_ENABLE_FAILED;
 		return;
 	}
-
-	dev_info(dsi->dev, "trace: pre_enable: resumed\n");
 
 	dsi->state &= ~DSIM_STATE_PRE_ENABLE_FAILED;
 	dsi->state |= DSIM_STATE_ENABLED;
@@ -2282,14 +2254,10 @@ static void samsung_dsim_atomic_enable(struct drm_bridge *bridge,
 	if (dsi->state & DSIM_STATE_PRE_ENABLE_FAILED)
 		return;
 
-	dev_info(dsi->dev, "trace: enable\n");
-
 	samsung_dsim_set_display_mode(dsi);
 	samsung_dsim_set_display_enable(dsi, true);
 
 	dsi->state |= DSIM_STATE_VIDOUT_AVAILABLE;
-
-	dev_info(dsi->dev, "trace: enable: done\n");
 }
 
 static void samsung_dsim_atomic_disable(struct drm_bridge *bridge,
@@ -2300,8 +2268,6 @@ static void samsung_dsim_atomic_disable(struct drm_bridge *bridge,
 	if ((dsi->state & DSIM_STATE_PRE_ENABLE_FAILED) ||
 	    !(dsi->state & DSIM_STATE_ENABLED))
 		return;
-
-	dev_info(dsi->dev, "trace: disable\n");
 
 	samsung_dsim_set_display_enable(dsi, false);
 	dsi->state &= ~DSIM_STATE_VIDOUT_AVAILABLE;
@@ -2317,13 +2283,9 @@ static void samsung_dsim_atomic_post_disable(struct drm_bridge *bridge,
 		return;
 	}
 
-	dev_info(dsi->dev, "trace: post_disable\n");
-
 	dsi->state &= ~DSIM_STATE_PRE_ENABLE_FAILED;
 	dsi->state &= ~DSIM_STATE_ENABLED;
 	pm_runtime_put_sync(dsi->dev);
-
-	dev_info(dsi->dev, "trace: post_disable: suspended\n");
 }
 
 /*
@@ -2647,18 +2609,11 @@ static ssize_t samsung_dsim_host_transfer(struct mipi_dsi_host *host,
 {
 	struct samsung_dsim *dsi = host_to_dsi(host);
 	struct samsung_dsim_transfer xfer;
-	static atomic_t xfer_count = ATOMIC_INIT(0);
-	int n;
 	int ret;
 
 	if ((dsi->state & DSIM_STATE_PRE_ENABLE_FAILED) ||
 	    !(dsi->state & DSIM_STATE_ENABLED))
 		return -EINVAL;
-
-	n = atomic_inc_return(&xfer_count);
-	if (n <= 12)
-		dev_info(dsi->dev, "trace: transfer #%d type=%#x len=%zu\n",
-			 n, msg->type, msg->tx_len);
 
 	ret = samsung_dsim_init(dsi);
 	if (ret)
@@ -2673,10 +2628,6 @@ static ssize_t samsung_dsim_host_transfer(struct mipi_dsi_host *host,
 	xfer.flags = msg->flags;
 
 	ret = samsung_dsim_transfer(dsi, &xfer);
-
-	if (n <= 12)
-		dev_info(dsi->dev, "trace: transfer #%d done ret=%d\n", n, ret);
-
 	return (ret < 0) ? ret : xfer.rx_done;
 }
 
@@ -2880,8 +2831,6 @@ static int samsung_dsim_suspend(struct device *dev)
 	bool was_initialized = dsi->state & DSIM_STATE_INITIALIZED;
 	int ret;
 
-	dev_info(dev, "trace: suspend (initialized=%d)\n", was_initialized);
-
 	usleep_range(10000, 20000);
 
 	if (was_initialized) {
@@ -2892,8 +2841,6 @@ static int samsung_dsim_suspend(struct device *dev)
 			phy_power_off(dsi->phy);
 			phy_exit(dsi->phy);
 		}
-
-		dev_info(dev, "trace: suspend: phy off\n");
 
 		samsung_dsim_disable_clock(dsi);
 		samsung_dsim_disable_irq(dsi);
@@ -2906,13 +2853,9 @@ static int samsung_dsim_suspend(struct device *dev)
 
 	clk_bulk_disable_unprepare(driver_data->num_clks, driver_data->clk_data);
 
-	dev_info(dev, "trace: suspend: clocks gated\n");
-
 	ret = regulator_bulk_disable(ARRAY_SIZE(dsi->supplies), dsi->supplies);
 	if (ret < 0)
 		dev_err(dsi->dev, "cannot disable regulators %d\n", ret);
-
-	dev_info(dev, "trace: suspend: done\n");
 
 	return 0;
 }
@@ -2922,8 +2865,6 @@ static int samsung_dsim_resume(struct device *dev)
 	struct samsung_dsim *dsi = dev_get_drvdata(dev);
 	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
 	int ret;
-
-	dev_info(dev, "trace: resume\n");
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(dsi->supplies), dsi->supplies);
 	if (ret < 0) {
@@ -2935,8 +2876,6 @@ static int samsung_dsim_resume(struct device *dev)
 	if (ret < 0)
 		goto err_clk;
 
-	dev_info(dev, "trace: resume: clocks on\n");
-
 	if (!driver_data->uses_external_dphy_pll) {
 		ret = phy_power_on(dsi->phy);
 		if (ret < 0) {
@@ -2944,8 +2883,6 @@ static int samsung_dsim_resume(struct device *dev)
 			goto err_clk;
 		}
 	}
-
-	dev_info(dev, "trace: resume: done\n");
 
 	return 0;
 

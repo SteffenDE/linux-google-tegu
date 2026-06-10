@@ -6,6 +6,7 @@
  * hardware-on validation.  It intentionally avoids DPP/RDMA programming.
  */
 
+#include <linux/bitops.h>
 #include <linux/component.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -53,12 +54,14 @@ struct zumapro_decon {
 	void __iomem *win_regs;
 	void __iomem *sub_regs;
 	void __iomem *wincon_regs;
+	void __iomem *dqe_regs;
 	u32 id;
 	u32 cgc_dma_id;
 	u32 max_windows;
 	const struct zumapro_panel_pipeline *pipeline;
 	int dpp_count;
 	bool enabled;
+	bool start_pending;
 };
 
 struct zumapro_decon_desc {
@@ -498,7 +501,8 @@ static const struct zumapro_panel_pipeline zumapro_decon0_tg4c_pipeline = {
 	.modes = zumapro_tg4c_modes,
 	.num_modes = ARRAY_SIZE(zumapro_tg4c_modes),
 	.dsc = &zumapro_tg4c_dsc,
-	.data_path = ZUMAPRO_DPATH_DSCC_DSCENC01_OUTFIFO01_DSIMIF0,
+	.data_path = ZUMAPRO_DECON_ENHANCE_DQE_ON |
+		     ZUMAPRO_DPATH_DSCC_DSCENC01_OUTFIFO01_DSIMIF0,
 	.out_type = ZUMAPRO_DECON_OUT_DSI0,
 	.dsimif_fifo = ZUMAPRO_DECON0_OFIFO0,
 	.dsimif = 0,
@@ -576,6 +580,95 @@ static void zumapro_decon_write_dsc_pps(struct zumapro_decon *decon, u8 dsc)
 		       zumapro_tg4c_dsc_pps[i].offset);
 }
 
+static u32 zumapro_dqe_size(u32 width, u32 height)
+{
+	return ZUMAPRO_DQE_IMG_VSIZE(height) |
+	       ZUMAPRO_DQE_IMG_HSIZE(width);
+}
+
+static u32 zumapro_dqe_atc_ibsi(u32 width, u32 height, u32 div)
+{
+	u32 hori_grid = DIV_ROUND_UP(width, 8);
+	u32 vert_grid = DIV_ROUND_UP(height, 16);
+	u32 ibsi_x = (1 << 16) / (hori_grid * div);
+	u32 ibsi_y = (1 << 16) / (vert_grid * div);
+
+	return ZUMAPRO_DQE_ATC_IBSI_Y(ibsi_y) |
+	       ZUMAPRO_DQE_ATC_IBSI_X(ibsi_x);
+}
+
+static u32 zumapro_dqe_atc_cdf(u32 width, u32 height)
+{
+	u32 pixels = width * height;
+	u32 tmp;
+	u32 shift;
+	u32 denom;
+	u32 div;
+
+	if (!pixels)
+		return 0;
+
+	tmp = (481 * pixels) / (255 * (1 << 14));
+	if (!tmp)
+		return 0;
+
+	if (tmp & (tmp - 1))
+		shift = fls(tmp);
+	else
+		shift = fls(tmp) - 1;
+
+	denom = pixels >> shift;
+	if (!denom)
+		return 0;
+
+	div = ((1 << 14) / denom) * 255;
+
+	return ZUMAPRO_DQE_ATC_CDF_SHIFT(shift) |
+	       ZUMAPRO_DQE_ATC_CDF_DIV_VAL(div);
+}
+
+static void zumapro_decon_program_dqe(struct zumapro_decon *decon,
+				      const struct drm_display_mode *mode)
+{
+	u32 width = mode->hdisplay;
+	u32 height = mode->vdisplay;
+	u32 size = zumapro_dqe_size(width, height);
+
+	writel(size, decon->dqe_regs + ZUMAPRO_DQE_TOP_IMG_SIZE);
+	writel(size, decon->dqe_regs + ZUMAPRO_DQE_TOP_FRM_SIZE);
+	writel(ZUMAPRO_DQE_FULL_PXL_NUM(width * height),
+	       decon->dqe_regs + ZUMAPRO_DQE_TOP_FRM_PXL_NUM);
+	writel(zumapro_dqe_atc_ibsi(width, height, 4),
+	       decon->dqe_regs + ZUMAPRO_DQE_ATC_PARTIAL_IBSI_P1);
+	writel(zumapro_dqe_atc_ibsi(width, height, 2),
+	       decon->dqe_regs + ZUMAPRO_DQE_ATC_PARTIAL_IBSI_P2);
+	writel(zumapro_dqe_atc_cdf(width, height),
+	       decon->dqe_regs + ZUMAPRO_DQE_ATC_CDF_DIV);
+	writel(0, decon->dqe_regs + ZUMAPRO_DQE_ATC_CONTROL);
+	writel(0, decon->dqe_regs + ZUMAPRO_DQE_DISP_DITHER_V4);
+}
+
+static void zumapro_decon_program_outfifo(struct zumapro_decon *decon)
+{
+	/* Downstream DECON0 primary OUTFIFO owns SRAM banks 0..10. */
+	writel(0x11111111, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(0));
+	writel(0x00000111, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(1));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(2));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(3));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(0));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(1));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(2));
+	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(3));
+
+	writel(0, decon->main_regs + ZUMAPRO_DECON_OF_PIXEL_ORDER);
+	writel(0x1, decon->main_regs + ZUMAPRO_DECON_OF_URGENT_EN);
+	writel(0x08000400, decon->main_regs + ZUMAPRO_DECON_OF_RD_URGENT_0);
+	writel(0x10, decon->main_regs + ZUMAPRO_DECON_OF_RD_URGENT_1);
+	writel(0, decon->main_regs + ZUMAPRO_DECON_OF_WR_URGENT_0);
+	writel(0x1, decon->main_regs + ZUMAPRO_DECON_OF_DTA_CONTROL);
+	writel(0x32000600, decon->main_regs + ZUMAPRO_DECON_OF_DTA_THRESHOLD);
+}
+
 static void zumapro_decon_program_dsc(struct zumapro_decon *decon,
 				      const struct drm_display_mode *mode)
 {
@@ -594,6 +687,8 @@ static void zumapro_decon_program_dsc(struct zumapro_decon *decon,
 	writel(ZUMAPRO_DECON_OF_HEIGHT(mode->vdisplay) |
 	       ZUMAPRO_DECON_OF_WIDTH(outfifo_width),
 	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_0);
+	writel(ZUMAPRO_DECON_OF_TH_1H,
+	       decon->main_regs + ZUMAPRO_DECON_OF_TH_TYPE);
 	writel(ZUMAPRO_DECON_OF_WIDTH(outfifo_width),
 	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_1);
 	writel(ZUMAPRO_DECON_OF_HEIGHT(dsc->slice_height) |
@@ -610,11 +705,14 @@ static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
 	       ZUMAPRO_DECON_OF_WIDTH(mode->hdisplay),
 	       decon->main_regs + ZUMAPRO_DECON_BLD_BG_IMG_SIZE_PRI);
 
+	zumapro_decon_program_outfifo(decon);
+
 	writel(ZUMAPRO_DSIMIF_SEL_DSIM(pipeline->dsimif_fifo),
 	       decon->sub_regs + ZUMAPRO_DSIMIF_SEL(pipeline->dsimif));
 	writel(pipeline->data_path,
 	       decon->main_regs + ZUMAPRO_DECON_DATA_PATH_CON_0);
 
+	zumapro_decon_program_dqe(decon, mode);
 	zumapro_decon_program_dsc(decon, mode);
 
 	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
@@ -676,6 +774,9 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	int ret;
 
 	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				  ZUMAPRO_DECON_SHD_DQE,
+				  ZUMAPRO_DECON_SHD_DQE);
+	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
 				  ZUMAPRO_DECON_SHD_ALL_WINDOWS,
 				  ZUMAPRO_DECON_SHD_ALL_WINDOWS);
 
@@ -723,6 +824,16 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 				  ZUMAPRO_DECON_SHD_CMP,
 				  ZUMAPRO_DECON_SHD_GLOBAL |
 				  ZUMAPRO_DECON_SHD_CMP);
+
+	/* Let a frame in flight drain before the reset, like downstream. */
+	ret = readl_poll_timeout(decon->main_regs + ZUMAPRO_DECON_GLOBAL_CON,
+				 val,
+				 !(val & ZUMAPRO_DECON_GLOBAL_CON_RUN_STATUS),
+				 10, 50000);
+	if (ret)
+		dev_warn(decon->dev, "DECON%u did not stop scanout: %d\n",
+			 decon->id, ret);
+
 	zumapro_decon_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
 				  ZUMAPRO_DECON_GLOBAL_CON_SRESET,
 				  ZUMAPRO_DECON_GLOBAL_CON_SRESET);
@@ -800,9 +911,22 @@ static void zumapro_decon_atomic_enable(struct exynos_drm_crtc *crtc)
 		return;
 	}
 
+	/*
+	 * The bootloader hands off a live, scanning DECON; downstream always
+	 * stops and soft-resets the block before reprogramming it.
+	 */
+	zumapro_decon_stop(decon);
+
 	zumapro_decon_program_lcd(decon, mode);
 	zumapro_decon_program_colormap_window(decon, mode);
-	zumapro_decon_start(decon);
+
+	/*
+	 * Scanout must not start while the DSIM frame geometry is still
+	 * unprogrammed and the panel uninitialized; both happen in the
+	 * bridge-enable phase, after this hook.  Defer the start/unmask to
+	 * atomic_flush, which runs after the bridge chain is enabled.
+	 */
+	decon->start_pending = true;
 	decon->enabled = true;
 }
 
@@ -815,7 +939,19 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 
 	zumapro_decon_stop(decon);
 	decon->enabled = false;
+	decon->start_pending = false;
 	pm_runtime_put_sync(decon->dev);
+}
+
+static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+
+	if (!decon->enabled || !decon->start_pending)
+		return;
+
+	zumapro_decon_start(decon);
+	decon->start_pending = false;
 }
 
 static int zumapro_decon_enable_vblank(struct exynos_drm_crtc *crtc)
@@ -840,6 +976,7 @@ static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
 static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
 	.atomic_enable = zumapro_decon_atomic_enable,
 	.atomic_disable = zumapro_decon_atomic_disable,
+	.atomic_flush = zumapro_decon_atomic_flush,
 	.enable_vblank = zumapro_decon_enable_vblank,
 	.disable_vblank = zumapro_decon_disable_vblank,
 	.mode_valid = zumapro_decon_mode_valid,
@@ -1154,6 +1291,13 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 		devm_platform_ioremap_resource_byname(pdev, "wincon");
 	if (IS_ERR(decon->wincon_regs))
 		return PTR_ERR(decon->wincon_regs);
+
+	if (decon->pipeline) {
+		decon->dqe_regs =
+			devm_platform_ioremap_resource_byname(pdev, "dqe");
+		if (IS_ERR(decon->dqe_regs))
+			return PTR_ERR(decon->dqe_regs);
+	}
 
 	decon->dpp_count = of_count_phandle_with_args(dev->of_node, "dpps",
 						      NULL);

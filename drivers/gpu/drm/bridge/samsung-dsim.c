@@ -2162,6 +2162,25 @@ static void samsung_dsim_enable_irq(struct samsung_dsim *dsi)
 		enable_irq(gpiod_to_irq(dsi->te_gpio));
 }
 
+static void samsung_dsim_zumapro_start_handoff_link(struct samsung_dsim *dsi)
+{
+	const struct samsung_dsim_driver_data *driver_data = dsi->driver_data;
+	u32 mask;
+	u32 reg;
+
+	reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+	reg |= BIT(driver_data->tx_req_hsclk_bit);
+	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+
+	mask = ~(DSIM_INT_RX_DONE |
+		 DSIM_INT_SFR_FIFO_EMPTY |
+		 DSIM_INT_SFR_HDR_FIFO_EMPTY |
+		 DSIM_INT_RX_ECC_ERR |
+		 DSIM_INT_SW_RST_RELEASE);
+	samsung_dsim_write(dsi, DSIM_INTMSK_REG, mask);
+	samsung_dsim_write(dsi, DSIM_INTSRC_REG, 0xffffffff);
+}
+
 static void samsung_dsim_disable_irq(struct samsung_dsim *dsi)
 {
 	if (dsi->te_gpio)
@@ -2208,6 +2227,11 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 		if (ret)
 			return ret;
 
+		ret = samsung_dsim_init_link(dsi);
+		if (ret)
+			return ret;
+
+		samsung_dsim_zumapro_start_handoff_link(dsi);
 		samsung_dsim_enable_irq(dsi);
 		dsi->state |= DSIM_STATE_INITIALIZED;
 

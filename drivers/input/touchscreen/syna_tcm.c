@@ -50,6 +50,17 @@
 #define SYNA_TCM_OUT_MAX		32
 #define SYNA_TCM_CONFIG_MAX		256
 
+/*
+ * Per-transfer bus ceiling.  Controllers may split a single transfer that
+ * does not fit their FIFO into several bursts (spi-s3c64xx does so in
+ * polling mode above its 64-byte FIFO), and nothing guarantees the chip
+ * select stays asserted across the splits — a CS drop mid-message makes
+ * the device restart its output at the message header.  Staying below
+ * typical FIFO sizes keeps every read a single burst; larger payloads are
+ * fetched through the protocol's own ACK-driven continued reads instead.
+ */
+#define SYNA_TCM_XFER_MAX		63
+
 #define SYNA_TCM_RETRIES		5
 
 /* Power sequencing, from the downstream tegu DT. */
@@ -251,7 +262,7 @@ static int syna_tcm_read_chunk(struct syna_tcm *ts, unsigned int payload_len,
 	if (payload_len)
 		xfer_len += payload_len + SYNA_TCM_CRC_SIZE;
 
-	if (xfer_len > SYNA_TCM_MSG_MAX)
+	if (xfer_len > SYNA_TCM_XFER_MAX)
 		return -EINVAL;
 
 	error = syna_tcm_spi_read(ts, xfer_len);
@@ -310,7 +321,7 @@ static int syna_tcm_get_response(struct syna_tcm *ts)
 				     "truncating oversized message %#x len %u\n",
 				     code, total);
 
-	chunk_space = SYNA_TCM_MSG_MAX;
+	chunk_space = SYNA_TCM_XFER_MAX;
 	if (ts->max_rd_size)
 		chunk_space = min_t(unsigned int, chunk_space, ts->max_rd_size);
 	chunk_space -= SYNA_TCM_HEADER_SIZE + SYNA_TCM_CRC_SIZE;

@@ -395,8 +395,9 @@
 			reg = <0x11000000 0x8000>;
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>,
-				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>;
-			clock-names = "oscclk", "noc";
+				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_HSI0_PERI>;
+			clock-names = "oscclk", "noc", "peri";
 		};
 
 		/*
@@ -1159,6 +1160,55 @@
 				snps,dis-u2-freeclk-exists-quirk;
 				snps,dis-u1-entry-quirk;
 				snps,dis-u2-entry-quirk;
+			};
+		};
+
+		/*
+		 * Source: the BLK_HSI0 sysreg base/size and the USI2 SW_CONF
+		 * offset (0x101c) are from research/dumped.dts spi@111D0000
+		 * (samsung,usi-phandle/samsung,usi-offset) and the downstream
+		 * zumapro-usi.dtsi ("BLK_HSI0 USI2_HSI0").
+		 */
+		sysreg_hsi0: syscon@11020000 {
+			compatible = "google,zumapro-hsi0-sysreg", "syscon";
+			reg = <0x11020000 0x10000>;
+		};
+
+		/*
+		 * BLK_HSI0 USI2 in SPI mode: the touchscreen bus on tegu.
+		 * Address/IRQ are from research/dumped.dts spi@111D0000;
+		 * the node layout mirrors the in-tree gs101 USI/SPI nodes.
+		 *
+		 * Deliberately no "dmas": spi-s3c64xx then uses its polling
+		 * fallback, so the downstream pdma1 (PL330) does not need to
+		 * be brought up for first touch bring-up.
+		 *
+		 * No power-domains: BLK_HSI0 is kept on by the bootloader for
+		 * the (always-live) USB block, like the other HSI0 nodes.
+		 */
+		usi2_hsi0: usi@111d00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x111d00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_PCLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_hsi0 0x101c>;
+			samsung,mode = <USI_MODE_SPI>;
+			status = "disabled";
+
+			spi_20: spi@111d0000 {
+				compatible = "google,gs101-spi";
+				reg = <0x111d0000 0x30>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_PCLK>,
+					 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
+				clock-names = "spi", "spi_busclk0";
+				interrupts = <GIC_SPI 408 IRQ_TYPE_LEVEL_HIGH 0>;
+				status = "disabled";
 			};
 		};
 

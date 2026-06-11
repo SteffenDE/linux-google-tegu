@@ -18,11 +18,11 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_DPUF1_NOC + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI0_PERI + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK + 1)
-#define CLKS_NR_HSI0		(CLK_FOUT_USB + 1)
+#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USI2_USI_PCLK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
@@ -55,8 +55,11 @@
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP	0x2118
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC	0x211c
 #define CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC		0x1094
+#define CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI	0x1098
 #define CLK_CON_DIV_CLKCMU_HSI0_NOC		0x188c
+#define CLK_CON_DIV_CLKCMU_HSI0_PERI		0x1890
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC	0x20bc
+#define CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI	0x20c0
 #define CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM	0x1050
 #define CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC		0x1054
 #define CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC	0x1058
@@ -110,6 +113,9 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC,
 	CLK_CON_DIV_CLKCMU_HSI0_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI,
+	CLK_CON_DIV_CLKCMU_HSI0_PERI,
+	CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI,
 };
 
 /*
@@ -151,6 +157,10 @@ PNAME(mout_cmu_hsi0_noc_p) = {
 	"fout_shared2_d2", "fout_shared3_d2",
 	"fout_spare_pll", "oscclk", "oscclk", "oscclk",
 };
+PNAME(mout_cmu_hsi0_peri_p) = {
+	"fout_shared0_d4", "fout_shared2_d2",
+	"fout_shared3_d2", "fout_spare_pll",
+};
 PNAME(mout_cmu_dpu_noc_p) = {
 	"fout_shared0_d3", "fout_shared3_d1",
 	"fout_shared1_d3", "fout_shared0_d4",
@@ -188,6 +198,8 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_pericx_p, CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP, 0, 2),
 	MUX(CLK_MOUT_CMU_HSI0_NOC, "mout_cmu_hsi0_noc",
 	    mout_cmu_hsi0_noc_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC, 0, 3),
+	MUX(CLK_MOUT_CMU_HSI0_PERI, "mout_cmu_hsi0_peri",
+	    mout_cmu_hsi0_peri_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI, 0, 2),
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
@@ -272,6 +284,14 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_CMU_HSI0_NOC, "gout_cmu_hsi0_noc",
 	     "mout_cmu_hsi0_noc", CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
 	     21, CLK_IS_CRITICAL, 0),
+	/*
+	 * BLK_HSI0 USI feed (the touchscreen SPI runs off USI2).  Unlike the
+	 * console-UART feeds above, nothing depends on this clock outside the
+	 * SPI driver's own enable/disable, so plain refcounted gating is fine.
+	 */
+	GATE(CLK_GOUT_CMU_HSI0_PERI, "gout_cmu_hsi0_peri",
+	     "mout_cmu_hsi0_peri", CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI,
+	     21, 0, 0),
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
@@ -303,6 +323,8 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_peric1_ip", CLK_CON_DIV_CLKCMU_PERIC1_IP, 0, 4),
 	DIV(CLK_DOUT_CMU_HSI0_NOC, "dout_cmu_hsi0_noc",
 	    "gout_cmu_hsi0_noc", CLK_CON_DIV_CLKCMU_HSI0_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_HSI0_PERI, "dout_cmu_hsi0_peri",
+	    "gout_cmu_hsi0_peri", CLK_CON_DIV_CLKCMU_HSI0_PERI, 0, 4),
 };
 
 static const struct samsung_cmu_info top_cmu_info __initconst = {
@@ -647,15 +669,31 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
  * internal PLL_USB / DIV_CLK_HSI0_USB path (19.2 MHz), not the CMU_TOP USB32DRD
  * USER path; only the NOC USER mux, DIV_CLK_HSI0_USB and DIV_CLK_HSI0_EUSB are
  * modelled.
+ *
+ * The USI2 chain (touchscreen SPI) comes from the downstream Zuma CMUCAL like
+ * the rest of this file.  TRACE NEEDED: the USI2/PERI offsets have not been
+ * hardware-validated yet (the USB offsets from the same table have been).
  */
 #define PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER	0x0620
+#define PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER	0x0680
+#define CLK_CON_MUX_MUX_CLK_HSI0_USI2		0x101c
 #define CLK_CON_DIV_DIV_CLK_HSI0_USB		0x1804
 #define CLK_CON_DIV_DIV_CLK_HSI0_EUSB		0x180c
+#define CLK_CON_DIV_DIV_CLK_HSI0_USI2		0x181c
+#define CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK \
+							0x20fc
+#define CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_PCLK \
+							0x2100
 
 static const unsigned long hsi0_clk_regs[] __initconst = {
 	PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER,
+	PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER,
+	CLK_CON_MUX_MUX_CLK_HSI0_USI2,
 	CLK_CON_DIV_DIV_CLK_HSI0_USB,
 	CLK_CON_DIV_DIV_CLK_HSI0_EUSB,
+	CLK_CON_DIV_DIV_CLK_HSI0_USI2,
+	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK,
+	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_PCLK,
 };
 
 /*
@@ -669,10 +707,16 @@ static const struct samsung_fixed_rate_clock hsi0_fixed_clks[] __initconst = {
 };
 
 PNAME(mout_hsi0_noc_user_p) = { "oscclk", "dout_cmu_hsi0_noc" };
+PNAME(mout_hsi0_peri_user_p) = { "oscclk", "dout_cmu_hsi0_peri" };
+PNAME(mout_hsi0_usi2_p) = { "mout_hsi0_peri_user", "oscclk" };
 
 static const struct samsung_mux_clock hsi0_mux_clks[] __initconst = {
 	MUX(CLK_MOUT_HSI0_NOC_USER, "mout_hsi0_noc_user",
 	    mout_hsi0_noc_user_p, PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER, 4, 1),
+	MUX(CLK_MOUT_HSI0_PERI_USER, "mout_hsi0_peri_user",
+	    mout_hsi0_peri_user_p, PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER, 4, 1),
+	MUX(CLK_MOUT_HSI0_USI2, "mout_hsi0_usi2",
+	    mout_hsi0_usi2_p, CLK_CON_MUX_MUX_CLK_HSI0_USI2, 0, 1),
 };
 
 static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
@@ -681,6 +725,24 @@ static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
 	    CLK_CON_DIV_DIV_CLK_HSI0_USB, 0, 6),
 	DIV(CLK_DOUT_HSI0_EUSB, "dout_hsi0_eusb", "mout_hsi0_noc_user",
 	    CLK_CON_DIV_DIV_CLK_HSI0_EUSB, 0, 2),
+	DIV(CLK_DOUT_HSI0_USI2, "dout_hsi0_usi2", "mout_hsi0_usi2",
+	    CLK_CON_DIV_DIV_CLK_HSI0_USI2, 0, 4),
+};
+
+static const struct samsung_gate_clock hsi0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_HSI0_USI2_USI_CLK, "gout_hsi0_usi2_usi_clk",
+	     "dout_hsi0_usi2",
+	     CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK,
+	     21, CLK_SET_RATE_PARENT, 0),
+	/*
+	 * Downstream parents the USI2 pclk on MUX_CLK_HSI0_NOC; this driver
+	 * models the BLK_HSI0 fabric as the single NOC USER mux, like the
+	 * HSI2 pclk gates.
+	 */
+	GATE(CLK_GOUT_HSI0_USI2_USI_PCLK, "gout_hsi0_usi2_usi_pclk",
+	     "mout_hsi0_noc_user",
+	     CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_PCLK,
+	     21, 0, 0),
 };
 
 static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
@@ -690,6 +752,8 @@ static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
 	.nr_mux_clks	= ARRAY_SIZE(hsi0_mux_clks),
 	.div_clks	= hsi0_div_clks,
 	.nr_div_clks	= ARRAY_SIZE(hsi0_div_clks),
+	.gate_clks	= hsi0_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(hsi0_gate_clks),
 	.nr_clk_ids	= CLKS_NR_HSI0,
 	.clk_regs	= hsi0_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(hsi0_clk_regs),

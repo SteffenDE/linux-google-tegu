@@ -172,6 +172,7 @@ config DRM_PANEL_GOOGLE_TG4C
 	tristate "Google tg4c (Pixel 9a) panel"
 	depends on OF
 	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
 	select DRM_DISPLAY_DSC_HELPER
 	select DRM_DISPLAY_HELPER
 	select DRM_KMS_HELPER

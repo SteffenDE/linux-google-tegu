@@ -14,6 +14,7 @@
  * Copyright (c) 2026 Linden Maskat
  */
 
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/mod_devicetable.h>
@@ -30,6 +31,15 @@
 
 /* MIPI DSI high-speed clock, see downstream MIPI_DSI_FREQ_MBPS_DEFAULT. */
 #define TG4C_DSI_HS_CLK_MBPS	1102
+
+/*
+ * Brightness (DBV) range, from the downstream tg4c_btr_configs[] PVT entry:
+ * normal range is DBV 1..3628 (2..1200 nits), default 1829. The HBM range
+ * (3629..3939, up to 1800 nits) is gated behind a separate mode downstream
+ * and is intentionally not exposed here.
+ */
+#define TG4C_BRIGHTNESS_MAX	3628
+#define TG4C_BRIGHTNESS_DEFAULT	1829
 
 struct google_tg4c {
 	struct drm_panel panel;
@@ -382,6 +392,40 @@ static const struct drm_panel_funcs google_tg4c_panel_funcs = {
 	.get_modes = google_tg4c_get_modes,
 };
 
+/*
+ * Brightness is a plain DCS set_display_brightness (0x51) write, transcribed
+ * from downstream tg4c_set_brightness(). The value is sent MSB first (the
+ * downstream "br >> 8, br & 0xff" order), hence the _large helper. The write
+ * goes out in whatever LP/HS state the panel left the link in; the init
+ * sequence already runs in LP mode over the adopted live link, so LP commands
+ * during active scanout are the path proven on this hardware.
+ */
+static int google_tg4c_bl_update_status(struct backlight_device *bl)
+{
+	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	u16 brightness = backlight_get_brightness(bl);
+
+	return mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+}
+
+static const struct backlight_ops google_tg4c_bl_ops = {
+	.update_status = google_tg4c_bl_update_status,
+};
+
+static struct backlight_device *
+google_tg4c_create_backlight(struct mipi_dsi_device *dsi)
+{
+	struct device *dev = &dsi->dev;
+	const struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		.brightness = TG4C_BRIGHTNESS_DEFAULT,
+		.max_brightness = TG4C_BRIGHTNESS_MAX,
+	};
+
+	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
+					      &google_tg4c_bl_ops, &props);
+}
+
 /* Truncate signed value to a 6-bit two's-complement field (downstream macro). */
 #define TG4C_6BIT_SIGNED(v)	((v) & 0x3f)
 #define TG4C_RC_RANGE(min, max, offset) \
@@ -505,14 +549,18 @@ static int google_tg4c_probe(struct mipi_dsi_device *dsi)
 	google_tg4c_dsc_init(&ctx->dsc);
 	dsi->dsc = &ctx->dsc;
 
+	ctx->panel.backlight = google_tg4c_create_backlight(dsi);
+	if (IS_ERR(ctx->panel.backlight))
+		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
+				     "Failed to create backlight\n");
+
 	/*
-	 * TODO: the downstream driver implements brightness control
-	 * (tg4c_set_brightness), LHBM/local HBM overdrive (tg4c_set_local_hbm_*),
-	 * HBM (tg4c_set_hbm_mode), AOD/low-power modes (tg4c_lp_cmds, set_lp_mode),
-	 * dynamic 60/120Hz switching (tg4c_change_frequency), TE2, FFC retuning
-	 * and DDIC id/panel-rev read-back (tg4c_read_id / tg4c_get_panel_rev).
-	 * None of that is implemented here; a backlight device and the runtime
-	 * command paths still need to be wired up.
+	 * TODO: the downstream driver also implements LHBM/local HBM overdrive
+	 * (tg4c_set_local_hbm_*), HBM (tg4c_set_hbm_mode), AOD/low-power modes
+	 * (tg4c_lp_cmds, set_lp_mode), dynamic 60/120Hz switching
+	 * (tg4c_change_frequency), TE2, FFC retuning and DDIC id/panel-rev
+	 * read-back (tg4c_read_id / tg4c_get_panel_rev). None of that is
+	 * implemented here.
 	 */
 
 	drm_panel_add(&ctx->panel);

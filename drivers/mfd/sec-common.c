@@ -56,6 +56,14 @@ static const struct mfd_cell s2mpg11_devs[] = {
 	MFD_CELL_OF("s2mpg11-gpio", NULL, NULL, 0, 0, "samsung,s2mpg11-gpio"),
 };
 
+/*
+ * Regulators only for now; meter/RTC/clk/gpio cells can be added once
+ * their drivers grow s2mpg14 support.
+ */
+static const struct mfd_cell s2mpg14_devs[] = {
+	MFD_CELL_NAME("s2mpg14-regulator"),
+};
+
 static const struct resource s2mps11_rtc_resources[] = {
 	DEFINE_RES_IRQ_NAMED(S2MPS11_IRQ_RTCA0, "alarm"),
 };
@@ -125,6 +133,7 @@ static void sec_pmic_dump_rev(struct sec_pmic_dev *sec_pmic)
 	switch (sec_pmic->device_type) {
 	case S2MPG10:
 	case S2MPG11:
+	case S2MPG14:
 		/* For s2mpg1x, the revision is in a different regmap */
 		return;
 	case S2MU005:
@@ -246,6 +255,10 @@ int sec_pmic_probe(struct device *dev, int device_type, unsigned int irq,
 	case S2MPG11:
 		sec_devs = s2mpg11_devs;
 		num_sec_devs = ARRAY_SIZE(s2mpg11_devs);
+		break;
+	case S2MPG14:
+		sec_devs = s2mpg14_devs;
+		num_sec_devs = ARRAY_SIZE(s2mpg14_devs);
 		break;
 	case S2MPS11X:
 		sec_devs = s2mps11_devs;

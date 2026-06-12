@@ -19,6 +19,7 @@
 #include <linux/mfd/samsung/core.h>
 #include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mpg11.h>
+#include <linux/mfd/samsung/s2mpg14.h>
 #include <linux/mfd/samsung/s2mps11.h>
 #include <linux/mfd/samsung/s2mps13.h>
 #include <linux/mfd/samsung/s2mps14.h>
@@ -1257,6 +1258,46 @@ static const struct s2mpg10_regulator_desc s2mpg11_regulators[] = {
 	s2mpg11_regulator_desc_ldo(15, "vinl3s", s2mpg11_ldo_vranges3)
 };
 
+/*
+ * S2MPG14 (Google Tensor G4 "zumapro" main PMIC): enable-only descriptors
+ * for the rails mainline currently consumes, addressed through the ACPM
+ * firmware like s2mpg10/11 above.
+ *
+ * Voltage control is deliberately not wired up: the bootloader leaves
+ * every voltage selector at the correct value, and the downstream kernel
+ * never rewrites them for these rails either (it only flips the enable
+ * bit; hardware-verified by tracing the ACPM PMIC channel on the
+ * Pixel 9a).  Without voltage ops a wrong device tree constraint fails
+ * regulator registration instead of programming the rail.  Add per-rail
+ * voltage ranges only when a consumer actually needs to change a voltage,
+ * with datasheet-verified selector encodings.
+ */
+static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
+	.is_enabled		= regulator_is_enabled_regmap,
+	.enable			= regulator_enable_regmap,
+	.disable		= regulator_disable_regmap,
+};
+
+/* LxM_CTRL bits 7:6 select the operating mode; bit 7 alone is plain on/off. */
+#define regulator_desc_s2mpg14_ldo(_num)				\
+	[S2MPG14_LDO##_num] = {						\
+		.name		= "ldo" #_num "m",			\
+		.of_match	= of_match_ptr("ldo" #_num "m"),	\
+		.regulators_node = of_match_ptr("regulators"),		\
+		.id		= S2MPG14_LDO##_num,			\
+		.ops		= &s2mpg14_reg_enable_only_ops,		\
+		.type		= REGULATOR_VOLTAGE,			\
+		.owner		= THIS_MODULE,				\
+		.enable_reg	= S2MPG14_PMIC_L##_num##M_CTRL,		\
+		.enable_mask	= BIT(7),				\
+		.enable_time	= 130,					\
+	}
+
+static const struct regulator_desc s2mpg14_regulators[] = {
+	regulator_desc_s2mpg14_ldo(4),
+	regulator_desc_s2mpg14_ldo(25),
+};
+
 static const struct regulator_ops s2mps11_ldo_ops = {
 	.list_voltage		= regulator_list_voltage_linear,
 	.map_voltage		= regulator_map_voltage_linear,
@@ -2187,6 +2228,11 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 		s2mpg1x_regulators = s2mpg11_regulators;
 		BUILD_BUG_ON(ARRAY_SIZE(s2mpg11_regulators) > S2MPS_REGULATOR_MAX);
 		break;
+	case S2MPG14:
+		rdev_num = ARRAY_SIZE(s2mpg14_regulators);
+		regulators = s2mpg14_regulators;
+		BUILD_BUG_ON(ARRAY_SIZE(s2mpg14_regulators) > S2MPS_REGULATOR_MAX);
+		break;
 	case S2MPS11X:
 		rdev_num = ARRAY_SIZE(s2mps11_regulators);
 		regulators = s2mps11_regulators;
@@ -2268,6 +2314,7 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 static const struct platform_device_id s2mps11_pmic_id[] = {
 	{ "s2mpg10-regulator", S2MPG10},
 	{ "s2mpg11-regulator", S2MPG11},
+	{ "s2mpg14-regulator", S2MPG14},
 	{ "s2mps11-regulator", S2MPS11X},
 	{ "s2mps13-regulator", S2MPS13X},
 	{ "s2mps14-regulator", S2MPS14X},

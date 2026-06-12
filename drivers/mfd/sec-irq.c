@@ -424,6 +424,13 @@ struct regmap_irq_chip_data *sec_irq_init(struct sec_pmic_dev *sec_pmic)
 	case S2MPG10:
 	case S2MPG11:
 		return sec_irq_init_s2mpg1x(sec_pmic);
+	case S2MPG14:
+		/*
+		 * The s2mpg14 interrupt arrives through the APM vGPIO
+		 * interrupt combiner, which has no mainline driver yet.
+		 * Regulator-only operation does not need it.
+		 */
+		return NULL;
 	case S2MPS11X:
 		sec_irq_chip = &s2mps11_irq_chip;
 		break;

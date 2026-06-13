@@ -824,10 +824,19 @@ static const struct acpm_match_data acpm_gs101 = {
 	.acpm_clk_dev_name = "gs101-acpm-clk",
 };
 
+static const struct acpm_match_data acpm_zumapro = {
+	/* Same SRAM channel-table offset as gs101, confirmed on silicon. */
+	.initdata_base = ACPM_GS101_INITDATA_BASE,
+	.acpm_clk_dev_name = "zumapro-acpm-clk",
+};
+
 static const struct of_device_id acpm_match[] = {
 	{
 		.compatible = "google,gs101-acpm-ipc",
 		.data = &acpm_gs101,
+	}, {
+		.compatible = "google,zumapro-acpm-ipc",
+		.data = &acpm_zumapro,
 	},
 	{},
 };

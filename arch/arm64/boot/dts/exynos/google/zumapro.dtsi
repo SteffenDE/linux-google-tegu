@@ -84,6 +84,14 @@
 				     "google,gs101-acpm-ipc";
 			mboxes = <&ap2apm_mailbox>;
 			shmem = <&apm_sram>;
+			/*
+			 * clk-acpm registers its ACPM-DVFS clocks against this
+			 * node (the child clk device has no of_node, so the clk
+			 * core falls back to the parent), so consumers reference
+			 * them as <&acpm_ipc id>, where id is the ACPM DVFS
+			 * domain index (e.g. 7 = G3D, 8 = G3DL2).
+			 */
+			#clock-cells = <1>;
 		};
 	};
 
@@ -847,6 +855,51 @@
 						data-lanes = <1 2 3 4>;
 						remote-endpoint = <&panel_in>;
 					};
+				};
+			};
+		};
+
+		/*
+		 * GPU: Mali-G715 (Valhall CSF, arch 11.2, product tTUx), driven by
+		 * mainline panthor.  Source: downstream research/dumped_uart.dts:5592
+		 * (mali@1F000000) and research/gpu.md.  Disabled here; enabled per
+		 * board in zumapro-tegu.dts once the CSF firmware blob is staged.
+		 *
+		 * Clocks are ACPM-backed (Route B).  The two GPU DVFS domains are
+		 * G3DL2 (ACPM id 8, downstream gpu0 = TOP_LEVEL) and G3D (id 7,
+		 * downstream gpu1 = SHADERS).  panthor's clk #0 ("core") is the
+		 * top-level clock, so core = G3DL2 (8) and stacks = G3D (7).
+		 *
+		 * panthor requires an operating-points-v2 table to probe
+		 * (panthor_devfreq_init -> devm_pm_opp_of_add_table returns -ENODEV
+		 * without one), so gpu_opp_table below pins the core/G3DL2 clock at
+		 * its ACPM idle rate (160 MHz) for first light; the full DVFS ladder
+		 * and thermal come in a later phase.  No mali-supply: the S2MPG15 GPU
+		 * bucks are regulator-always-on and GPU voltage scales through ACPM
+		 * (gpu.md §9), so each OPP is frequency-only and ACPM applies the
+		 * matching voltage in firmware.  The s2mpu_s0_g3d bypass is handled
+		 * separately on the G3D power-on path (gpu.md §8).
+		 */
+		gpu: gpu@1f000000 {
+			compatible = "google,zumapro-mali", "arm,mali-valhall-csf";
+			reg = <0x1f000000 0x480000>;
+			#cooling-cells = <2>;
+			clocks = <&acpm_ipc 8>, <&acpm_ipc 7>;
+			clock-names = "core", "stacks";
+			interrupts = <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 346 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "job", "mmu", "gpu";
+			operating-points-v2 = <&gpu_opp_table>;
+			power-domains = <&pd_g3d>, <&pd_embedded_g3d>;
+			power-domain-names = "top", "cores";
+			status = "disabled";
+
+			gpu_opp_table: opp-table {
+				compatible = "operating-points-v2";
+
+				opp-160000000 {
+					opp-hz = /bits/ 64 <160000000>;
 				};
 			};
 		};

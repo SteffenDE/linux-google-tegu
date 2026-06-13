@@ -344,12 +344,16 @@
 	 * research/dumped_uart.dts:2699-2719 and the Phase-0 power-on trace
 	 * (research/gpu-power-trace-results.md).  Two domains: pd_g3d (top, the
 	 * EL3-protected PMU register -> secure SMC path) and pd_embedded_g3d
-	 * (the shader cores, a child of pd_g3d).  Power ordering observed
-	 * downstream: top->cores on, cores->top off, all clean (no SError) over
-	 * ~30 cycles.  Unlike the display domains below, these are NOT marked
-	 * samsung,always-on: panthor's runtime PM toggles them.  Enabled here so
-	 * the provider registers (Phase 1); the actual power transition is
-	 * exercised by the GPU consumer (Phase 3).
+	 * (the shader cores, a child of pd_g3d).
+	 *
+	 * Both are samsung,always-on.  On silicon the bootloader hands the GPU
+	 * over fully powered (both PMU status regs 0x15461a84/0x15461c84 read 1),
+	 * and the mainline power-OFF sequence times out on the cores domain (the
+	 * CMU handshake the downstream pmucal performs around the transition is
+	 * not yet replicated here), so genpd_power_off_unused cannot gate them.
+	 * For first light we adopt the live, powered state (as the display splash
+	 * pipeline does) instead of exercising an unproven off->on cycle; real
+	 * runtime-PM power-cycling can drop always-on once the off-sequence works.
 	 */
 	pd_g3d: power-domain@15461a80 {
 		compatible = "google,zumapro-pd";
@@ -357,6 +361,7 @@
 		      <0x0 0x1ee00800 0x4>;
 		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x1ee10204>;
+		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "G3D";
 	};
@@ -366,6 +371,7 @@
 		reg = <0x0 0x15461c80 0x20>;
 		reg-names = "pmu";
 		power-domains = <&pd_g3d>;
+		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "G3D_CORES";
 	};

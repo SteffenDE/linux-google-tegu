@@ -332,6 +332,37 @@
 	};
 
 	/*
+	 * GPU (Mali-G715 / Tensor G4 "G3D") PM domains.  Source: downstream
+	 * research/dumped_uart.dts:2699-2719 and the Phase-0 power-on trace
+	 * (research/gpu-power-trace-results.md).  Two domains: pd_g3d (top, the
+	 * EL3-protected PMU register -> secure SMC path) and pd_embedded_g3d
+	 * (the shader cores, a child of pd_g3d).  Power ordering observed
+	 * downstream: top->cores on, cores->top off, all clean (no SError) over
+	 * ~30 cycles.  Unlike the display domains below, these are NOT marked
+	 * samsung,always-on: panthor's runtime PM toggles them.  Enabled here so
+	 * the provider registers (Phase 1); the actual power transition is
+	 * exercised by the GPU consumer (Phase 3).
+	 */
+	pd_g3d: power-domain@15461a80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461a80 0x20>,
+		      <0x0 0x1ee00800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x1ee10204>;
+		#power-domain-cells = <0>;
+		label = "G3D";
+	};
+
+	pd_embedded_g3d: power-domain@15461c80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461c80 0x20>;
+		reg-names = "pmu";
+		power-domains = <&pd_g3d>;
+		#power-domain-cells = <0>;
+		label = "G3D_CORES";
+	};
+
+	/*
 	 * Display PM domains.  Source: downstream zumapro-pm-domains.dtsi and
 	 * research/dumped.dts:2721-2754.  Keep disabled until the display clock,
 	 * SysMMU, DSIM, and DECON drivers can consume them together; enabling

@@ -8,6 +8,8 @@
 
 /dts-v1/;
 
+#include <dt-bindings/input/input.h>
+
 #include "zumapro.dtsi"
 
 / {
@@ -50,6 +52,43 @@
 			stride = <(1080 * 4)>;
 			format = "a8r8g8b8";
 			status = "okay";
+		};
+	};
+
+	/*
+	 * Hardware buttons.  All three are plain alive-bank GPIOs with wakeup
+	 * EINTs and no PMIC involvement, so they work with just gpio-keys + the
+	 * pin mux below.  Source: research/dumped.dts:15219-15245 (gpio_keys)
+	 * and the key-power/key-volup/key-voldown pin nodes there: power on
+	 * gpa4-0 (pull-up), volume-down on gpa4-1 and volume-up on gpa6-2 (both
+	 * pull-none), all in EINT function.  The downstream Android gpio flag
+	 * 0x0f is its own encoding; mainline buttons are active-low (pressed =
+	 * grounded), matching the in-tree exynos2200-g0s gpio-keys.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&key_power &key_voldown &key_volup>;
+
+		key-power {
+			label = "Power";
+			linux,code = <KEY_POWER>;
+			gpios = <&gpa4 0 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		key-voldown {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&gpa4 1 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		key-volup {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&gpa6 2 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 	};
 
@@ -525,6 +564,35 @@
 &pinctrl_peric0 {
 	ts_reset: ts-reset-pins {
 		samsung,pins = "gpp1-1";
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+/*
+ * Button pin mux.  Function EINT (0xf) and the pulls match the downstream
+ * key-power/key-voldown/key-volup nodes exactly (power pulls up, the volume
+ * keys float).  Requesting the wakeup EINT on each gpio-keys gpio drives the
+ * interrupt; the static EINT mux here mirrors the in-tree exynos2200-g0s board.
+ */
+&pinctrl_alive {
+	key_power: key-power-pins {
+		samsung,pins = "gpa4-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	key_voldown: key-voldown-pins {
+		samsung,pins = "gpa4-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	key_volup: key-volup-pins {
+		samsung,pins = "gpa6-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};

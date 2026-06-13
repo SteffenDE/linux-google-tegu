@@ -8,6 +8,8 @@
 
 /dts-v1/;
 
+#include <dt-bindings/input/input.h>
+
 #include "zumapro.dtsi"
 
 / {
@@ -50,6 +52,43 @@
 			stride = <(1080 * 4)>;
 			format = "a8r8g8b8";
 			status = "okay";
+		};
+	};
+
+	/*
+	 * Hardware buttons.  All three are plain alive-bank GPIOs with wakeup
+	 * EINTs and no PMIC involvement, so they work with just gpio-keys + the
+	 * pin mux below.  Source: research/dumped.dts:15219-15245 (gpio_keys)
+	 * and the key-power/key-volup/key-voldown pin nodes there: power on
+	 * gpa4-0 (pull-up), volume-down on gpa4-1 and volume-up on gpa6-2 (both
+	 * pull-none), all in EINT function.  The downstream Android gpio flag
+	 * 0x0f is its own encoding; mainline buttons are active-low (pressed =
+	 * grounded), matching the in-tree exynos2200-g0s gpio-keys.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&key_power &key_voldown &key_volup>;
+
+		key-power {
+			label = "Power";
+			linux,code = <KEY_POWER>;
+			gpios = <&gpa4 0 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		key-voldown {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&gpa4 1 GPIO_ACTIVE_LOW>;
+			wakeup-source;
+		};
+
+		key-volup {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&gpa6 2 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 	};
 
@@ -461,5 +500,124 @@
 
 	panel@0 {
 		status = "okay";
+	};
+};
+
+/*
+ * S2MPG14 main PMIC, reached over ACPM IPC channel 2 with PMIC select 0.
+ * Source: downstream zuma-pmic.dtsi s2mpg14mfd (acpm-ipc-channel = <2>,
+ * acpm-speedy-channel = <0>, IRQ = INTCOMB_VGPIO2AP_ALIVE = GIC SPI 74).
+ * The interrupt is the APM vGPIO combiner output; the mainline driver
+ * does not request it yet (no combiner driver), it only has to resolve.
+ *
+ * Only the touchscreen rails are described, and deliberately WITHOUT
+ * voltage constraints: the driver is enable-only, the bootloader leaves
+ * the voltage selectors at the correct values (L4M reads 0x3c, L25M 0x2c
+ * before the downstream kernel touches them), and the downstream kernel
+ * also only ever flips the enable bit (UPDATE val=0x80 mask=0x80) —
+ * hardware-verified in research/tracing/acpm-boot-rail-snapshot.md.
+ * Downstream constraints, for reference only: L4M 2.5-3.3 V (TS1_AVDD),
+ * L25M 1.6-1.95 V (TS1_DVDD).  Keep new rails equally minimal; a wrong
+ * voltage constraint here is the one thing that can genuinely damage
+ * hardware.
+ */
+&acpm_ipc {
+	pmic {
+		compatible = "samsung,s2mpg14-pmic";
+		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH 0>;
+
+		regulators {
+			s2mpg14_ldo4: ldo4m {
+				regulator-name = "L4M_TS1_AVDD";
+			};
+
+			s2mpg14_ldo25: ldo25m {
+				regulator-name = "L25M_TS1_DVDD";
+			};
+		};
+	};
+};
+
+/*
+ * Touchscreen: Synaptics TouchComm on BLK_HSI0 USI2 SPI, CS0, 10 MHz.
+ * Wiring is from the downstream zuma-tegu-common-touch.dtsi and
+ * research/dumped.dts touchscreen@0: IRQ gpn0-0 (active-low, custom-alive
+ * EINT bank), reset gpp1-1 (active-low), rails S2MPG14 m_ldo25 (vdd,
+ * 1.8 V, L25M_TSP_DVDD) and m_ldo4 (avdd, 3.3 V, L4M_TS_AVDD).
+ *
+ * The SPI bus pins keep their bootloader mux: downstream ships an empty
+ * pinctrl-0 on this bus, and pinctrl_hsi0 stays disabled here so nothing
+ * disturbs them (same adoption approach as the display pipeline).
+ *
+ * HW boot 2026-06-12 confirmed the rails are off after ABL (probe ran,
+ * SPI transferred, IDENTIFY read all-zero), so they are wired to the
+ * real s2mpg14 LDOs above and the driver powers them up itself.
+ */
+&pinctrl_eint {
+	ts_irq: ts-irq-pins {
+		samsung,pins = "gpn0-0";
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+&pinctrl_peric0 {
+	ts_reset: ts-reset-pins {
+		samsung,pins = "gpp1-1";
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+/*
+ * Button pin mux.  Function EINT (0xf) and the pulls match the downstream
+ * key-power/key-voldown/key-volup nodes exactly (power pulls up, the volume
+ * keys float).  Requesting the wakeup EINT on each gpio-keys gpio drives the
+ * interrupt; the static EINT mux here mirrors the in-tree exynos2200-g0s board.
+ */
+&pinctrl_alive {
+	key_power: key-power-pins {
+		samsung,pins = "gpa4-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	key_voldown: key-voldown-pins {
+		samsung,pins = "gpa4-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	key_volup: key-volup-pins {
+		samsung,pins = "gpa6-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+&usi2_hsi0 {
+	status = "okay";
+};
+
+&spi_20 {
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "syna,tcm-spi";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-cs-setup-delay-ns = <2000>;
+
+		interrupts-extended = <&gpn0 0 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&gpp1 1 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts_irq &ts_reset>;
+
+		vdd-supply = <&s2mpg14_ldo25>;
+		avdd-supply = <&s2mpg14_ldo4>;
 	};
 };

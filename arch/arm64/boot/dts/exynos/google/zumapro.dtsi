@@ -69,6 +69,25 @@
 	};
 
 	/*
+	 * Source: gs101.dtsi ACPM pattern.  Protocol identity with gs101 was
+	 * hardware-verified on the Pixel 9a: the channel table at SRAM+0xa000
+	 * parses with the mainline gs101 initdata structs (16 channels, PMIC
+	 * on channel 2), and a full boot of the downstream kernel traced
+	 * under the m1n1 hypervisor showed the identical doorbell/queue/PMIC
+	 * wire protocol, so the gs101 fallback compatible drives the zumapro
+	 * ACPM firmware unmodified.  See research/tracing/acpm-channels.md
+	 * and research/tracing/acpm-boot-rail-snapshot.md.
+	 */
+	firmware {
+		acpm_ipc: power-management {
+			compatible = "google,zumapro-acpm-ipc",
+				     "google,gs101-acpm-ipc";
+			mboxes = <&ap2apm_mailbox>;
+			shmem = <&apm_sram>;
+		};
+	};
+
+	/*
 	 * Source: dumped.dts:7858-7863. The pre-guest m1n1 readout shows
 	 * gpp0-1 is an output but low at handoff, so Linux must assert this
 	 * fixed-regulator GPIO before UFS link startup.
@@ -395,8 +414,9 @@
 			reg = <0x11000000 0x8000>;
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>,
-				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>;
-			clock-names = "oscclk", "noc";
+				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_HSI0_PERI>;
+			clock-names = "oscclk", "noc", "peri";
 		};
 
 		/*
@@ -1163,6 +1183,55 @@
 		};
 
 		/*
+		 * Source: the BLK_HSI0 sysreg base/size and the USI2 SW_CONF
+		 * offset (0x101c) are from research/dumped.dts spi@111D0000
+		 * (samsung,usi-phandle/samsung,usi-offset) and the downstream
+		 * zumapro-usi.dtsi ("BLK_HSI0 USI2_HSI0").
+		 */
+		sysreg_hsi0: syscon@11020000 {
+			compatible = "google,zumapro-hsi0-sysreg", "syscon";
+			reg = <0x11020000 0x10000>;
+		};
+
+		/*
+		 * BLK_HSI0 USI2 in SPI mode: the touchscreen bus on tegu.
+		 * Address/IRQ are from research/dumped.dts spi@111D0000;
+		 * the node layout mirrors the in-tree gs101 USI/SPI nodes.
+		 *
+		 * Deliberately no "dmas": spi-s3c64xx then uses its polling
+		 * fallback, so the downstream pdma1 (PL330) does not need to
+		 * be brought up for first touch bring-up.
+		 *
+		 * No power-domains: BLK_HSI0 is kept on by the bootloader for
+		 * the (always-live) USB block, like the other HSI0 nodes.
+		 */
+		usi2_hsi0: usi@111d00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x111d00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_PCLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_hsi0 0x101c>;
+			samsung,mode = <USI_MODE_SPI>;
+			status = "disabled";
+
+			spi_20: spi@111d0000 {
+				compatible = "google,gs101-spi";
+				reg = <0x111d0000 0x30>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_PCLK>,
+					 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
+				clock-names = "spi", "spi_busclk0";
+				interrupts = <GIC_SPI 408 IRQ_TYPE_LEVEL_HIGH 0>;
+				status = "disabled";
+			};
+		};
+
+		/*
 		 * Source: pinctrl controller addresses/IRQs are from:
 		 *  - peric0: research/dumped.dts:3393-3397
 		 *  - peric1: research/dumped.dts:4139-4143
@@ -1768,6 +1837,26 @@
 			reg = <0x15460000 0x10000>;
 		};
 
+		/*
+		 * Source: AP2APM mailbox base and IRQ are from the downstream
+		 * ACPM node in research/dumped.dts:15292-15296 (reg 0x15110000,
+		 * GIC SPI 80).  The register layout was hardware-verified by
+		 * tracing the downstream kernel under the m1n1 hypervisor:
+		 * doorbell = 1 << channel to INTGR1 (+0x40), AP-side ack/status
+		 * on INTCR0/INTSR0, exactly the gs101 driver's model.  The
+		 * mailbox pclk sits in the always-on APM block with no mainline
+		 * CMU support; ext_24_5m stands in for it like the watchdog
+		 * clocks below.
+		 */
+		ap2apm_mailbox: mailbox@15110000 {
+			compatible = "google,zumapro-mbox", "google,gs101-mbox";
+			reg = <0x15110000 0x1000>;
+			clocks = <&ext_24_5m>;
+			clock-names = "pclk";
+			interrupts = <GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH 0>;
+			#mbox-cells = <0>;
+		};
+
 		pinctrl_gsacore4: pinctrl@16140000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x16140000 0x1000>;
@@ -1828,6 +1917,20 @@
 			timeout-sec = <30>;
 			status = "disabled";
 		};
+	};
+
+	/*
+	 * Source: APM SRAM base/size are from the downstream ACPM node in
+	 * research/dumped.dts:15296 (0x15700000, 0x58000).  The ACPM channel
+	 * table at offset 0xa000 was dumped live over the m1n1 proxy
+	 * (scripts/acpm-dump-channels.py, research/tracing/acpm-channels.md).
+	 */
+	apm_sram: sram@15700000 {
+		compatible = "mmio-sram";
+		reg = <0x0 0x15700000 0x58000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0x15700000 0x58000>;
 	};
 
 	/*

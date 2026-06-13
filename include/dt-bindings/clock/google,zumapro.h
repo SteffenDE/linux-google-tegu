@@ -56,6 +56,15 @@
 #define CLK_DOUT_CMU_HSI0_NOC			36
 
 /*
+ * CMU_TOP HSI0 PERI feed.  Unlike USB, the BLK_HSI0 USI serial engines (the
+ * touchscreen SPI hangs off USI2) are clocked from this CMU_TOP feed via the
+ * CMU_HSI0 PERI USER mux.
+ */
+#define CLK_MOUT_CMU_HSI0_PERI			51
+#define CLK_GOUT_CMU_HSI0_PERI			52
+#define CLK_DOUT_CMU_HSI0_PERI			53
+
+/*
  * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
  * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
  * brought up.
@@ -145,6 +154,17 @@
 #define CLK_DOUT_HSI0_USB			2
 #define CLK_DOUT_HSI0_EUSB			3
 #define CLK_FOUT_USB				4
+
+/*
+ * CMU_HSI0 USI2 clocks (touchscreen SPI).  The ipclk chain is
+ * PERI USER mux -> USI2 mux -> USI2 div -> ipclk gate; the pclk gate sits on
+ * the NOC user mux like the other BLK_HSI0 bus clocks.
+ */
+#define CLK_MOUT_HSI0_PERI_USER			5
+#define CLK_MOUT_HSI0_USI2			6
+#define CLK_DOUT_HSI0_USI2			7
+#define CLK_GOUT_HSI0_USI2_USI_CLK		8
+#define CLK_GOUT_HSI0_USI2_USI_PCLK		9
 
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1

@@ -541,6 +541,7 @@
 		compatible = "syna,tcm-spi";
 		reg = <0>;
 		spi-max-frequency = <10000000>;
+		spi-cs-setup-delay-ns = <2000>;
 
 		interrupts-extended = <&gpn0 0 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpp1 1 GPIO_ACTIVE_LOW>;

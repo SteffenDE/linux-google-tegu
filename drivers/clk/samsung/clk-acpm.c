@@ -63,6 +63,42 @@ static const struct acpm_clk_driver_data acpm_clk_gs101 = {
 	.mbox_chan_id = 0,
 };
 
+/*
+ * Zuma/Zumapro (Tensor G4) ACPM DVFS domains, in the firmware enum order from
+ * the downstream cal-if (drivers/soc/google/cal-if/zuma/acpm_dvfs_zuma.h):
+ * MIF, INT, CPUCL0..2, then DSU and BCI, then G3D and G3DL2.  The DSU/BCI
+ * insertion is why the GPU domains sit at indices 7/8 here, versus 5/6 on
+ * gs101 -- the GPU cal_ids (0xb040007 = G3D, 0xb040008 = G3DL2) carry those
+ * indices in their low 16 bits (cmucal MASK_OF_ID), and the driver passes the
+ * array index straight to ACPM as the DVFS domain id, so the array order must
+ * match the firmware enum exactly.  Only the prefix through G3DL2 is listed:
+ * everything up to here is needed to keep index == domain-id for the GPU, and
+ * later domains (TPU, CAM, ...) can be appended when a consumer lands.
+ */
+static const struct acpm_clk_variant zumapro_acpm_clks[] = {
+	ACPM_CLK("mif"),	/* 0 */
+	ACPM_CLK("int"),	/* 1 */
+	ACPM_CLK("cpucl0"),	/* 2 */
+	ACPM_CLK("cpucl1"),	/* 3 */
+	ACPM_CLK("cpucl2"),	/* 4 */
+	ACPM_CLK("dsu"),	/* 5 */
+	ACPM_CLK("bci"),	/* 6 */
+	ACPM_CLK("g3d"),	/* 7 */
+	ACPM_CLK("g3dl2"),	/* 8 */
+};
+
+static const struct acpm_clk_driver_data acpm_clk_zumapro = {
+	.clks = zumapro_acpm_clks,
+	.nr_clks = ARRAY_SIZE(zumapro_acpm_clks),
+	/*
+	 * DVFS requests go on ACPM mailbox channel 1 on zumapro (channel 0 is
+	 * framework/control).  Confirmed by the on-silicon channel dump
+	 * (research/tracing/acpm-channels.md) and the downstream
+	 * samsung,exynos-dvfs-manager acpm-ipc-channel = <1>.
+	 */
+	.mbox_chan_id = 1,
+};
+
 static unsigned long acpm_clk_recalc_rate(struct clk_hw *hw,
 					  unsigned long parent_rate)
 {
@@ -113,6 +149,7 @@ static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
 
 static int acpm_clk_probe(struct platform_device *pdev)
 {
+	const struct acpm_clk_driver_data *data;
 	struct acpm_handle *acpm_handle;
 	struct clk_hw_onecell_data *clk_data;
 	struct clk_hw **hws;
@@ -121,13 +158,18 @@ static int acpm_clk_probe(struct platform_device *pdev)
 	unsigned int mbox_chan_id;
 	int i, err, count;
 
+	data = (const struct acpm_clk_driver_data *)
+		platform_get_device_id(pdev)->driver_data;
+	if (!data)
+		return -ENODEV;
+
 	acpm_handle = devm_acpm_get_by_node(dev, dev->parent->of_node);
 	if (IS_ERR(acpm_handle))
 		return dev_err_probe(dev, PTR_ERR(acpm_handle),
 				     "Failed to get acpm handle\n");
 
-	count = acpm_clk_gs101.nr_clks;
-	mbox_chan_id = acpm_clk_gs101.mbox_chan_id;
+	count = data->nr_clks;
+	mbox_chan_id = data->mbox_chan_id;
 
 	clk_data = devm_kzalloc(dev, struct_size(clk_data, hws, count),
 				GFP_KERNEL);
@@ -154,8 +196,7 @@ static int acpm_clk_probe(struct platform_device *pdev)
 
 		hws[i] = &aclk->hw;
 
-		err = acpm_clk_register(dev, aclk,
-					acpm_clk_gs101.clks[i].name);
+		err = acpm_clk_register(dev, aclk, data->clks[i].name);
 		if (err)
 			return dev_err_probe(dev, err,
 					     "Failed to register clock\n");
@@ -166,7 +207,8 @@ static int acpm_clk_probe(struct platform_device *pdev)
 }
 
 static const struct platform_device_id acpm_clk_id[] = {
-	{ "gs101-acpm-clk" },
+	{ "gs101-acpm-clk", (kernel_ulong_t)&acpm_clk_gs101 },
+	{ "zumapro-acpm-clk", (kernel_ulong_t)&acpm_clk_zumapro },
 	{}
 };
 MODULE_DEVICE_TABLE(platform, acpm_clk_id);

@@ -18,6 +18,7 @@ properties:
     oneOf:
       - items:
           - enum:
+              - google,zumapro-mali       # G715
               - mediatek,mt8196-mali
               - nxp,imx95-mali            # G310
               - rockchip,rk3588-mali

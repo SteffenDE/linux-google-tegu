@@ -911,6 +911,25 @@
 		};
 
 		/*
+		 * G3D (GPU) Stage-2 Memory Protection Unit.  Source: downstream
+		 * research/dumped_uart.dts s2mpu_s0_g3d@1ee70000 (google,s2mpu-v9,
+		 * in pd_g3d).  When enforcing, it blocks all GPU DMA until its
+		 * protection table is programmed; downstream owns that from pKVM at
+		 * EL2, which mainline lacks.  NOTE: on tegu the bootloader hands this
+		 * S2MPU over already open (enforcement disabled for all VIDs), so the
+		 * exynos-s2mpu bypass is a no-op on the current boot and was NOT what
+		 * GPU first light needed (that was the panthor ASN hash).  It is kept
+		 * for boot paths that leave the unit enforcing; see gpu.md §8.
+		 * Disabled here and enabled per-board, like the GPU.
+		 */
+		s2mpu_g3d: iommu@1ee70000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1ee70000 0x10000>;
+			power-domains = <&pd_g3d>;
+			status = "disabled";
+		};
+
+		/*
 		 * Source: MCT address, clocks, and interrupt map are from
 		 * research/dumped.dts:15079-15097.  It is disabled for now because
 		 * the architectural timer below is enough for first boot.

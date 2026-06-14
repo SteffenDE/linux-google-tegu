@@ -633,6 +633,16 @@
  * without it the GPU's DRAM accesses (including its own MMU page-table walks)
  * decode to the wrong channel and bus-fault, and the MCU never boots.
  */
+
+/*
+ * G3D S2MPU bypass (draft).  No-op on tegu -- the bootloader hands the unit
+ * over open -- and not what first light needed (the ASN hash, above).  Enabled
+ * here for the exynos-s2mpu shim on boot paths that leave it enforcing.
+ */
+&s2mpu_g3d {
+	status = "okay";
+};
+
 &gpu {
 	status = "okay";
 };

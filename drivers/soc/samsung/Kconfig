@@ -75,4 +75,20 @@ config SAMSUNG_PM_CHECK_CHUNKSIZE
 config EXYNOS_REGULATOR_COUPLER
 	bool "Exynos SoC Regulator Coupler" if COMPILE_TEST
 	depends on ARCH_EXYNOS || COMPILE_TEST
+
+config EXYNOS_S2MPU
+	tristate "Exynos S2MPU bring-up bypass"
+	depends on (ARCH_EXYNOS && PM_GENERIC_DOMAINS) || COMPILE_TEST
+	help
+	  Say y here to enable a minimal driver for the Stage-2 Memory
+	  Protection Units (S2MPU) found on Google Tensor (zumapro) SoCs.
+
+	  An S2MPU blocks all of a device's DMA traffic after reset until its
+	  memory-protection table is programmed.  On these SoCs that owner is
+	  pKVM at EL2, which mainline does not provide, so a DMA master such as
+	  the GPU faults as soon as it touches DRAM.  This driver disables S2MPU
+	  enforcement (bypass) for the units it is bound to, which is required
+	  to bring such masters up but provides no memory protection.
+
+	  If unsure, say N.
 endif

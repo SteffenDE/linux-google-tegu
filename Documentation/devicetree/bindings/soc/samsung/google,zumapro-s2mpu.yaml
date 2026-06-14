@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/google,zumapro-s2mpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor (zumapro) Stage-2 Memory Protection Unit
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  An S2MPU sits between a DMA master and the system bus and blocks all of that
+  master's DMA traffic after reset until its memory-protection table is
+  programmed. On Google Tensor (zumapro) SoCs there is one S2MPU instance per
+  DMA master, each in the master's power domain, and each returns to the
+  all-blocked reset state whenever that domain is powered off.
+
+properties:
+  compatible:
+    const: google,zumapro-s2mpu
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: Permission-fault interrupt.
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    iommu@1ee70000 {
+        compatible = "google,zumapro-s2mpu";
+        reg = <0x1ee70000 0x10000>;
+        interrupts = <GIC_SPI 354 IRQ_TYPE_LEVEL_HIGH>;
+        power-domains = <&pd_g3d>;
+    };

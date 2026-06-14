@@ -237,6 +237,18 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * When the bootloader hands a secure power domain over already powered
+	 * (e.g. the always-on G3D adopted for GPU bring-up), genpd records it as
+	 * on and never calls our .power_on, so the secure-side context that
+	 * callback restores via SMC is never established for this boot.  That
+	 * context includes the TZPC protection setup the IP's bus master needs to
+	 * reach DRAM, which the bootloader only programs for the masters it uses
+	 * itself.  Establish it now for secure domains adopted in the on state.
+	 */
+	if (on && pd->secure_pwr_id)
+		exynos_pd_secure_control(pd, true);
+
 	ret = of_genpd_add_provider_simple(np, &pd->pd);
 
 	if (ret == 0 && of_parse_phandle_with_args(np, "power-domains",

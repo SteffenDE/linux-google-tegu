@@ -642,13 +642,15 @@
  * gauge tracks state-of-charge autonomously and this driver only reads it, so
  * no battery model is programmed and no rail is touched.  The interrupt lives
  * on the MAX77779 PMIC core (not yet supported), so the driver polls; the node
- * therefore carries no interrupt.  shunt-resistor-micro-ohms is omitted until
- * the sense-resistor value is sourced -- without it only the current and charge
- * readings are unavailable; SoC, voltage and temperature are reported anyway.
+ * therefore carries no interrupt.  The 2 mOhm sense resistor matches the
+ * downstream default (max77779,rsense-default of 200 in 10-uOhm units) and the
+ * tegu battery model files (BC79_TG4_2mOhm_*), and scales the current and
+ * charge readings.
  */
 &hsi2c_6 {
 	fuel-gauge@36 {
 		compatible = "maxim,max77779fg";
 		reg = <0x36>;
+		shunt-resistor-micro-ohms = <2000>;
 	};
 };

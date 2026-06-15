@@ -30,6 +30,14 @@
 #define EXYNOS_DEV_ADDR_START	0x20000000
 #define EXYNOS_DEV_ADDR_SIZE	0x40000000
 
+static bool exynos_drm_has_iommu(struct device *dev)
+{
+	if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU))
+		return IS_ENABLED(CONFIG_EXYNOS_IOMMU);
+
+	return IS_ENABLED(CONFIG_IOMMU_DMA) && device_iommu_mapped(dev);
+}
+
 /*
  * drm_iommu_attach_device- attach device to iommu mapping
  *
@@ -96,6 +104,7 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
 			    void **dma_priv)
 {
 	struct exynos_drm_private *priv = drm->dev_private;
+	bool has_iommu = exynos_drm_has_iommu(dev);
 
 	if (!priv->dma_dev) {
 		priv->dma_dev = dev;
@@ -103,8 +112,11 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
 			 dev_name(dev));
 	}
 
-	if (!IS_ENABLED(CONFIG_EXYNOS_IOMMU))
+	if (!has_iommu) {
+		if (priv->mapping)
+			return -ENODEV;
 		return 0;
+	}
 
 	if (!priv->mapping) {
 		void *mapping = NULL;
@@ -126,7 +138,9 @@ int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
 void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev,
 			       void **dma_priv)
 {
-	if (IS_ENABLED(CONFIG_EXYNOS_IOMMU))
+	struct exynos_drm_private *priv = drm->dev_private;
+
+	if (priv->mapping)
 		drm_iommu_detach_device(drm, dev, dma_priv);
 }
 
@@ -134,7 +148,7 @@ void exynos_drm_cleanup_dma(struct drm_device *drm)
 {
 	struct exynos_drm_private *priv = drm->dev_private;
 
-	if (!IS_ENABLED(CONFIG_EXYNOS_IOMMU))
+	if (!priv->mapping)
 		return;
 
 	arm_iommu_release_mapping(priv->mapping);

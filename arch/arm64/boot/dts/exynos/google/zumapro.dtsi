@@ -185,6 +185,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x0>;
+			clocks = <&acpm_ipc 2>;
+			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
 			capacity-dmips-mhz = <0xc1>;
@@ -195,6 +197,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x100>;
+			clocks = <&acpm_ipc 2>;
+			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
 			capacity-dmips-mhz = <0xc1>;
@@ -205,6 +209,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x200>;
+			clocks = <&acpm_ipc 2>;
+			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
 			capacity-dmips-mhz = <0xc1>;
@@ -215,6 +221,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x300>;
+			clocks = <&acpm_ipc 2>;
+			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
 			capacity-dmips-mhz = <0xc1>;
@@ -225,6 +233,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x400>;
+			clocks = <&acpm_ipc 3>;
+			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
 			capacity-dmips-mhz = <0x39f>;
@@ -235,6 +245,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x500>;
+			clocks = <&acpm_ipc 3>;
+			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
 			capacity-dmips-mhz = <0x39f>;
@@ -245,6 +257,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x600>;
+			clocks = <&acpm_ipc 3>;
+			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
 			capacity-dmips-mhz = <0x39f>;
@@ -255,6 +269,8 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-x4";
 			reg = <0x0 0x700>;
+			clocks = <&acpm_ipc 4>;
+			operating-points-v2 = <&cpucl2_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunterelp_cpu_sleep>;
 			capacity-dmips-mhz = <0x400>;
@@ -299,6 +315,80 @@
 				min-residency-us = <0xdac>;
 			};
 		};
+	};
+
+	/*
+	 * CPU operating points for the three clusters.  Frequencies are the
+	 * downstream pixel-em "default" profile (research/dumped.dts:3360, the
+	 * cpu0/cpu4/cpu7 ladders) and match the exynos-acme per-domain
+	 * min/max-freq at research/dumped.dts:3326-3370.  The supplying clock is
+	 * the ACPM DVFS domain for each cluster (CPUCL0/1/2 = ids 2/3/4 per
+	 * private/.../cal-if/zuma/acpm_dvfs_zuma.h), so ACPM owns the rail
+	 * voltage: no opp-microvolt is listed and the CPUs carry no cpu-supply.
+	 * cpufreq-dt binds via the platdev fallback once cpu@0 has
+	 * operating-points-v2.
+	 */
+	cpucl0_opp_table: opp-table-cpucl0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-820000000  { opp-hz = /bits/ 64 <820000000>; };
+		opp-955000000  { opp-hz = /bits/ 64 <955000000>; };
+		opp-1098000000 { opp-hz = /bits/ 64 <1098000000>; };
+		opp-1197000000 { opp-hz = /bits/ 64 <1197000000>; };
+		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; };
+		opp-1425000000 { opp-hz = /bits/ 64 <1425000000>; };
+		opp-1548000000 { opp-hz = /bits/ 64 <1548000000>; };
+		opp-1696000000 { opp-hz = /bits/ 64 <1696000000>; };
+		opp-1849000000 { opp-hz = /bits/ 64 <1849000000>; };
+		opp-1950000000 { opp-hz = /bits/ 64 <1950000000>; };
+	};
+
+	cpucl1_opp_table: opp-table-cpucl1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-357000000  { opp-hz = /bits/ 64 <357000000>; };
+		opp-578000000  { opp-hz = /bits/ 64 <578000000>; };
+		opp-648000000  { opp-hz = /bits/ 64 <648000000>; };
+		opp-787000000  { opp-hz = /bits/ 64 <787000000>; };
+		opp-910000000  { opp-hz = /bits/ 64 <910000000>; };
+		opp-1065000000 { opp-hz = /bits/ 64 <1065000000>; };
+		opp-1221000000 { opp-hz = /bits/ 64 <1221000000>; };
+		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; };
+		opp-1418000000 { opp-hz = /bits/ 64 <1418000000>; };
+		opp-1549000000 { opp-hz = /bits/ 64 <1549000000>; };
+		opp-1795000000 { opp-hz = /bits/ 64 <1795000000>; };
+		opp-1945000000 { opp-hz = /bits/ 64 <1945000000>; };
+		opp-2130000000 { opp-hz = /bits/ 64 <2130000000>; };
+		opp-2245000000 { opp-hz = /bits/ 64 <2245000000>; };
+		opp-2367000000 { opp-hz = /bits/ 64 <2367000000>; };
+		opp-2450000000 { opp-hz = /bits/ 64 <2450000000>; };
+		opp-2600000000 { opp-hz = /bits/ 64 <2600000000>; };
+	};
+
+	cpucl2_opp_table: opp-table-cpucl2 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-700000000  { opp-hz = /bits/ 64 <700000000>; };
+		opp-1164000000 { opp-hz = /bits/ 64 <1164000000>; };
+		opp-1396000000 { opp-hz = /bits/ 64 <1396000000>; };
+		opp-1557000000 { opp-hz = /bits/ 64 <1557000000>; };
+		opp-1745000000 { opp-hz = /bits/ 64 <1745000000>; };
+		opp-1885000000 { opp-hz = /bits/ 64 <1885000000>; };
+		opp-1999000000 { opp-hz = /bits/ 64 <1999000000>; };
+		opp-2147000000 { opp-hz = /bits/ 64 <2147000000>; };
+		opp-2294000000 { opp-hz = /bits/ 64 <2294000000>; };
+		opp-2363000000 { opp-hz = /bits/ 64 <2363000000>; };
+		opp-2499000000 { opp-hz = /bits/ 64 <2499000000>; };
+		opp-2687000000 { opp-hz = /bits/ 64 <2687000000>; };
+		opp-2802000000 { opp-hz = /bits/ 64 <2802000000>; };
+		opp-2914000000 { opp-hz = /bits/ 64 <2914000000>; };
+		opp-2943000000 { opp-hz = /bits/ 64 <2943000000>; };
+		opp-2970000000 { opp-hz = /bits/ 64 <2970000000>; };
+		opp-3015000000 { opp-hz = /bits/ 64 <3015000000>; };
+		opp-3105000000 { opp-hz = /bits/ 64 <3105000000>; };
 	};
 
 	/*

@@ -636,3 +636,19 @@
 &gpu {
 	status = "okay";
 };
+
+/*
+ * MAX77779 ModelGauge m5 fuel gauge on the PMIC I2C bus (USI6/PERIC0).  The
+ * gauge tracks state-of-charge autonomously and this driver only reads it, so
+ * no battery model is programmed and no rail is touched.  The interrupt lives
+ * on the MAX77779 PMIC core (not yet supported), so the driver polls; the node
+ * therefore carries no interrupt.  shunt-resistor-micro-ohms is omitted until
+ * the sense-resistor value is sourced -- without it only the current and charge
+ * readings are unavailable; SoC, voltage and temperature are reported anyway.
+ */
+&hsi2c_6 {
+	fuel-gauge@36 {
+		compatible = "maxim,max77779fg";
+		reg = <0x36>;
+	};
+};

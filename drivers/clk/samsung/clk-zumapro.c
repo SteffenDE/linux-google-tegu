@@ -839,10 +839,18 @@ static const struct samsung_gate_clock dpub_gate_clks[] __initconst = {
 	     "mout_dpub_noc_user",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON,
 	     21, CLK_IGNORE_UNUSED, 0),
+	/*
+	 * The MIPI D-PHY's first cold bring-up access is a write to SYSREG_DPUB
+	 * (DISP_DPU_MIPI_PHY_CON, the DPHY reset) via zumapro_dphy_sysreg_update().
+	 * This PCLK is QCH/HWACG-gated when the DPUB sysreg is idle, so after a
+	 * DSIM link teardown the next phy_power_on() sysreg write stalls the NoC
+	 * and silently freezes the SoC -- intermittently, only when QCH had gated
+	 * it.  Pin it like the DSIM0 clocks below until the QCH protocol is modeled.
+	 */
 	GATE(CLK_GOUT_DPUB_SYSREG_PCLK, "gout_dpub_sysreg_pclk",
 	     "dout_dpub_nocp",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, CLK_IS_CRITICAL, 0),
 	/*
 	 * Gating these two from the DSIM suspend path and re-enabling them on
 	 * resume leaves the MIPI DPHY register window (0x1946xxxx) dead: the

@@ -2144,6 +2144,20 @@ static irqreturn_t samsung_dsim_irq(int irq, void *dev_id)
 		return IRQ_HANDLED;
 	}
 
+	/*
+	 * The remaining interrupts drive the command-transfer state machine,
+	 * which is only meaningful while the link is initialized (HS clock and
+	 * D-PHY up).  System suspend tears the link down by clearing
+	 * DSIM_STATE_INITIALIZED before gating the clocks/PHY; a FIFO or PLL
+	 * interrupt latched on the dying link must be dropped here, since the
+	 * in-flight transfer has already gone away and completing it would
+	 * touch freed (on-stack) memory.  Downstream gates its whole handler on
+	 * DSIM_STATE_HSCLKEN for the same reason.  The reset handshake above
+	 * runs before INITIALIZED is set and is intentionally left ungated.
+	 */
+	if (!(dsi->state & DSIM_STATE_INITIALIZED))
+		return IRQ_HANDLED;
+
 	if (!(status & (DSIM_INT_RX_DONE | DSIM_INT_SFR_FIFO_EMPTY |
 			DSIM_INT_PLL_STABLE)))
 		return IRQ_HANDLED;

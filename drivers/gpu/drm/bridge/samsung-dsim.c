@@ -1100,8 +1100,21 @@ static int samsung_dsim_enable_clock(struct samsung_dsim *dsi)
 		reg |= DSIM_ESC_PRESCALER(esc_div) |
 		       DSIM_ZUMAPRO_CLKCTRL_LANE_ESCCLK_EN(lanes_mask) |
 		       BIT(driver_data->esc_clken_bit) |
-		       BIT(driver_data->byte_clken_bit) |
-		       BIT(driver_data->tx_req_hsclk_bit);
+		       BIT(driver_data->byte_clken_bit);
+
+		/*
+		 * The HS-clock request must not be asserted before the external
+		 * D-PHY PLL has locked: requesting the HS clock out of an
+		 * unlocked PLL prevents it from locking.  The bootloader and
+		 * downstream dsim_reg_init() defer TX_REQUEST_HSCLK until after
+		 * the PLL lock poll (in dsim_reg_start()).  For the external-PLL
+		 * cold bring-up it is asserted after phy_power_on() in
+		 * samsung_dsim_init(); the bootloader-adopt path sets it in
+		 * samsung_dsim_zumapro_start_handoff_link().  Internal PLLs lock
+		 * independently of this request, so keep the combined write.
+		 */
+		if (!driver_data->uses_external_dphy_pll)
+			reg |= BIT(driver_data->tx_req_hsclk_bit);
 
 		if (dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS)
 			reg |= DSIM_ZUMAPRO_CLKCTRL_NONCONT_CLOCK_LANE;
@@ -2195,6 +2208,19 @@ static void samsung_dsim_zumapro_start_handoff_link(struct samsung_dsim *dsi)
 	samsung_dsim_write(dsi, DSIM_INTSRC_REG, 0xffffffff);
 }
 
+/*
+ * Request the HS byte clock once the external D-PHY PLL is locked.  Deferred
+ * out of samsung_dsim_enable_clock() so the cold bring-up locks the PLL with
+ * TX_REQUEST_HSCLK clear, matching the bootloader/downstream order.
+ */
+static void samsung_dsim_zumapro_request_hs_clock(struct samsung_dsim *dsi)
+{
+	u32 reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+
+	reg |= BIT(dsi->driver_data->tx_req_hsclk_bit);
+	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+}
+
 static void samsung_dsim_disable_irq(struct samsung_dsim *dsi)
 {
 	if (dsi->te_gpio)
@@ -2285,6 +2311,9 @@ static int samsung_dsim_init(struct samsung_dsim *dsi)
 	ret = samsung_dsim_init_link(dsi);
 	if (ret)
 		goto err_disable_phy;
+
+	if (driver_data->uses_external_dphy_pll)
+		samsung_dsim_zumapro_request_hs_clock(dsi);
 
 	dsi->state |= DSIM_STATE_INITIALIZED;
 

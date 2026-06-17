@@ -10,6 +10,7 @@
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/dma-mapping.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
@@ -122,9 +123,41 @@ static const struct drm_driver exynos_drm_driver = {
 	.minor	= DRIVER_MINOR,
 };
 
+/*
+ * tegu keeps the display live across s2idle (retain-live): instead of the full
+ * atomic disable that drm_mode_config_helper_suspend() performs -- which sends
+ * panel-off DCS (DISPLAY_OFF/SLEEP_IN) and stops/soft-resets the DECON -- park
+ * the pipeline in place so the panel keeps its image, and unpark it on resume.
+ * The DSIM link, clocks and external D-PHY PLL stay up via the bridge's own
+ * system-sleep op (it skips the forced runtime suspend for tegu); here we only
+ * quiesce and re-arm the DECON frame engine.  Userspace is already frozen when
+ * .prepare runs, so no atomic commit races the quiesce.  See
+ * research/drm-suspend-plan-A.md.
+ */
+static void exynos_drm_tegu_set_quiesced(struct drm_device *drm_dev, bool quiesce)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, drm_dev) {
+		struct exynos_drm_crtc *exynos_crtc = to_exynos_crtc(crtc);
+
+		if (quiesce) {
+			if (exynos_crtc->ops->quiesce)
+				exynos_crtc->ops->quiesce(exynos_crtc);
+		} else if (exynos_crtc->ops->unquiesce) {
+			exynos_crtc->ops->unquiesce(exynos_crtc);
+		}
+	}
+}
+
 static int exynos_drm_suspend(struct device *dev)
 {
 	struct drm_device *drm_dev = dev_get_drvdata(dev);
+
+	if (of_machine_is_compatible("google,zumapro-tegu")) {
+		exynos_drm_tegu_set_quiesced(drm_dev, true);
+		return 0;
+	}
 
 	return  drm_mode_config_helper_suspend(drm_dev);
 }
@@ -132,6 +165,11 @@ static int exynos_drm_suspend(struct device *dev)
 static void exynos_drm_resume(struct device *dev)
 {
 	struct drm_device *drm_dev = dev_get_drvdata(dev);
+
+	if (of_machine_is_compatible("google,zumapro-tegu")) {
+		exynos_drm_tegu_set_quiesced(drm_dev, false);
+		return;
+	}
 
 	drm_mode_config_helper_resume(drm_dev);
 }

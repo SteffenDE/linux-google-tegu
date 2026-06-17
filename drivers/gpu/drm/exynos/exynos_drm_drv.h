@@ -135,6 +135,13 @@ struct exynos_drm_crtc;
 struct exynos_drm_crtc_ops {
 	void (*atomic_enable)(struct exynos_drm_crtc *crtc);
 	void (*atomic_disable)(struct exynos_drm_crtc *crtc);
+	/*
+	 * Park/unpark the pipeline across a retain-live system suspend without
+	 * a full disable/modeset, so the panel keeps its image.  Optional; the
+	 * system-suspend hook invokes them only when both are present.
+	 */
+	void (*quiesce)(struct exynos_drm_crtc *crtc);
+	void (*unquiesce)(struct exynos_drm_crtc *crtc);
 	int (*enable_vblank)(struct exynos_drm_crtc *crtc);
 	void (*disable_vblank)(struct exynos_drm_crtc *crtc);
 	enum drm_mode_status (*mode_valid)(struct exynos_drm_crtc *crtc,

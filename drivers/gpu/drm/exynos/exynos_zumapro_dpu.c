@@ -8,6 +8,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/completion.h>
 #include <linux/component.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -72,6 +73,7 @@ struct zumapro_decon {
 	bool enabled;
 	bool start_pending;
 	bool win_dirty;
+	struct completion framedone;
 };
 
 struct zumapro_decon_desc {
@@ -1213,6 +1215,100 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	pm_runtime_put_sync(decon->dev);
 }
 
+/*
+ * Park the DECON across a retain-live system suspend.  Unlike
+ * zumapro_decon_stop(), this leaves GLOBAL_CON, the windows and the DSC/LCD
+ * programming intact so the panel keeps its image and unquiesce can resume
+ * scanout without a full modeset; it only stops the frame engine from latching
+ * new transfers and masks the interrupt master so the parked block cannot wake
+ * the system.  The drv-level system-suspend hook calls this in a later change.
+ */
+static void zumapro_decon_quiesce(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
+
+	if (!decon->enabled)
+		return;
+
+	/*
+	 * Mask the HW trigger so no further panel TE latches a new frame
+	 * transfer, then let an already-triggered frame drain so the panel RAM
+	 * holds a complete image.  In command mode frame_done fires once per
+	 * transferred frame; if none is in flight the wait times out
+	 * harmlessly.
+	 */
+	spin_lock_irqsave(&decon->slock, flags);
+	reinit_completion(&decon->framedone);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				ZUMAPRO_DECON_HW_TRIG_MASK,
+				ZUMAPRO_DECON_HW_TRIG_MASK);
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	if (!wait_for_completion_timeout(&decon->framedone,
+					 msecs_to_jiffies(60)))
+		dev_dbg(decon->dev, "DECON%u: no frame to drain before park\n",
+			decon->id);
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
+				ZUMAPRO_DECON_INT_MASTER, 0);
+	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
+	       ZUMAPRO_DECON_INT_EXTRA,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	spin_unlock_irqrestore(&decon->slock, flags);
+}
+
+/*
+ * Resume scanout after a quiesce: restore the interrupt master, re-arm the
+ * per-frame enable and the window/global shadow updates (in command mode EN_F
+ * is consumed per frame), drop a stale frame_start, and unmask the HW trigger
+ * so the next panel TE transfers the retained framebuffer again.  Mirrors the
+ * re-arm in zumapro_decon_atomic_flush() without reprogramming the pipeline.
+ */
+static void zumapro_decon_unquiesce(struct exynos_drm_crtc *crtc)
+{
+	struct zumapro_decon *decon = crtc->ctx;
+	unsigned long flags;
+	int ret;
+
+	if (!decon->enabled)
+		return;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
+				ZUMAPRO_DECON_INT_MASTER,
+				ZUMAPRO_DECON_INT_MASTER);
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				ZUMAPRO_DECON_SHD_ALL_WINDOWS,
+				ZUMAPRO_DECON_SHD_ALL_WINDOWS);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				ZUMAPRO_DECON_GLOBAL_CON_EN |
+				ZUMAPRO_DECON_GLOBAL_CON_EN_F,
+				ZUMAPRO_DECON_GLOBAL_CON_EN |
+				ZUMAPRO_DECON_GLOBAL_CON_EN_F);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
+				ZUMAPRO_DECON_SHD_GLOBAL | ZUMAPRO_DECON_SHD_CMP,
+				ZUMAPRO_DECON_SHD_GLOBAL | ZUMAPRO_DECON_SHD_CMP);
+
+	spin_lock_irqsave(&decon->slock, flags);
+	writel(ZUMAPRO_DECON_INT_FRAME_START,
+	       decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	ret = zumapro_decon_wait_run(decon);
+	if (ret)
+		dev_warn(decon->dev, "DECON%u did not re-enter run state: %d\n",
+			 decon->id, ret);
+
+	spin_lock_irqsave(&decon->slock, flags);
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+				ZUMAPRO_DECON_HW_TRIG_MASK, 0);
+	spin_unlock_irqrestore(&decon->slock, flags);
+}
+
 static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
@@ -1370,7 +1466,11 @@ static irqreturn_t zumapro_decon_frame_done_irq(int irq, void *dev_id)
 		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
 	spin_unlock(&decon->slock);
 
-	return pend ? IRQ_HANDLED : IRQ_NONE;
+	if (!pend)
+		return IRQ_NONE;
+
+	complete(&decon->framedone);
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t zumapro_decon_extra_irq(int irq, void *dev_id)
@@ -1472,6 +1572,8 @@ static void zumapro_decon_disable_plane(struct exynos_drm_crtc *crtc,
 static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
 	.atomic_enable = zumapro_decon_atomic_enable,
 	.atomic_disable = zumapro_decon_atomic_disable,
+	.quiesce = zumapro_decon_quiesce,
+	.unquiesce = zumapro_decon_unquiesce,
 	.atomic_begin = zumapro_decon_atomic_begin,
 	.atomic_flush = zumapro_decon_atomic_flush,
 	.enable_vblank = zumapro_decon_enable_vblank,
@@ -1866,6 +1968,7 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	}
 
 	spin_lock_init(&decon->slock);
+	init_completion(&decon->framedone);
 
 	/*
 	 * The DPU power domains are always on, so the registers are reachable

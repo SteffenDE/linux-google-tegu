@@ -479,6 +479,7 @@ struct exynos5_usbdrd_phy_drvdata {
 	const struct exynos5_usbdrd_phy_config *phy_cfg;
 	const struct exynos5_usbdrd_phy_tuning **phy_tunes;
 	const struct phy_ops *phy_ops;
+	int (*resume_prepare)(struct exynos5_usbdrd_phy *phy_drd);
 	const char * const *clk_names;
 	int n_clks;
 	const char * const *core_clk_names;
@@ -1465,6 +1466,29 @@ static int exynos2200_usbdrd_phy_init(struct phy *phy)
 	return 0;
 }
 
+static int exynos2200_usbdrd_phy_resume_prepare(struct exynos5_usbdrd_phy *phy_drd)
+{
+	struct phy_usb_instance *inst = &phy_drd->phys[EXYNOS5_DRDPHY_UTMI];
+	int ret;
+
+	/*
+	 * DWC3 system resume reads its GUSB* registers before phy_init().
+	 * Restore the Exynos2200-style link/PMU state needed for those
+	 * register accesses here; full PHY init still happens from phy_init().
+	 */
+	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
+	if (ret)
+		return ret;
+
+	exynos5_usbdrd_phy_isol(inst, false);
+	exynos2200_usbdrd_link_init(phy_drd);
+	exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
+
+	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
+
+	return 0;
+}
+
 static int exynos2200_usbdrd_phy_exit(struct phy *phy)
 {
 	struct phy_usb_instance *inst = phy_get_drvdata(phy);
@@ -2021,6 +2045,7 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
 static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
 	.phy_cfg		= phy_cfg_exynos2200,
 	.phy_ops		= &exynos2200_usbdrd_phy_ops,
+	.resume_prepare		= exynos2200_usbdrd_phy_resume_prepare,
 	.pmu_offset_usbdrd0_phy	= GS101_PHY_CTRL_USB20,
 	.clk_names		= exynos5_clk_names,
 	.n_clks			= ARRAY_SIZE(exynos5_clk_names),
@@ -3085,11 +3110,25 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static int exynos5_usbdrd_phy_resume(struct device *dev)
+{
+	struct exynos5_usbdrd_phy *phy_drd = dev_get_drvdata(dev);
+
+	if (!phy_drd->drv_data->resume_prepare)
+		return 0;
+
+	return phy_drd->drv_data->resume_prepare(phy_drd);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(exynos5_usbdrd_phy_pm_ops, NULL,
+				exynos5_usbdrd_phy_resume);
+
 static struct platform_driver exynos5_usb3drd_phy = {
 	.probe	= exynos5_usbdrd_phy_probe,
 	.driver = {
 		.of_match_table	= exynos5_usbdrd_phy_of_match,
 		.name		= "exynos5_usb3drd_phy",
+		.pm		= pm_sleep_ptr(&exynos5_usbdrd_phy_pm_ops),
 		.suppress_bind_attrs = true,
 	}
 };

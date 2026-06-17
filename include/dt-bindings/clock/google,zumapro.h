@@ -147,8 +147,9 @@
  * and the DWC3 core "ref" both run at this 19.2 MHz; modelling the wrong rate
  * would make phy-snps-eusb2 program the wrong PLL config and break USB HS.
  *
- * So expose: the NOC USER mux (fabric / link_aclk / phy), DIV_CLK_HSI0_USB (the
- * 19.2 MHz reference), and DIV_CLK_HSI0_EUSB (eUSB control, NOC/2).
+ * So expose: the NOC USER mux (fabric / bus / phy), DIV_CLK_HSI0_USB (the
+ * 19.2 MHz reference), DIV_CLK_HSI0_EUSB (eUSB control, NOC/2), and the
+ * USB32DRD link Q-channel gate consumed by the DWC3 wrapper.
  */
 #define CLK_MOUT_HSI0_NOC_USER			1
 #define CLK_DOUT_HSI0_USB			2
@@ -165,6 +166,9 @@
 #define CLK_DOUT_HSI0_USI2			7
 #define CLK_GOUT_HSI0_USI2_USI_CLK		8
 #define CLK_GOUT_HSI0_USI2_USI_PCLK		9
+
+/* USB32DRD link Q-channel gate. */
+#define CLK_GOUT_HSI0_USB32DRD_LINK		10
 
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1

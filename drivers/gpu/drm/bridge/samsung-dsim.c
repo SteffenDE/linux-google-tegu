@@ -2983,10 +2983,49 @@ err_clk:
 	return ret;
 }
 
+/*
+ * On tegu the display is kept live across s2idle (retain-live): the DSIM link,
+ * its clocks and the external D-PHY PLL must stay up so resume continues
+ * scanning out the retained image without a cold PLL re-lock -- the cold
+ * re-lock is exactly what the bootloader handoff papers over and has not been
+ * made to work.  pm_runtime_force_suspend() would run samsung_dsim_suspend()
+ * (the hard-off: PHY off, PLL unlocked, clocks gated) even though the display
+ * was never disabled, because the bridge holds a runtime-PM reference while
+ * enabled.  Skip the forced suspend for the retain-live case and leave the
+ * device runtime-active; the genuine hard-off still runs on runtime suspend
+ * when the display is actually turned off.  Other SoCs keep the normal
+ * force-suspend/resume behaviour.
+ */
+static bool samsung_dsim_retains_link_on_suspend(struct samsung_dsim *dsi)
+{
+	return dsi->driver_data->uses_external_dphy_pll &&
+	       of_machine_is_compatible("google,zumapro-tegu");
+}
+
+static int samsung_dsim_system_suspend(struct device *dev)
+{
+	struct samsung_dsim *dsi = dev_get_drvdata(dev);
+
+	if (samsung_dsim_retains_link_on_suspend(dsi))
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int samsung_dsim_system_resume(struct device *dev)
+{
+	struct samsung_dsim *dsi = dev_get_drvdata(dev);
+
+	if (samsung_dsim_retains_link_on_suspend(dsi))
+		return 0;
+
+	return pm_runtime_force_resume(dev);
+}
+
 const struct dev_pm_ops samsung_dsim_pm_ops = {
 	RUNTIME_PM_OPS(samsung_dsim_suspend, samsung_dsim_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(samsung_dsim_system_suspend,
+				samsung_dsim_system_resume)
 };
 EXPORT_SYMBOL_GPL(samsung_dsim_pm_ops);
 

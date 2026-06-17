@@ -1325,8 +1325,10 @@
 			compatible = "google,zumapro-dwusb3";
 			ranges = <0x0 0x11210000 0x10000>;
 
-			clocks = <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>;
-			clock-names = "link_aclk";
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USB32DRD_LINK>,
+				 <&cmu_hsi0 CLK_DOUT_HSI0_USB>,
+				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>;
+			clock-names = "aclk", "sclk", "bus";
 
 			/* Placeholder rails until s2mpg14/15 PMIC support lands. */
 			vdd33-supply = <&reg_placeholder>;

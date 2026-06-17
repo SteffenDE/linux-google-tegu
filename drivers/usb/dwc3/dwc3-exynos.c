@@ -153,18 +153,14 @@ static const struct dwc3_exynos_driverdata exynos2200_drvdata = {
 
 /*
  * Google Tensor G4 (zumapro / Pixel 9a). Same DWC3 wrapper shape as Exynos
- * 2200: a single link/fabric (NOC) clock gates the DWC3 link, and USB is live
- * at fastboot handoff so no PMU/regulator programming is needed here (the
- * vdd33/vdd10 supplies resolve to dummy regulators, as on other Exynos parts).
- * The downstream wrapper additionally lists "sclk" (USB ref) and "bus" clocks,
- * but for first high-speed bring-up only the link clock is required; the ref
- * clock is consumed by the eUSB2/combo PHYs. suspend_clk_idx = -1 (no separate
- * wrapper suspend clock), matching exynos2200.
+ * 2200, but downstream owns the USB32DRD link, suspend/ref, and bus clocks
+ * through the wrapper node. Keep the same ownership here so system resume
+ * restores the link Q-channel before the child DWC3 core touches registers.
  */
 static const struct dwc3_exynos_driverdata zumapro_drvdata = {
-	.clk_names = { "link_aclk" },
-	.num_clks = 1,
-	.suspend_clk_idx = -1,
+	.clk_names = { "aclk", "sclk", "bus" },
+	.num_clks = 3,
+	.suspend_clk_idx = 1,
 };
 
 static const struct dwc3_exynos_driverdata exynos5250_drvdata = {

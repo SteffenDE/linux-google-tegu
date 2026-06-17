@@ -22,7 +22,7 @@
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK + 1)
-#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USI2_USI_PCLK + 1)
+#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USB32DRD_LINK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
@@ -667,8 +667,8 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
  * USB is live at handoff and this driver only observes the tree.  Per the
  * hardware trace (research/NEEDS-HARDWARE.md H1/H3), the USB reference is the
  * internal PLL_USB / DIV_CLK_HSI0_USB path (19.2 MHz), not the CMU_TOP USB32DRD
- * USER path; only the NOC USER mux, DIV_CLK_HSI0_USB and DIV_CLK_HSI0_EUSB are
- * modelled.
+ * USER path; model only the NOC USER mux, USB/eUSB dividers, the USB32DRD
+ * link Q-channel gate, and the clocks needed by early HSI0 consumers.
  *
  * The USI2 chain (touchscreen SPI) comes from the downstream Zuma CMUCAL like
  * the rest of this file.  TRACE NEEDED: the USI2/PERI offsets have not been
@@ -684,6 +684,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 							0x20fc
 #define CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_PCLK \
 							0x2100
+#define QCH_CON_USB32DRD_QCH_LINK		0x30c0
 
 static const unsigned long hsi0_clk_regs[] __initconst = {
 	PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER,
@@ -694,6 +695,7 @@ static const unsigned long hsi0_clk_regs[] __initconst = {
 	CLK_CON_DIV_DIV_CLK_HSI0_USI2,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_PCLK,
+	QCH_CON_USB32DRD_QCH_LINK,
 };
 
 /*
@@ -730,6 +732,8 @@ static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
 };
 
 static const struct samsung_gate_clock hsi0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_HSI0_USB32DRD_LINK, "gout_hsi0_usb32drd_link",
+	     "dout_hsi0_usb", QCH_CON_USB32DRD_QCH_LINK, 0, 0, 0),
 	GATE(CLK_GOUT_HSI0_USI2_USI_CLK, "gout_hsi0_usi2_usi_clk",
 	     "dout_hsi0_usi2",
 	     CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK,

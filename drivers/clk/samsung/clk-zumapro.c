@@ -18,7 +18,7 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI0_PERI + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_MISC_NOC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2UFS_QCH + 1)
@@ -26,6 +26,7 @@
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
+#define CLKS_NR_MISC		(CLK_GOUT_MISC_MCT_PCLK + 1)
 
 /* ---- CMU_TOP ------------------------------------------------------------ */
 
@@ -60,6 +61,9 @@
 #define CLK_CON_DIV_CLKCMU_HSI0_PERI		0x1890
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC	0x20bc
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI	0x20c0
+#define CLK_CON_MUX_MUX_CLKCMU_MISC_NOC		0x10d0
+#define CLK_CON_DIV_CLKCMU_MISC_NOC		0x18c4
+#define CLK_CON_GAT_GATE_CLKCMU_MISC_NOC	0x20f4
 #define CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM	0x1050
 #define CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC		0x1054
 #define CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC	0x1058
@@ -116,6 +120,9 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI,
 	CLK_CON_DIV_CLKCMU_HSI0_PERI,
 	CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI,
+	CLK_CON_MUX_MUX_CLKCMU_MISC_NOC,
+	CLK_CON_DIV_CLKCMU_MISC_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_MISC_NOC,
 };
 
 /*
@@ -168,6 +175,10 @@ PNAME(mout_cmu_dpu_noc_p) = {
 	"fout_spare_pll", "oscclk",
 };
 PNAME(mout_cmu_dpub_dsim_p) = { "fout_shared0_d4", "fout_shared2_d2" };
+PNAME(mout_cmu_misc_noc_p) = {
+	"fout_shared0_d4", "fout_shared2_d2",
+	"fout_shared3_d2", "fout_spare_pll",
+};
 
 static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	MUX(CLK_MOUT_CMU_DPUB_DSIM, "mout_cmu_dpub_dsim",
@@ -200,6 +211,8 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_hsi0_noc_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC, 0, 3),
 	MUX(CLK_MOUT_CMU_HSI0_PERI, "mout_cmu_hsi0_peri",
 	    mout_cmu_hsi0_peri_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI, 0, 2),
+	MUX(CLK_MOUT_CMU_MISC_NOC, "mout_cmu_misc_noc",
+	    mout_cmu_misc_noc_p, CLK_CON_MUX_MUX_CLKCMU_MISC_NOC, 0, 2),
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
@@ -292,6 +305,18 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_CMU_HSI0_PERI, "gout_cmu_hsi0_peri",
 	     "mout_cmu_hsi0_peri", CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI,
 	     21, 0, 0),
+	/*
+	 * CMU_TOP feed for BLK_MISC.  Modelled only to clock the MCT, but the
+	 * same fabric clock also feeds MISC-block IPs the bootloader leaves
+	 * running and that this driver does not model yet (PDMA, PPMU, the
+	 * MISC sysreg).  Keep it on so clk_disable_unused() cannot collapse
+	 * the fabric out from under them while bring-up still relies on
+	 * bootloader state.  The MCT's own clk_prepare_enable() additionally
+	 * pins this when its USER mux selects the NOC feed over oscclk.
+	 */
+	GATE(CLK_GOUT_CMU_MISC_NOC, "gout_cmu_misc_noc",
+	     "mout_cmu_misc_noc", CLK_CON_GAT_GATE_CLKCMU_MISC_NOC,
+	     21, CLK_IS_CRITICAL, 0),
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
@@ -325,6 +350,8 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_hsi0_noc", CLK_CON_DIV_CLKCMU_HSI0_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_HSI0_PERI, "dout_cmu_hsi0_peri",
 	    "gout_cmu_hsi0_peri", CLK_CON_DIV_CLKCMU_HSI0_PERI, 0, 4),
+	DIV(CLK_DOUT_CMU_MISC_NOC, "dout_cmu_misc_noc",
+	    "gout_cmu_misc_noc", CLK_CON_DIV_CLKCMU_MISC_NOC, 0, 4),
 };
 
 static const struct samsung_cmu_info top_cmu_info __initconst = {
@@ -348,6 +375,63 @@ static void __init zumapro_cmu_top_init(struct device_node *np)
 
 CLK_OF_DECLARE(zumapro_cmu_top, "google,zumapro-cmu-top",
 	       zumapro_cmu_top_init);
+
+/* ---- CMU_MISC ----------------------------------------------------------- */
+
+/* Register offsets for CMU_MISC (0x10010000) */
+#define PLL_CON0_MUX_CLKCMU_MISC_NOC_USER			0x0600
+#define CLK_CON_DIV_DIV_CLK_MISC_NOCP				0x1808
+#define CLK_CON_GAT_GOUT_BLK_MISC_UID_MCT_IPCLKPORT_PCLK	0x20c8
+
+static const unsigned long misc_clk_regs[] __initconst = {
+	PLL_CON0_MUX_CLKCMU_MISC_NOC_USER,
+	CLK_CON_DIV_DIV_CLK_MISC_NOCP,
+	CLK_CON_GAT_GOUT_BLK_MISC_UID_MCT_IPCLKPORT_PCLK,
+};
+
+PNAME(mout_misc_noc_user_p) = { "oscclk", "dout_cmu_misc_noc" };
+
+static const struct samsung_mux_clock misc_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MISC_NOC_USER, "mout_misc_noc_user",
+	    mout_misc_noc_user_p, PLL_CON0_MUX_CLKCMU_MISC_NOC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock misc_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MISC_NOCP, "dout_misc_nocp", "mout_misc_noc_user",
+	    CLK_CON_DIV_DIV_CLK_MISC_NOCP, 0, 3),
+};
+
+static const struct samsung_gate_clock misc_gate_clks[] __initconst = {
+	/*
+	 * The MCT register-access pclk.  The MCT v3 driver enables this from
+	 * its TIMER_OF_DECLARE init, well before clk_disable_unused(), so a
+	 * plain refcounted gate keeps it on for the life of the timer.
+	 */
+	GATE(CLK_GOUT_MISC_MCT_PCLK, "gout_misc_mct_pclk", "dout_misc_nocp",
+	     CLK_CON_GAT_GOUT_BLK_MISC_UID_MCT_IPCLKPORT_PCLK, 21, 0, 0),
+};
+
+static const struct samsung_cmu_info misc_cmu_info __initconst = {
+	.mux_clks	= misc_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(misc_mux_clks),
+	.div_clks	= misc_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(misc_div_clks),
+	.gate_clks	= misc_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(misc_gate_clks),
+	.nr_clk_ids	= CLKS_NR_MISC,
+	.clk_regs	= misc_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(misc_clk_regs),
+	.clk_name	= "bus",
+};
+
+static void __init zumapro_cmu_misc_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &misc_cmu_info);
+}
+
+/* Register CMU_MISC early, as it is needed for the MCT timer. */
+CLK_OF_DECLARE(zumapro_cmu_misc, "google,zumapro-cmu-misc",
+	       zumapro_cmu_misc_init);
 
 /* ---- CMU_PERIC0 --------------------------------------------------------- */
 

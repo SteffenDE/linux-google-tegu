@@ -2014,12 +2014,27 @@ static void samsung_dsim_transfer_start(struct samsung_dsim *dsi)
 		if (xfer->packet.payload_length || xfer->rx_len)
 			return;
 
+		/*
+		 * Short packets complete here.  Unlink the xfer from the list
+		 * *before* signalling completion: once complete() wakes the
+		 * waiter (samsung_dsim_host_transfer) it takes the success path
+		 * and frees this on-stack xfer immediately.  transfer_start()
+		 * also runs off the waiter's thread (from the threaded IRQ and
+		 * from samsung_dsim_remove_transfer()), so a concurrent
+		 * samsung_dsim_transfer_finish() must no longer be able to reach
+		 * the freed xfer via list_first_entry().  This mirrors the
+		 * ordering already used by samsung_dsim_transfer_finish()
+		 * (list_del_init then complete); keep complete() outside
+		 * transfer_lock to avoid a transfer_lock -> wait.lock nesting.
+		 */
+		spin_lock_irqsave(&dsi->transfer_lock, flags);
+		list_del_init(&xfer->list);
+		spin_unlock_irqrestore(&dsi->transfer_lock, flags);
+
 		xfer->result = 0;
 		complete(&xfer->completed);
 
 		spin_lock_irqsave(&dsi->transfer_lock, flags);
-
-		list_del_init(&xfer->list);
 	}
 
 	spin_unlock_irqrestore(&dsi->transfer_lock, flags);

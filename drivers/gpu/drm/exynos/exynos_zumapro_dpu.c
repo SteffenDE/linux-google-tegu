@@ -72,6 +72,8 @@ struct zumapro_decon {
 	bool enabled;
 	bool start_pending;
 	bool win_dirty;
+	/* gates frame_start vblank delivery; the HW interrupt stays enabled */
+	bool vblank_enabled;
 };
 
 struct zumapro_decon_desc {
@@ -968,10 +970,17 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	int ret;
 
 	/*
-	 * Enable the interrupt master, the frame_done source and the extra
-	 * source (resource conflict/timeout diagnostics); frame_start is
-	 * unmasked by enable_vblank.  Stale pending bits would fire as soon
-	 * as the master bit is set, so clear them first.
+	 * Enable the interrupt master, frame_start, frame_done and the extra
+	 * source (resource conflict/timeout diagnostics).  frame_start must be
+	 * unmasked here, before the trigger is unmasked below: the very first
+	 * frame after enable is driven by a panel TE the moment the trigger
+	 * goes live, and if its frame_start interrupt is not yet enabled the
+	 * vblank is lost (then the commit's flip event never gets delivered).
+	 * vblank delivery is gated in software (decon->vblank_enabled) so the
+	 * HW interrupt can stay enabled for the whole enabled-DECON lifetime
+	 * without enable_vblank()/disable_vblank() racing the trigger or the
+	 * deferred vblank-disable against an incoming frame.  Stale pending
+	 * bits would fire as soon as the master bit is set, so clear them first.
 	 */
 	spin_lock_irqsave(&decon->slock, flags);
 	writel(ZUMAPRO_DECON_INT_FRAME_START | ZUMAPRO_DECON_INT_FRAME_DONE |
@@ -983,9 +992,11 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	       decon->main_regs + ZUMAPRO_DECON_INT_EN_EXTRA);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
 				ZUMAPRO_DECON_INT_MASTER |
+				ZUMAPRO_DECON_INT_FRAME_START |
 				ZUMAPRO_DECON_INT_FRAME_DONE |
 				ZUMAPRO_DECON_INT_EXTRA,
 				ZUMAPRO_DECON_INT_MASTER |
+				ZUMAPRO_DECON_INT_FRAME_START |
 				ZUMAPRO_DECON_INT_FRAME_DONE |
 				ZUMAPRO_DECON_INT_EXTRA);
 	spin_unlock_irqrestore(&decon->slock, flags);
@@ -1313,9 +1324,7 @@ static int zumapro_decon_enable_vblank(struct exynos_drm_crtc *crtc)
 	unsigned long flags;
 
 	spin_lock_irqsave(&decon->slock, flags);
-	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
-				ZUMAPRO_DECON_INT_FRAME_START,
-				ZUMAPRO_DECON_INT_FRAME_START);
+	decon->vblank_enabled = true;
 	spin_unlock_irqrestore(&decon->slock, flags);
 
 	return 0;
@@ -1327,8 +1336,7 @@ static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
 	unsigned long flags;
 
 	spin_lock_irqsave(&decon->slock, flags);
-	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_INT_EN,
-				ZUMAPRO_DECON_INT_FRAME_START, 0);
+	decon->vblank_enabled = false;
 	spin_unlock_irqrestore(&decon->slock, flags);
 }
 
@@ -1340,6 +1348,7 @@ static void zumapro_decon_disable_vblank(struct exynos_drm_crtc *crtc)
 static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 {
 	struct zumapro_decon *decon = dev_id;
+	bool deliver;
 	u32 pend;
 
 	spin_lock(&decon->slock);
@@ -1347,12 +1356,13 @@ static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 	       ZUMAPRO_DECON_INT_FRAME_START;
 	if (pend)
 		writel(pend, decon->main_regs + ZUMAPRO_DECON_INT_PEND);
+	deliver = decon->vblank_enabled;
 	spin_unlock(&decon->slock);
 
 	if (!pend)
 		return IRQ_NONE;
 
-	if (decon->crtc)
+	if (deliver && decon->crtc)
 		drm_crtc_handle_vblank(&decon->crtc->base);
 
 	return IRQ_HANDLED;

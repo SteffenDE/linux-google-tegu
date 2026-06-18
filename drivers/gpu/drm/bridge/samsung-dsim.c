@@ -2116,12 +2116,32 @@ static int samsung_dsim_transfer(struct samsung_dsim *dsi,
 	if (stopped)
 		samsung_dsim_transfer_start(dsi);
 
-	wait_for_completion_timeout(&xfer->completed,
-				    msecs_to_jiffies(DSI_XFER_TIMEOUT_MS));
-	if (xfer->result == -ETIMEDOUT) {
+	/*
+	 * Decide timeout from the completion itself, not from xfer->result.
+	 * The threaded IRQ samsung_dsim_transfer_finish() sets xfer->result = 0
+	 * immediately *before* it calls complete(), so a transfer that finishes
+	 * right at the timeout boundary can leave result == 0 while complete()
+	 * has not run yet. Keying the timeout off result would then take the
+	 * success path and free this on-stack xfer before the handler's
+	 * complete() touches it -- a use-after-free whose stray try_to_wake_up
+	 * write smashes whatever now owns the reused stack (seen as a NULL-ish
+	 * spinlock deref in complete(), or a pointer-auth/FPAC fault on a
+	 * corrupted return address). wait_for_completion_timeout() returning 0
+	 * means the completion was never signalled.
+	 */
+	if (!wait_for_completion_timeout(&xfer->completed,
+					 msecs_to_jiffies(DSI_XFER_TIMEOUT_MS))) {
 		struct mipi_dsi_packet *pkt = &xfer->packet;
 
 		samsung_dsim_remove_transfer(dsi, xfer);
+		/*
+		 * The handler dequeues the xfer under transfer_lock but then drops
+		 * the lock and keeps using the pointer, finally complete()ing it.
+		 * The xfer is now off the list, so no later IRQ can reach it; wait
+		 * for any handler still in that window to drain before the stack
+		 * frame holding the xfer and its completion is freed on return.
+		 */
+		synchronize_irq(dsi->irq);
 		dev_err(dsi->dev, "xfer timed out: %*ph %*ph\n", 4, pkt->header,
 			(int)pkt->payload_length, pkt->payload);
 		return -ETIMEDOUT;

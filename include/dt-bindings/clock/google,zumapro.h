@@ -65,6 +65,14 @@
 #define CLK_DOUT_CMU_HSI0_PERI			53
 
 /*
+ * CMU_TOP MISC feed.  Only the NOC (bus) feed is exposed: it is the input the
+ * CMU_MISC slice's USER mux selects to clock the Multi-Core Timer (MCT).
+ */
+#define CLK_MOUT_CMU_MISC_NOC			54
+#define CLK_GOUT_CMU_MISC_NOC			55
+#define CLK_DOUT_CMU_MISC_NOC			56
+
+/*
  * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
  * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
  * brought up.
@@ -205,5 +213,14 @@
 #define CLK_GOUT_DPUF1_SYSMMU_PMMU0_CLK		8
 #define CLK_GOUT_DPUF1_SYSMMU_PMMU1_CLK		9
 #define CLK_GOUT_DPUF1_SRAMC_ACLK		10
+
+/*
+ * CMU_MISC clocks.  Only the path that clocks the Multi-Core Timer (MCT) is
+ * modelled: the NOC USER mux (oscclk / CMU_TOP misc feed), the peripheral
+ * divider, and the MCT pclk gate the timer driver enables.
+ */
+#define CLK_MOUT_MISC_NOC_USER			1
+#define CLK_DOUT_MISC_NOCP			2
+#define CLK_GOUT_MISC_MCT_PCLK			3
 
 #endif /* _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H */

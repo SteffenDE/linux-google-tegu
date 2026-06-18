@@ -537,6 +537,20 @@
 		};
 
 		/*
+		 * CMU_MISC clocks the Multi-Core Timer (MCT).  Modelled only far
+		 * enough to gate the MCT register-access pclk; the NOC USER mux
+		 * selects either the oscillator or the CMU_TOP MISC feed.
+		 */
+		cmu_misc: clock-controller@10010000 {
+			compatible = "google,zumapro-cmu-misc";
+			reg = <0x10010000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_MISC_NOC>;
+			clock-names = "oscclk", "bus";
+		};
+
+		/*
 		 * CMU_HSI0 feeds the USB block (DWC3 + USB-DRD/eUSB PHY).  The
 		 * base and the CMU_TOP NOC feed come from research/dumped.dts and
 		 * the downstream zuma cmucal tables.  The USB reference clock is
@@ -1002,13 +1016,16 @@
 
 		/*
 		 * Source: MCT address, clocks, and interrupt map are from
-		 * research/dumped.dts:15079-15097.  It is disabled for now because
-		 * the architectural timer below is enough for first boot.
+		 * research/dumped.dts:15079-15097.  The architectural timer below
+		 * stops in the c2 power-down idle state (local-timer-stop), so the
+		 * MCT global comparator provides the always-on broadcast clockevent
+		 * the tick framework needs for deep idle / s2idle.  The register
+		 * pclk is the real CMU_MISC MCT gate, matching how gs101 wires it.
 		 */
 		mct: timer@10050000 {
 			compatible = "samsung,exynos4210-mct";
 			reg = <0x10050000 0x800>;
-			clocks = <&ext_24_5m>, <&ext_24_5m>;
+			clocks = <&ext_24_5m>, <&cmu_misc CLK_GOUT_MISC_MCT_PCLK>;
 			clock-names = "fin_pll", "mct";
 			interrupts = <GIC_SPI 754 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 755 IRQ_TYPE_LEVEL_HIGH 0>,
@@ -1022,7 +1039,6 @@
 				     <GIC_SPI 763 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 764 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 765 IRQ_TYPE_LEVEL_HIGH 0>;
-			status = "disabled";
 		};
 
 		/*

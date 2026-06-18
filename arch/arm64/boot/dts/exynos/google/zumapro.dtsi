@@ -289,7 +289,6 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
-				local-timer-stop;
 				entry-latency-us = <0x46>;
 				exit-latency-us = <0xa0>;
 				min-residency-us = <0x7d0>;
@@ -299,7 +298,6 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
-				local-timer-stop;
 				entry-latency-us = <0x96>;
 				exit-latency-us = <0xbe>;
 				min-residency-us = <0x9c4>;
@@ -309,7 +307,6 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
-				local-timer-stop;
 				entry-latency-us = <0xeb>;
 				exit-latency-us = <0xdc>;
 				min-residency-us = <0xdac>;
@@ -534,6 +531,20 @@
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>;
 			clock-names = "oscclk";
+		};
+
+		/*
+		 * CMU_MISC clocks the Multi-Core Timer (MCT).  Modelled only far
+		 * enough to gate the MCT register-access pclk; the NOC USER mux
+		 * selects either the oscillator or the CMU_TOP MISC feed.
+		 */
+		cmu_misc: clock-controller@10010000 {
+			compatible = "google,zumapro-cmu-misc";
+			reg = <0x10010000 0x8000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_MISC_NOC>;
+			clock-names = "oscclk", "bus";
 		};
 
 		/*
@@ -1001,14 +1012,18 @@
 		};
 
 		/*
-		 * Source: MCT address, clocks, and interrupt map are from
-		 * research/dumped.dts:15079-15097.  It is disabled for now because
-		 * the architectural timer below is enough for first boot.
+		 * Legacy exynos4210-mct global/local timer block.  On Zumapro its
+		 * interrupts are not wired -- the L0-L7 SPIs below are actually
+		 * raised by the v3 MCT block (mct_v3@100d0000), and the legacy
+		 * global comparator IRQ (G0, SPI 754) never fires.  Driving it with
+		 * the exynos4210-mct driver hangs deep idle (broadcast never wakes)
+		 * and SMP bring-up (local timers never tick), so keep it disabled
+		 * and use the v3 block instead.  Source: research/dumped.dts.
 		 */
 		mct: timer@10050000 {
 			compatible = "samsung,exynos4210-mct";
 			reg = <0x10050000 0x800>;
-			clocks = <&ext_24_5m>, <&ext_24_5m>;
+			clocks = <&ext_24_5m>, <&cmu_misc CLK_GOUT_MISC_MCT_PCLK>;
 			clock-names = "fin_pll", "mct";
 			interrupts = <GIC_SPI 754 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 755 IRQ_TYPE_LEVEL_HIGH 0>,
@@ -1023,6 +1038,31 @@
 				     <GIC_SPI 764 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 765 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "disabled";
+		};
+
+		/*
+		 * v3 MCT: free-running counter + per-CPU comparators in the
+		 * always-on MISC block.  The comparators keep counting across the
+		 * c2 CPU power-down state, so they serve as the always-on per-CPU
+		 * tick (the ARM architected timer stops in c2).  Interrupts are the
+		 * nine local lines L0-L8 (GIC_SPI 758-766); the driver uses one per
+		 * possible CPU.  reg/clocks/div from downstream zuma cmucal + DT.
+		 */
+		mct_v3: timer@100d0000 {
+			compatible = "samsung,exynos-mct-v3";
+			reg = <0x100d0000 0x800>;
+			clocks = <&ext_24_5m>, <&cmu_misc CLK_GOUT_MISC_MCT_PCLK>;
+			clock-names = "fin_pll", "mct";
+			interrupts = <GIC_SPI 758 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 759 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 760 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 761 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 762 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 763 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 764 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 765 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 766 IRQ_TYPE_LEVEL_HIGH 0>;
+			div = <1>;
 		};
 
 		/*

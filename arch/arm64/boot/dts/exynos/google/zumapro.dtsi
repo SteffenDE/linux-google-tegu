@@ -289,6 +289,7 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
+				local-timer-stop;
 				entry-latency-us = <0x46>;
 				exit-latency-us = <0xa0>;
 				min-residency-us = <0x7d0>;
@@ -298,6 +299,7 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
+				local-timer-stop;
 				entry-latency-us = <0x96>;
 				exit-latency-us = <0xbe>;
 				min-residency-us = <0x9c4>;
@@ -307,6 +309,7 @@
 				idle-state-name = "c2";
 				compatible = "arm,idle-state";
 				arm,psci-suspend-param = <0x10000>;
+				local-timer-stop;
 				entry-latency-us = <0xeb>;
 				exit-latency-us = <0xdc>;
 				min-residency-us = <0xdac>;

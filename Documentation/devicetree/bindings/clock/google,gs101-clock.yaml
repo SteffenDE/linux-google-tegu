@@ -42,6 +42,7 @@ properties:
       - google,zumapro-cmu-hsi0
       - google,zumapro-cmu-top
       - google,zumapro-cmu-hsi2
+      - google,zumapro-cmu-misc
       - google,zumapro-cmu-peric0
       - google,zumapro-cmu-peric1
 
@@ -241,6 +242,24 @@ allOf:
       properties:
         compatible:
           contains:
+            const: google,zumapro-cmu-misc
+
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock
+            - description: Misc bus clock (from CMU_TOP)
+
+        clock-names:
+          items:
+            - const: oscclk
+            - const: bus
+
+  - if:
+      properties:
+        compatible:
+          contains:
             enum:
               - google,gs101-cmu-peric0
               - google,gs101-cmu-peric1
@@ -271,6 +290,7 @@ allOf:
               - google,zumapro-cmu-dpuf0
               - google,zumapro-cmu-dpuf1
               - google,zumapro-cmu-hsi0
+              - google,zumapro-cmu-misc
               - google,zumapro-cmu-top
     then:
       properties:

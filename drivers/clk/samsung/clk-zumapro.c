@@ -352,11 +352,13 @@ CLK_OF_DECLARE(zumapro_cmu_top, "google,zumapro-cmu-top",
 /* ---- CMU_MISC ----------------------------------------------------------- */
 
 /* Register offsets for CMU_MISC (0x10010000) */
+#define CLK_CON_CMU_MISC_CONTROLLER_OPTION			0x0800
 #define PLL_CON0_MUX_CLKCMU_MISC_NOC_USER			0x0600
 #define CLK_CON_DIV_DIV_CLK_MISC_NOCP				0x1808
 #define CLK_CON_GAT_GOUT_BLK_MISC_UID_MCT_IPCLKPORT_PCLK	0x20c8
 
 static const unsigned long misc_clk_regs[] __initconst = {
+	CLK_CON_CMU_MISC_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_MISC_NOC_USER,
 	CLK_CON_DIV_DIV_CLK_MISC_NOCP,
 	CLK_CON_GAT_GOUT_BLK_MISC_UID_MCT_IPCLKPORT_PCLK,
@@ -395,6 +397,9 @@ static const struct samsung_cmu_info misc_cmu_info __initconst = {
 	.clk_regs	= misc_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(misc_clk_regs),
 	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_MISC_CONTROLLER_OPTION,
 };
 
 static void __init zumapro_cmu_misc_init(struct device_node *np)
@@ -409,6 +414,7 @@ CLK_OF_DECLARE(zumapro_cmu_misc, "google,zumapro-cmu-misc",
 /* ---- CMU_PERIC0 --------------------------------------------------------- */
 
 /* Register offsets for CMU_PERIC0 (0x10800000) */
+#define CLK_CON_CMU_PERIC0_CONTROLLER_OPTION			0x0800
 #define PLL_CON0_MUX_CLKCMU_PERIC0_NOC_USER			0x0600
 #define PLL_CON0_MUX_CLKCMU_PERIC0_USI0_UART_USER		0x0620
 #define PLL_CON0_MUX_CLKCMU_PERIC0_USI6_USI_USER		0x06a0
@@ -432,6 +438,7 @@ CLK_OF_DECLARE(zumapro_cmu_misc, "google,zumapro-cmu-misc",
 								0x209c
 
 static const unsigned long peric0_clk_regs[] __initconst = {
+	CLK_CON_CMU_PERIC0_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_PERIC0_NOC_USER,
 	PLL_CON0_MUX_CLKCMU_PERIC0_USI0_UART_USER,
 	PLL_CON0_MUX_CLKCMU_PERIC0_USI6_USI_USER,
@@ -519,11 +526,15 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
 	.clk_regs	= peric0_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(peric0_clk_regs),
 	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_PERIC0_CONTROLLER_OPTION,
 };
 
 /* ---- CMU_PERIC1 --------------------------------------------------------- */
 
 /* Register offsets for CMU_PERIC1 (0x10c00000) */
+#define CLK_CON_CMU_PERIC1_CONTROLLER_OPTION			0x0800
 #define PLL_CON0_MUX_CLKCMU_PERIC1_NOC_USER			0x0610
 #define PLL_CON0_MUX_CLKCMU_PERIC1_USI10_USI_USER		0x0630
 #define CLK_CON_DIV_DIV_CLK_PERIC1_USI10_USI			0x180c
@@ -541,6 +552,7 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
 								0x20a4
 
 static const unsigned long peric1_clk_regs[] __initconst = {
+	CLK_CON_CMU_PERIC1_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_PERIC1_NOC_USER,
 	PLL_CON0_MUX_CLKCMU_PERIC1_USI10_USI_USER,
 	CLK_CON_DIV_DIV_CLK_PERIC1_USI10_USI,
@@ -609,11 +621,15 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 	.clk_regs	= peric1_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(peric1_clk_regs),
 	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_PERIC1_CONTROLLER_OPTION,
 };
 
 /* ---- CMU_HSI2 ----------------------------------------------------------- */
 
 /* Register offsets for CMU_HSI2 (0x13000000) */
+#define CLK_CON_CMU_HSI2_CONTROLLER_OPTION		0x0800
 #define PLL_CON0_MUX_CLKCMU_HSI2_MMC_CARD_USER		0x0600
 #define PLL_CON0_MUX_CLKCMU_HSI2_NOC_USER		0x0610
 #define PLL_CON0_MUX_CLKCMU_HSI2_PCIE_USER		0x0620
@@ -637,6 +653,7 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 								0x20d0
 
 static const unsigned long hsi2_clk_regs[] __initconst = {
+	CLK_CON_CMU_HSI2_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_HSI2_MMC_CARD_USER,
 	PLL_CON0_MUX_CLKCMU_HSI2_NOC_USER,
 	PLL_CON0_MUX_CLKCMU_HSI2_PCIE_USER,
@@ -719,6 +736,9 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 	.clk_regs	= hsi2_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(hsi2_clk_regs),
 	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_HSI2_CONTROLLER_OPTION,
 };
 
 /* ---- CMU_HSI0 ----------------------------------------------------------- */
@@ -736,6 +756,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
  * the rest of this file.  TRACE NEEDED: the USI2/PERI offsets have not been
  * hardware-validated yet (the USB offsets from the same table have been).
  */
+#define CLK_CON_CMU_HSI0_CONTROLLER_OPTION	0x0800
 #define PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER	0x0620
 #define PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER	0x0680
 #define CLK_CON_MUX_MUX_CLK_HSI0_USI2		0x101c
@@ -749,6 +770,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 #define QCH_CON_USB32DRD_QCH_LINK		0x30c0
 
 static const unsigned long hsi0_clk_regs[] __initconst = {
+	CLK_CON_CMU_HSI0_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER,
 	PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER,
 	CLK_CON_MUX_MUX_CLK_HSI0_USI2,
@@ -824,6 +846,9 @@ static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
 	.clk_regs	= hsi0_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(hsi0_clk_regs),
 	.clk_name	= "noc",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_HSI0_CONTROLLER_OPTION,
 };
 
 /* ---- CMU_DPUB ----------------------------------------------------------- */

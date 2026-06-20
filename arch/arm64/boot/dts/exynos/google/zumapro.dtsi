@@ -2060,6 +2060,19 @@
 		pmu_system_controller: system-controller@15460000 {
 			compatible = "google,zumapro-pmu", "syscon";
 			reg = <0x15460000 0x10000>;
+			google,pmu-intr-gen-syscon = <&pmu_intr_gen>;
+		};
+
+		/*
+		 * PMU interrupt generator.  Base is PMU + 0x10000 (matches the
+		 * gs101 layout and the downstream pmucal address that programs
+		 * GRP*_INTR_BID at 0x15470xxx).  Unlike the PMU block this region
+		 * is not secured, so a plain mmio syscon works.  Used to route the
+		 * boot core's wakeup on deep-sleep (SYS_SLEEP) entry.
+		 */
+		pmu_intr_gen: syscon@15470000 {
+			compatible = "google,zumapro-pmu-intr-gen", "syscon";
+			reg = <0x15470000 0x10000>;
 		};
 
 		/*

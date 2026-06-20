@@ -732,66 +732,15 @@ static void zumapro_sleep_dump(void)
 	}
 }
 
-/*
- * CMU_TOP (0x26040000) fabric-feed gates that clk-zumapro.c pins CLK_IS_CRITICAL
- * for bring-up (console UART, UFS, USB, MCT).  Critical clocks are never gated
- * by CCF, even in suspend, so the ACPM cannot quiesce the shared peripheral NOC
- * fabric to power it down during SYS_SLEEP - it spin-waits on a domain status
- * bit (observed: APM watchdog stuck at PMU+0x2ca4, PERIC1 region) and resets.
- * Gate these directly here (behind CCF's back, bit21 = clock enable), after the
- * console has flushed, and restore on resume.  Test whether quiescing the fabric
- * lets the ACPM complete the down sequence.
- */
-static void __iomem *zumapro_cmu_top_base;
-static const struct {
-	u32 off;
-	const char *name;
-} zumapro_sleep_gate_feeds[] = {
-	{ 0x20bc, "HSI0_NOC" },
-	{ 0x20d8, "HSI2_NOC" },
-	{ 0x20e0, "HSI2_UFS_EMBD" },
-	{ 0x20f4, "MISC_NOC" },
-	{ 0x2110, "PERIC0_IP" },
-	{ 0x2114, "PERIC0_NOC" },
-};
-static u32 zumapro_sleep_gate_saved[ARRAY_SIZE(zumapro_sleep_gate_feeds)];
-#define ZUMAPRO_CMU_GATE_EN	BIT(21)
-
-static void zumapro_sleep_gate_feeds_set(bool gate)
-{
-	int i;
-
-	if (!zumapro_cmu_top_base)
-		return;
-
-	for (i = 0; i < ARRAY_SIZE(zumapro_sleep_gate_feeds); i++) {
-		void __iomem *r = zumapro_cmu_top_base +
-				  zumapro_sleep_gate_feeds[i].off;
-
-		if (gate) {
-			zumapro_sleep_gate_saved[i] = readl(r);
-			writel(zumapro_sleep_gate_saved[i] & ~ZUMAPRO_CMU_GATE_EN, r);
-		} else {
-			writel(zumapro_sleep_gate_saved[i], r);
-		}
-	}
-}
-
 static int zumapro_sys_sleep_suspend(void *data)
 {
 	zumapro_sys_sleep_arm(true);
 	zumapro_sleep_dump();
-	/* last thing before PSCI: gate the critical fabric feeds (console dies) */
-	zumapro_sleep_gate_feeds_set(true);
 	return 0;
 }
 
 static void zumapro_sys_sleep_resume(void *data)
 {
-	/* restore the gated fabric feeds first - the console UART needs PERIC0
-	 * back before the pr_emerg below can reach the wire */
-	zumapro_sleep_gate_feeds_set(false);
-
 	/*
 	 * TEMPORARY deep-wake diagnostic.  With no pstore/RTC, and the console
 	 * UART clock (plus other peripherals) very likely lost across the
@@ -1143,14 +1092,6 @@ static int exynos_pmu_probe(struct platform_device *pdev)
 		ret = init_pmu_intr_gen_regmap(dev);
 		if (ret)
 			return ret;
-		/*
-		 * Persistent CMU_TOP mapping for the syscore fabric-feed gating
-		 * (zumapro_sleep_gate_feeds_set); ioremap can't run in the atomic
-		 * syscore path, so map it once here.
-		 */
-		zumapro_cmu_top_base = ioremap(0x26040000, 0x10000);
-		if (!zumapro_cmu_top_base)
-			dev_warn(dev, "CMU_TOP map failed; sleep fabric gating off\n");
 		if (pmu_context->pmuintrgen)
 			register_syscore(&zumapro_sys_sleep_syscore);
 		else

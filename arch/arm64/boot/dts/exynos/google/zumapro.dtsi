@@ -527,7 +527,7 @@
 		 */
 		cmu_top: clock-controller@26040000 {
 			compatible = "google,zumapro-cmu-top";
-			reg = <0x26040000 0x8000>;
+			reg = <0x26040000 0x10000>;
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>;
 			clock-names = "oscclk";

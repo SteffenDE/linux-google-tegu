@@ -28,9 +28,18 @@
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
 #define CLKS_NR_MISC		(CLK_GOUT_MISC_MCT_PCLK + 1)
 
+/*
+ * Gate "debug" register window offset. In automatic clock mode the framework
+ * reads each gate's auto-clock-gating status from CLK_CON_GAT + this offset.
+ * Same value as gs101/gs201 (GS101_GATE_DBG_OFFSET); the Tensor CMU IP is
+ * shared across the family.
+ */
+#define ZUMAPRO_GATE_DBG_OFFSET			0x4000
+
 /* ---- CMU_TOP ------------------------------------------------------------ */
 
 /* Register offsets for CMU_TOP (0x26040000) */
+#define CLK_CON_CMU_TOP_CONTROLLER_OPTION	0x0800
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD	0x10ac
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_NOC		0x10b0
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_PCIE	0x10b4
@@ -78,6 +87,7 @@
 #define CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC	0x2084
 
 static const unsigned long top_clk_regs[] __initconst = {
+	CLK_CON_CMU_TOP_CONTROLLER_OPTION,
 	CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM,
 	CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC,
@@ -217,106 +227,66 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	/*
-	 * TRACE NEEDED: these display roots come from downstream Zuma CMUCAL
-	 * offsets and match the bootloader-owned simplefb path observed on Tegu.
-	 * Keep them out of clk_disable_unused while DECON/DSIM/DPUF consumers are
-	 * still missing, otherwise CCF can blank the handoff framebuffer.
+	 * CMU_TOP runs in automatic (HWACG) clock mode, like gs101 and the
+	 * downstream Zuma kernel: clk_enable()/clk_disable() are nops and the
+	 * hardware Q-Channel gates each feed when its consumer block is idle and
+	 * re-ungates on access. So no gate here needs CLK_IS_CRITICAL or
+	 * CLK_IGNORE_UNUSED; the bring-up pins those flags papered over (console
+	 * UART feed collapse, simplefb blanking, transient probe refcounts) cannot
+	 * happen because CCF never touches the gate bits. Critically, this also
+	 * lets the ACPM quiesce the peripheral fabric during suspend instead of
+	 * spinning on a never-idle domain bit (the APM watchdog seen otherwise).
 	 */
 	GATE(CLK_GOUT_CMU_DPUB_DSIM, "gout_cmu_dpub_dsim",
 	     "mout_cmu_dpub_dsim", CLK_CON_GAT_GATE_CLKCMU_DPUB_DSIM,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_DPUB_NOC, "gout_cmu_dpub_noc",
 	     "mout_cmu_dpub_noc", CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_DPUF0_NOC, "gout_cmu_dpuf0_noc",
 	     "mout_cmu_dpuf0_noc", CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_DPUF1_NOC, "gout_cmu_dpuf1_noc",
 	     "mout_cmu_dpuf1_noc", CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_HSI2_MMC_CARD, "gout_cmu_hsi2_mmc_card",
 	     "mout_cmu_hsi2_mmc_card", CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD,
 	     21, 0, 0),
-	/*
-	 * Like the PERIC0 root feeds, keep the HSI2 roots on.  UFS is the boot
-	 * storage path on stock firmware, and the HSI2 leaf controller's
-	 * consumers come and go during probe error paths.  Do not let CCF
-	 * collapse the shared fabric clocks while this bring-up is still
-	 * relying on bootloader state for rails and power domains.
-	 */
+	/* HSI2 storage fabric (UFS is the boot path). */
 	GATE(CLK_GOUT_CMU_HSI2_NOC, "gout_cmu_hsi2_noc",
 	     "mout_cmu_hsi2_noc", CLK_CON_GAT_GATE_CLKCMU_HSI2_NOC,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_HSI2_PCIE, "gout_cmu_hsi2_pcie",
 	     "mout_cmu_hsi2_pcie", CLK_CON_GAT_GATE_CLKCMU_HSI2_PCIE,
 	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_HSI2_UFS_EMBD, "gout_cmu_hsi2_ufs_embd",
 	     "mout_cmu_hsi2_ufs_embd", CLK_CON_GAT_GATE_CLKCMU_HSI2_UFS_EMBD,
-	     21, CLK_IS_CRITICAL, 0),
-	/*
-	 * Keep both CMU_TOP PERIC0 feeds running continuously. They sit at
-	 * the root of every PERIC0 USI's clock chain, and the debug console
-	 * UART hangs off the same chain: clk_uart_baud0 reaches
-	 * gout_cmu_peric0_ip via mout_peric0_usi0_uart_user, and the UART
-	 * pclk reaches gout_cmu_peric0_noc via mout_peric0_noc_user.
-	 *
-	 * exynos_usi_enable() finishes by calling clk_bulk_disable_unprepare()
-	 * on the USI's clocks, so each USI's probe transiently bumps these
-	 * feeds' refcount up and then immediately drops it again. Until
-	 * samsung_tty probes and pins the chain via CCF, the console is on
-	 * earlycon and is not holding it. Without CLK_IS_CRITICAL the
-	 * transient takes the refcount to zero, CCF gates the feed, the
-	 * UART loses its baud/pclk source, and earlycon's TX-poll spins
-	 * forever waiting on a FIFO that can no longer drain.
-	 *
-	 * Observed on tegu via the m1n1 MMIO trace while bringing up the
-	 * USI6 I2C controller: the clk-disable read landed on the IP feed
-	 * (CMU_TOP + 0x2110) and no further traced MMIO ever followed.
-	 */
+	     21, 0, 0),
+	/* PERIC0 fabric (debug console UART + every PERIC0 USI). */
 	GATE(CLK_GOUT_CMU_PERIC0_NOC, "gout_cmu_peric0_noc",
 	     "mout_cmu_peric0_noc", CLK_CON_GAT_GATE_CLKCMU_PERIC0_NOC,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_PERIC0_IP, "gout_cmu_peric0_ip",
 	     "mout_cmu_peric0_ip", CLK_CON_GAT_GATE_CLKCMU_PERIC0_IP,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_PERIC1_NOC, "gout_cmu_peric1_noc",
 	     "mout_cmu_peric1_noc", CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC,
 	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_PERIC1_IP, "gout_cmu_peric1_ip",
 	     "mout_cmu_peric1_ip", CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP,
 	     21, 0, 0),
-	/*
-	 * Keep the CMU_TOP HSI0 NOC feed on during bring-up.  USB is already
-	 * live at handoff (the device boots over fastboot), and the HSI0 leaf
-	 * consumers (DWC3 wrapper, USB-DRD/eUSB PHY) come and go across probe.
-	 * As with the HSI2 storage feeds, do not let CCF collapse the shared
-	 * HSI0 fabric root while the kernel still relies on bootloader state
-	 * for the rest of the USB block.  (The USB reference clock is not a
-	 * CMU_TOP feed; it comes from CMU_HSI0's internal PLL_USB.)
-	 */
+	/* HSI0 USB fabric (live at fastboot handoff). */
 	GATE(CLK_GOUT_CMU_HSI0_NOC, "gout_cmu_hsi0_noc",
 	     "mout_cmu_hsi0_noc", CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
-	     21, CLK_IS_CRITICAL, 0),
-	/*
-	 * BLK_HSI0 USI feed (the touchscreen SPI runs off USI2).  Unlike the
-	 * console-UART feeds above, nothing depends on this clock outside the
-	 * SPI driver's own enable/disable, so plain refcounted gating is fine.
-	 */
+	     21, 0, 0),
+	/* BLK_HSI0 USI feed (touchscreen SPI runs off USI2). */
 	GATE(CLK_GOUT_CMU_HSI0_PERI, "gout_cmu_hsi0_peri",
 	     "mout_cmu_hsi0_peri", CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI,
 	     21, 0, 0),
-	/*
-	 * CMU_TOP feed for BLK_MISC.  Modelled only to clock the MCT, but the
-	 * same fabric clock also feeds MISC-block IPs the bootloader leaves
-	 * running and that this driver does not model yet (PDMA, PPMU, the
-	 * MISC sysreg).  Keep it on so clk_disable_unused() cannot collapse
-	 * the fabric out from under them while bring-up still relies on
-	 * bootloader state.  The MCT's own clk_prepare_enable() additionally
-	 * pins this when its USER mux selects the NOC feed over oscclk.
-	 */
+	/* BLK_MISC fabric (clocks the MCT and the unmodelled MISC IPs). */
 	GATE(CLK_GOUT_CMU_MISC_NOC, "gout_cmu_misc_noc",
 	     "mout_cmu_misc_noc", CLK_CON_GAT_GATE_CLKCMU_MISC_NOC,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
@@ -366,6 +336,9 @@ static const struct samsung_cmu_info top_cmu_info __initconst = {
 	.nr_clk_ids	= CLKS_NR_TOP,
 	.clk_regs	= top_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(top_clk_regs),
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_TOP_CONTROLLER_OPTION,
 };
 
 static void __init zumapro_cmu_top_init(struct device_node *np)

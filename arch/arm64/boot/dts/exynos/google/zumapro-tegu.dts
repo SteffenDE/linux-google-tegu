@@ -654,3 +654,42 @@
 		shunt-resistor-micro-ohms = <2000>;
 	};
 };
+
+/*
+ * PCIe GEN3A_1 root complex for the on-board Broadcom BCM4383 WiFi.
+ *
+ * Pin wiring is from research/dumped.dts:4714-4750: PERST# on gph3-0
+ * (active low, driven by the controller), CLKREQ# on gph3-1 (special
+ * function 2, pull-up), and WL_REG_ON on gph3-4.  The WiFi chip is the
+ * PCIe link partner, so it must be powered for the link to train; until a
+ * WiFi driver owns WL_REG_ON, a GPIO hog holds it asserted from boot so
+ * the endpoint enumerates.
+ */
+&pinctrl_hsi2 {
+	pcie1_clkreq: pcie1-clkreq-pins {
+		samsung,pins = "gph3-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+};
+
+&gph3 {
+	wlan_reg_on_hog: wlan-reg-on-hog {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "wlan-reg-on";
+	};
+};
+
+&pcie_phy {
+	status = "okay";
+};
+
+&pcie {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_clkreq>;
+	reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};

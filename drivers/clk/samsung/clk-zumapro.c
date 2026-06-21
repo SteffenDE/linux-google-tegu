@@ -758,10 +758,13 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 	.nr_clk_ids	= CLKS_NR_HSI2,
 	.clk_regs	= hsi2_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(hsi2_clk_regs),
+	.sysreg_clk_regs = zumapro_dcrg_sysreg,
+	.nr_sysreg_clk_regs = ARRAY_SIZE(zumapro_dcrg_sysreg),
 	.clk_name	= "bus",
 	.auto_clock_gate = true,
 	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
 	.option_offset	= CLK_CON_CMU_HSI2_CONTROLLER_OPTION,
+	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
 };
 
 /* ---- CMU_HSI0 ----------------------------------------------------------- */

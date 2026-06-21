@@ -36,8 +36,10 @@
 /* udbg / external PLL */
 #define PLL_EXT_CTRL			0xc700	/* bit0 init, bit1 resetb override */
 #define PLL_EXT_LOCK			0xc734	/* bit 2 */
+#define PLL_PWR_GATING			0xc800	/* power-gating / state monitor */
 
-/* HSI2 SoC block: PHY input-clock mux select */
+/* HSI2 SoC block: PHY input-clock mux mode + select */
+#define SOC_PHY_CLK_MODE		0x4000
 #define SOC_PHY_CLK_SEL			0x4004
 
 #define PCIE_PHY_LOCK_US		100000
@@ -171,6 +173,9 @@ static int zumapro_pcie_phy_power_on(struct phy *p)
 	if (ret)
 		return ret;
 
+	/* Put the SoC PHY clock mux into SW mode before the PLL select. */
+	writel(0x15, phy->soc + SOC_PHY_CLK_MODE);
+
 	zumapro_pcie_phy_pwrdn_clear(phy);
 
 	ret = zumapro_pcie_phy_ext_pll(phy);
@@ -224,6 +229,9 @@ static int zumapro_pcie_phy_calibrate(struct phy *p)
 	}
 
 	writel(0x0, phy->pma + PMA_PHY_INPUT_CLK);
+
+	/* External-PLL power-gating / state-monitor setting for GEN3A_1. */
+	writel(0x421, phy->pll + PLL_PWR_GATING);
 
 	return 0;
 }

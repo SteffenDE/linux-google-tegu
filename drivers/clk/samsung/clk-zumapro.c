@@ -36,6 +36,14 @@
  */
 #define ZUMAPRO_GATE_DBG_OFFSET			0x4000
 
+/*
+ * BUS_COMPONENT_DRCG_EN offset in a leaf CMU's SYSREG. Writing all-ones enables
+ * dynamic root clock gating of the block's NOC/bus components so the fabric can
+ * report idle and the domain can be quiesced for ACPM power-down. Same value as
+ * gs101 (GS101_DRCG_EN_OFFSET) and the downstream Zuma cmucal save/restore set.
+ */
+#define ZUMAPRO_DRCG_EN_OFFSET			0x104
+
 /* ---- CMU_TOP ------------------------------------------------------------ */
 
 /* Register offsets for CMU_TOP (0x26040000) */
@@ -515,6 +523,15 @@ static const struct samsung_gate_clock peric0_gate_clks[] __initconst = {
 	     21, CLK_SET_RATE_PARENT, 0),
 };
 
+/*
+ * SYSREG registers saved/restored across power-down for the peripheral leaf
+ * CMUs. Only BUS_COMPONENT_DRCG_EN; the PERIC SYSREGs have no MEMCLK gate
+ * (matches gs101's dcrg_sysreg[]).
+ */
+static const unsigned long zumapro_dcrg_sysreg[] __initconst = {
+	ZUMAPRO_DRCG_EN_OFFSET,
+};
+
 static const struct samsung_cmu_info peric0_cmu_info __initconst = {
 	.mux_clks	= peric0_mux_clks,
 	.nr_mux_clks	= ARRAY_SIZE(peric0_mux_clks),
@@ -525,10 +542,13 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
 	.nr_clk_ids	= CLKS_NR_PERIC0,
 	.clk_regs	= peric0_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(peric0_clk_regs),
+	.sysreg_clk_regs = zumapro_dcrg_sysreg,
+	.nr_sysreg_clk_regs = ARRAY_SIZE(zumapro_dcrg_sysreg),
 	.clk_name	= "bus",
 	.auto_clock_gate = true,
 	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
 	.option_offset	= CLK_CON_CMU_PERIC0_CONTROLLER_OPTION,
+	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
 };
 
 /* ---- CMU_PERIC1 --------------------------------------------------------- */
@@ -620,10 +640,13 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 	.nr_clk_ids	= CLKS_NR_PERIC1,
 	.clk_regs	= peric1_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(peric1_clk_regs),
+	.sysreg_clk_regs = zumapro_dcrg_sysreg,
+	.nr_sysreg_clk_regs = ARRAY_SIZE(zumapro_dcrg_sysreg),
 	.clk_name	= "bus",
 	.auto_clock_gate = true,
 	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
 	.option_offset	= CLK_CON_CMU_PERIC1_CONTROLLER_OPTION,
+	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
 };
 
 /* ---- CMU_HSI2 ----------------------------------------------------------- */

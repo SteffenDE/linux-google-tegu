@@ -1108,9 +1108,9 @@
 			samsung,sysreg = <&sysreg_peric0>;
 		};
 
-		sysreg_peric0: syscon@10821000 {
+		sysreg_peric0: syscon@10820000 {
 			compatible = "google,zumapro-peric0-sysreg", "syscon";
-			reg = <0x10821000 0x1000>;
+			reg = <0x10820000 0x10000>;
 		};
 
 		/*
@@ -1147,7 +1147,7 @@
 			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI6_USI_PCLK>,
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI6_USI>;
 			clock-names = "pclk", "ipclk";
-			samsung,sysreg = <&sysreg_peric0 0x14>;
+			samsung,sysreg = <&sysreg_peric0 0x1014>;
 			samsung,mode = <USI_MODE_I2C>;
 			status = "okay";
 
@@ -1184,9 +1184,9 @@
 			samsung,sysreg = <&sysreg_peric1>;
 		};
 
-		sysreg_peric1: syscon@10c21000 {
+		sysreg_peric1: syscon@10c20000 {
 			compatible = "google,zumapro-peric1-sysreg", "syscon";
-			reg = <0x10c21000 0x1000>;
+			reg = <0x10c20000 0x10000>;
 		};
 
 		usi10: usi@10ca00c0 {
@@ -1198,7 +1198,7 @@
 			clocks = <&cmu_peric1 CLK_GOUT_PERIC1_USI10_USI_PCLK>,
 				 <&cmu_peric1 CLK_DOUT_PERIC1_USI10_USI>;
 			clock-names = "pclk", "ipclk";
-			samsung,sysreg = <&sysreg_peric1 0x08>;
+			samsung,sysreg = <&sysreg_peric1 0x1008>;
 			samsung,mode = <USI_MODE_I2C>;
 			status = "okay";
 

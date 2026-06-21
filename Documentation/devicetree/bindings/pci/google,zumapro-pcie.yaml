@@ -23,14 +23,14 @@ properties:
 
   reg:
     items:
-      - description: Data Bus Interface (DBI) registers
       - description: External Local Bus Interface (ELBI/app) registers
+      - description: Data Bus Interface (DBI) registers
       - description: PCIe configuration space region
 
   reg-names:
     items:
-      - const: dbi
       - const: elbi
+      - const: dbi
       - const: config
 
   interrupts:
@@ -113,10 +113,10 @@ examples:
 
     pcie@13120000 {
         compatible = "google,zumapro-pcie";
-        reg = <0x13400000 0x381000>,
-              <0x13120000 0x2000>,
+        reg = <0x13120000 0x2000>,
+              <0x13400000 0x381000>,
               <0x60ffe000 0x2000>;
-        reg-names = "dbi", "elbi", "config";
+        reg-names = "elbi", "dbi", "config";
         #address-cells = <3>;
         #size-cells = <2>;
         #interrupt-cells = <1>;

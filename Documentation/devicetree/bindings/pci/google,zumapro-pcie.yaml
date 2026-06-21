@@ -131,7 +131,7 @@ examples:
         clock-names = "dbi", "mstr", "slv", "apb";
         phys = <&pcie_phy>;
         phy-names = "pcie";
-        reset-gpios = <&gph3 0 GPIO_ACTIVE_HIGH>;
+        reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
         samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
         num-lanes = <1>;
         max-link-speed = <2>;

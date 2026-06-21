@@ -577,7 +577,7 @@
 		 */
 		cmu_dpub: clock-controller@19400000 {
 			compatible = "google,zumapro-cmu-dpub";
-			reg = <0x19400000 0x8000>;
+			reg = <0x19400000 0x10000>;
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>,
 				 <&cmu_top CLK_DOUT_CMU_DPUB_NOC>,

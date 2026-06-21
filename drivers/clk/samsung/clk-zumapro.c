@@ -898,8 +898,26 @@ static const struct samsung_cmu_info hsi0_cmu_info __initconst = {
 							0x202c
 #define CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK \
 							0x2044
+/*
+ * CONTROLLER_OPTION turns on global automatic (HWACG/Q-Channel) clock gating
+ * for the whole CMU; the QCH_CON nodes are the per-block Q-Channels the option
+ * drives. Saved/restored so auto mode and the QCH state survive a pd_dpub power
+ * cycle. Offsets from downstream Zuma cmucal-sfr.c (CMU_DPUB base 0x19400000).
+ */
+#define DPUB_CMU_DPUB_CONTROLLER_OPTION		0x0800
+#define QCH_CON_DPUB_CMU_DPUB_QCH		0x3060
+#define QCH_CON_DPUB_QCH			0x3064
+#define QCH_CON_DPUB_QCH_ALV_DSIM0		0x3068
+#define QCH_CON_DPUB_QCH_ALV_DSIM1		0x306c
+#define QCH_CON_DPUB_QCH_OSC_DSIM0		0x3070
+#define QCH_CON_DPUB_QCH_OSC_DSIM1		0x3074
+#define QCH_CON_D_TZPC_DPUB_QCH			0x3078
+#define QCH_CON_GPC_DPUB_QCH			0x307c
+#define QCH_CON_SLH_AXI_MI_P_DPUB_QCH		0x30ec
+#define QCH_CON_SYSREG_DPUB_QCH			0x30f0
 
 static const unsigned long dpub_clk_regs[] __initconst = {
+	DPUB_CMU_DPUB_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_DPUB_DSIM_USER,
 	PLL_CON0_MUX_CLKCMU_DPUB_NOC_USER,
 	CLK_CON_DIV_DIV_CLK_DPUB_NOCP,
@@ -909,6 +927,16 @@ static const unsigned long dpub_clk_regs[] __initconst = {
 	CLK_CON_GAT_GOUT_BLK_DPUB_UID_AD_APB_DECON_MAIN_IPCLKPORT_PCLKM,
 	CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON,
 	CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
+	QCH_CON_DPUB_CMU_DPUB_QCH,
+	QCH_CON_DPUB_QCH,
+	QCH_CON_DPUB_QCH_ALV_DSIM0,
+	QCH_CON_DPUB_QCH_ALV_DSIM1,
+	QCH_CON_DPUB_QCH_OSC_DSIM0,
+	QCH_CON_DPUB_QCH_OSC_DSIM1,
+	QCH_CON_D_TZPC_DPUB_QCH,
+	QCH_CON_GPC_DPUB_QCH,
+	QCH_CON_SLH_AXI_MI_P_DPUB_QCH,
+	QCH_CON_SYSREG_DPUB_QCH,
 };
 
 PNAME(mout_dpub_dsim_user_p) = { "oscclk", "dout_cmu_dpub_dsim" };
@@ -928,51 +956,48 @@ static const struct samsung_div_clock dpub_div_clks[] __initconst = {
 
 static const struct samsung_gate_clock dpub_gate_clks[] __initconst = {
 	/*
-	 * TRACE NEEDED: these gates are the minimum downstream DPUB subset for
-	 * DECON/DSIM0 handoff.  Keep them out of clk_disable_unused until the
-	 * matching DECON and DSIM consumers own the clocks.
+	 * CMU_DPUB runs in automatic clock mode (see dpub_cmu_info), so the
+	 * hardware Q-Channel gates each of these when its consumer is idle and
+	 * re-ungates on access. None of them needs CLK_IGNORE_UNUSED or
+	 * CLK_IS_CRITICAL: clk_disable is a no-op in auto mode, and the QCH is
+	 * what previously had to be worked around by pinning (see below). This
+	 * matches gs101, which leaves the equivalent DPU gates with flags 0.
 	 */
 	GATE(CLK_GOUT_DPUB_CMU_DPUB_PCLK, "gout_dpub_cmu_dpub_pclk",
 	     "dout_dpub_nocp",
 	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_CMU_DPUB_IPCLKPORT_PCLK,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_DPUB_DECON_PCLK, "gout_dpub_decon_pclk",
 	     "mout_dpub_noc_user",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_AD_APB_DECON_MAIN_IPCLKPORT_PCLKM,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_DPUB_DECON_ACLK, "gout_dpub_decon_aclk",
 	     "mout_dpub_noc_user",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_DPUB_IPCLKPORT_ACLK_DECON,
-	     21, CLK_IGNORE_UNUSED, 0),
+	     21, 0, 0),
 	/*
-	 * The MIPI D-PHY's first cold bring-up access is a write to SYSREG_DPUB
-	 * (DISP_DPU_MIPI_PHY_CON, the DPHY reset) via zumapro_dphy_sysreg_update().
-	 * This PCLK is QCH/HWACG-gated when the DPUB sysreg is idle, so after a
-	 * DSIM link teardown the next phy_power_on() sysreg write stalls the NoC
-	 * and silently freezes the SoC -- intermittently, only when QCH had gated
-	 * it.  Pin it like the DSIM0 clocks below until the QCH protocol is modeled.
+	 * Previously CLK_IS_CRITICAL: the MIPI D-PHY's first cold bring-up access
+	 * is a write to SYSREG_DPUB via zumapro_dphy_sysreg_update(), and the
+	 * DSIM0 ALV/OSC clocks keep the dphy register window alive. When the CMU
+	 * was in manual mode the QCH gating of these was not modeled, so a
+	 * post-teardown access could stall the NoC and freeze the SoC; pinning
+	 * them was the blunt-force stand-in for the QCH IGNORE_FORCE_PM bit.
+	 * Automatic mode now models the Q-Channel (auto-ungate on access), so the
+	 * pins are removed -- and a permanently-on clock here is exactly what
+	 * blocks pd_dpub from quiescing for deep suspend.
 	 */
 	GATE(CLK_GOUT_DPUB_SYSREG_PCLK, "gout_dpub_sysreg_pclk",
 	     "dout_dpub_nocp",
 	     CLK_CON_GAT_GOUT_BLK_DPUB_UID_SYSREG_DPUB_IPCLKPORT_PCLK,
-	     21, CLK_IS_CRITICAL, 0),
-	/*
-	 * Gating these two from the DSIM suspend path and re-enabling them on
-	 * resume leaves the MIPI DPHY register window (0x1946xxxx) dead: the
-	 * first write of the next phy_power_on() stalls the NoC and freezes
-	 * the SoC (first display re-enable after a cold link teardown).
-	 * Downstream never gates them manually either - the DPUB gates are
-	 * QCH/HWACG-managed there.  Pin them until the QCH protocol is
-	 * modeled.
-	 */
+	     21, 0, 0),
 	GATE(CLK_GOUT_DPUB_DSIM0_ALVCLK, "gout_dpub_dsim0_alvclk",
 	     "mout_dpub_dsim_user",
 	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_ALVCLK_DSIM0,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 	GATE(CLK_GOUT_DPUB_DSIM0_OSCCLK, "gout_dpub_dsim0_oscclk",
 	     "oscclk",
 	     CLK_CON_GAT_CLK_BLK_DPUB_UID_DPUB_IPCLKPORT_OSCCLK_DSIM0,
-	     21, CLK_IS_CRITICAL, 0),
+	     21, 0, 0),
 };
 
 static const struct samsung_cmu_info dpub_cmu_info __initconst = {
@@ -986,6 +1011,9 @@ static const struct samsung_cmu_info dpub_cmu_info __initconst = {
 	.clk_regs	= dpub_clk_regs,
 	.nr_clk_regs	= ARRAY_SIZE(dpub_clk_regs),
 	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= DPUB_CMU_DPUB_CONTROLLER_OPTION,
 };
 
 /* ---- CMU_DPUF0 ---------------------------------------------------------- */

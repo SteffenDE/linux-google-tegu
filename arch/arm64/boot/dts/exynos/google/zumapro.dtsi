@@ -1771,6 +1771,8 @@
 		pinctrl_hsi1: pinctrl@13040000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x13040000 0x1000>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_GPIO_HSI2_PCLK>;
+			clock-names = "pclk";
 			interrupts = <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "disabled";
 

@@ -665,7 +665,14 @@
  * WiFi driver owns WL_REG_ON, a GPIO hog holds it asserted from boot so
  * the endpoint enumerates.
  */
-&pinctrl_hsi2 {
+/*
+ * gph3/gph4 live on the HSI2 GPIO pin controller (pinctrl_hsi1, 0x13040000),
+ * which the minimal tree leaves disabled.  Enable it so the PCIe PERST#,
+ * CLKREQ# and WL_REG_ON lines on gph3 are usable.
+ */
+&pinctrl_hsi1 {
+	status = "okay";
+
 	pcie1_clkreq: pcie1-clkreq-pins {
 		samsung,pins = "gph3-1";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;

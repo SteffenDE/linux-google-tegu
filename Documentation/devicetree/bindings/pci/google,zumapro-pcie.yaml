@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/google,zumapro-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Zumapro (Tensor G4) PCIe Root Complex
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  PCIe root complex for the GEN3A_1 controller of the Google Zumapro
+  (Tensor G4) SoC, used for the on-board WiFi.  It is based on the Synopsys
+  DesignWare PCIe IP and inherits the common properties from snps,dw-pcie.yaml.
+
+allOf:
+  - $ref: /schemas/pci/snps,dw-pcie.yaml#
+
+properties:
+  compatible:
+    const: google,zumapro-pcie
+
+  reg:
+    items:
+      - description: Data Bus Interface (DBI) registers
+      - description: External Local Bus Interface (ELBI/app) registers
+      - description: PCIe configuration space region
+
+  reg-names:
+    items:
+      - const: dbi
+      - const: elbi
+      - const: config
+
+  interrupts:
+    items:
+      - description: PCIe controller (link/INTx) interrupt
+      - description: MSI interrupt
+
+  interrupt-names:
+    items:
+      - const: intr
+      - const: msi
+
+  clocks:
+    items:
+      - description: DBI access clock
+      - description: AXI master (outbound) clock
+      - description: AXI slave (inbound) clock
+      - description: controller APB clock
+
+  clock-names:
+    items:
+      - const: dbi
+      - const: mstr
+      - const: slv
+      - const: apb
+
+  phys:
+    maxItems: 1
+
+  phy-names:
+    items:
+      - const: pcie
+
+  reset-gpios:
+    maxItems: 1
+    description: PERST# reset line to the endpoint.
+
+  samsung,pmu-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    items:
+      minItems: 2
+      items:
+        - description: phandle to the PMU system controller
+        - description: offset of the PCIE wakeup control register
+    description:
+      Phandle/offset pair for the PMU register controlling the PCIe block.
+
+  num-lanes:
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - "#address-cells"
+  - "#size-cells"
+  - "#interrupt-cells"
+  - ranges
+  - bus-range
+  - device_type
+  - num-lanes
+  - max-link-speed
+  - clocks
+  - clock-names
+  - phys
+  - phy-names
+  - reset-gpios
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/clock/google,zumapro.h>
+    #include <dt-bindings/gpio/gpio.h>
+
+    pcie@13120000 {
+        compatible = "google,zumapro-pcie";
+        reg = <0x13400000 0x381000>,
+              <0x13120000 0x2000>,
+              <0x60ffe000 0x2000>;
+        reg-names = "dbi", "elbi", "config";
+        #address-cells = <3>;
+        #size-cells = <2>;
+        #interrupt-cells = <1>;
+        device_type = "pci";
+        interrupts = <GIC_SPI 439 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 441 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "intr", "msi";
+        clocks = <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_DBI_ACLK>,
+                 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_MSTR_ACLK>,
+                 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_SLV_ACLK>,
+                 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_DRIVER_APB_CLK>;
+        clock-names = "dbi", "mstr", "slv", "apb";
+        phys = <&pcie_phy>;
+        phy-names = "pcie";
+        reset-gpios = <&gph3 0 GPIO_ACTIVE_HIGH>;
+        samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
+        num-lanes = <1>;
+        max-link-speed = <2>;
+        bus-range = <0x00 0xff>;
+        ranges = <0x82000000 0 0x60000000 0x60000000 0 0xff0000>;
+        interrupt-map-mask = <0 0 0 0>;
+        interrupt-map = <0 0 0 0 &gic GIC_SPI 439 IRQ_TYPE_LEVEL_HIGH>;
+    };
+...

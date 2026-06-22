@@ -400,6 +400,18 @@ config PCI_EXYNOS
 	  hardware and therefore the driver re-uses the DesignWare core
 	  functions to implement the driver.
 
+config PCIE_ZUMAPRO
+	tristate "Google Zumapro (Tensor G4) PCIe controller"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on PCI_MSI
+	select PCIE_DW_HOST
+	select MFD_SYSCON
+	help
+	  Enables support for the DesignWare-based PCIe root complex on the
+	  Google Zumapro (Tensor G4) SoC, used for the on-board WiFi.  The PMA
+	  and PCS programming is handled by the separate PHY_ZUMAPRO_PCIE
+	  driver.
+
 config PCIE_FU740
 	bool "SiFive FU740 PCIe controller"
 	depends on PCI_MSI

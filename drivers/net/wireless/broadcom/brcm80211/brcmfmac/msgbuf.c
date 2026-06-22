@@ -346,8 +346,13 @@ brcmf_msgbuf_alloc_pktid(struct device *dev,
 	count = 0;
 	do {
 		(*idx)++;
-		if (*idx == pktids->array_size)
-			*idx = 0;
+		/* Packet ID 0 is reserved and never handed out: the firmware
+		 * treats a work item whose request_id is 0 as invalid and traps
+		 * while completing it, which a sustained transfer hits once this
+		 * wrapping allocator cycles back to 0.
+		 */
+		if (*idx >= pktids->array_size)
+			*idx = 1;
 		if (array[*idx].allocated.counter == 0)
 			if (atomic_cmpxchg(&array[*idx].allocated, 0, 1) == 0)
 				break;

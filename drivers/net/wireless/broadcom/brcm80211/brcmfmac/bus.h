@@ -129,6 +129,7 @@ struct brcmf_bus_msgbuf {
 	u16 max_flowrings;
 	u16 max_submissionrings;
 	u16 max_completionrings;
+	bool ext_txpost;
 };
 
 

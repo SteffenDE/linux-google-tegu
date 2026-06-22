@@ -225,6 +225,9 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
 #define BRCMF_PCIE_SHARED_HOSTRDY_DB1		0x10000000
 
+/* Second shared-flags word (pciedev_shared_t.flags2). */
+#define BRCMF_PCIE_SHARED2_TXPOST_EXT		0x00400000
+
 #define BRCMF_PCIE_FLAGS_HTOD_SPLIT		0x4000
 #define BRCMF_PCIE_FLAGS_DTOH_SPLIT		0x8000
 
@@ -235,6 +238,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_SHARED_HTOD_MB_DATA_ADDR_OFFSET	40
 #define BRCMF_SHARED_DTOH_MB_DATA_ADDR_OFFSET	44
 #define BRCMF_SHARED_RING_INFO_ADDR_OFFSET	48
+#define BRCMF_SHARED_FLAGS2_OFFSET		80
 #define BRCMF_SHARED_DMA_SCRATCH_LEN_OFFSET	52
 #define BRCMF_SHARED_DMA_SCRATCH_ADDR_OFFSET	56
 #define BRCMF_SHARED_DMA_RINGUPD_LEN_OFFSET	64
@@ -319,6 +323,7 @@ struct brcmf_pcie_shared_info {
 	void *ringupd;
 	dma_addr_t ringupd_dmahandle;
 	u8 version;
+	bool ext_txpost;
 };
 
 #define BRCMF_OTP_MAX_PARAM_LEN 16
@@ -1701,6 +1706,7 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
 	struct brcmf_pcie_shared_info *shared;
 	u32 addr;
+	u32 flags2;
 
 	shared = &devinfo->shared;
 	shared->tcm_base_address = sharedram_addr;
@@ -1739,6 +1745,12 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 
 	addr = sharedram_addr + BRCMF_SHARED_RING_INFO_ADDR_OFFSET;
 	shared->ring_info_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+
+	addr = sharedram_addr + BRCMF_SHARED_FLAGS2_OFFSET;
+	flags2 = brcmf_pcie_read_tcm32(devinfo, addr);
+	shared->ext_txpost = !!(flags2 & BRCMF_PCIE_SHARED2_TXPOST_EXT);
+	brcmf_dbg(PCIE, "flags2 0x%08x, extended tx-post %s\n", flags2,
+		  shared->ext_txpost ? "enabled" : "disabled");
 
 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
 		  shared->max_rxbufpost, shared->rx_dataoffset);
@@ -2298,6 +2310,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	bus->msgbuf->rx_dataoffset = devinfo->shared.rx_dataoffset;
 	bus->msgbuf->max_rxbufpost = devinfo->shared.max_rxbufpost;
 	bus->msgbuf->max_flowrings = devinfo->shared.max_flowrings;
+	bus->msgbuf->ext_txpost = devinfo->shared.ext_txpost;
 
 	init_waitqueue_head(&devinfo->mbdata_resp_wait);
 

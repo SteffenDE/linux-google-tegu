@@ -22,6 +22,11 @@
 #define BRCMF_D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7	32
 #define BRCMF_D2H_MSGRING_RX_COMPLETE_ITEMSIZE		40
 #define BRCMF_H2D_TXFLOWRING_ITEMSIZE			48
+/* Firmware that advertises extended TX-post work items (PCIE_SHARED2_TXPOST_EXT)
+ * uses a larger flowring item; the leading fields are unchanged, only the
+ * stride grows, with the trailing bytes carrying optional ext tags (left zero).
+ */
+#define BRCMF_H2D_TXFLOWRING_ITEMSIZE_EXT		56
 
 struct msgbuf_buf_addr {
 	__le32		low_addr;

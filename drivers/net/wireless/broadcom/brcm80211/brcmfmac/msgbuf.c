@@ -243,6 +243,7 @@ struct brcmf_msgbuf {
 	u16 max_flowrings;
 	u16 max_submissionrings;
 	u16 max_completionrings;
+	u16 h2d_txflowring_itemsize;
 
 	u16 rx_dataoffset;
 	u32 max_rxbufpost;
@@ -559,7 +560,7 @@ brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 
 	brcmf_dbg(MSGBUF, "Removing flowring %d\n", flowid);
 
-	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * BRCMF_H2D_TXFLOWRING_ITEMSIZE;
+	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * msgbuf->h2d_txflowring_itemsize;
 	dma_buf = msgbuf->flowrings[flowid]->buf_addr;
 	dma_free_coherent(msgbuf->drvr->bus_if->dev, dma_sz, dma_buf,
 			  msgbuf->flowring_dma_handle[flowid]);
@@ -601,7 +602,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 	int err;
 
 	flowid = work->flowid;
-	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * BRCMF_H2D_TXFLOWRING_ITEMSIZE;
+	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * msgbuf->h2d_txflowring_itemsize;
 	dma_buf = dma_alloc_coherent(msgbuf->drvr->bus_if->dev, dma_sz,
 				     &msgbuf->flowring_dma_handle[flowid],
 				     GFP_KERNEL);
@@ -613,7 +614,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 
 	brcmf_commonring_config(msgbuf->flowrings[flowid],
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
-				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
+				msgbuf->h2d_txflowring_itemsize, dma_buf);
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
@@ -638,7 +639,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 	create->flow_ring_addr.high_addr = cpu_to_le32(address >> 32);
 	create->flow_ring_addr.low_addr = cpu_to_le32(address & 0xffffffff);
 	create->max_items = cpu_to_le16(BRCMF_H2D_TXFLOWRING_MAX_ITEM);
-	create->len_item = cpu_to_le16(BRCMF_H2D_TXFLOWRING_ITEMSIZE);
+	create->len_item = cpu_to_le16(msgbuf->h2d_txflowring_itemsize);
 
 	brcmf_dbg(MSGBUF, "Send Flow Create Req flow ID %d for peer %pM prio %d ifindex %d\n",
 		  flowid, work->da, create->tid, work->ifidx);
@@ -747,6 +748,11 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 		count++;
 
 		tx_msghdr = (struct msgbuf_tx_msghdr *)ret_ptr;
+
+		/* Clear the whole work item so the trailing bytes of an
+		 * extended TX-post item (and rsvd0) are left as zero/default.
+		 */
+		memset(ret_ptr, 0, msgbuf->h2d_txflowring_itemsize);
 
 		tx_msghdr->msg.msgtype = MSGBUF_TYPE_TX_POST;
 		tx_msghdr->msg.request_id = cpu_to_le32(pktid + 1);
@@ -1594,6 +1600,9 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 		(struct brcmf_commonring **)if_msgbuf->commonrings;
 	msgbuf->flowrings = (struct brcmf_commonring **)if_msgbuf->flowrings;
 	msgbuf->max_flowrings = if_msgbuf->max_flowrings;
+	msgbuf->h2d_txflowring_itemsize = if_msgbuf->ext_txpost ?
+		BRCMF_H2D_TXFLOWRING_ITEMSIZE_EXT :
+		BRCMF_H2D_TXFLOWRING_ITEMSIZE;
 	msgbuf->flowring_dma_handle =
 		kzalloc_objs(*msgbuf->flowring_dma_handle,
 			     msgbuf->max_flowrings);

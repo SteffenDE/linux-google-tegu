@@ -81,8 +81,11 @@ struct zumapro_pcie {
 };
 
 /*
- * Assert the controller and PMA resets (downstream assert_phy_reset path).
- * Leaves the PMA held in reset so the PHY can be configured under reset.
+ * Controller reset and PMA reset pulse before PHY bring-up.  The PMA reset is
+ * pulsed and left *released* (=1): downstream runs the whole phy_config
+ * (external-PLL select/lock and the PMA PLL/CDR/OC locks) with the PMA out of
+ * reset, and on HW a working link reads PMA_RST = 1 while 0 = held.  Holding
+ * the PMA asserted across phy_power_on blocks the external PLL from locking.
  */
 static void zumapro_pcie_assert_phy_reset(struct zumapro_pcie *zp)
 {
@@ -96,25 +99,15 @@ static void zumapro_pcie_assert_phy_reset(struct zumapro_pcie *zp)
 	writel(SOFT_RESET_ALL, elbi + PCIE_SOFT_RESET);
 	udelay(10);
 
-	writel(1, elbi + PCIE_PMA_RST_1);
-	writel(1, elbi + PCIE_PMA_RST_2);
-	writel(1, elbi + PCIE_PMA_RST_0);
 	writel(0, elbi + PCIE_PMA_RST_1);
 	writel(0, elbi + PCIE_PMA_RST_2);
 	writel(0, elbi + PCIE_PMA_RST_0);
-
-	writel(1, elbi + PCIE_SLV_PEND_SEL_NAK);
-}
-
-/* Release the PMA reset (downstream, after the PHY is configured). */
-static void zumapro_pcie_deassert_phy_reset(struct zumapro_pcie *zp)
-{
-	void __iomem *elbi = zp->pci.elbi_base;
-
-	writel(1, elbi + PCIE_PMA_RST_1);
 	udelay(10);
+	writel(1, elbi + PCIE_PMA_RST_1);
 	writel(1, elbi + PCIE_PMA_RST_2);
 	writel(1, elbi + PCIE_PMA_RST_0);
+
+	writel(1, elbi + PCIE_SLV_PEND_SEL_NAK);
 }
 
 /* ELBI app-layer configuration done after the PHY is locked. */
@@ -181,14 +174,12 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 	if (ret)
 		return ret;
 
-	/* Hold the PMA in reset while the PHY is configured. */
+	/* Controller reset; PMA left released for PHY bring-up. */
 	zumapro_pcie_assert_phy_reset(zp);
 
 	ret = phy_power_on(zp->phy);
 	if (ret)
 		goto err_phy_exit;
-
-	zumapro_pcie_deassert_phy_reset(zp);
 
 	ret = phy_calibrate(zp->phy);
 	if (ret)

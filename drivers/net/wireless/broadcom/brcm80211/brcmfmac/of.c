@@ -3,6 +3,8 @@
  * Copyright (c) 2014 Broadcom Corporation
  */
 #include <linux/init.h>
+#include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_net.h>
@@ -64,6 +66,26 @@ static int brcmf_of_get_country_codes(struct device *dev,
 	settings->country_codes = cc;
 
 	return 0;
+}
+
+/* Google Tensor (Pixel) bootloaders do not program the WLAN MAC into the chip
+ * or the fmac node; they publish the per-device address as a string in
+ * /chosen/config/wlan_mac1. Use it as a fallback when the node carries no MAC.
+ */
+static void brcmf_of_probe_chosen_mac(struct brcmf_mp_device *settings)
+{
+	struct device_node *chosen;
+	const char *mac_str;
+
+	chosen = of_find_node_by_path("/chosen/config");
+	if (!chosen)
+		return;
+
+	if (!of_property_read_string(chosen, "wlan_mac1", &mac_str) &&
+	    !mac_pton(mac_str, settings->mac))
+		eth_zero_addr(settings->mac);
+
+	of_node_put(chosen);
 }
 
 int brcmf_of_probe(struct device *dev, enum brcmf_bus_type bus_type,
@@ -131,6 +153,8 @@ int brcmf_of_probe(struct device *dev, enum brcmf_bus_type bus_type,
 	err = of_get_mac_address(np, settings->mac);
 	if (err == -EPROBE_DEFER)
 		return err;
+	if (err)
+		brcmf_of_probe_chosen_mac(settings);
 
 	if (bus_type != BRCMF_BUSTYPE_SDIO)
 		return 0;

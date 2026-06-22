@@ -49,7 +49,14 @@
 #define MSGBUF_TYPE_LPBK_DMAXFER_CMPLT		0x14
 
 #define NR_TX_PKTIDS				2048
-#define NR_RX_PKTIDS				1024
+/* The rx pktid pool is shared between posted rx data buffers and the
+ * ioctl-response/event control buffers. High-throughput chips (e.g. BCM4383)
+ * report max_rxbufpost just under 1024, which with a 1024-entry pool consumes
+ * every id and leaves none to post the control buffers the dongle needs to
+ * return ioctl responses (-> dcmd timeouts on attach). Size the pool above the
+ * largest max_rxbufpost plus the control buffers.
+ */
+#define NR_RX_PKTIDS				2048
 
 #define BRCMF_IOCTL_REQ_PKTID			0xFFFE
 

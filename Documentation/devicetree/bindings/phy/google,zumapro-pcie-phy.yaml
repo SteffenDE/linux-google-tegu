@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/google,zumapro-pcie-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Zumapro PCIe PHY
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  PCIe PHY (PMA + PCS) for the GEN3A_1 root complex of the Google Zumapro
+  (Tensor G4) SoC, used for the on-board WiFi controller.  The PHY is driven by
+  an external PLL reached through the udbg register block and is brought out of
+  isolation through a PMU PCIE_PHY_CONTROL register.
+
+properties:
+  "#phy-cells":
+    const: 0
+
+  compatible:
+    const: google,zumapro-pcie-phy
+
+  reg:
+    maxItems: 4
+
+  reg-names:
+    items:
+      - const: pma
+      - const: pcs
+      - const: pll
+      - const: soc
+
+  clocks:
+    items:
+      - description: PHY reference clock (off the dedicated pcie_user mux)
+      - description: PIPE/PAL PMA+PCS register APB clock
+      - description: udbg/external-PLL register APB clock
+
+  clock-names:
+    items:
+      - const: ref
+      - const: apb
+      - const: udbg
+
+  samsung,pmu-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    items:
+      minItems: 2
+      items:
+        - description: phandle to the PMU system controller
+        - description: offset of the PCIE_PHY_CONTROL isolation register
+    description:
+      Phandle/offset pair for the PMU register that releases the PCIe PHY from
+      isolation.
+
+required:
+  - "#phy-cells"
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - samsung,pmu-syscon
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/google,zumapro.h>
+
+    pcie-phy@13160000 {
+        compatible = "google,zumapro-pcie-phy";
+        reg = <0x13160000 0x3000>,
+              <0x13140000 0x5000>,
+              <0x13150000 0xd000>,
+              <0x13130000 0x5000>;
+        reg-names = "pma", "pcs", "pll", "soc";
+        clocks = <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_PHY_REFCLK_IN>,
+                 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK>,
+                 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_UDBG_APB_PCLK>;
+        clock-names = "ref", "apb", "udbg";
+        samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
+        #phy-cells = <0>;
+    };
+...

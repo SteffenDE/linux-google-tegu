@@ -3519,6 +3519,16 @@ static s32 brcmf_inform_single_bss(struct brcmf_cfg80211_info *cfg,
 
 	freq = ieee80211_channel_to_frequency(channel, band);
 	bss_data.chan = ieee80211_get_channel(wiphy, freq);
+	if (!bss_data.chan) {
+		/* The firmware reports BSSes on bands the wiphy does not
+		 * advertise (e.g. 6 GHz, which this driver does not yet map);
+		 * cfg80211_inform_bss_data() dereferences the channel, so drop
+		 * the entry rather than hand it a NULL channel.
+		 */
+		brcmf_dbg(SCAN, "no channel for freq %d (chan %d), skipping %pM\n",
+			  freq, channel, bi->BSSID);
+		return 0;
+	}
 	bss_data.boottime_ns = ktime_to_ns(ktime_get_boottime());
 
 	notify_capability = le16_to_cpu(bi->capability);

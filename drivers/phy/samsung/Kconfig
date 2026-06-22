@@ -39,6 +39,17 @@ config PHY_EXYNOS_PCIE
 	  Enable PCIe PHY support for Exynos SoC series.
 	  This driver provides PHY interface for Exynos PCIe controller.
 
+config PHY_ZUMAPRO_PCIE
+	tristate "Google Tensor G4 Zumapro PCIe PHY driver"
+	depends on OF && HAS_IOMEM
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	select GENERIC_PHY
+	select MFD_SYSCON
+	help
+	  Enable PCIe PHY support for the Google Tensor G4 / Samsung Zumapro
+	  SoC.  This driver brings up the GEN3A_1 PCIe PHY used by the on-board
+	  WiFi root complex.
+
 config PHY_SAMSUNG_UFS
 	tristate "Exynos SoC series UFS PHY driver"
 	depends on OF && (ARCH_EXYNOS || COMPILE_TEST)

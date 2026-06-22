@@ -533,6 +533,45 @@ struct brcmf_ext_join_params_le {
 	struct brcmf_assoc_params_le assoc_le;
 };
 
+/* Firmware that reports a non-zero "join_ver" expects the versioned join
+ * structures below: a version/flags prefix and a bssid_cnt field that the
+ * legacy (v0) layout above lacks.
+ */
+#define BRCMF_JOIN_VERSION_MAJOR_V1	1
+
+/* response to the "join_ver" iovar */
+struct brcmf_join_version_le {
+	__le16 version;		/* version of this structure */
+	__le16 length;		/* length of the entire structure */
+	__le16 join_ver_major;	/* join interface major version number */
+	u8 pad[2];
+};
+
+/* used for association with a specific BSSID and chanspec list (v1) */
+struct brcmf_assoc_params_v1_le {
+	__le16 version;
+	__le16 flags;
+	u8 bssid[ETH_ALEN];
+	__le16 bssid_cnt;
+	__le32 chanspec_num;
+	__le16 chanspec_list[1];
+};
+
+/* join with or without a specific bssid and channel list (v1) */
+struct brcmf_join_params_v1 {
+	struct brcmf_ssid_le ssid_le;
+	struct brcmf_assoc_params_v1_le params_le;
+};
+
+/* extended join params (v1) */
+struct brcmf_ext_join_params_v1_le {
+	__le16 version;
+	__le16 pad;
+	struct brcmf_ssid_le ssid_le;	/* {0, ""}: wildcard scan */
+	struct brcmf_join_scan_params_le scan_le;
+	struct brcmf_assoc_params_v1_le assoc_le;
+};
+
 struct brcmf_wsec_key {
 	u32 index;		/* key index */
 	u32 len;		/* key length */

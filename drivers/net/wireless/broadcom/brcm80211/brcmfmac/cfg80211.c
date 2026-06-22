@@ -2373,6 +2373,141 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
 }
 
+/* Firmware branches that use the versioned (v1) join layout but predate the
+ * "join_ver" iovar; mirrored from the downstream vendor driver so the version
+ * can be derived from the WLC version instead.
+ */
+#define BRCMF_JOINEXT_V1_FW_MAJOR	17
+#define BRCMF_JOINEXT_V1_BR2_FW_MAJOR	16
+#define BRCMF_JOINEXT_V1_BR2_FW_MINOR	1
+#define BRCMF_JOINEXT_V1_BR1_FW_MAJOR	14
+#define BRCMF_JOINEXT_V1_BR1_FW_MINOR_2	2
+#define BRCMF_JOINEXT_V1_BR1_FW_MINOR_4	4
+
+/* Determine the firmware join interface version. Prefer the explicit
+ * "join_ver" iovar; firmware that lacks it derives the version from the WLC
+ * version, and anything older is treated as legacy (v0).
+ */
+static u16 brcmf_get_join_ver(struct brcmf_if *ifp)
+{
+	struct brcmf_join_version_le join_ver;
+	struct brcmf_wlc_version_le wlc_ver;
+	u16 major, minor;
+	s32 err;
+
+	err = brcmf_fil_iovar_data_get(ifp, "join_ver", &join_ver,
+				       sizeof(join_ver));
+	if (!err)
+		return le16_to_cpu(join_ver.join_ver_major);
+
+	err = brcmf_fil_iovar_data_get(ifp, "wlc_ver", &wlc_ver,
+				       sizeof(wlc_ver));
+	if (err)
+		return 0;
+
+	major = le16_to_cpu(wlc_ver.wlc_ver_major);
+	minor = le16_to_cpu(wlc_ver.wlc_ver_minor);
+
+	if (major >= BRCMF_JOINEXT_V1_FW_MAJOR ||
+	    (major == BRCMF_JOINEXT_V1_BR2_FW_MAJOR &&
+	     minor >= BRCMF_JOINEXT_V1_BR2_FW_MINOR) ||
+	    (major == BRCMF_JOINEXT_V1_BR1_FW_MAJOR &&
+	     (minor == BRCMF_JOINEXT_V1_BR1_FW_MINOR_2 ||
+	      minor == BRCMF_JOINEXT_V1_BR1_FW_MINOR_4)))
+		return BRCMF_JOIN_VERSION_MAJOR_V1;
+
+	return 0;
+}
+
+/* Build and issue the versioned (join_ver >= 1) join. These firmwares parse a
+ * version/flags prefix and a bssid_cnt field that the legacy join lacks, so
+ * the older layout is rejected with BCME_BADSSIDLEN / BCME_BUFTOOSHORT.
+ */
+static s32
+brcmf_cfg80211_do_join_v1(struct brcmf_if *ifp,
+			  struct cfg80211_connect_params *sme,
+			  u32 channel, u16 chanspec, u32 ssid_len)
+{
+	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_ext_join_params_v1_le *ext_join_params;
+	struct brcmf_join_params_v1 join_params;
+	size_t join_params_size;
+	s32 err;
+
+	ext_join_params = kzalloc_obj(*ext_join_params);
+	if (!ext_join_params)
+		return -ENOMEM;
+
+	join_params_size = offsetof(struct brcmf_ext_join_params_v1_le, assoc_le) +
+		offsetof(struct brcmf_assoc_params_v1_le, chanspec_list);
+	if (channel)
+		join_params_size += sizeof(u16);
+
+	ext_join_params->version = cpu_to_le16(BRCMF_JOIN_VERSION_MAJOR_V1);
+	ext_join_params->assoc_le.version = cpu_to_le16(BRCMF_JOIN_VERSION_MAJOR_V1);
+	ext_join_params->ssid_le.SSID_len = cpu_to_le32(ssid_len);
+	memcpy(&ext_join_params->ssid_le.SSID, sme->ssid, ssid_len);
+
+	ext_join_params->scan_le.scan_type = -1;
+	ext_join_params->scan_le.home_time = cpu_to_le32(-1);
+
+	if (sme->bssid)
+		memcpy(&ext_join_params->assoc_le.bssid, sme->bssid, ETH_ALEN);
+	else
+		eth_broadcast_addr(ext_join_params->assoc_le.bssid);
+
+	if (channel) {
+		ext_join_params->assoc_le.chanspec_num = cpu_to_le32(1);
+		ext_join_params->assoc_le.chanspec_list[0] = cpu_to_le16(chanspec);
+		ext_join_params->scan_le.active_time =
+			cpu_to_le32(BRCMF_SCAN_JOIN_ACTIVE_DWELL_TIME_MS);
+		ext_join_params->scan_le.passive_time =
+			cpu_to_le32(BRCMF_SCAN_JOIN_PASSIVE_DWELL_TIME_MS);
+		ext_join_params->scan_le.nprobes =
+			cpu_to_le32(BRCMF_SCAN_JOIN_ACTIVE_DWELL_TIME_MS /
+				    BRCMF_SCAN_JOIN_PROBE_INTERVAL_MS);
+	} else {
+		ext_join_params->scan_le.active_time = cpu_to_le32(-1);
+		ext_join_params->scan_le.passive_time = cpu_to_le32(-1);
+		ext_join_params->scan_le.nprobes = cpu_to_le32(-1);
+	}
+
+	brcmf_set_join_pref(ifp, &sme->bss_select);
+
+	err = brcmf_fil_bsscfg_data_set(ifp, "join", ext_join_params,
+					join_params_size);
+	kfree(ext_join_params);
+	if (!err)
+		return 0;
+
+	/* join command failed, fallback to set ssid */
+	memset(&join_params, 0, sizeof(join_params));
+	join_params_size = sizeof(join_params.ssid_le);
+
+	memcpy(&join_params.ssid_le.SSID, sme->ssid, ssid_len);
+	join_params.ssid_le.SSID_len = cpu_to_le32(ssid_len);
+	join_params.params_le.version = cpu_to_le16(BRCMF_JOIN_VERSION_MAJOR_V1);
+
+	if (sme->bssid)
+		memcpy(join_params.params_le.bssid, sme->bssid, ETH_ALEN);
+	else
+		eth_broadcast_addr(join_params.params_le.bssid);
+
+	if (channel) {
+		join_params.params_le.chanspec_list[0] = cpu_to_le16(chanspec);
+		join_params.params_le.chanspec_num = cpu_to_le32(1);
+		join_params_size +=
+			offsetof(struct brcmf_assoc_params_v1_le, chanspec_list) +
+			sizeof(u16);
+	}
+	err = brcmf_fil_cmd_data_set(ifp, BRCMF_C_SET_SSID,
+				     &join_params, join_params_size);
+	if (err)
+		bphy_err(drvr, "BRCMF_C_SET_SSID failed (%d)\n", err);
+
+	return err;
+}
+
 static s32
 brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		       struct cfg80211_connect_params *sme)
@@ -2523,6 +2658,14 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 	/* Join with specific BSSID and cached SSID
 	 * If SSID is zero join based on BSSID only
 	 */
+	ssid_len = min_t(u32, sme->ssid_len, IEEE80211_MAX_SSID_LEN);
+
+	if (cfg->join_ver >= BRCMF_JOIN_VERSION_MAJOR_V1) {
+		err = brcmf_cfg80211_do_join_v1(ifp, sme, cfg->channel,
+						chanspec, ssid_len);
+		goto done;
+	}
+
 	join_params_size = offsetof(struct brcmf_ext_join_params_le, assoc_le) +
 		offsetof(struct brcmf_assoc_params_le, chanspec_list);
 	if (cfg->channel)
@@ -2532,7 +2675,6 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		err = -ENOMEM;
 		goto done;
 	}
-	ssid_len = min_t(u32, sme->ssid_len, IEEE80211_MAX_SSID_LEN);
 	ext_join_params->ssid_le.SSID_len = cpu_to_le32(ssid_len);
 	memcpy(&ext_join_params->ssid_le.SSID, sme->ssid, ssid_len);
 	if (ssid_len < IEEE80211_MAX_SSID_LEN)
@@ -8361,6 +8503,11 @@ struct brcmf_cfg80211_info *brcmf_cfg80211_attach(struct brcmf_pub *drvr,
 	}
 	cfg->d11inf.io_type = (u8)io_type;
 	brcmu_d11_attach(&cfg->d11inf);
+
+	/* Newer firmware expects versioned join structures; query the join
+	 * interface version (0/unsupported == legacy layout).
+	 */
+	cfg->join_ver = brcmf_get_join_ver(ifp);
 
 	/* regulatory notifier below needs access to cfg so
 	 * assign it now.

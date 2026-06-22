@@ -21,7 +21,7 @@
 #define CLKS_NR_TOP		(CLK_DOUT_CMU_MISC_NOC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
-#define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2UFS_QCH + 1)
+#define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
 #define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USB32DRD_LINK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
@@ -660,6 +660,8 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 #define CLK_CON_GAT_CLK_BLK_HSI2_UID_GPIO_HSI2UFS_IPCLKPORT_PCLK \
 								0x2008
 #define QCH_CON_GPIO_HSI2UFS_QCH			0x302c
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_GPIO_HSI2_IPCLKPORT_PCLK	0x2060
+#define QCH_CON_GPIO_HSI2_QCH				0x3030
 #define CLK_CON_GAT_GOUT_BLK_HSI2_UID_HSI2_CMU_HSI2_IPCLKPORT_PCLK \
 								0x2064
 #define CLK_CON_GAT_GOUT_BLK_HSI2_UID_SYSREG_HSI2_IPCLKPORT_PCLK \
@@ -675,6 +677,15 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 #define CLK_CON_GAT_GOUT_BLK_HSI2_UID_QE_UFS_EMBD_HSI2_IPCLKPORT_PCLK \
 								0x20d0
 
+/* PCIe GEN3A_1: WiFi root complex on pcie@13120000 (CH1, Gen3 x1) */
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PHY_REFCLK_IN	0x201c
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DBI_ACLK	0x2088
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_MSTR_ACLK	0x208c
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_SLV_ACLK	0x2090
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DRIVER_APB_CLK	0x2094
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_UDBG_APB_PCLK	0x2098
+#define CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK	0x209c
+
 static const unsigned long hsi2_clk_regs[] __initconst = {
 	CLK_CON_CMU_HSI2_CONTROLLER_OPTION,
 	PLL_CON0_MUX_CLKCMU_HSI2_MMC_CARD_USER,
@@ -683,6 +694,8 @@ static const unsigned long hsi2_clk_regs[] __initconst = {
 	PLL_CON0_MUX_CLKCMU_HSI2_UFS_EMBD_USER,
 	CLK_CON_GAT_CLK_BLK_HSI2_UID_GPIO_HSI2UFS_IPCLKPORT_PCLK,
 	QCH_CON_GPIO_HSI2UFS_QCH,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_GPIO_HSI2_IPCLKPORT_PCLK,
+	QCH_CON_GPIO_HSI2_QCH,
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_HSI2_CMU_HSI2_IPCLKPORT_PCLK,
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_SYSREG_HSI2_IPCLKPORT_PCLK,
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_UFS_EMBD_IPCLKPORT_I_ACLK,
@@ -690,6 +703,13 @@ static const unsigned long hsi2_clk_regs[] __initconst = {
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_UFS_EMBD_IPCLKPORT_I_FMP_CLK,
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_QE_UFS_EMBD_HSI2_IPCLKPORT_ACLK,
 	CLK_CON_GAT_GOUT_BLK_HSI2_UID_QE_UFS_EMBD_HSI2_IPCLKPORT_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PHY_REFCLK_IN,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DBI_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_MSTR_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_SLV_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DRIVER_APB_CLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_UDBG_APB_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK,
 };
 
 PNAME(mout_hsi2_mmc_card_user_p) = { "oscclk", "dout_cmu_hsi2_mmc_card" };
@@ -720,6 +740,13 @@ static const struct samsung_gate_clock hsi2_gate_clks[] __initconst = {
 	     "gout_hsi2_gpio_hsi2ufs_pclk", "gout_hsi2_gpio_hsi2ufs_qch",
 	     CLK_CON_GAT_CLK_BLK_HSI2_UID_GPIO_HSI2UFS_IPCLKPORT_PCLK,
 	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_GPIO_HSI2_QCH,
+	     "gout_hsi2_gpio_hsi2_qch", "mout_hsi2_noc_user",
+	     QCH_CON_GPIO_HSI2_QCH, 0, 0, 0),
+	GATE(CLK_GOUT_HSI2_GPIO_HSI2_PCLK,
+	     "gout_hsi2_gpio_hsi2_pclk", "gout_hsi2_gpio_hsi2_qch",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_GPIO_HSI2_IPCLKPORT_PCLK,
+	     21, 0, 0),
 	GATE(CLK_GOUT_HSI2_CMU_HSI2_PCLK,
 	     "gout_hsi2_cmu_hsi2_pclk", "mout_hsi2_noc_user",
 	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_HSI2_CMU_HSI2_IPCLKPORT_PCLK,
@@ -747,6 +774,39 @@ static const struct samsung_gate_clock hsi2_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_HSI2_QE_UFS_EMBD_HSI2_PCLK,
 	     "gout_hsi2_qe_ufs_embd_hsi2_pclk", "mout_hsi2_noc_user",
 	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_QE_UFS_EMBD_HSI2_IPCLKPORT_PCLK,
+	     21, 0, 0),
+	/*
+	 * PCIe GEN3A_1 (WiFi).  Only the PHY reference runs off the dedicated
+	 * pcie_user mux; the controller AXI/APB clocks share the HSI2 bus mux,
+	 * matching the gs101 layout.
+	 */
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_PHY_REFCLK_IN,
+	     "gout_hsi2_pcie_gen3a_1_phy_refclk_in", "mout_hsi2_pcie_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PHY_REFCLK_IN,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_DBI_ACLK,
+	     "gout_hsi2_pcie_gen3a_1_dbi_aclk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DBI_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_MSTR_ACLK,
+	     "gout_hsi2_pcie_gen3a_1_mstr_aclk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_MSTR_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_SLV_ACLK,
+	     "gout_hsi2_pcie_gen3a_1_slv_aclk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_SLV_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_DRIVER_APB_CLK,
+	     "gout_hsi2_pcie_gen3a_1_driver_apb_clk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_DRIVER_APB_CLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_UDBG_APB_PCLK,
+	     "gout_hsi2_pcie_gen3a_1_udbg_apb_pclk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_UDBG_APB_PCLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI2_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK,
+	     "gout_hsi2_pcie_gen3a_1_pipe_pal_apb_pclk", "mout_hsi2_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI2_UID_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK,
 	     21, 0, 0),
 };
 

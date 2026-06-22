@@ -223,6 +223,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
 #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
+#define BRCMF_PCIE_SHARED_D2H_SYNC_XORCSUM	0x40000
 #define BRCMF_PCIE_SHARED_HOSTRDY_DB1		0x10000000
 
 /* Second shared-flags word (pciedev_shared_t.flags2). */
@@ -1749,8 +1750,11 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	addr = sharedram_addr + BRCMF_SHARED_FLAGS2_OFFSET;
 	flags2 = brcmf_pcie_read_tcm32(devinfo, addr);
 	shared->ext_txpost = !!(flags2 & BRCMF_PCIE_SHARED2_TXPOST_EXT);
-	brcmf_dbg(PCIE, "flags2 0x%08x, extended tx-post %s\n", flags2,
-		  shared->ext_txpost ? "enabled" : "disabled");
+	brcmf_err(bus, "DIAG: flags 0x%08x flags2 0x%08x, ext tx-post %s, rx_dataoffset %d\n",
+		  shared->flags, flags2,
+		  shared->ext_txpost ? "on" : "off", shared->rx_dataoffset);
+	/* DIAG: force the firmware-console poll on so a fw trap is captured */
+	devinfo->console_interval = BRCMF_CONSOLE;
 
 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
 		  shared->max_rxbufpost, shared->rx_dataoffset);
@@ -1887,6 +1891,18 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 	}
 
 	pci_set_master(pdev);
+
+	/* The Exynos/Tensor PCIe DMA engine cannot drive the full 64-bit
+	 * address space (downstream caps host DMA at 36 bits). All of this
+	 * platform's DRAM lives within 36 bits, so a 36-bit mask both keeps
+	 * device-visible addresses within the engine's range and lets the
+	 * high memory banks be reached without bounce buffering.
+	 */
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(36));
+	if (err) {
+		brcmf_err(bus, "Failed to set 36-bit DMA mask err=%d\n", err);
+		return err;
+	}
 
 	/* Bar-0 mapped address */
 	bar0_addr = pci_resource_start(pdev, 0);
@@ -2311,6 +2327,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	bus->msgbuf->max_rxbufpost = devinfo->shared.max_rxbufpost;
 	bus->msgbuf->max_flowrings = devinfo->shared.max_flowrings;
 	bus->msgbuf->ext_txpost = devinfo->shared.ext_txpost;
+	bus->msgbuf->d2h_sync_xorcsum =
+		!!(devinfo->shared.flags & BRCMF_PCIE_SHARED_D2H_SYNC_XORCSUM);
 
 	init_waitqueue_head(&devinfo->mbdata_resp_wait);
 
@@ -2416,7 +2434,7 @@ brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *devinfo, bool active)
 
 	/* don't start the timer */
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP ||
-	    !devinfo->console_interval || !BRCMF_FWCON_ON())
+	    !devinfo->console_interval)
 		return;
 
 	if (!devinfo->console_active) {
@@ -2438,7 +2456,7 @@ brcmf_pcie_fwcon(struct timer_list *t)
 	if (!devinfo->console_active)
 		return;
 
-	brcmf_pcie_bus_console_read(devinfo, false);
+	brcmf_pcie_bus_console_read(devinfo, true);
 
 	/* Reschedule the timer if console interval is not zero */
 	mod_timer(&devinfo->timer, jiffies + devinfo->console_interval);

@@ -6,12 +6,21 @@
 #define BRCMFMAC_COMMONRING_H
 
 
+/* D2H message sync (D2H_SYNC_XORCSUM): the firmware stamps each completion-ring
+ * item with a per-ring epoch (modulo 253) and a marker chosen so the XOR of the
+ * item's 32-bit words is zero, letting the host detect items whose body has not
+ * yet fully DMA'd. The sequence counter starts one past the modulo.
+ */
+#define BRCMF_D2H_EPOCH_MODULO		253
+#define BRCMF_D2H_EPOCH_INIT_VAL	(BRCMF_D2H_EPOCH_MODULO + 1)
+
 struct brcmf_commonring {
 	u16 r_ptr;
 	u16 w_ptr;
 	u16 f_ptr;
 	u16 depth;
 	u16 item_len;
+	u32 seqnum;
 
 	void *buf_addr;
 

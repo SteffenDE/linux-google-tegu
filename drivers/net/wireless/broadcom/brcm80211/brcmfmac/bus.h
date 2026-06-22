@@ -130,6 +130,7 @@ struct brcmf_bus_msgbuf {
 	u16 max_submissionrings;
 	u16 max_completionrings;
 	bool ext_txpost;
+	bool d2h_sync_xorcsum;
 };
 
 

@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/delay.h>
 
 #include <brcmu_utils.h>
 #include <brcmu_wifi.h>
@@ -79,6 +80,12 @@
 #define BRCMF_MSGBUF_UPDATE_RX_PTR_THRS		48
 
 #define BRCMF_MAX_TXSTATUS_WAIT_RETRIES		10
+
+/* Number of times to re-poll a D2H completion item for its body to finish
+ * landing before giving up on it (D2H_SYNC_XORCSUM). Steady-state traffic
+ * completes within the first try; this only absorbs the rare in-flight window.
+ */
+#define BRCMF_D2H_SYNC_MAX_TRIES		64
 
 struct msgbuf_common_hdr {
 	u8				msgtype;
@@ -249,6 +256,7 @@ struct brcmf_msgbuf {
 	u32 max_rxbufpost;
 	u16 rx_metadata_offset;
 	u32 rxbufpost;
+	bool d2h_sync_xorcsum;
 
 	u32 max_ioctlrespbuf;
 	u32 cur_ioctlrespbuf;
@@ -347,8 +355,14 @@ brcmf_msgbuf_alloc_pktid(struct device *dev,
 	count = 0;
 	do {
 		(*idx)++;
-		if (*idx == pktids->array_size)
-			*idx = 0;
+		/* Index 0 is reserved and never handed out: the firmware treats
+		 * a work item whose request_id is 0 as invalid and traps (fatal
+		 * event 0x30) while completing it, which a sustained transfer
+		 * hits once the wrapping allocator cycles back to 0. The vendor
+		 * driver keeps the same invariant (pktid 0 == invalid).
+		 */
+		if (*idx >= pktids->array_size)
+			*idx = 1;
 		if (array[*idx].allocated.counter == 0)
 			if (atomic_cmpxchg(&array[*idx].allocated, 0, 1) == 0)
 				break;
@@ -1193,7 +1207,16 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 		ifp = msgbuf->drvr->mon_if;
 
 		if (!ifp) {
-			bphy_err(drvr, "Received unexpected monitor pkt\n");
+			static int diag_mon_cnt;
+
+			if (diag_mon_cnt < 48) {
+				bphy_err(drvr, "DIAG monitor pkt #%d flags=0x%04x data_len=%u ifidx=%u rxst=0x%08x/0x%08x\n",
+					 diag_mon_cnt, flags, buflen,
+					 rx_complete->msg.ifidx,
+					 le32_to_cpu(rx_complete->rx_status_0),
+					 le32_to_cpu(rx_complete->rx_status_1));
+				diag_mon_cnt++;
+			}
 			brcmu_pkt_buf_free_skb(skb);
 			return;
 		}
@@ -1347,6 +1370,46 @@ static void brcmf_msgbuf_process_msgtype(struct brcmf_msgbuf *msgbuf, void *buf)
 }
 
 
+/* Confirm a D2H completion item has fully landed in host memory before it is
+ * consumed (D2H_SYNC_XORCSUM). The firmware does not order the message-body DMA
+ * ahead of the write-index update it advertises the item with, so under load the
+ * host can see the index move while the body is still in flight. The firmware
+ * stamps each item with a per-ring epoch (the common header's rsvd0 byte) and a
+ * marker chosen so the XOR of all the item's 32-bit words is zero; an item that
+ * fails either check has not arrived yet. Consuming a half-written item feeds the
+ * firmware a bogus read pointer and crashes it, so spin briefly for the body and,
+ * failing that, drop the item (mirrors the downstream livelock handling). Ring
+ * memory is dma-coherent so the reads need no cache maintenance, only a volatile
+ * access to force a re-read each iteration.
+ */
+static bool brcmf_msgbuf_d2h_sync(struct brcmf_commonring *commonring, void *buf)
+{
+	volatile struct msgbuf_common_hdr *hdr = buf;
+	volatile u32 *words = buf;
+	u16 nwords = brcmf_commonring_len_item(commonring) / sizeof(*words);
+	u8 epoch = commonring->seqnum % BRCMF_D2H_EPOCH_MODULO;
+	u32 tries;
+	u16 i;
+
+	for (tries = 0; tries < BRCMF_D2H_SYNC_MAX_TRIES; tries++) {
+		if (hdr->rsvd0 == epoch) {
+			u32 csum = 0;
+
+			for (i = 0; i < nwords; i++)
+				csum ^= words[i];
+			if (csum == 0) {
+				commonring->seqnum++;
+				return true;
+			}
+		}
+		cpu_relax();
+		udelay(1);
+	}
+
+	commonring->seqnum++;
+	return false;
+}
+
 static void brcmf_msgbuf_process_rx(struct brcmf_msgbuf *msgbuf,
 				    struct brcmf_commonring *commonring)
 {
@@ -1361,8 +1424,10 @@ again:
 
 	processed = 0;
 	while (count) {
-		brcmf_msgbuf_process_msgtype(msgbuf,
-					     buf + msgbuf->rx_dataoffset);
+		if (!msgbuf->d2h_sync_xorcsum ||
+		    brcmf_msgbuf_d2h_sync(commonring, buf))
+			brcmf_msgbuf_process_msgtype(msgbuf,
+						     buf + msgbuf->rx_dataoffset);
 		buf += brcmf_commonring_len_item(commonring);
 		processed++;
 		if (processed == BRCMF_MSGBUF_UPDATE_RX_PTR_THRS) {
@@ -1611,6 +1676,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 
 	msgbuf->rx_dataoffset = if_msgbuf->rx_dataoffset;
 	msgbuf->max_rxbufpost = if_msgbuf->max_rxbufpost;
+	msgbuf->d2h_sync_xorcsum = if_msgbuf->d2h_sync_xorcsum;
 
 	msgbuf->max_ioctlrespbuf = BRCMF_MSGBUF_MAX_IOCTLRESPBUF_POST;
 	msgbuf->max_eventbuf = BRCMF_MSGBUF_MAX_EVENTBUF_POST;

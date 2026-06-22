@@ -518,9 +518,13 @@
 		/*
 		 * Source: bus shape follows upstream GS101 in gs101.dtsi:529-532.
 		 * The 0x40000000 span covers the MMIO addresses used below from the
-		 * downstream dump.
+		 * downstream dump.  The second window passes through the PCIe CH1
+		 * outbound + ECAM region at 0x6000_0000..0x6100_0000 (the pcie@13120000
+		 * "config" reg and "ranges" memory window) which lives above the first
+		 * span; without it of_translate_address() returns OF_BAD_ADDR for those.
 		 */
-		ranges = <0x0 0x0 0x0 0x40000000>;
+		ranges = <0x0 0x0 0x0 0x40000000>,
+			 <0x60000000 0x0 0x60000000 0x1000000>;
 
 		/*
 		 * Source: downstream CMU_TOP block base/size and PERIC0 parent
@@ -1290,6 +1294,59 @@
 		};
 
 		/*
+		 * PCIe GEN3A_1 root complex and PHY for the on-board WiFi
+		 * (Broadcom BCM4383).  Addresses, interrupts and ranges are from
+		 * research/dumped.dts:8217-8265 (pcie@13120000); the PHY register
+		 * regions are the controller's "phy"/"pcs"/"udbg"/"soc" windows.
+		 * Both nodes stay disabled here and are enabled by the board.
+		 */
+		pcie_phy: pcie-phy@13160000 {
+			compatible = "google,zumapro-pcie-phy";
+			reg = <0x13160000 0x3000>,
+			      <0x13140000 0x5000>,
+			      <0x13150000 0xd000>,
+			      <0x13130000 0x5000>;
+			reg-names = "pma", "pcs", "pll", "soc";
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_PHY_REFCLK_IN>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_UDBG_APB_PCLK>;
+			clock-names = "ref", "apb", "udbg";
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		pcie: pcie@13120000 {
+			compatible = "google,zumapro-pcie";
+			reg = <0x13120000 0x2000>,
+			      <0x13400000 0x381000>,
+			      <0x60ffe000 0x2000>;
+			reg-names = "elbi", "dbi", "config";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			device_type = "pci";
+			interrupts = <GIC_SPI 439 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 441 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "intr", "msi";
+			interrupt-map-mask = <0 0 0 0>;
+			interrupt-map = <0 0 0 0 &gic GIC_SPI 439 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_DBI_ACLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_MSTR_ACLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_SLV_ACLK>,
+				 <&cmu_hsi2 CLK_GOUT_HSI2_PCIE_GEN3A_1_DRIVER_APB_CLK>;
+			clock-names = "dbi", "mstr", "slv", "apb";
+			phys = <&pcie_phy>;
+			phy-names = "pcie";
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
+			num-lanes = <1>;
+			max-link-speed = <2>;
+			bus-range = <0x00 0xff>;
+			ranges = <0x82000000 0 0x60000000 0x60000000 0 0xff0000>;
+			status = "disabled";
+		};
+
+		/*
 		 * USB2 high-speed peripheral path (Pixel 9a boots over fastboot, so
 		 * USB is live at handoff).  Structural template: the in-tree
 		 * exynos2200.dtsi USB block; all addresses/clocks/IRQs are zumapro's
@@ -1718,6 +1775,8 @@
 		pinctrl_hsi1: pinctrl@13040000 {
 			compatible = "google,zumapro-pinctrl";
 			reg = <0x13040000 0x1000>;
+			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_GPIO_HSI2_PCLK>;
+			clock-names = "pclk";
 			interrupts = <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH 0>;
 			status = "disabled";
 

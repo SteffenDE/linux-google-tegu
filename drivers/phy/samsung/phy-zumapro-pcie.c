@@ -11,21 +11,29 @@
  * phy_calibrate() to wait for the PLL/CDR locks.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
-#include <linux/mfd/syscon.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 
-/* PMU PCIE_PHY_CONTROL: bit 0 == bypass isolation (1 = PHY active). */
+/*
+ * PMU PCIE_PHY_CONTROL bit 0 bypasses PHY isolation (1 = PHY active).  On
+ * Zumapro this register is firewalled to the secure world: a non-secure write
+ * async-aborts (SError), so it must be programmed through the EL3
+ * private-register SMC, matching the downstream rmw_priv_reg() path (and the
+ * secure PMU writes the pmdomain-samsung driver already uses on this SoC).
+ */
 #define PCIE_PHY_CONTROL_BYPASS		BIT(0)
+#define EXYNOS_SMC_CMD_PRIV_REG		0x82000504
+#define EXYNOS_PRIV_REG_OPT_RMW		2
 
 /* PMA */
 #define PMA_PHY_INPUT_CLK		0x032c	/* 0x3 = ungate, 0x0 = gate */
@@ -54,8 +62,7 @@ struct zumapro_pcie_phy {
 	void __iomem		*pll;
 	void __iomem		*soc;
 	struct clk_bulk_data	clks[PCIE_PHY_NUM_CLKS];
-	struct regmap		*pmu;
-	unsigned int		pmu_offset;
+	phys_addr_t		pmu_phys;
 };
 
 struct zumapro_pcie_phy_reg {
@@ -155,13 +162,29 @@ static int zumapro_pcie_phy_ext_pll(struct zumapro_pcie_phy *phy)
 	return 0;
 }
 
+/* Release (active) or re-assert PHY isolation via the secure PMU RMW. */
+static int zumapro_pcie_phy_set_isolation(struct zumapro_pcie_phy *phy, bool active)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(EXYNOS_SMC_CMD_PRIV_REG, phy->pmu_phys,
+		      EXYNOS_PRIV_REG_OPT_RMW, PCIE_PHY_CONTROL_BYPASS,
+		      active ? PCIE_PHY_CONTROL_BYPASS : 0, 0, 0, 0, &res);
+	if (res.a0) {
+		dev_err(phy->dev, "secure PMU isolation write failed: %ld\n",
+			res.a0);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static int zumapro_pcie_phy_init(struct phy *p)
 {
 	struct zumapro_pcie_phy *phy = phy_get_drvdata(p);
 
 	/* Release the PHY from PMU isolation (bypass = 1). */
-	return regmap_update_bits(phy->pmu, phy->pmu_offset,
-				  PCIE_PHY_CONTROL_BYPASS, PCIE_PHY_CONTROL_BYPASS);
+	return zumapro_pcie_phy_set_isolation(phy, true);
 }
 
 static int zumapro_pcie_phy_power_on(struct phy *p)
@@ -266,8 +289,7 @@ static int zumapro_pcie_phy_exit(struct phy *p)
 	struct zumapro_pcie_phy *phy = phy_get_drvdata(p);
 
 	/* Put the PHY back into PMU isolation. */
-	return regmap_update_bits(phy->pmu, phy->pmu_offset,
-				  PCIE_PHY_CONTROL_BYPASS, 0);
+	return zumapro_pcie_phy_set_isolation(phy, false);
 }
 
 static const struct phy_ops zumapro_pcie_phy_ops = {
@@ -288,7 +310,8 @@ static int zumapro_pcie_phy_probe(struct platform_device *pdev)
 	struct zumapro_pcie_phy *phy;
 	struct phy_provider *provider;
 	struct phy *generic_phy;
-	unsigned int args[1];
+	struct of_phandle_args pmu_args;
+	struct resource pmu_res;
 	int i, ret;
 
 	phy = devm_kzalloc(dev, sizeof(*phy), GFP_KERNEL);
@@ -316,13 +339,15 @@ static int zumapro_pcie_phy_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get clocks\n");
 
-	phy->pmu = syscon_regmap_lookup_by_phandle_args(dev->of_node,
-							"samsung,pmu-syscon",
-							1, args);
-	if (IS_ERR(phy->pmu))
-		return dev_err_probe(dev, PTR_ERR(phy->pmu),
-				     "failed to get PMU syscon\n");
-	phy->pmu_offset = args[0];
+	ret = of_parse_phandle_with_fixed_args(dev->of_node, "samsung,pmu-syscon",
+					       1, 0, &pmu_args);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get PMU syscon\n");
+	ret = of_address_to_resource(pmu_args.np, 0, &pmu_res);
+	of_node_put(pmu_args.np);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to resolve PMU base\n");
+	phy->pmu_phys = pmu_res.start + pmu_args.args[0];
 
 	generic_phy = devm_phy_create(dev, NULL, &zumapro_pcie_phy_ops);
 	if (IS_ERR(generic_phy))

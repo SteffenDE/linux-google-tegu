@@ -9,17 +9,17 @@
  * which this driver brackets with the ELBI PMA-reset assert/release.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
-#include <linux/mfd/syscon.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 
 #include "pcie-designware.h"
 
@@ -58,8 +58,15 @@
 #define PCIE_PMA_RST_1			0x1404
 #define PCIE_PMA_RST_2			0x1408
 
-/* PMU PCIE_PHY_CONTROL: bit 10 is the PCIe wakeup/IDLE-IP control. */
+/*
+ * PMU PCIE_PHY_CONTROL: bit 10 is the PCIe wakeup/IDLE-IP control.  Like the
+ * isolation bit the PHY driver owns, this register is firewalled to the secure
+ * world on Zumapro, so it is programmed through the EL3 private-register SMC
+ * (downstream rmw_priv_reg()); a non-secure write async-aborts (SError).
+ */
 #define PCIE_PMU_WAKE_CTRL		BIT(10)
+#define EXYNOS_SMC_CMD_PRIV_REG		0x82000504
+#define EXYNOS_PRIV_REG_OPT_RMW		2
 
 /* PERST settle time after deassert (downstream perst-delay-us). */
 #define PCIE_PERST_DELAY_US		15000
@@ -70,8 +77,7 @@ struct zumapro_pcie {
 	int			num_clks;
 	struct phy		*phy;
 	struct gpio_desc	*perst;
-	struct regmap		*pmu;
-	unsigned int		pmu_offset;
+	phys_addr_t		pmu_phys;
 };
 
 /*
@@ -153,6 +159,17 @@ static const struct dw_pcie_ops zumapro_dw_pcie_ops = {
 	.start_link	= zumapro_pcie_start_link,
 };
 
+/* Masked read-modify-write of a secure PMU register through the EL3 SMC. */
+static int zumapro_pcie_pmu_rmw(phys_addr_t reg, u32 mask, u32 val)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(EXYNOS_SMC_CMD_PRIV_REG, reg, EXYNOS_PRIV_REG_OPT_RMW,
+		      mask, val, 0, 0, 0, &res);
+
+	return res.a0 ? -EIO : 0;
+}
+
 static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
@@ -184,9 +201,10 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 	 * PCIE_PHY_CONTROL after the PHY reset; whether it is required for
 	 * link-up on bare hardware is still TRACE NEEDED.
 	 */
-	if (zp->pmu)
-		regmap_update_bits(zp->pmu, zp->pmu_offset,
-				   PCIE_PMU_WAKE_CTRL, PCIE_PMU_WAKE_CTRL);
+	ret = zumapro_pcie_pmu_rmw(zp->pmu_phys, PCIE_PMU_WAKE_CTRL,
+				   PCIE_PMU_WAKE_CTRL);
+	if (ret)
+		dev_warn(pci->dev, "failed to set PMU PCIe wake control\n");
 
 	/* Release PERST# and let the endpoint settle before link training. */
 	gpiod_set_value_cansleep(zp->perst, 0);
@@ -210,7 +228,8 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct zumapro_pcie *zp;
-	unsigned int args[1];
+	struct of_phandle_args pmu_args;
+	struct resource pmu_res;
 	int ret;
 
 	zp = devm_kzalloc(dev, sizeof(*zp), GFP_KERNEL);
@@ -235,12 +254,15 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(zp->perst),
 				     "failed to get reset GPIO\n");
 
-	zp->pmu = syscon_regmap_lookup_by_phandle_args(np, "samsung,pmu-syscon",
-						       1, args);
-	if (IS_ERR(zp->pmu))
-		return dev_err_probe(dev, PTR_ERR(zp->pmu),
-				     "failed to get PMU syscon\n");
-	zp->pmu_offset = args[0];
+	ret = of_parse_phandle_with_fixed_args(np, "samsung,pmu-syscon",
+					       1, 0, &pmu_args);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get PMU syscon\n");
+	ret = of_address_to_resource(pmu_args.np, 0, &pmu_res);
+	of_node_put(pmu_args.np);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to resolve PMU base\n");
+	zp->pmu_phys = pmu_res.start + pmu_args.args[0];
 
 	platform_set_drvdata(pdev, zp);
 

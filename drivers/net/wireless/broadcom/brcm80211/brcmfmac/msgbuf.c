@@ -23,6 +23,7 @@
 #include "flowring.h"
 #include "bus.h"
 #include "tracepoint.h"
+#include "pcie.h"
 
 
 #define MSGBUF_IOCTL_RESP_TIMEOUT		msecs_to_jiffies(2000)
@@ -47,6 +48,8 @@
 #define MSGBUF_TYPE_RX_CMPLT			0x12
 #define MSGBUF_TYPE_LPBK_DMAXFER		0x13
 #define MSGBUF_TYPE_LPBK_DMAXFER_CMPLT		0x14
+#define MSGBUF_TYPE_H2D_MAILBOX_DATA		0x23
+#define MSGBUF_TYPE_D2H_MAILBOX_DATA		0x24
 
 #define NR_TX_PKTIDS				2048
 /* The rx pktid pool is shared between posted rx data buffers and the
@@ -79,6 +82,8 @@
 #define BRCMF_MSGBUF_UPDATE_RX_PTR_THRS		48
 
 #define BRCMF_MAX_TXSTATUS_WAIT_RETRIES		10
+
+#define BRCMF_H2D_EPOCH_MODULO			253
 
 struct msgbuf_common_hdr {
 	u8				msgtype;
@@ -132,6 +137,33 @@ struct msgbuf_completion_hdr {
 	__le16				status;
 	__le16				flow_ring_id;
 };
+
+/* Host -> device mailbox data, sent as a control-ring message on cores that
+ * have no function-0 mailbox (PCIe2 core rev >= 64).
+ */
+struct msgbuf_h2d_mailbox_data {
+	struct msgbuf_common_hdr	msg;
+	__le32				mail_box_data;
+	__le32				rsvd0[7];
+};
+
+/* Device -> host mailbox data, delivered as a control-completion message. */
+struct msgbuf_d2h_mailbox_data {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	__le32				mail_box_data;
+	__le32				rsvd0;
+	__le32				marker;
+};
+
+static u8 brcmf_msgbuf_next_h2d_epoch(struct brcmf_commonring *commonring)
+{
+	u8 epoch = commonring->seqnum % BRCMF_H2D_EPOCH_MODULO;
+
+	commonring->seqnum++;
+
+	return epoch;
+}
 
 /* Data struct for the MSGBUF_TYPE_GEN_STATUS */
 struct msgbuf_gen_status {
@@ -281,6 +313,16 @@ struct brcmf_msgbuf {
 	spinlock_t flowring_work_lock;
 	struct list_head work_queue;
 };
+
+static int brcmf_msgbuf_pm_enter(struct brcmf_msgbuf *msgbuf)
+{
+	return brcmf_pcie_pm_enter_active(msgbuf->drvr->bus_if);
+}
+
+static void brcmf_msgbuf_pm_leave(struct brcmf_msgbuf *msgbuf)
+{
+	brcmf_pcie_pm_leave_active(msgbuf->drvr->bus_if);
+}
 
 struct brcmf_msgbuf_pktid {
 	atomic_t  allocated;
@@ -450,13 +492,18 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	void *ret_ptr;
 	int err;
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
+		return err;
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 
 	msgbuf->reqid++;
@@ -465,6 +512,7 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	request->msg.msgtype = MSGBUF_TYPE_IOCTLPTR_REQ;
 	request->msg.ifidx = (u8)ifidx;
 	request->msg.flags = 0;
+	request->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	request->msg.request_id = cpu_to_le32(BRCMF_IOCTL_REQ_PKTID);
 	request->cmd = cpu_to_le32(cmd);
 	request->output_buf_len = cpu_to_le16(len);
@@ -482,6 +530,8 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
 
+out:
+	brcmf_msgbuf_pm_leave(msgbuf);
 	return err;
 }
 
@@ -620,12 +670,19 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err) {
+		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+		return BRCMF_FLOWRING_INVALID_ID;
+	}
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
+		brcmf_msgbuf_pm_leave(msgbuf);
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
@@ -633,6 +690,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 	create = (struct msgbuf_tx_flowring_create_req *)ret_ptr;
 	create->msg.msgtype = MSGBUF_TYPE_FLOW_RING_CREATE;
 	create->msg.ifidx = work->ifidx;
+	create->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	create->msg.request_id = 0;
 	create->tid = brcmf_flowring_tid(msgbuf->flow, flowid);
 	create->flow_ring_id = cpu_to_le16(flowid +
@@ -650,6 +708,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 	if (err) {
 		bphy_err(drvr, "Failed to write commonring\n");
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
@@ -719,10 +778,17 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	u32 pktid;
 	struct msgbuf_tx_msghdr *tx_msghdr;
 	u64 address;
+	int err;
 
 	commonring = msgbuf->flowrings[flowid];
-	if (!brcmf_commonring_write_available(commonring))
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
 		return;
+
+	if (!brcmf_commonring_write_available(commonring)) {
+		brcmf_msgbuf_pm_leave(msgbuf);
+		return;
+	}
 
 	brcmf_commonring_lock(commonring);
 
@@ -756,6 +822,7 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 		tx_msghdr->msg.msgtype = MSGBUF_TYPE_TX_POST;
 		tx_msghdr->msg.request_id = cpu_to_le32(pktid + 1);
 		tx_msghdr->msg.ifidx = brcmf_flowring_ifidx_get(flow, flowid);
+		tx_msghdr->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 		tx_msghdr->flags = BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_3;
 		tx_msghdr->flags |= (skb->priority & 0x07) <<
 				    BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT;
@@ -778,6 +845,7 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	if (count)
 		brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 }
 
 
@@ -925,13 +993,19 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 	u64 address;
 	u32 pktid;
 	u32 i;
+	int err;
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_RXPOST_SUBMIT];
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
+		return 0;
+
 	ret_ptr = brcmf_commonring_reserve_for_write_multiple(commonring,
 							      count,
 							      &alloced);
 	if (!ret_ptr) {
 		brcmf_dbg(MSGBUF, "Failed to reserve space in commonring\n");
+		brcmf_msgbuf_pm_leave(msgbuf);
 		return 0;
 	}
 
@@ -972,6 +1046,7 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 		}
 		rx_bufpost->msg.msgtype = MSGBUF_TYPE_RXBUF_POST;
 		rx_bufpost->msg.request_id = cpu_to_le32(pktid);
+		rx_bufpost->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 
 		address = (u64)physaddr;
 		rx_bufpost->data_buf_len = cpu_to_le16((u16)pktlen);
@@ -986,6 +1061,7 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 	if (i)
 		brcmf_commonring_write_complete(commonring);
 
+	brcmf_msgbuf_pm_leave(msgbuf);
 	return i;
 }
 
@@ -1033,8 +1109,13 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 	u64 address;
 	u32 pktid;
 	u32 i;
+	int err;
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
+		return 0;
+
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write_multiple(commonring,
 							      count,
@@ -1042,6 +1123,7 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
+		brcmf_msgbuf_pm_leave(msgbuf);
 		return 0;
 	}
 
@@ -1072,6 +1154,7 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 			rx_bufpost->msg.msgtype =
 				MSGBUF_TYPE_IOCTLRESP_BUF_POST;
 		rx_bufpost->msg.request_id = cpu_to_le32(pktid);
+		rx_bufpost->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 
 		address = (u64)physaddr;
 		rx_bufpost->host_buf_len = cpu_to_le16((u16)pktlen);
@@ -1087,6 +1170,7 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 		brcmf_commonring_write_complete(commonring);
 
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 
 	return i;
 }
@@ -1297,6 +1381,45 @@ brcmf_msgbuf_process_flow_ring_delete_response(struct brcmf_msgbuf *msgbuf,
 }
 
 
+int brcmf_msgbuf_h2d_mbdata(struct brcmf_pub *drvr, u32 mbdata)
+{
+	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
+	struct msgbuf_h2d_mailbox_data *request;
+	struct brcmf_commonring *commonring;
+	void *ret_ptr;
+	int err;
+
+	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
+	brcmf_commonring_lock(commonring);
+	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
+	if (!ret_ptr) {
+		bphy_err(drvr, "Failed to reserve space in commonring\n");
+		brcmf_commonring_unlock(commonring);
+		return -ENOMEM;
+	}
+
+	request = (struct msgbuf_h2d_mailbox_data *)ret_ptr;
+	memset(request, 0, sizeof(*request));
+	request->msg.msgtype = MSGBUF_TYPE_H2D_MAILBOX_DATA;
+	request->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
+	request->msg.request_id = 0;
+	request->mail_box_data = cpu_to_le32(mbdata);
+
+	err = brcmf_commonring_write_complete(commonring);
+	brcmf_commonring_unlock(commonring);
+
+	return err;
+}
+
+static void brcmf_msgbuf_process_d2h_mailbox_data(struct brcmf_msgbuf *msgbuf,
+						  void *buf)
+{
+	struct msgbuf_d2h_mailbox_data *resp = buf;
+
+	brcmf_pcie_handle_mbdata(msgbuf->drvr->bus_if,
+				 le32_to_cpu(resp->mail_box_data));
+}
+
 static void brcmf_msgbuf_process_msgtype(struct brcmf_msgbuf *msgbuf, void *buf)
 {
 	struct brcmf_pub *drvr = msgbuf->drvr;
@@ -1338,6 +1461,10 @@ static void brcmf_msgbuf_process_msgtype(struct brcmf_msgbuf *msgbuf, void *buf)
 	case MSGBUF_TYPE_RX_CMPLT:
 		brcmf_dbg(MSGBUF, "MSGBUF_TYPE_RX_CMPLT\n");
 		brcmf_msgbuf_process_rx_complete(msgbuf, buf);
+		break;
+	case MSGBUF_TYPE_D2H_MAILBOX_DATA:
+		brcmf_dbg(MSGBUF, "MSGBUF_TYPE_D2H_MAILBOX_DATA\n");
+		brcmf_msgbuf_process_d2h_mailbox_data(msgbuf, buf);
 		break;
 	default:
 		bphy_err(drvr, "Unsupported msgtype %d\n", msg->msgtype);
@@ -1444,12 +1571,19 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 		return;
 	}
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err) {
+		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+		return;
+	}
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "FW unaware, flowring will be removed !!\n");
 		brcmf_commonring_unlock(commonring);
+		brcmf_msgbuf_pm_leave(msgbuf);
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
 		return;
 	}
@@ -1460,6 +1594,7 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 
 	delete->msg.msgtype = MSGBUF_TYPE_FLOW_RING_DELETE;
 	delete->msg.ifidx = ifidx;
+	delete->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	delete->msg.request_id = 0;
 
 	delete->flow_ring_id = cpu_to_le16(flowid +
@@ -1471,6 +1606,7 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 	if (err) {
 		bphy_err(drvr, "Failed to submit RING_DELETE, flowring will be removed\n");
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);

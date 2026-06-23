@@ -29,6 +29,7 @@ struct msgbuf_buf_addr {
 };
 
 int brcmf_proto_msgbuf_rx_trigger(struct device *dev);
+int brcmf_msgbuf_h2d_mbdata(struct brcmf_pub *drvr, u32 mbdata);
 void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid);
 int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr);
 void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr);

@@ -1434,6 +1434,15 @@
 			vdd33-supply = <&reg_placeholder>;
 			vdd10-supply = <&reg_placeholder>;
 
+			/*
+			 * The USB32DRD PHY/link gates access to the child DWC3
+			 * core's global registers: suspend's phy_exit() isolates
+			 * the link, so the resume path must re-init the PHY before
+			 * reading GUSB* registers. Needed because an aborted
+			 * suspend can resume DWC3 without resuming the PHY provider.
+			 */
+			samsung,phy-init-before-setup;
+
 			#address-cells = <1>;
 			#size-cells = <1>;
 

@@ -848,7 +848,7 @@ static void samsung_dsim_zumapro_select_word_clock(struct samsung_dsim *dsi,
 
 static inline bool samsung_dsim_init_on_transfer(enum samsung_dsim_type hw)
 {
-	return samsung_dsim_hw_is_exynos(hw) || hw == DSIM_TYPE_ZUMAPRO;
+	return samsung_dsim_hw_is_exynos(hw);
 }
 
 static void samsung_dsim_wait_for_reset(struct samsung_dsim *dsi)

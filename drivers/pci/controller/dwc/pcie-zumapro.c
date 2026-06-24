@@ -267,8 +267,92 @@ err_phy_exit:
 	return ret;
 }
 
+/*
+ * Enable ASPM (including L1.1/L1.2) on one device.  The substate timing, LTR
+ * and L1SS enable bits are all programmed by the generic ASPM core; the host
+ * driver's only job is to request the states once the device is enumerated.
+ * Mirrors pcie-qcom.c qcom_pcie_enable_aspm().  The on-board BCM4383 needs the
+ * link to reach L1.2 before its firmware will enter in-band deep sleep.
+ */
+static int zumapro_pcie_enable_aspm(struct pci_dev *pdev, void *userdata)
+{
+	int l1ss = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_L1SS);
+	u16 lnkctl = 0, devctl2 = 0;
+	u32 l1ss_ctl1 = 0;
+
+	/* Substates may only be enabled from D0 (matches pcie-qcom.c). */
+	pci_set_power_state_locked(pdev, PCI_D0);
+	pci_enable_link_state_locked(pdev, PCIE_LINK_STATE_ALL);
+
+	/* Report what the core actually managed to turn on, per device. */
+	pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &lnkctl);
+	pcie_capability_read_word(pdev, PCI_EXP_DEVCTL2, &devctl2);
+	if (l1ss)
+		pci_read_config_dword(pdev, l1ss + PCI_L1SS_CTL1, &l1ss_ctl1);
+	pci_info(pdev, "ASPM L1=%d LTR=%d L1SS_CTL1=%#x\n",
+		 !!(lnkctl & PCI_EXP_LNKCTL_ASPM_L1),
+		 !!(devctl2 & PCI_EXP_DEVCTL2_LTR_EN), l1ss_ctl1);
+
+	return 0;
+}
+
+/*
+ * The ASPM core enables the L1 PM Substates by writing PCI_L1SS_CTL1 through
+ * normal config accesses, but the DWC root port's config space is read-only
+ * unless DBI read-only-write is enabled, and dw_pcie_own_conf_map_bus() does
+ * not toggle it.  So the core sets the endpoint's enable bits while the root
+ * port keeps its synthesis default (substates disabled), and the link never
+ * descends below L1.0.  Re-apply the endpoint's enable bits to the root port
+ * through the DBI to complete the link's L1SS configuration.
+ */
+static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
+{
+	u16 rc_l1ss = dw_pcie_find_ext_capability(pci, PCI_EXT_CAP_ID_L1SS);
+	int ep_l1ss = pci_find_ext_capability(ep, PCI_EXT_CAP_ID_L1SS);
+	u32 ep_ctl1 = 0, val;
+
+	if (!rc_l1ss || !ep_l1ss)
+		return;
+
+	pci_read_config_dword(ep, ep_l1ss + PCI_L1SS_CTL1, &ep_ctl1);
+
+	dw_pcie_dbi_ro_wr_en(pci);
+	val = dw_pcie_read_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4);
+	val &= ~PCI_L1SS_CTL1_L1SS_MASK;
+	val |= ep_ctl1 & PCI_L1SS_CTL1_L1SS_MASK;
+	dw_pcie_write_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4, val);
+	dw_pcie_dbi_ro_wr_dis(pci);
+
+	dev_info(pci->dev, "L1SS: root-port CTL1 fixed up to %#x\n",
+		 dw_pcie_read_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4));
+}
+
+/*
+ * Runs after pci_host_probe() has enumerated the endpoint.  The DWC core only
+ * leaves the RC's L1 PM Substate capability advertised because probe() sets
+ * pci->l1ss_support (see dw_pcie_hide_unsupported_l1ss()); with the capability
+ * visible on both ends, walking the hierarchy and enabling the link states
+ * lets the ASPM core do the actual L1SS/LTR register programming.
+ */
+static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
+{
+	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+	struct pci_dev *rp, *ep = NULL;
+
+	pci_walk_bus(pp->bridge->bus, zumapro_pcie_enable_aspm, NULL);
+
+	rp = pci_get_slot(pp->bridge->bus, PCI_DEVFN(0, 0));
+	if (rp && rp->subordinate)
+		ep = pci_get_slot(rp->subordinate, PCI_DEVFN(0, 0));
+	if (ep)
+		zumapro_pcie_fixup_rc_l1ss(pci, ep);
+	pci_dev_put(ep);
+	pci_dev_put(rp);
+}
+
 static const struct dw_pcie_host_ops zumapro_pcie_host_ops = {
-	.init	= zumapro_pcie_host_init,
+	.init		= zumapro_pcie_host_init,
+	.post_init	= zumapro_pcie_host_post_init,
 };
 
 static int zumapro_pcie_probe(struct platform_device *pdev)
@@ -287,6 +371,13 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 	zp->pci.dev = dev;
 	zp->pci.ops = &zumapro_dw_pcie_ops;
 	zp->pci.pp.ops = &zumapro_pcie_host_ops;
+
+	/*
+	 * Keep the L1 PM Substate capability advertised so the ASPM core can
+	 * manage L1.1/L1.2; otherwise the DWC core hides it (it requires
+	 * CLKREQ#, which the board's PCIe pinmux provides).
+	 */
+	zp->pci.l1ss_support = true;
 
 	zp->phy = devm_of_phy_get(dev, np, NULL);
 	if (IS_ERR(zp->phy))

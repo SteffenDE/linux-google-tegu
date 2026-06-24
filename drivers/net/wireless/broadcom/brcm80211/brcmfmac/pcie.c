@@ -17,6 +17,7 @@
 #include <linux/io.h>
 #include <linux/random.h>
 #include <linux/pm_runtime.h>
+#include <linux/workqueue.h>
 #include <linux/unaligned.h>
 
 #include <soc.h>
@@ -256,6 +257,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_SHARED_HTOD_MB_DATA_ADDR_OFFSET	40
 #define BRCMF_SHARED_DTOH_MB_DATA_ADDR_OFFSET	44
 #define BRCMF_SHARED_RING_INFO_ADDR_OFFSET	48
+#define BRCMF_SHARED_FLAGS2_OFFSET		80
 #define BRCMF_SHARED_HOST_CAP_OFFSET		84
 #define BRCMF_SHARED_HOST_TRAP_ADDR_OFFSET	88
 #define BRCMF_SHARED_HOST_CAP2_OFFSET		112
@@ -300,6 +302,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 #define BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS	1000
+/* Idle settle before releasing the dongle (in-band device-wake deassert). */
+#define BRCMF_PCIE_DS_IDLE_DEASSERT_MS		50
 
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
@@ -391,6 +395,7 @@ struct brcmf_pciedev_info {
 	spinlock_t ds_lock;
 	enum brcmf_pcie_inband_ds_state ds_state;
 	atomic_t ds_active_count;
+	struct delayed_work ds_idle_work;
 	bool ds_exit_completed;
 	bool skip_ds_ack;
 	bool runtime_pm_enabled;
@@ -515,6 +520,7 @@ static void
 brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *devinfo, bool active);
 static void brcmf_pcie_debugfs_create(struct device *dev);
 static void brcmf_pcie_set_host_cap(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
 static bool brcmf_pcie_use_inband_ds(struct brcmf_pciedev_info *devinfo);
 
 static u16
@@ -952,12 +958,32 @@ brcmf_pcie_set_inband_ds_state(struct brcmf_pciedev_info *devinfo,
 	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
 }
 
+/* TEGURPM debug: human-readable in-band deep-sleep state. */
+static const char *brcmf_pcie_ds_state_str(enum brcmf_pcie_inband_ds_state s)
+{
+	switch (s) {
+	case BRCMF_PCIE_DS_DISABLED:		return "DISABLED";
+	case BRCMF_PCIE_DS_ACTIVE:		return "ACTIVE";
+	case BRCMF_PCIE_DS_DEV_SLEEP_PEND:	return "DEV_SLEEP_PEND";
+	case BRCMF_PCIE_DS_DEV_SLEEP:		return "DEV_SLEEP";
+	case BRCMF_PCIE_DS_DEV_WAKE:		return "DEV_WAKE";
+	case BRCMF_PCIE_DS_DISABLED_WAIT:	return "DISABLED_WAIT";
+	case BRCMF_PCIE_DS_HOST_SLEEP_WAIT:	return "HOST_SLEEP_WAIT";
+	case BRCMF_PCIE_DS_HOST_SLEEP:		return "HOST_SLEEP";
+	case BRCMF_PCIE_DS_HOST_WAKE_WAIT:	return "HOST_WAKE_WAIT";
+	default:				return "?";
+	}
+}
+
 static void
 brcmf_pcie_request_runtime_autosuspend(struct brcmf_pciedev_info *devinfo)
 {
 	if (!devinfo->runtime_pm_enabled)
 		return;
 
+	dev_info(&devinfo->pdev->dev,
+		 "TEGURPM: request autosuspend (delay %dms)\n",
+		 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
 	pm_runtime_mark_last_busy(&devinfo->pdev->dev);
 	pm_request_autosuspend(&devinfo->pdev->dev);
 }
@@ -988,6 +1014,9 @@ static void brcmf_pcie_ack_pending_ds(struct brcmf_pciedev_info *devinfo)
 		return;
 	}
 
+	dev_info(&devinfo->pdev->dev,
+		 "TEGURPM: sent DS_ACK -> DEV_SLEEP (active_count=%d)\n",
+		 atomic_read(&devinfo->ds_active_count));
 	wake_up(&devinfo->ds_enter_wait);
 	brcmf_pcie_request_runtime_autosuspend(devinfo);
 }
@@ -1001,6 +1030,10 @@ static void brcmf_pcie_process_mb_data(struct brcmf_pciedev_info *devinfo,
 	unsigned long flags;
 
 	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", dtoh_mb_data);
+	dev_info(&devinfo->pdev->dev,
+		 "TEGURPM: process_mb_data 0x%08x ds_state=%s active=%d\n",
+		 dtoh_mb_data, brcmf_pcie_ds_state_str(devinfo->ds_state),
+		 atomic_read(&devinfo->ds_active_count));
 	if (dtoh_mb_data & BRCMF_D2H_DEV_DS_ENTER_REQ) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP REQ\n");
 
@@ -1010,6 +1043,11 @@ static void brcmf_pcie_process_mb_data(struct brcmf_pciedev_info *devinfo,
 			devinfo->ds_state = BRCMF_PCIE_DS_DEV_SLEEP_PEND;
 		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
 
+		dev_info(&devinfo->pdev->dev,
+			 "TEGURPM: D2H DS_ENTER_REQ -> %s (active_count=%d skip_ack=%d)\n",
+			 brcmf_pcie_ds_state_str(brcmf_pcie_get_inband_ds_state(devinfo)),
+			 atomic_read(&devinfo->ds_active_count),
+			 devinfo->skip_ds_ack);
 		brcmf_pcie_ack_pending_ds(devinfo);
 	}
 	if (dtoh_mb_data & BRCMF_D2H_DEV_DS_EXIT_NOTE) {
@@ -1032,6 +1070,9 @@ static void brcmf_pcie_process_mb_data(struct brcmf_pciedev_info *devinfo,
 		}
 		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
 
+		dev_info(&devinfo->pdev->dev,
+			 "TEGURPM: D2H DS_EXIT_NOTE (was %s)\n",
+			 brcmf_pcie_ds_state_str(state));
 		if (wake_ds_exit)
 			wake_up(&devinfo->ds_exit_wait);
 
@@ -1042,13 +1083,15 @@ static void brcmf_pcie_process_mb_data(struct brcmf_pciedev_info *devinfo,
 						       BRCMF_PCIE_DS_ACTIVE);
 	}
 	if (dtoh_mb_data & BRCMF_D2H_DEV_D3_ACK) {
-		brcmf_dbg(PCIE, "D2H_MB_DATA: D3 ACK\n");
+		dev_info(&devinfo->pdev->dev, "TEGURPM: D2H D3_ACK -> HOST_SLEEP\n");
 		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_HOST_SLEEP);
 		devinfo->mbdata_completed = true;
 		wake_up(&devinfo->mbdata_resp_wait);
 	}
-	if (dtoh_mb_data & BRCMF_D2H_DEV_D0_ACK)
+	if (dtoh_mb_data & BRCMF_D2H_DEV_D0_ACK) {
+		dev_info(&devinfo->pdev->dev, "TEGURPM: D2H D0_ACK -> ACTIVE\n");
 		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+	}
 	if (dtoh_mb_data & BRCMF_D2H_DEV_FWHALT) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
 		brcmf_fw_crashed(&devinfo->pdev->dev);
@@ -1124,12 +1167,29 @@ static int brcmf_pcie_inband_device_wake(struct brcmf_pciedev_info *devinfo,
 		if (state == BRCMF_PCIE_DS_DISABLED_WAIT)
 			return brcmf_pcie_wait_mbdata(devinfo, &devinfo->ds_exit_wait,
 						      &devinfo->ds_exit_completed);
+		if (state == BRCMF_PCIE_DS_ACTIVE) {
+			/*
+			 * The device is awake but the firmware believes the host
+			 * is idle and may micro-sleep.  Assert device-wake to
+			 * hold it awake for this access; paired with the deassert
+			 * on idle this is the active->idle edge the firmware
+			 * needs before it will enter in-band deep sleep.
+			 */
+			err = brcmf_pcie_send_mb_data(devinfo,
+					BRCMF_H2D_HOST_DS_DEVICE_WAKE_ASSERT);
+			if (!err)
+				brcmf_pcie_set_inband_ds_state(devinfo,
+						BRCMF_PCIE_DS_DEV_WAKE);
+			return err;
+		}
 		if (state != BRCMF_PCIE_DS_DEV_SLEEP)
 			return 0;
 
 		devinfo->ds_exit_completed = false;
 		brcmf_pcie_set_inband_ds_state(devinfo,
 					       BRCMF_PCIE_DS_DISABLED_WAIT);
+		dev_info(&devinfo->pdev->dev,
+			 "TEGURPM: device_wake ASSERT 0x40 (DEV_SLEEP->DISABLED_WAIT), waiting DS_EXIT_NOTE\n");
 		err = brcmf_pcie_send_mb_data(devinfo,
 					      BRCMF_H2D_HOST_DS_DEVICE_WAKE_ASSERT);
 		if (err) {
@@ -1140,9 +1200,15 @@ static int brcmf_pcie_inband_device_wake(struct brcmf_pciedev_info *devinfo,
 
 		err = brcmf_pcie_wait_mbdata(devinfo, &devinfo->ds_exit_wait,
 					     &devinfo->ds_exit_completed);
-		if (err)
+		if (err) {
+			dev_info(&devinfo->pdev->dev,
+				 "TEGURPM: device_wake ASSERT timed out (no DS_EXIT_NOTE) -> ACTIVE\n");
 			brcmf_pcie_set_inband_ds_state(devinfo,
 						       BRCMF_PCIE_DS_ACTIVE);
+		} else {
+			dev_info(&devinfo->pdev->dev,
+				 "TEGURPM: device_wake ASSERT done (DS_EXIT_NOTE seen)\n");
+		}
 
 		return err;
 	}
@@ -1159,12 +1225,31 @@ static int brcmf_pcie_inband_device_wake(struct brcmf_pciedev_info *devinfo,
 	if (state != BRCMF_PCIE_DS_DEV_WAKE)
 		return 0;
 
+	dev_info(&devinfo->pdev->dev,
+		 "TEGURPM: device_wake DEASSERT 0x20 (DEV_WAKE->ACTIVE)\n");
 	err = brcmf_pcie_send_mb_data(devinfo,
 				      BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT);
 	if (!err)
 		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
 
 	return err;
+}
+
+/*
+ * Deferred device-wake deassert: once the host has settled idle, release the
+ * dongle so it can enter in-band deep sleep.  Runs in process context so it may
+ * send the mailbox message.
+ */
+static void brcmf_pcie_ds_idle_work(struct work_struct *work)
+{
+	struct brcmf_pciedev_info *devinfo = container_of(to_delayed_work(work),
+			struct brcmf_pciedev_info, ds_idle_work);
+
+	if (devinfo->state == BRCMFMAC_PCIE_STATE_DOWN ||
+	    atomic_read(&devinfo->ds_active_count) != 0)
+		return;
+
+	brcmf_pcie_inband_device_wake(devinfo, false);
 }
 
 int brcmf_pcie_pm_enter_active(struct brcmf_bus *bus)
@@ -1180,6 +1265,7 @@ int brcmf_pcie_pm_enter_active(struct brcmf_bus *bus)
 		return 0;
 
 	atomic_inc(&devinfo->ds_active_count);
+	cancel_delayed_work_sync(&devinfo->ds_idle_work);
 
 	err = pm_runtime_resume_and_get(&devinfo->pdev->dev);
 	if (err) {
@@ -1210,8 +1296,15 @@ void brcmf_pcie_pm_leave_active(struct brcmf_bus *bus)
 		return;
 
 	atomic_dec(&devinfo->ds_active_count);
-	brcmf_pcie_inband_device_wake(devinfo, false);
 	brcmf_pcie_ack_pending_ds(devinfo);
+	/*
+	 * Defer the device-wake deassert until the host settles, so a burst of
+	 * back-to-back accesses doesn't thrash the mailbox.  The deassert is
+	 * what releases the firmware to enter in-band deep sleep.
+	 */
+	if (atomic_read(&devinfo->ds_active_count) == 0)
+		schedule_delayed_work(&devinfo->ds_idle_work,
+			msecs_to_jiffies(BRCMF_PCIE_DS_IDLE_DEASSERT_MS));
 	pm_runtime_mark_last_busy(&devinfo->pdev->dev);
 	pm_runtime_put_autosuspend(&devinfo->pdev->dev);
 }
@@ -1876,6 +1969,16 @@ static int brcmf_pcie_preinit(struct device *dev)
 	brcmf_pcie_intr_enable(buspub->devinfo);
 	brcmf_pcie_hostready(buspub->devinfo);
 
+	/*
+	 * Only now that host_cap has enabled in-band deep sleep may we start
+	 * managing device-wake.  Doing it earlier ran the device-wake protocol
+	 * before the firmware was told in-band DS exists, which left the
+	 * firmware's DS subsystem dark.  The preinit dcmds that follow this
+	 * callback then assert/deassert device-wake with DS already enabled,
+	 * matching downstream's ordering.
+	 */
+	brcmf_pcie_runtime_pm_enable(buspub->devinfo);
+
 	return 0;
 }
 
@@ -2057,17 +2160,14 @@ static void brcmf_pcie_set_host_cap(struct brcmf_pciedev_info *devinfo)
 	host_cap |= BRCMF_PCIE_HOSTCAP_EXTENDED_TRAP_DATA |
 		    BRCMF_PCIE_HOSTCAP_UR_FW_NO_TRAP;
 
-	/* BCM4383 v7 firmware can trap if host_cap is written immediately after
-	 * the shared structure becomes visible, even though the shared pointer,
-	 * rings_info pointer, and h2d/d2h mailbox pointers are already valid.
-	 * A diagnostic shared-struct dump accidentally made bring-up reliable;
-	 * replacing that dump with this delay kept it reliable too. Downstream
-	 * has no obvious host_cap-ready bit for BCM4383: it waits for the same
-	 * last-TCM-word shared-struct pointer publication, then reaches host_cap
-	 * later after its bus/protocol setup path. Keep this temporary delay until
-	 * we identify a real firmware readiness predicate or a better ordering.
+	/*
+	 * BCM4383 v7 firmware traps if host_cap is written too soon after the
+	 * shared structure becomes visible (HW-confirmed: a 0ms write halts the
+	 * dongle).  A delay is required; keep it as short as reliably works so
+	 * host_cap still lands before the firmware latches its deep-sleep
+	 * decision.  100ms was known-good; trying 50ms.
 	 */
-	msleep(100);
+	msleep(50);
 
 	addr = devinfo->shared.tcm_base_address + BRCMF_SHARED_HOST_CAP_OFFSET;
 	brcmf_pcie_write_tcm32(devinfo, addr, host_cap);
@@ -2082,6 +2182,16 @@ static void brcmf_pcie_set_host_cap(struct brcmf_pciedev_info *devinfo)
 
 	dev_info(&devinfo->pdev->dev, "wrote host_cap 0x%x (fw rev %u active %u)\n",
 		 host_cap, devinfo->shared.version, devinfo->shared.active_version);
+
+	/*
+	 * Diagnostic: mainline never reads the firmware's flags2 word, where the
+	 * BCM4383 (rev 7) advertises capabilities this generic driver does not
+	 * implement (e.g. PCIE_SHARED2_EDL_RING 0x1000).  Log it to see exactly
+	 * which features we are dropping vs the downstream driver.
+	 */
+	addr = devinfo->shared.tcm_base_address + BRCMF_SHARED_FLAGS2_OFFSET;
+	dev_info(&devinfo->pdev->dev, "TEGURPM: fw flags=0x%08x flags2=0x%08x\n",
+		 devinfo->shared.flags, brcmf_pcie_read_tcm32(devinfo, addr));
 }
 
 static int
@@ -2626,6 +2736,11 @@ static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
+	dev_info(dev,
+		 "TEGURPM: runtime PM enabled (autosuspend %dms, control=%s rpm_suspended=%d usage=%d)\n",
+		 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS,
+		 dev->power.runtime_auto ? "auto" : "on",
+		 pm_runtime_suspended(dev), atomic_read(&dev->power.usage_count));
 }
 
 static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
@@ -2635,6 +2750,8 @@ static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
 
 	if (!devinfo->runtime_pm_enabled)
 		return;
+
+	cancel_delayed_work_sync(&devinfo->ds_idle_work);
 
 	ret = pm_runtime_resume_and_get(dev);
 	pm_runtime_disable(dev);
@@ -2727,6 +2844,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	init_waitqueue_head(&devinfo->ds_enter_wait);
 	init_waitqueue_head(&devinfo->ds_exit_wait);
 	spin_lock_init(&devinfo->ds_lock);
+	INIT_DELAYED_WORK(&devinfo->ds_idle_work, brcmf_pcie_ds_idle_work);
 	devinfo->ds_state = brcmf_pcie_use_inband_ds(devinfo) ?
 			    BRCMF_PCIE_DS_ACTIVE : BRCMF_PCIE_DS_DISABLED;
 	atomic_set(&devinfo->ds_active_count, 0);
@@ -2735,11 +2853,15 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	devinfo->skip_ds_ack = false;
 	devinfo->runtime_pm_enabled = false;
 
+	/*
+	 * Device-wake management is enabled from brcmf_pcie_preinit(), right
+	 * after host_cap turns on in-band deep sleep, so the protocol never runs
+	 * before the firmware knows it exists.
+	 */
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
 
-	brcmf_pcie_runtime_pm_enable(devinfo);
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
@@ -3160,6 +3282,12 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
+	dev_info(dev,
+		 "TEGURPM: enter_D3 runtime=%d pcie_state=%d ds_state=%s rpm_suspended=%d usage=%d\n",
+		 runtime, devinfo->state,
+		 brcmf_pcie_ds_state_str(brcmf_pcie_get_inband_ds_state(devinfo)),
+		 pm_runtime_suspended(dev), atomic_read(&dev->power.usage_count));
+
 	if (devinfo->state == BRCMFMAC_PCIE_STATE_DOWN)
 		return 0;
 
@@ -3173,6 +3301,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 	if (use_inband_ds) {
 		if (brcmf_pcie_get_inband_ds_state(devinfo) !=
 		    BRCMF_PCIE_DS_DEV_SLEEP) {
+			dev_info(dev,
+				 "TEGURPM: enter_D3 runtime=%d abort -EBUSY, ds_state=%s (need DEV_SLEEP)\n",
+				 runtime,
+				 brcmf_pcie_ds_state_str(brcmf_pcie_get_inband_ds_state(devinfo)));
 			err = -EBUSY;
 			goto fail;
 		}
@@ -3205,6 +3337,9 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 	devinfo->skip_ds_ack = false;
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 
+	dev_info(dev, "TEGURPM: enter_D3 runtime=%d D3 entered (ds_state=%s)\n",
+		 runtime,
+		 brcmf_pcie_ds_state_str(brcmf_pcie_get_inband_ds_state(devinfo)));
 	return 0;
 
 fail:
@@ -3212,6 +3347,7 @@ fail:
 	if (!runtime)
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	dev_info(dev, "TEGURPM: enter_D3 runtime=%d FAILED err=%d\n", runtime, err);
 	return err;
 }
 
@@ -3228,6 +3364,11 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+	dev_info(dev,
+		 "TEGURPM: leave_D3 pcie_state=%d ds_state=%s rpm_suspended=%d usage=%d\n",
+		 devinfo->state,
+		 brcmf_pcie_ds_state_str(brcmf_pcie_get_inband_ds_state(devinfo)),
+		 pm_runtime_suspended(dev), atomic_read(&dev->power.usage_count));
 	devinfo->skip_ds_ack = false;
 	devinfo->ds_exit_completed = false;
 	if (brcmf_pcie_use_inband_ds(devinfo))

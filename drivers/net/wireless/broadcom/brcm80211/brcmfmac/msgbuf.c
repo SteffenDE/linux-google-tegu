@@ -1389,6 +1389,7 @@ int brcmf_msgbuf_h2d_mbdata(struct brcmf_pub *drvr, u32 mbdata)
 	void *ret_ptr;
 	int err;
 
+	bphy_err(drvr, "TEGURPM: H2D_MAILBOX_DATA send 0x%08x\n", mbdata);
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
@@ -1416,6 +1417,8 @@ static void brcmf_msgbuf_process_d2h_mailbox_data(struct brcmf_msgbuf *msgbuf,
 {
 	struct msgbuf_d2h_mailbox_data *resp = buf;
 
+	bphy_err(msgbuf->drvr, "TEGURPM: D2H_MAILBOX_DATA arrival 0x%08x\n",
+		 le32_to_cpu(resp->mail_box_data));
 	brcmf_pcie_handle_mbdata(msgbuf->drvr->bus_if,
 				 le32_to_cpu(resp->mail_box_data));
 }

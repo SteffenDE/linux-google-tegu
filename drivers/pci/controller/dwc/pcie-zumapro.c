@@ -14,6 +14,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/iopoll.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -34,7 +35,17 @@
 #define   DEVICE_TYPE_RC		0x4
 #define PCIE_ELBI_RDLH_LINKUP		0x02c8
 #define   LTSSM_STATE_MASK		0x3f
+/*
+ * The link is established across the whole range from recovery
+ * (S_RCVRY_LOCK) through L1 idle (S_L1_IDLE), matching downstream
+ * exynos_pcie_rc_link_up().  Requiring exactly L0 makes dw_pcie_link_up()
+ * report "down" whenever the link dips into L0s/L1/recovery, which gates off
+ * endpoint config access (reads return 0xffffffff) and was a source of
+ * cold-boot mis-enumeration.
+ */
+#define   LTSSM_STATE_RCVRY_LOCK	0x0d
 #define   LTSSM_STATE_L0		0x11
+#define   LTSSM_STATE_L1_IDLE		0x14
 #define PCIE_LINKDOWN_RST_CTRL_SEL	0x03a0
 #define   LINKDOWN_RST_MANUAL		BIT(1)
 #define PCIE_SOFT_RESET			0x03a4
@@ -68,8 +79,13 @@
 #define EXYNOS_SMC_CMD_PRIV_REG		0x82000504
 #define EXYNOS_PRIV_REG_OPT_RMW		2
 
-/* PERST settle time after deassert (downstream perst-delay-us). */
-#define PCIE_PERST_DELAY_US		15000
+/* PERST settle time after deassert (downstream perst-delay-us default). */
+#define PCIE_PERST_DELAY_US		20000
+
+/* Per-attempt link-up poll budget and cold-boot retraining retry count. */
+#define PCIE_LINK_WAIT_US		50000
+#define PCIE_LINK_WAIT_STEP_US		10
+#define PCIE_LINK_TRAIN_RETRIES		10
 
 struct zumapro_pcie {
 	struct dw_pcie		pci;
@@ -134,17 +150,58 @@ static void zumapro_pcie_config_elbi(struct zumapro_pcie *zp)
 	writel(PEND_SEL_NAK, elbi + PCIE_MSTR_PEND_SEL_NAK);
 }
 
+static int zumapro_pcie_wait_link_up(struct dw_pcie *pci)
+{
+	u32 state;
+
+	return readl_poll_timeout(pci->elbi_base + PCIE_ELBI_RDLH_LINKUP, state,
+				  (state & LTSSM_STATE_MASK) >= LTSSM_STATE_RCVRY_LOCK &&
+				  (state & LTSSM_STATE_MASK) <= LTSSM_STATE_L1_IDLE,
+				  PCIE_LINK_WAIT_STEP_US, PCIE_LINK_WAIT_US);
+}
+
+/*
+ * Enable LTSSM and wait for the link.  Cold-boot link training on this SoC is
+ * marginal and often needs several attempts (downstream retries up to 10
+ * times), so on failure reset the endpoint over PERST# and retrain.  Only the
+ * endpoint reset and the app-layer LTSSM enable are toggled here; the
+ * controller core reset is left alone so the dw_pcie_setup_rc() RC config that
+ * already ran survives across retries.
+ */
 static int zumapro_pcie_start_link(struct dw_pcie *pci)
 {
-	writel(LTSSM_ENABLE, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
-	return 0;
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
+	int try, ret;
+
+	for (try = 0; try < PCIE_LINK_TRAIN_RETRIES; try++) {
+		writel(LTSSM_ENABLE, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
+
+		ret = zumapro_pcie_wait_link_up(pci);
+		if (!ret)
+			return 0;
+
+		dev_info(pci->dev,
+			 "link training attempt %d timed out, retraining\n",
+			 try + 1);
+
+		writel(0, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
+		gpiod_set_value_cansleep(zp->perst, 1);
+		usleep_range(1000, 2000);
+		gpiod_set_value_cansleep(zp->perst, 0);
+		usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
+	}
+
+	dev_err(pci->dev, "link failed to come up after %d attempts\n",
+		PCIE_LINK_TRAIN_RETRIES);
+	return -ETIMEDOUT;
 }
 
 static bool zumapro_pcie_link_up(struct dw_pcie *pci)
 {
-	u32 val = readl(pci->elbi_base + PCIE_ELBI_RDLH_LINKUP);
+	u32 state = readl(pci->elbi_base + PCIE_ELBI_RDLH_LINKUP) &
+		    LTSSM_STATE_MASK;
 
-	return (val & LTSSM_STATE_MASK) == LTSSM_STATE_L0;
+	return state >= LTSSM_STATE_RCVRY_LOCK && state <= LTSSM_STATE_L1_IDLE;
 }
 
 static const struct dw_pcie_ops zumapro_dw_pcie_ops = {

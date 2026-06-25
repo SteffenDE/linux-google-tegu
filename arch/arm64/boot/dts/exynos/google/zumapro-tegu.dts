@@ -699,4 +699,25 @@
 	pinctrl-0 = <&pcie1_clkreq>;
 	reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
 	status = "okay";
+
+	/*
+	 * Describe the on-board BCM4383 endpoint (bus 1, device 0) behind the
+	 * root port (bus 0, device 0) so brcmfmac gets an of_node and runs its
+	 * MAC-address path.  The per-device WLAN MAC is not in the chip; the
+	 * bootloader publishes it in /chosen/config/wlan_mac1, which brcmfmac
+	 * reads as a fallback (see brcmfmac of.c).
+	 */
+	pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		bus-range = <0x01 0x01>;
+		ranges;
+
+		wifi@0,0 {
+			compatible = "pci14e4,4449", "brcm,bcm4329-fmac";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+		};
+	};
 };

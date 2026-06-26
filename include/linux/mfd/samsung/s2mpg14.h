@@ -62,6 +62,8 @@ enum s2mpg14_pmic_reg {
 enum s2mpg14_meter_reg {
 	S2MPG14_METER_CTRL1 = 0x08,
 	S2MPG14_METER_CTRL2 = 0x09,
+	S2MPG14_METER_CTRL4 = 0x0b,
+	S2MPG14_METER_CTRL5 = 0x0c,
 	S2MPG14_METER_BUCKEN1 = 0x0f,
 	S2MPG14_METER_BUCKEN2 = 0x10,
 	S2MPG14_METER_MUXSEL0 = 0x11,
@@ -82,6 +84,12 @@ enum s2mpg14_meter_reg {
 
 /* METER_CTRL2: write ASYNC_RD to latch the accumulators, self-clears */
 #define S2MPG14_METER_ASYNC_RD_MASK	BIT(7)
+
+/*
+ * METER_CTRL4 (channels 0-7) + METER_CTRL5[3:0] (channels 8-11): per-channel
+ * accumulation mode, 0 = power, 1 = current.
+ */
+#define S2MPG14_METER_ACC_MODE_HI_MASK	0x0f
 
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12

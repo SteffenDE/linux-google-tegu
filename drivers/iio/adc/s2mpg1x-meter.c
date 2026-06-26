@@ -287,6 +287,15 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 	unsigned int i;
 	int ret;
 
+	/* Accumulate power (not current) on all 12 channels. */
+	ret = regmap_write(m->regmap, S2MPG14_METER_CTRL4, 0x00);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL5,
+				 S2MPG14_METER_ACC_MODE_HI_MASK, 0x00);
+	if (ret)
+		return ret;
+
 	/* Enable current sensing for all main-PMIC bucks (BUCK1..9). */
 	ret = regmap_write(m->regmap, S2MPG14_METER_BUCKEN1, 0xff);
 	if (ret)

@@ -57,11 +57,12 @@ static const struct mfd_cell s2mpg11_devs[] = {
 };
 
 /*
- * Regulators only for now; meter/RTC/clk/gpio cells can be added once
- * their drivers grow s2mpg14 support.
+ * Regulators and the power meter for now; RTC/clk/gpio cells can be added
+ * once their drivers grow s2mpg14 support.
  */
 static const struct mfd_cell s2mpg14_devs[] = {
 	MFD_CELL_NAME("s2mpg14-regulator"),
+	MFD_CELL_OF("s2mpg14-meter", NULL, NULL, 0, 0, "samsung,s2mpg14-meter"),
 };
 
 static const struct resource s2mps11_rtc_resources[] = {

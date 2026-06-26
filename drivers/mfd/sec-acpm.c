@@ -388,6 +388,50 @@ static const struct regmap_config s2mpg14_regmap_config_pmic = {
 	.max_register = S2MPG14_PMIC_SW_RESET,
 };
 
+/*
+ * Unlike the common/pmic regmaps above, the meter block has a stable, fully
+ * described layout, so give it proper access tables.  Don't cache it: the
+ * accumulated data registers must always reflect live hardware, and the
+ * configuration (channel mux, enables) is set up by firmware before the
+ * kernel runs, so a write-through cache would just mask the real values.
+ */
+static const struct regmap_range s2mpg14_meter_registers[] = {
+	regmap_reg_range(0x00, 0x01), /* INT1, INT2 */
+	regmap_reg_range(0x04, 0x05), /* INT1M, INT2M */
+	regmap_reg_range(0x08, 0x28), /* CTRL, BUCKEN, MUXSEL, LPF coeff */
+	regmap_reg_range(0x31, 0x3c), /* PWR_WARN */
+	regmap_reg_range(0x55, 0x5a), /* PWR_HYS */
+	regmap_reg_range(0x63, 0xd3), /* ACC / ACC_COUNT / LPF data, VBAT */
+	regmap_reg_range(0xe4, 0xe5), /* EXT signed data */
+};
+
+static const struct regmap_range s2mpg14_meter_ro_registers[] = {
+	regmap_reg_range(0x00, 0x01), /* INT1, INT2 */
+	regmap_reg_range(0x63, 0xd3), /* Meter data */
+	regmap_reg_range(0xe4, 0xe5), /* Meter data */
+};
+
+static const struct regmap_access_table s2mpg14_meter_wr_table = {
+	.yes_ranges = s2mpg14_meter_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_meter_registers),
+	.no_ranges = s2mpg14_meter_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg14_meter_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg14_meter_rd_table = {
+	.yes_ranges = s2mpg14_meter_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_meter_registers),
+};
+
+static const struct regmap_config s2mpg14_regmap_config_meter = {
+	.name = "meter",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG14_METER_EXT_SIGNED_DATA_2,
+	.wr_table = &s2mpg14_meter_wr_table,
+	.rd_table = &s2mpg14_meter_rd_table,
+};
+
 struct sec_pmic_acpm_shared_bus_context {
 	struct acpm_handle *acpm;
 	unsigned int acpm_chan_id;
@@ -595,6 +639,7 @@ static const struct sec_pmic_acpm_platform_data s2mpg14_data = {
 	.speedy_channel = 0,
 	.regmap_cfg_common = &s2mpg14_regmap_config_common,
 	.regmap_cfg_pmic = &s2mpg14_regmap_config_pmic,
+	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
 };
 
 static const struct of_device_id sec_pmic_acpm_of_match[] = {

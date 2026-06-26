@@ -14,6 +14,8 @@
 #ifndef __LINUX_MFD_S2MPG14_H
 #define __LINUX_MFD_S2MPG14_H
 
+#include <linux/bits.h>
+
 /* Common registers (type 0x000) */
 enum s2mpg14_common_reg {
 	S2MPG14_COMMON_VGPIO0,
@@ -59,6 +61,8 @@ enum s2mpg14_pmic_reg {
 /* Meter registers (type 0x00a) */
 enum s2mpg14_meter_reg {
 	S2MPG14_METER_CTRL1 = 0x08,
+	S2MPG14_METER_BUCKEN1 = 0x0f,
+	S2MPG14_METER_BUCKEN2 = 0x10,
 	S2MPG14_METER_MUXSEL0 = 0x11,
 	S2MPG14_METER_ACC_DATA_CH0_1 = 0x63,
 	S2MPG14_METER_ACC_COUNT_1 = 0xab,
@@ -69,10 +73,18 @@ enum s2mpg14_meter_reg {
 	S2MPG14_METER_EXT_SIGNED_DATA_2 = 0xe5,
 };
 
+/* METER_CTRL1 */
+#define S2MPG14_METER_EN_MASK		BIT(0)
+#define S2MPG14_METER_INT_SAMP_RATE_SHIFT 2
+#define S2MPG14_METER_INT_SAMP_RATE_MASK (0x7 << S2MPG14_METER_INT_SAMP_RATE_SHIFT)
+#define S2MPG14_METER_INT_SAMP_RATE_125HZ 4
+
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12
 #define S2MPG14_METER_ACC_DATA_BYTES	6
-#define S2MPG14_METER_LPF_DATA_BYTES	3
+#define S2MPG14_METER_ACC_COUNT_BYTES	3
+#define S2MPG14_METER_ACC_DATA_BITS	41
+#define S2MPG14_METER_ACC_COUNT_BITS	20
 
 /*
  * Regulators.  Deliberately partial: just the touchscreen rails for now.

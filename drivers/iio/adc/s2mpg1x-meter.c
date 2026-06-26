@@ -7,7 +7,9 @@
  * channel continuously accumulates the power of a muxed rail into a 41-bit
  * accumulator alongside a shared 20-bit sample counter.
  *
- * Average power over an interval is ACC_DATA / ACC_COUNT scaled by the rail's
+ * The accumulators free-run and are copied to readable registers on demand by
+ * pulsing CTRL2.ASYNC_RD.  Average power over an interval is therefore the
+ * change in ACC_DATA divided by the change in ACC_COUNT, scaled by the rail's
  * per-LSB resolution.  We never change a rail's power state: the only writes
  * are to the meter's own mux/enable registers (the measurement selector), so
  * the driver is read-only with respect to the regulators.  The mux is
@@ -37,7 +39,6 @@
 #define S2MPG1X_METER_MIN_REFRESH_MS	100
 
 struct s2mpg1x_meter_chan {
-	u8 hw_idx;	/* hardware meter channel (MUXSEL index) */
 	u8 muxsel;	/* rail mux selection */
 	u32 res_pw;	/* power resolution, pW per accumulator LSB */
 	const char *label;
@@ -45,8 +46,10 @@ struct s2mpg1x_meter_chan {
 
 struct s2mpg1x_meter {
 	struct regmap *regmap;
-	struct mutex lock;	/* serialises snapshot state + cache */
+	struct mutex lock;	/* serialises latch + snapshot state + cache */
 	unsigned int n;
+	u8 hw_idx[S2MPG14_METER_CHANNELS];	/* enabled channels, in IIO order */
+	/* The following are all indexed by hardware channel (MUXSEL index). */
 	struct s2mpg1x_meter_chan chan[S2MPG14_METER_CHANNELS];
 	u64 prev_acc[S2MPG14_METER_CHANNELS];
 	s64 cache_uw[S2MPG14_METER_CHANNELS];
@@ -79,6 +82,27 @@ static u32 s2mpg14_muxsel_power_pw(u8 muxsel)
 	default:
 		return 0;
 	}
+}
+
+/*
+ * Pulse ASYNC_RD to copy the live accumulators into the readable registers.
+ * The bit self-clears once the transfer completes, within one acquisition
+ * window (~8 ms at 125 Hz).
+ */
+static int s2mpg1x_meter_latch(struct s2mpg1x_meter *m)
+{
+	unsigned int val;
+	int ret;
+
+	ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL2,
+				 S2MPG14_METER_ASYNC_RD_MASK,
+				 S2MPG14_METER_ASYNC_RD_MASK);
+	if (ret)
+		return ret;
+
+	return regmap_read_poll_timeout(m->regmap, S2MPG14_METER_CTRL2, val,
+					!(val & S2MPG14_METER_ASYNC_RD_MASK),
+					500, 10000);
 }
 
 static int s2mpg1x_meter_read_acc(struct s2mpg1x_meter *m, u8 hw, u64 *out)
@@ -116,7 +140,13 @@ static int s2mpg1x_meter_read_count(struct s2mpg1x_meter *m, u32 *out)
 	return 0;
 }
 
-/* Caller holds m->lock. Snapshots the accumulators and recomputes power. */
+/*
+ * Caller holds m->lock.  Latches and snapshots the accumulators, then
+ * recomputes per-rail power as the average since the previous snapshot.
+ * Deltas use modular subtraction, correct across a single wrap of the
+ * counter/accumulator; reads more than ~2 h apart (the saturation time at
+ * 125 Hz) would under-count, which is far beyond any expected polling rate.
+ */
 static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 {
 	ktime_t now = ktime_get();
@@ -129,6 +159,10 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 					   S2MPG1X_METER_MIN_REFRESH_MS)))
 		return 0;
 
+	ret = s2mpg1x_meter_latch(m);
+	if (ret)
+		return ret;
+
 	ret = s2mpg1x_meter_read_count(m, &count);
 	if (ret)
 		return ret;
@@ -136,7 +170,7 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 	d_count = (count - m->prev_count) & GENMASK(S2MPG14_METER_ACC_COUNT_BITS - 1, 0);
 
 	for (i = 0; i < m->n; i++) {
-		u8 hw = m->chan[i].hw_idx;
+		u8 hw = m->hw_idx[i];
 		u64 acc, d_acc;
 
 		ret = s2mpg1x_meter_read_acc(m, hw, &acc);
@@ -147,7 +181,7 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 			d_acc = (acc - m->prev_acc[hw]) &
 				GENMASK_ULL(S2MPG14_METER_ACC_DATA_BITS - 1, 0);
 			m->cache_uw[hw] = div64_u64(div64_u64(d_acc, d_count) *
-						    m->chan[i].res_pw, 1000000);
+						    m->chan[hw].res_pw, 1000000);
 		}
 		m->prev_acc[hw] = acc;
 	}
@@ -201,7 +235,7 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 	unsigned int n = 0;
 
 	device_for_each_child_node_scoped(dev, child) {
-		struct s2mpg1x_meter_chan *c = &m->chan[n];
+		struct s2mpg1x_meter_chan *c;
 		const char *label;
 		u32 reg, muxsel;
 		int ret;
@@ -221,6 +255,7 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 					     "channel %u: missing samsung,muxsel\n",
 					     reg);
 
+		c = &m->chan[reg];
 		c->res_pw = s2mpg14_muxsel_power_pw(muxsel);
 		if (!c->res_pw)
 			return dev_err_probe(dev, -EINVAL,
@@ -232,12 +267,11 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 			return dev_err_probe(dev, ret,
 					     "channel %u: missing label\n", reg);
 
-		c->hw_idx = reg;
 		c->muxsel = muxsel;
 		c->label = devm_kstrdup(dev, label, GFP_KERNEL);
 		if (!c->label)
 			return -ENOMEM;
-		n++;
+		m->hw_idx[n++] = reg;
 	}
 
 	if (!n)
@@ -262,17 +296,21 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 		return ret;
 
 	for (i = 0; i < m->n; i++) {
-		ret = regmap_write(m->regmap,
-				   S2MPG14_METER_MUXSEL0 + m->chan[i].hw_idx,
-				   m->chan[i].muxsel);
+		u8 hw = m->hw_idx[i];
+
+		ret = regmap_write(m->regmap, S2MPG14_METER_MUXSEL0 + hw,
+				   m->chan[hw].muxsel);
 		if (ret)
 			return ret;
 	}
 
-	return regmap_write(m->regmap, S2MPG14_METER_CTRL1,
-			    S2MPG14_METER_EN_MASK |
-			    (S2MPG14_METER_INT_SAMP_RATE_125HZ <<
-			     S2MPG14_METER_INT_SAMP_RATE_SHIFT));
+	/* Set the sample rate and enable, preserving the other CTRL1 bits. */
+	return regmap_update_bits(m->regmap, S2MPG14_METER_CTRL1,
+				  S2MPG14_METER_EN_MASK |
+				  S2MPG14_METER_INT_SAMP_RATE_MASK,
+				  S2MPG14_METER_EN_MASK |
+				  (S2MPG14_METER_INT_SAMP_RATE_125HZ <<
+				   S2MPG14_METER_INT_SAMP_RATE_SHIFT));
 }
 
 static int s2mpg1x_meter_probe(struct platform_device *pdev)
@@ -310,8 +348,8 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 	for (i = 0; i < m->n; i++) {
 		channels[i].type = IIO_POWER;
 		channels[i].indexed = 1;
-		channels[i].channel = m->chan[i].hw_idx;
-		channels[i].address = m->chan[i].hw_idx;
+		channels[i].channel = m->hw_idx[i];
+		channels[i].address = m->hw_idx[i];
 		channels[i].info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED);
 	}
 

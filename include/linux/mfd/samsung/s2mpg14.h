@@ -61,6 +61,7 @@ enum s2mpg14_pmic_reg {
 /* Meter registers (type 0x00a) */
 enum s2mpg14_meter_reg {
 	S2MPG14_METER_CTRL1 = 0x08,
+	S2MPG14_METER_CTRL2 = 0x09,
 	S2MPG14_METER_BUCKEN1 = 0x0f,
 	S2MPG14_METER_BUCKEN2 = 0x10,
 	S2MPG14_METER_MUXSEL0 = 0x11,
@@ -78,6 +79,9 @@ enum s2mpg14_meter_reg {
 #define S2MPG14_METER_INT_SAMP_RATE_SHIFT 2
 #define S2MPG14_METER_INT_SAMP_RATE_MASK (0x7 << S2MPG14_METER_INT_SAMP_RATE_SHIFT)
 #define S2MPG14_METER_INT_SAMP_RATE_125HZ 4
+
+/* METER_CTRL2: write ASYNC_RD to latch the accumulators, self-clears */
+#define S2MPG14_METER_ASYNC_RD_MASK	BIT(7)
 
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12

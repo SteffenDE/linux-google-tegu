@@ -535,6 +535,65 @@
 				regulator-name = "L25M_TS1_DVDD";
 			};
 		};
+
+		/*
+		 * On-device power metering, read-only.  Channel -> rail mux is
+		 * the authoritative tegu ODPM assignment from
+		 * research/dumped.dts (mux codes are the S2MPG14 muxsel values,
+		 * BUCK1..9 = 0x01..0x09).  Only the internal buck rails are
+		 * described here; the external (shunt) rails are not yet.
+		 */
+		meter {
+			compatible = "samsung,s2mpg14-meter";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			channel@0 {
+				reg = <0>;
+				samsung,muxsel = <0x01>;
+				label = "VDD_MIF";
+			};
+			channel@1 {
+				reg = <1>;
+				samsung,muxsel = <0x02>;
+				label = "VDD_CPUCL1_MID";
+			};
+			channel@2 {
+				reg = <2>;
+				samsung,muxsel = <0x03>;
+				label = "VDD_CPUCL2_BIG";
+			};
+			channel@3 {
+				reg = <3>;
+				samsung,muxsel = <0x04>;
+				label = "VDD_CPUCL0_LITTLE";
+			};
+			channel@4 {
+				reg = <4>;
+				samsung,muxsel = <0x05>;
+				label = "VDD_INT";
+			};
+			channel@5 {
+				reg = <5>;
+				samsung,muxsel = <0x06>;
+				label = "LLDO1";
+			};
+			channel@6 {
+				reg = <6>;
+				samsung,muxsel = <0x07>;
+				label = "VDD_TPU";
+			};
+			channel@7 {
+				reg = <7>;
+				samsung,muxsel = <0x08>;
+				label = "LLDO2";
+			};
+			channel@8 {
+				reg = <8>;
+				samsung,muxsel = <0x09>;
+				label = "VDD_CPUCL1_M";
+			};
+		};
 	};
 };
 

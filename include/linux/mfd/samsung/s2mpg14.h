@@ -56,6 +56,24 @@ enum s2mpg14_pmic_reg {
 	S2MPG14_PMIC_SW_RESET = 0xe4,
 };
 
+/* Meter registers (type 0x00a) */
+enum s2mpg14_meter_reg {
+	S2MPG14_METER_CTRL1 = 0x08,
+	S2MPG14_METER_MUXSEL0 = 0x11,
+	S2MPG14_METER_ACC_DATA_CH0_1 = 0x63,
+	S2MPG14_METER_ACC_COUNT_1 = 0xab,
+	S2MPG14_METER_LPF_DATA_CH0_1 = 0xae,
+	S2MPG14_METER_VBAT_DATA1 = 0xd2,
+	S2MPG14_METER_VBAT_DATA2 = 0xd3,
+	S2MPG14_METER_EXT_SIGNED_DATA_1 = 0xe4,
+	S2MPG14_METER_EXT_SIGNED_DATA_2 = 0xe5,
+};
+
+/* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
+#define S2MPG14_METER_CHANNELS		12
+#define S2MPG14_METER_ACC_DATA_BYTES	6
+#define S2MPG14_METER_LPF_DATA_BYTES	3
+
 /*
  * Regulators.  Deliberately partial: just the touchscreen rails for now.
  * Append new IDs here (and a matching descriptor in s2mps11.c) when a

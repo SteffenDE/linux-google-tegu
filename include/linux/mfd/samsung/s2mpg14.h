@@ -76,14 +76,26 @@ enum s2mpg14_meter_reg {
 	S2MPG14_METER_EXT_SIGNED_DATA_2 = 0xe5,
 };
 
+/*
+ * The S2MPG14 and S2MPG15 share an identical meter block; these
+ * S2MPG14_METER_* definitions describe both and are used by the common
+ * s2mpg1x meter driver for either PMIC.
+ */
+
 /* METER_CTRL1 */
 #define S2MPG14_METER_EN_MASK		BIT(0)
+#define S2MPG14_METER_EXT_EN_MASK	BIT(1)	/* external (shunt) meter */
 #define S2MPG14_METER_INT_SAMP_RATE_SHIFT 2
 #define S2MPG14_METER_INT_SAMP_RATE_MASK (0x7 << S2MPG14_METER_INT_SAMP_RATE_SHIFT)
 #define S2MPG14_METER_INT_SAMP_RATE_125HZ 4
 
 /* METER_CTRL2: write ASYNC_RD to latch the accumulators, self-clears */
 #define S2MPG14_METER_ASYNC_RD_MASK	BIT(7)
+/* METER_CTRL2: external channel enable + external sample rate */
+#define S2MPG14_METER_EXT_CH_EN_SHIFT	3
+#define S2MPG14_METER_EXT_CH_EN_MASK	(0x7 << S2MPG14_METER_EXT_CH_EN_SHIFT)
+#define S2MPG14_METER_EXT_SAMP_RATE_MASK 0x7
+#define S2MPG14_METER_EXT_SAMP_RATE_31_25HZ 2
 
 /*
  * METER_CTRL4 (channels 0-7) + METER_CTRL5[3:0] (channels 8-11): per-channel

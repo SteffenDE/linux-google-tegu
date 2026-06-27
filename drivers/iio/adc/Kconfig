@@ -1525,6 +1525,19 @@ config RZT2H_ADC
 	  To compile this driver as a module, choose M here: the
 	  module will be called rzt2h_adc.
 
+config S2MPG1X_METER
+	tristate "Samsung S2MPG1x ODPM power meter"
+	depends on MFD_SEC_ACPM || COMPILE_TEST
+	select REGMAP
+	help
+	  Say yes here to build read-only support for the on-device power
+	  metering (ODPM) block of the Samsung S2MPG14/S2MPG15 PMICs found on
+	  Google Tensor SoCs.  It reports the per-rail power as IIO power
+	  channels, computed from the meter's accumulators.
+
+	  This driver can also be built as a module.  If so, the module will
+	  be called s2mpg1x-meter.
+
 config SC27XX_ADC
 	tristate "Spreadtrum SC27xx series PMICs ADC"
 	depends on MFD_SC27XX_PMIC || COMPILE_TEST

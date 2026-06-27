@@ -47,6 +47,7 @@ struct s2mpg1x_meter_chan {
 struct s2mpg1x_meter {
 	struct regmap *regmap;
 	struct mutex lock;	/* serialises latch + cache */
+	unsigned long dev_type;	/* enum sec_device_type */
 	unsigned int n;
 	u8 hw_idx[S2MPG14_METER_CHANNELS];	/* enabled channels, in IIO order */
 	/* chan[] and cache_uw[] are indexed by hardware channel (MUXSEL index). */
@@ -57,10 +58,10 @@ struct s2mpg1x_meter {
 };
 
 /*
- * S2MPG14 buck power resolution (pW per LSB), derived from the downstream
- * IQ30 constants and confirmed on hardware against in_powerN_scale:
- * CMS 0.006868132, CMD 0.013736264, CMT 0.020604396 mW/LSB.
- * External (VSEN shunt) and LDO rails are not handled yet.
+ * Internal buck/LDO power resolution (pW per LSB), derived from the
+ * downstream IQ30 constants.  The buck classes were confirmed on hardware
+ * against in_powerN_scale: CMS 0.006868132, CMD 0.013736264,
+ * CMT 0.020604396 mW/LSB.
  */
 static u32 s2mpg14_muxsel_power_pw(u8 muxsel)
 {
@@ -80,6 +81,61 @@ static u32 s2mpg14_muxsel_power_pw(u8 muxsel)
 	default:
 		return 0;
 	}
+}
+
+static u32 s2mpg15_muxsel_power_pw(u8 muxsel)
+{
+	switch (muxsel) {
+	case 0x01: /* BUCK1 (CMD) */
+	case 0x02: /* BUCK2 (CMD) */
+	case 0x0c: /* BUCK12 (CMD) */
+		return 13736264;
+	case 0x03: /* BUCK3 (CMS) */
+	case 0x04: /* BUCK4 (CMS) */
+	case 0x05: /* BUCK5 (CMS) */
+	case 0x09: /* BUCK9 (CMS) */
+		return 6868132;
+	case 0x22: /* LDO2 (NLDO 1200mA) */
+		return 1831502;
+	case 0x35: /* LDO21 (NLDO 800mA) */
+		return 2442002;
+	case 0x36: /* LDO22 (PLDO 150mA) */
+		return 915751;
+	default:
+		return 0;
+	}
+}
+
+/* External (shunt) rails occupy this muxsel range. */
+#define S2MPG1X_METER_MUXSEL_EXT_FIRST	0x5c
+#define S2MPG1X_METER_MUXSEL_EXT_LAST	0x5e
+
+static bool s2mpg1x_muxsel_is_external(u8 muxsel)
+{
+	return muxsel >= S2MPG1X_METER_MUXSEL_EXT_FIRST &&
+	       muxsel <= S2MPG1X_METER_MUXSEL_EXT_LAST;
+}
+
+/*
+ * External (VSEN) rails measure the drop across an off-chip sense resistor,
+ * so the per-LSB power depends on the shunt value.  Derive it the same way
+ * as the downstream odpm driver from these IQ30 (value << 30) calibration
+ * constants: VRAIL = _IQ30(2.1978021), VSHUNT = _IQ30(0.7935698),
+ * TRIM = BIT(3).
+ */
+#define S2MPG1X_METER_EXT_RES_VRAIL	2359872035U
+#define S2MPG1X_METER_EXT_RES_VSHUNT	852089084U
+#define S2MPG1X_METER_EXT_RES_TRIM	8U
+
+static u32 s2mpg1x_shunt_power_pw(u32 shunt_uohms)
+{
+	u64 raw_iq60 = div64_u64((u64)S2MPG1X_METER_EXT_RES_VRAIL *
+				 S2MPG1X_METER_EXT_RES_VSHUNT *
+				 S2MPG1X_METER_EXT_RES_TRIM, shunt_uohms);
+	u32 res_mw_iq30 = (raw_iq60 * 10) >> 30;
+
+	/* mW/LSB (IQ30) -> pW/LSB, rounded */
+	return div64_u64((u64)res_mw_iq30 * 1000000000ULL + (1U << 29), 1U << 30);
 }
 
 /*
@@ -252,7 +308,21 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 					     reg);
 
 		c = &m->chan[reg];
-		c->res_pw = s2mpg14_muxsel_power_pw(muxsel);
+		if (s2mpg1x_muxsel_is_external(muxsel)) {
+			u32 shunt_uohms;
+
+			ret = fwnode_property_read_u32(child, "shunt-resistor-micro-ohms",
+						       &shunt_uohms);
+			if (ret || !shunt_uohms)
+				return dev_err_probe(dev, -EINVAL,
+						     "channel %u: external rail needs shunt-resistor-micro-ohms\n",
+						     reg);
+			c->res_pw = s2mpg1x_shunt_power_pw(shunt_uohms);
+		} else if (m->dev_type == S2MPG15) {
+			c->res_pw = s2mpg15_muxsel_power_pw(muxsel);
+		} else {
+			c->res_pw = s2mpg14_muxsel_power_pw(muxsel);
+		}
 		if (!c->res_pw)
 			return dev_err_probe(dev, -EINVAL,
 					     "channel %u: unsupported muxsel 0x%02x\n",
@@ -280,6 +350,8 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 /* Program the mux for the configured channels and enable the meter. */
 static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 {
+	unsigned int ctrl1_mask, ctrl1_val;
+	u8 ext_ch_mask = 0;
 	unsigned int i;
 	int ret;
 
@@ -292,30 +364,62 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 	if (ret)
 		return ret;
 
-	/* Enable current sensing for all main-PMIC bucks (BUCK1..9). */
+	/*
+	 * Enable current sensing for all bucks: BUCKEN1 covers BUCK1..8,
+	 * BUCKEN2 the rest.  Enable BUCK9 (bit0) and BUCK12 (bit3) -- the
+	 * highest-numbered bucks either PMIC meters (s2mpg15 BUCK12S = AUR).
+	 */
 	ret = regmap_write(m->regmap, S2MPG14_METER_BUCKEN1, 0xff);
 	if (ret)
 		return ret;
-	ret = regmap_write(m->regmap, S2MPG14_METER_BUCKEN2, 0x01);
+	ret = regmap_write(m->regmap, S2MPG14_METER_BUCKEN2, 0x09);
 	if (ret)
 		return ret;
 
 	for (i = 0; i < m->n; i++) {
 		u8 hw = m->hw_idx[i];
+		u8 muxsel = m->chan[hw].muxsel;
 
-		ret = regmap_write(m->regmap, S2MPG14_METER_MUXSEL0 + hw,
-				   m->chan[hw].muxsel);
+		ret = regmap_write(m->regmap, S2MPG14_METER_MUXSEL0 + hw, muxsel);
+		if (ret)
+			return ret;
+
+		if (s2mpg1x_muxsel_is_external(muxsel))
+			ext_ch_mask |= BIT(muxsel - S2MPG1X_METER_MUXSEL_EXT_FIRST);
+	}
+
+	if (ext_ch_mask) {
+		/*
+		 * Program the external sample rate and channel-enable bits
+		 * while the external meter is disabled, then turn it on
+		 * together with the meter below.
+		 */
+		ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL1,
+					 S2MPG14_METER_EXT_EN_MASK, 0);
+		if (ret)
+			return ret;
+		ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL2,
+					 S2MPG14_METER_EXT_CH_EN_MASK |
+					 S2MPG14_METER_EXT_SAMP_RATE_MASK,
+					 (ext_ch_mask <<
+					  S2MPG14_METER_EXT_CH_EN_SHIFT) |
+					 S2MPG14_METER_EXT_SAMP_RATE_31_25HZ);
 		if (ret)
 			return ret;
 	}
 
 	/* Set the sample rate and enable, preserving the other CTRL1 bits. */
-	return regmap_update_bits(m->regmap, S2MPG14_METER_CTRL1,
-				  S2MPG14_METER_EN_MASK |
-				  S2MPG14_METER_INT_SAMP_RATE_MASK,
-				  S2MPG14_METER_EN_MASK |
-				  (S2MPG14_METER_INT_SAMP_RATE_125HZ <<
-				   S2MPG14_METER_INT_SAMP_RATE_SHIFT));
+	ctrl1_mask = S2MPG14_METER_EN_MASK | S2MPG14_METER_INT_SAMP_RATE_MASK;
+	ctrl1_val = S2MPG14_METER_EN_MASK |
+		    (S2MPG14_METER_INT_SAMP_RATE_125HZ <<
+		     S2MPG14_METER_INT_SAMP_RATE_SHIFT);
+	if (ext_ch_mask) {
+		ctrl1_mask |= S2MPG14_METER_EXT_EN_MASK;
+		ctrl1_val |= S2MPG14_METER_EXT_EN_MASK;
+	}
+
+	return regmap_update_bits(m->regmap, S2MPG14_METER_CTRL1, ctrl1_mask,
+				  ctrl1_val);
 }
 
 static int s2mpg1x_meter_probe(struct platform_device *pdev)
@@ -333,6 +437,7 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 
 	m = iio_priv(indio_dev);
 	mutex_init(&m->lock);
+	m->dev_type = platform_get_device_id(pdev)->driver_data;
 
 	m->regmap = dev_get_regmap(dev->parent, "meter");
 	if (!m->regmap)
@@ -375,6 +480,7 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 
 static const struct platform_device_id s2mpg1x_meter_id[] = {
 	{ "s2mpg14-meter", S2MPG14 },
+	{ "s2mpg15-meter", S2MPG15 },
 	{ }
 };
 MODULE_DEVICE_TABLE(platform, s2mpg1x_meter_id);
@@ -385,6 +491,7 @@ MODULE_DEVICE_TABLE(platform, s2mpg1x_meter_id);
  */
 static const struct of_device_id s2mpg1x_meter_of_match[] __used = {
 	{ .compatible = "samsung,s2mpg14-meter" },
+	{ .compatible = "samsung,s2mpg15-meter" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s2mpg1x_meter_of_match);

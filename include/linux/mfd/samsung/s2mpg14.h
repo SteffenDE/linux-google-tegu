@@ -14,6 +14,8 @@
 #ifndef __LINUX_MFD_S2MPG14_H
 #define __LINUX_MFD_S2MPG14_H
 
+#include <linux/bits.h>
+
 /* Common registers (type 0x000) */
 enum s2mpg14_common_reg {
 	S2MPG14_COMMON_VGPIO0,
@@ -59,6 +61,11 @@ enum s2mpg14_pmic_reg {
 /* Meter registers (type 0x00a) */
 enum s2mpg14_meter_reg {
 	S2MPG14_METER_CTRL1 = 0x08,
+	S2MPG14_METER_CTRL2 = 0x09,
+	S2MPG14_METER_CTRL4 = 0x0b,
+	S2MPG14_METER_CTRL5 = 0x0c,
+	S2MPG14_METER_BUCKEN1 = 0x0f,
+	S2MPG14_METER_BUCKEN2 = 0x10,
 	S2MPG14_METER_MUXSEL0 = 0x11,
 	S2MPG14_METER_ACC_DATA_CH0_1 = 0x63,
 	S2MPG14_METER_ACC_COUNT_1 = 0xab,
@@ -69,10 +76,30 @@ enum s2mpg14_meter_reg {
 	S2MPG14_METER_EXT_SIGNED_DATA_2 = 0xe5,
 };
 
+/* METER_CTRL1 */
+#define S2MPG14_METER_EN_MASK		BIT(0)
+#define S2MPG14_METER_INT_SAMP_RATE_SHIFT 2
+#define S2MPG14_METER_INT_SAMP_RATE_MASK (0x7 << S2MPG14_METER_INT_SAMP_RATE_SHIFT)
+#define S2MPG14_METER_INT_SAMP_RATE_125HZ 4
+
+/* METER_CTRL2: write ASYNC_RD to latch the accumulators, self-clears */
+#define S2MPG14_METER_ASYNC_RD_MASK	BIT(7)
+
+/*
+ * METER_CTRL4 (channels 0-7) + METER_CTRL5[3:0] (channels 8-11): per-channel
+ * accumulation mode, 0 = power, 1 = current.
+ */
+#define S2MPG14_METER_ACC_MODE_HI_MASK	0x0f
+
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12
 #define S2MPG14_METER_ACC_DATA_BYTES	6
-#define S2MPG14_METER_LPF_DATA_BYTES	3
+#define S2MPG14_METER_ACC_COUNT_BYTES	3
+#define S2MPG14_METER_ACC_DATA_BITS	41
+#define S2MPG14_METER_ACC_COUNT_BITS	20
+/* ACC is 41-bit over a 20-bit count, so a valid per-sample code is < 2^21. */
+#define S2MPG14_METER_MAX_SAMPLE_CODE	BIT(S2MPG14_METER_ACC_DATA_BITS - \
+					    S2MPG14_METER_ACC_COUNT_BITS)
 
 /*
  * Regulators.  Deliberately partial: just the touchscreen rails for now.

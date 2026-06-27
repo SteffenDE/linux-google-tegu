@@ -15,6 +15,7 @@
 #include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mpg11.h>
 #include <linux/mfd/samsung/s2mpg14.h>
+#include <linux/mfd/samsung/s2mpg15.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -431,6 +432,26 @@ static const struct regmap_config s2mpg14_regmap_config_meter = {
 	.rd_table = &s2mpg14_meter_rd_table,
 };
 
+/*
+ * s2mpg15 (zumapro sub PMIC): same uncached, permissive style as s2mpg14.
+ * The meter block is register-identical to the s2mpg14, so it reuses that
+ * regmap config (s2mpg14_regmap_config_meter) below; only the common/pmic
+ * blocks have a different register extent and need their own configs.
+ */
+static const struct regmap_config s2mpg15_regmap_config_common = {
+	.name = "common",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG15_COMMON_IBIM2,
+};
+
+static const struct regmap_config s2mpg15_regmap_config_pmic = {
+	.name = "pmic",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG15_PMIC_BB_USONIC,
+};
+
 struct sec_pmic_acpm_shared_bus_context {
 	struct acpm_handle *acpm;
 	unsigned int acpm_chan_id;
@@ -557,9 +578,19 @@ static int sec_pmic_acpm_probe(struct platform_device *pdev)
 	if (IS_ERR(acpm))
 		return dev_err_probe(dev, PTR_ERR(acpm), "failed to get acpm\n");
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	/*
+	 * The PMIC interrupt is carried by the s2mpg10/11/14 nodes (and used
+	 * by the s2mpg10/11 regulator/RTC IRQ chips), but the meter-only
+	 * s2mpg15 sub PMIC has no interrupt consumer -- sec_irq_init() ignores
+	 * it, and its combiner interrupt has no mainline parent -- so allow it
+	 * to be absent there.
+	 */
+	irq = platform_get_irq_optional(pdev, 0);
+	if (irq < 0) {
+		if (irq == -EPROBE_DEFER || pdata->device_type != S2MPG15)
+			return dev_err_probe(dev, irq, "failed to get IRQ\n");
+		irq = 0;
+	}
 
 	shared_ctx = devm_kzalloc(dev, sizeof(*shared_ctx), GFP_KERNEL);
 	if (!shared_ctx)
@@ -641,10 +672,25 @@ static const struct sec_pmic_acpm_platform_data s2mpg14_data = {
 	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
 };
 
+/*
+ * Tensor G4 (zumapro) sub PMIC.  Same ACPM IPC channel as the main PMIC
+ * (s2mpg14) but PMIC select 1, mirroring the s2mpg10/s2mpg11 main/sub pair.
+ */
+static const struct sec_pmic_acpm_platform_data s2mpg15_data = {
+	.device_type = S2MPG15,
+	.acpm_chan_id = 2,
+	.speedy_channel = 1,
+	.regmap_cfg_common = &s2mpg15_regmap_config_common,
+	.regmap_cfg_pmic = &s2mpg15_regmap_config_pmic,
+	/* The s2mpg15 meter block is register-identical to the s2mpg14. */
+	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
+};
+
 static const struct of_device_id sec_pmic_acpm_of_match[] = {
 	{ .compatible = "samsung,s2mpg10-pmic", .data = &s2mpg10_data, },
 	{ .compatible = "samsung,s2mpg11-pmic", .data = &s2mpg11_data, },
 	{ .compatible = "samsung,s2mpg14-pmic", .data = &s2mpg14_data, },
+	{ .compatible = "samsung,s2mpg15-pmic", .data = &s2mpg15_data, },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, sec_pmic_acpm_of_match);

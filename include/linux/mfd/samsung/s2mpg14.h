@@ -97,6 +97,11 @@ enum s2mpg14_meter_reg {
 #define S2MPG14_METER_ACC_COUNT_BYTES	3
 #define S2MPG14_METER_ACC_DATA_BITS	41
 #define S2MPG14_METER_ACC_COUNT_BITS	20
+/* The meter is driven at this rate; used to sanity-check accumulator deltas. */
+#define S2MPG14_METER_SAMPLE_RATE_HZ	125
+/* ACC is 41-bit over a 20-bit count, so a valid per-sample code is < 2^21. */
+#define S2MPG14_METER_MAX_SAMPLE_CODE	BIT(S2MPG14_METER_ACC_DATA_BITS - \
+					    S2MPG14_METER_ACC_COUNT_BITS)
 
 /*
  * Regulators.  Deliberately partial: just the touchscreen rails for now.

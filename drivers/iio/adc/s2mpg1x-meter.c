@@ -143,15 +143,18 @@ static int s2mpg1x_meter_read_count(struct s2mpg1x_meter *m, u32 *out)
 /*
  * Caller holds m->lock.  Latches and snapshots the accumulators, then
  * recomputes per-rail power as the average since the previous snapshot.
- * Deltas use modular subtraction, correct across a single wrap of the
- * counter/accumulator; reads more than ~2 h apart (the saturation time at
- * 125 Hz) would under-count, which is far beyond any expected polling rate.
+ * Deltas use modular subtraction, correct across a single wrap.  If the
+ * sample-count delta is implausible for the elapsed wall-clock time -- the
+ * 20-bit counter wrapped, or the meter was reset (e.g. across suspend, which
+ * clears the accumulators) -- the snapshot is used only to re-baseline and
+ * the previous readings are kept, rather than emitting a garbage spike.
  */
 static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 {
 	ktime_t now = ktime_get();
 	u32 count, d_count;
 	unsigned int i;
+	bool valid;
 	int ret;
 
 	if (m->primed &&
@@ -169,19 +172,33 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 
 	d_count = (count - m->prev_count) & GENMASK(S2MPG14_METER_ACC_COUNT_BITS - 1, 0);
 
+	valid = m->primed && d_count;
+	if (valid) {
+		u64 elapsed_ms = ktime_to_ms(ktime_sub(now, m->last_refresh));
+		u64 max_count = (elapsed_ms + MSEC_PER_SEC) *
+				S2MPG14_METER_SAMPLE_RATE_HZ / MSEC_PER_SEC * 2;
+
+		/* Far more samples than the interval allows => wrap or reset. */
+		if (d_count > max_count)
+			valid = false;
+	}
+
 	for (i = 0; i < m->n; i++) {
 		u8 hw = m->hw_idx[i];
-		u64 acc, d_acc;
+		u64 acc, d_acc, avg;
 
 		ret = s2mpg1x_meter_read_acc(m, hw, &acc);
 		if (ret)
 			return ret;
 
-		if (m->primed && d_count) {
+		if (valid) {
 			d_acc = (acc - m->prev_acc[hw]) &
 				GENMASK_ULL(S2MPG14_METER_ACC_DATA_BITS - 1, 0);
-			m->cache_uw[hw] = div64_u64(div64_u64(d_acc, d_count) *
-						    m->chan[hw].res_pw, 1000000);
+			avg = div64_u64(d_acc, d_count);
+			/* Per-sample code cannot exceed the structural full scale. */
+			if (avg < S2MPG14_METER_MAX_SAMPLE_CODE)
+				m->cache_uw[hw] = div64_u64(avg * m->chan[hw].res_pw,
+							    1000000);
 		}
 		m->prev_acc[hw] = acc;
 	}

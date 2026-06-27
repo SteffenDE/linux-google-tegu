@@ -4,12 +4,12 @@
  *
  * Read-only ODPM (on-device power metering) driver for the Samsung S2MPG1x
  * PMICs on Google Tensor SoCs.  Each PMIC has a 12-channel power meter; a
- * channel continuously accumulates the power of a muxed rail into a 41-bit
- * accumulator alongside a shared 20-bit sample counter.
+ * channel accumulates the power of a muxed rail into a 41-bit accumulator
+ * alongside a shared 20-bit sample counter.
  *
- * The accumulators free-run and are copied to readable registers on demand by
- * pulsing CTRL2.ASYNC_RD.  Average power over an interval is therefore the
- * change in ACC_DATA divided by the change in ACC_COUNT, scaled by the rail's
+ * Writing CTRL2.ASYNC_RD copies the accumulators into the readable registers
+ * and restarts accumulation, so a read returns the average power over the
+ * window since the previous read: ACC_DATA / ACC_COUNT scaled by the rail's
  * per-LSB resolution.  We never change a rail's power state: the only writes
  * are to the meter's own mux/enable registers (the measurement selector), so
  * the driver is read-only with respect to the regulators.  The mux is
@@ -32,8 +32,8 @@
 #include <linux/regmap.h>
 
 /*
- * Re-snapshot at most this often, so that reading all channels back-to-back
- * (e.g. "cat in_power*_input") shares one coherent accumulator sample and the
+ * Re-latch at most this often, so that reading all channels back-to-back
+ * (e.g. "cat in_power*_input") shares one coherent measurement window and the
  * reported power is the average since the previous read pass.
  */
 #define S2MPG1X_METER_MIN_REFRESH_MS	100
@@ -46,16 +46,14 @@ struct s2mpg1x_meter_chan {
 
 struct s2mpg1x_meter {
 	struct regmap *regmap;
-	struct mutex lock;	/* serialises latch + snapshot state + cache */
+	struct mutex lock;	/* serialises latch + cache */
 	unsigned int n;
 	u8 hw_idx[S2MPG14_METER_CHANNELS];	/* enabled channels, in IIO order */
-	/* The following are all indexed by hardware channel (MUXSEL index). */
+	/* chan[] and cache_uw[] are indexed by hardware channel (MUXSEL index). */
 	struct s2mpg1x_meter_chan chan[S2MPG14_METER_CHANNELS];
-	u64 prev_acc[S2MPG14_METER_CHANNELS];
 	s64 cache_uw[S2MPG14_METER_CHANNELS];
-	u32 prev_count;
 	ktime_t last_refresh;
-	bool primed;
+	bool valid;
 };
 
 /*
@@ -85,9 +83,9 @@ static u32 s2mpg14_muxsel_power_pw(u8 muxsel)
 }
 
 /*
- * Pulse ASYNC_RD to copy the live accumulators into the readable registers.
- * The bit self-clears once the transfer completes, within one acquisition
- * window (~8 ms at 125 Hz).
+ * Pulse ASYNC_RD to copy the live accumulators into the readable registers
+ * and restart accumulation.  The bit self-clears once the transfer completes,
+ * within one acquisition window (~8 ms at 125 Hz).
  */
 static int s2mpg1x_meter_latch(struct s2mpg1x_meter *m)
 {
@@ -141,23 +139,18 @@ static int s2mpg1x_meter_read_count(struct s2mpg1x_meter *m, u32 *out)
 }
 
 /*
- * Caller holds m->lock.  Latches and snapshots the accumulators, then
- * recomputes per-rail power as the average since the previous snapshot.
- * Deltas use modular subtraction, correct across a single wrap.  If the
- * sample-count delta is implausible for the elapsed wall-clock time -- the
- * 20-bit counter wrapped, or the meter was reset (e.g. across suspend, which
- * clears the accumulators) -- the snapshot is used only to re-baseline and
- * the previous readings are kept, rather than emitting a garbage spike.
+ * Caller holds m->lock.  Latches the accumulators (which restarts the window)
+ * and recomputes per-rail power as ACC_DATA / ACC_COUNT for the elapsed
+ * window.  Reads within MIN_REFRESH_MS reuse the cached window.
  */
 static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 {
 	ktime_t now = ktime_get();
-	u32 count, d_count;
+	u32 count;
 	unsigned int i;
-	bool valid;
 	int ret;
 
-	if (m->primed &&
+	if (m->valid &&
 	    ktime_before(now, ktime_add_ms(m->last_refresh,
 					   S2MPG1X_METER_MIN_REFRESH_MS)))
 		return 0;
@@ -170,42 +163,27 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 	if (ret)
 		return ret;
 
-	d_count = (count - m->prev_count) & GENMASK(S2MPG14_METER_ACC_COUNT_BITS - 1, 0);
-
-	valid = m->primed && d_count;
-	if (valid) {
-		u64 elapsed_ms = ktime_to_ms(ktime_sub(now, m->last_refresh));
-		u64 max_count = (elapsed_ms + MSEC_PER_SEC) *
-				S2MPG14_METER_SAMPLE_RATE_HZ / MSEC_PER_SEC * 2;
-
-		/* Far more samples than the interval allows => wrap or reset. */
-		if (d_count > max_count)
-			valid = false;
-	}
-
 	for (i = 0; i < m->n; i++) {
 		u8 hw = m->hw_idx[i];
-		u64 acc, d_acc, avg;
+		u64 acc, avg;
 
 		ret = s2mpg1x_meter_read_acc(m, hw, &acc);
 		if (ret)
 			return ret;
 
-		if (valid) {
-			d_acc = (acc - m->prev_acc[hw]) &
-				GENMASK_ULL(S2MPG14_METER_ACC_DATA_BITS - 1, 0);
-			avg = div64_u64(d_acc, d_count);
-			/* Per-sample code cannot exceed the structural full scale. */
-			if (avg < S2MPG14_METER_MAX_SAMPLE_CODE)
-				m->cache_uw[hw] = div64_u64(avg * m->chan[hw].res_pw,
-							    1000000);
-		}
-		m->prev_acc[hw] = acc;
+		avg = count ? div64_u64(acc, count) : 0;
+		/*
+		 * The per-sample code cannot exceed the accumulator's structural
+		 * full scale (41-bit ACC over a 20-bit count); a larger value
+		 * means a corrupt latch, so keep the previous reading.
+		 */
+		if (avg < S2MPG14_METER_MAX_SAMPLE_CODE)
+			m->cache_uw[hw] = div64_u64(avg * m->chan[hw].res_pw,
+						    1000000);
 	}
 
-	m->prev_count = count;
 	m->last_refresh = now;
-	m->primed = true;
+	m->valid = true;
 	return 0;
 }
 
@@ -379,9 +357,11 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 		channels[i].info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED);
 	}
 
-	/* Prime the accumulator baseline so the first read has a valid delta. */
-	scoped_guard(mutex, &m->lock)
-		s2mpg1x_meter_refresh(m);
+	/* Latch once to start a clean measurement window. */
+	scoped_guard(mutex, &m->lock) {
+		if (!s2mpg1x_meter_latch(m))
+			m->last_refresh = ktime_get();
+	}
 
 	indio_dev->name = dev_name(dev);
 	indio_dev->info = &s2mpg1x_meter_info;

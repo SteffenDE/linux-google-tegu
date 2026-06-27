@@ -598,6 +598,97 @@
 };
 
 /*
+ * S2MPG15 sub PMIC, reached over ACPM IPC channel 2 with PMIC select 1
+ * (mirroring the s2mpg10/s2mpg11 main/sub pair).  Source: downstream
+ * zuma-pmic.dtsi s2mpg15mfd (acpm-speedy-channel = <1>).  Only the
+ * read-only ODPM power meter is described; no regulators are claimed.
+ *
+ * Channel -> rail mux follows the tegu ODPM assignment from
+ * research/dumped.dts.  Internal rails use the S2MPG15 muxsel values
+ * (BUCKnS = 0x0n, LDOnS = 0x20 + n); two external rails (MODEM, WLAN-BT)
+ * measure the VSYS drop across an off-chip shunt (muxsel 0x5c-0x5d) and
+ * carry the shunt value so the driver can scale them.  Channel 11 is the
+ * VSEN_C6/mmWave slot downstream, but the Pixel 9a has no mmWave, so it
+ * is mapped to S12S_VDD_AUR (BUCK12S) -- the live rail the downstream
+ * kernel meters there on this board.  Labels are the downstream
+ * schematic rail names.
+ */
+&acpm_ipc {
+	pmic-sub {
+		compatible = "samsung,s2mpg15-pmic";
+
+		meter {
+			compatible = "samsung,s2mpg15-meter";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			channel@0 {
+				reg = <0>;
+				samsung,muxsel = <0x01>;
+				label = "S1S_VDD_CAM";
+			};
+			channel@1 {
+				reg = <1>;
+				samsung,muxsel = <0x02>;
+				label = "S2S_VDD_G3D";
+			};
+			channel@2 {
+				reg = <2>;
+				samsung,muxsel = <0x04>;
+				label = "S4S_VDD2H_MEM";
+			};
+			channel@3 {
+				reg = <3>;
+				samsung,muxsel = <0x05>;
+				label = "S5S_VDDQ_MEM";
+			};
+			channel@4 {
+				reg = <4>;
+				samsung,muxsel = <0x36>;
+				label = "L22S_UDFPS";
+			};
+			channel@5 {
+				reg = <5>;
+				samsung,muxsel = <0x09>;
+				label = "S9S_VDD_AOC";
+			};
+			channel@6 {
+				reg = <6>;
+				samsung,muxsel = <0x22>;
+				label = "L2S_PLL_MIPI_UFS";
+			};
+			channel@7 {
+				reg = <7>;
+				samsung,muxsel = <0x03>;
+				label = "S3S_LLDO1";
+			};
+			channel@8 {
+				reg = <8>;
+				samsung,muxsel = <0x35>;
+				label = "L21S_VDD2L_MEM";
+			};
+			channel@9 {
+				reg = <9>;
+				samsung,muxsel = <0x5c>;
+				shunt-resistor-micro-ohms = <5000>;
+				label = "VSYS_PWR_MODEM";
+			};
+			channel@10 {
+				reg = <10>;
+				samsung,muxsel = <0x5d>;
+				shunt-resistor-micro-ohms = <10000>;
+				label = "VSYS_PWR_WLAN_BT";
+			};
+			channel@11 {
+				reg = <11>;
+				samsung,muxsel = <0x0c>;
+				label = "S12S_VDD_AUR";
+			};
+		};
+	};
+};
+
+/*
  * Touchscreen: Synaptics TouchComm on BLK_HSI0 USI2 SPI, CS0, 10 MHz.
  * Wiring is from the downstream zuma-tegu-common-touch.dtsi and
  * research/dumped.dts touchscreen@0: IRQ gpn0-0 (active-low, custom-alive

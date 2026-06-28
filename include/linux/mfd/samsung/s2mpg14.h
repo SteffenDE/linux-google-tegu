@@ -103,6 +103,9 @@ enum s2mpg14_meter_reg {
  */
 #define S2MPG14_METER_ACC_MODE_HI_MASK	0x0f
 
+/* METER_CTRL5 bit 6: soft-reset the accumulators (clears ACC_DATA/ACC_COUNT). */
+#define S2MPG14_METER_SOFT_RST_MASK	BIT(6)
+
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12
 #define S2MPG14_METER_ACC_DATA_BYTES	6

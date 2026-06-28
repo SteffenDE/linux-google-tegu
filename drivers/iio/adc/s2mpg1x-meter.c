@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
@@ -508,6 +509,7 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 	m = iio_priv(indio_dev);
 	mutex_init(&m->lock);
 	m->dev_type = platform_get_device_id(pdev)->driver_data;
+	platform_set_drvdata(pdev, indio_dev);
 
 	m->regmap = dev_get_regmap(dev->parent, "meter");
 	if (!m->regmap)
@@ -556,6 +558,25 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 	return devm_iio_device_register(dev, indio_dev);
 }
 
+/*
+ * The deadline work cannot run while the system is suspended, but the always-on
+ * PMIC keeps the firmware meter accumulating, so a long suspend can saturate the
+ * counter with nothing able to refresh it.  Re-init on resume (soft-reset +
+ * reconfigure) so the stale suspend window is discarded before userspace reads.
+ */
+static int s2mpg1x_meter_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+
+	guard(mutex)(&m->lock);
+	m->valid = false;
+	return s2mpg1x_meter_hw_init(m);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(s2mpg1x_meter_pm_ops, NULL,
+				s2mpg1x_meter_resume);
+
 static const struct platform_device_id s2mpg1x_meter_id[] = {
 	{ "s2mpg14-meter", S2MPG14 },
 	{ "s2mpg15-meter", S2MPG15 },
@@ -577,6 +598,7 @@ MODULE_DEVICE_TABLE(of, s2mpg1x_meter_of_match);
 static struct platform_driver s2mpg1x_meter_driver = {
 	.driver = {
 		.name = "s2mpg1x-meter",
+		.pm = pm_sleep_ptr(&s2mpg1x_meter_pm_ops),
 	},
 	.probe = s2mpg1x_meter_probe,
 	.id_table = s2mpg1x_meter_id,

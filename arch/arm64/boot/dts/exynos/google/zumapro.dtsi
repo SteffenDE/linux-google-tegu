@@ -10,6 +10,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/thermal/thermal.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
 #include "zumapro-pinctrl.h"
 
@@ -92,6 +93,175 @@
 			 * domain index (e.g. 7 = G3D, 8 = G3DL2).
 			 */
 			#clock-cells = <1>;
+
+			/*
+			 * The TMU is owned by the ACPM firmware; temperatures
+			 * are read over ACPM IPC channel 9 (hardware-verified,
+			 * research/tracing/acpm-channels.md).  The thermal-zone
+			 * cell is the firmware tzid: 0 BIG, 1 MID, 2 LITTLE,
+			 * 3 G3D, 4 ISP, 5 TPU, 6 AUR (downstream gs-tmu-v3
+			 * node ids, dumped.dts:17702-17878).
+			 */
+			acpm_tmu: thermal-sensor {
+				compatible = "google,zumapro-acpm-tmu";
+				#thermal-sensor-cells = <1>;
+			};
+		};
+	};
+
+	/*
+	 * ACPM TMU zones.  The ACPM firmware only *measures* on a bare boot (its
+	 * throttling governor is configured by the downstream kernel, not the
+	 * bootloader), so the CPU-cluster zones own throttling in Linux via
+	 * cpufreq cooling under the power_allocator (IPA) PID governor -- the
+	 * mainline analog of downstream's use-pi-thermal.  step_wise only
+	 * limit-cycles on the fast X4; IPA holds the setpoint (HW-validated).
+	 * Each CPU zone has a SINGLE passive control trip (the IPA setpoint,
+	 * downstream BIG 90 / MID,LITTLE 95, dumped.dts:17894+) plus a critical
+	 * backstop.  With one passive trip IPA runs always-on and its band is the
+	 * control temperature itself, so estimate_pid_constants() derives gentle
+	 * gains (k_po~17) -- a second "switch-on" passive trip narrows the band
+	 * into steep gains and resets the PID integral whenever the fast X4 dips
+	 * below it, collapsing the controller into a bang-bang relay (HW-confirmed
+	 * 45<->100 C swing).  sustainable-power is measured per cluster with the
+	 * S2MPG14 ODPM meter under an all-core load: BIG=1200 (its draw while IPA
+	 * holds it at the 90 C trip); MID=1500 and LITTLE=1000 are the clusters'
+	 * full-tilt power -- they only reach ~80/60 C, well below their 95 C trip,
+	 * so their value is a never-actuated safety-net feed-forward.
+	 * Cluster<->sensor: cpu7 (X4)=BIG tzid0, cpu4 (A720)=MID tzid1, cpu0
+	 * (A520)=LITTLE tzid2.  G3D/ISP/TPU/AUR stay monitor-only.
+	 */
+	thermal-zones {
+		big-thermal {
+			polling-delay = <250>;
+			polling-delay-passive = <25>;
+			thermal-sensors = <&acpm_tmu 0>;
+			sustainable-power = <1200>;
+
+			trips {
+				/*
+				 * Single passive trip = always-on IPA: the band is
+				 * the control temperature itself (90 C), which makes
+				 * estimate_pid_constants() derive gentle gains
+				 * (k_po~17).  A second "switch-on" passive trip would
+				 * narrow the band into steep gains AND reset the PID
+				 * integral every time the fast X4 dips below it, which
+				 * degrades the controller into a bang-bang relay
+				 * (HW-confirmed).  This is also step_wise's throttle
+				 * point when that fallback governor is selected.
+				 */
+				big_alert: throttle {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				big_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&big_alert>;
+					cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		mid-thermal {
+			polling-delay = <250>;
+			polling-delay-passive = <25>;
+			thermal-sensors = <&acpm_tmu 1>;
+			/*
+			 * Measured ~1500 mW full-tilt (ODPM, all-core load); MID
+			 * peaks ~80 C, 15 C below its control trip, so like LITTLE
+			 * this is a never-actuated safety-net feed-forward.
+			 */
+			sustainable-power = <1500>;
+
+			trips {
+				/* Always-on IPA, single passive trip; see big-thermal. */
+				mid_alert: throttle {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				mid_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&mid_alert>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		little-thermal {
+			polling-delay = <250>;
+			polling-delay-passive = <25>;
+			thermal-sensors = <&acpm_tmu 2>;
+			/*
+			 * Measured ~1000 mW full-tilt (ODPM, all-core load -- the
+			 * EM estimate of ~440 mW was ~2x low for the A520).  LITTLE
+			 * peaks ~60 C, 35 C below its control trip, so this never
+			 * actuates; it is a safety-net feed-forward only.
+			 */
+			sustainable-power = <1000>;
+
+			trips {
+				/* Always-on IPA, single passive trip; see big-thermal. */
+				little_alert: throttle {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				little_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&little_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		g3d-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&acpm_tmu 3>;
+		};
+
+		isp-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&acpm_tmu 4>;
+		};
+
+		tpu-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&acpm_tmu 5>;
+		};
+
+		aur-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&acpm_tmu 6>;
 		};
 	};
 
@@ -191,6 +361,7 @@
 			cpu-idle-states = <&hayes_cpu_sleep>;
 			capacity-dmips-mhz = <0xc1>;
 			dynamic-power-coefficient = <0x46>;
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@100 {
@@ -239,6 +410,7 @@
 			cpu-idle-states = <&hunter_cpu_sleep>;
 			capacity-dmips-mhz = <0x39f>;
 			dynamic-power-coefficient = <0x201>;
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@500 {
@@ -275,6 +447,7 @@
 			cpu-idle-states = <&hunterelp_cpu_sleep>;
 			capacity-dmips-mhz = <0x400>;
 			dynamic-power-coefficient = <0x2f5>;
+			#cooling-cells = <2>;
 		};
 
 		idle-states {
@@ -324,71 +497,80 @@
 	 * min/max-freq at research/dumped.dts:3326-3370.  The supplying clock is
 	 * the ACPM DVFS domain for each cluster (CPUCL0/1/2 = ids 2/3/4 per
 	 * private/.../cal-if/zuma/acpm_dvfs_zuma.h), so ACPM owns the rail
-	 * voltage: no opp-microvolt is listed and the CPUs carry no cpu-supply.
-	 * cpufreq-dt binds via the platdev fallback once cpu@0 has
+	 * voltage; cpufreq-dt binds via the platdev fallback once cpu@0 has
 	 * operating-points-v2.
+	 *
+	 * opp-microvolt is NOT actuated here: the CPUs carry no cpu-supply, so the
+	 * OPP core never programs a rail (ACPM still owns voltage).  It exists only
+	 * so cpufreq-dt builds an Energy Model (P = C*V^2*f), which makes the
+	 * cpufreq cooling devices power actors so the thermal power_allocator (IPA)
+	 * governor can hold the CPU zones at their trip instead of letting step_wise
+	 * oscillate.  These values are an ESTIMATED monotonic V/f curve (~0.6 V min
+	 * to ~1.05 V max); IPA's feedback tolerates the approximation.
+	 * TODO: replace with the real per-chip ASV ladder read from the ACPM fvmap
+	 * at runtime (a small fvmap-reader EM driver; see research/thermal-acpm-tmu.md).
 	 */
 	cpucl0_opp_table: opp-table-cpucl0 {
 		compatible = "operating-points-v2";
 		opp-shared;
 
-		opp-820000000  { opp-hz = /bits/ 64 <820000000>; };
-		opp-955000000  { opp-hz = /bits/ 64 <955000000>; };
-		opp-1098000000 { opp-hz = /bits/ 64 <1098000000>; };
-		opp-1197000000 { opp-hz = /bits/ 64 <1197000000>; };
-		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; };
-		opp-1425000000 { opp-hz = /bits/ 64 <1425000000>; };
-		opp-1548000000 { opp-hz = /bits/ 64 <1548000000>; };
-		opp-1696000000 { opp-hz = /bits/ 64 <1696000000>; };
-		opp-1849000000 { opp-hz = /bits/ 64 <1849000000>; };
-		opp-1950000000 { opp-hz = /bits/ 64 <1950000000>; };
+		opp-820000000  { opp-hz = /bits/ 64 <820000000>;  opp-microvolt = <600000>; };
+		opp-955000000  { opp-hz = /bits/ 64 <955000000>;  opp-microvolt = <625000>; };
+		opp-1098000000 { opp-hz = /bits/ 64 <1098000000>; opp-microvolt = <650000>; };
+		opp-1197000000 { opp-hz = /bits/ 64 <1197000000>; opp-microvolt = <675000>; };
+		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; opp-microvolt = <700000>; };
+		opp-1425000000 { opp-hz = /bits/ 64 <1425000000>; opp-microvolt = <725000>; };
+		opp-1548000000 { opp-hz = /bits/ 64 <1548000000>; opp-microvolt = <755000>; };
+		opp-1696000000 { opp-hz = /bits/ 64 <1696000000>; opp-microvolt = <800000>; };
+		opp-1849000000 { opp-hz = /bits/ 64 <1849000000>; opp-microvolt = <850000>; };
+		opp-1950000000 { opp-hz = /bits/ 64 <1950000000>; opp-microvolt = <900000>; };
 	};
 
 	cpucl1_opp_table: opp-table-cpucl1 {
 		compatible = "operating-points-v2";
 		opp-shared;
 
-		opp-357000000  { opp-hz = /bits/ 64 <357000000>; };
-		opp-578000000  { opp-hz = /bits/ 64 <578000000>; };
-		opp-648000000  { opp-hz = /bits/ 64 <648000000>; };
-		opp-787000000  { opp-hz = /bits/ 64 <787000000>; };
-		opp-910000000  { opp-hz = /bits/ 64 <910000000>; };
-		opp-1065000000 { opp-hz = /bits/ 64 <1065000000>; };
-		opp-1221000000 { opp-hz = /bits/ 64 <1221000000>; };
-		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; };
-		opp-1418000000 { opp-hz = /bits/ 64 <1418000000>; };
-		opp-1549000000 { opp-hz = /bits/ 64 <1549000000>; };
-		opp-1795000000 { opp-hz = /bits/ 64 <1795000000>; };
-		opp-1945000000 { opp-hz = /bits/ 64 <1945000000>; };
-		opp-2130000000 { opp-hz = /bits/ 64 <2130000000>; };
-		opp-2245000000 { opp-hz = /bits/ 64 <2245000000>; };
-		opp-2367000000 { opp-hz = /bits/ 64 <2367000000>; };
-		opp-2450000000 { opp-hz = /bits/ 64 <2450000000>; };
-		opp-2600000000 { opp-hz = /bits/ 64 <2600000000>; };
+		opp-357000000  { opp-hz = /bits/ 64 <357000000>;  opp-microvolt = <575000>; };
+		opp-578000000  { opp-hz = /bits/ 64 <578000000>;  opp-microvolt = <600000>; };
+		opp-648000000  { opp-hz = /bits/ 64 <648000000>;  opp-microvolt = <615000>; };
+		opp-787000000  { opp-hz = /bits/ 64 <787000000>;  opp-microvolt = <640000>; };
+		opp-910000000  { opp-hz = /bits/ 64 <910000000>;  opp-microvolt = <665000>; };
+		opp-1065000000 { opp-hz = /bits/ 64 <1065000000>; opp-microvolt = <690000>; };
+		opp-1221000000 { opp-hz = /bits/ 64 <1221000000>; opp-microvolt = <715000>; };
+		opp-1328000000 { opp-hz = /bits/ 64 <1328000000>; opp-microvolt = <740000>; };
+		opp-1418000000 { opp-hz = /bits/ 64 <1418000000>; opp-microvolt = <765000>; };
+		opp-1549000000 { opp-hz = /bits/ 64 <1549000000>; opp-microvolt = <790000>; };
+		opp-1795000000 { opp-hz = /bits/ 64 <1795000000>; opp-microvolt = <825000>; };
+		opp-1945000000 { opp-hz = /bits/ 64 <1945000000>; opp-microvolt = <850000>; };
+		opp-2130000000 { opp-hz = /bits/ 64 <2130000000>; opp-microvolt = <890000>; };
+		opp-2245000000 { opp-hz = /bits/ 64 <2245000000>; opp-microvolt = <915000>; };
+		opp-2367000000 { opp-hz = /bits/ 64 <2367000000>; opp-microvolt = <940000>; };
+		opp-2450000000 { opp-hz = /bits/ 64 <2450000000>; opp-microvolt = <965000>; };
+		opp-2600000000 { opp-hz = /bits/ 64 <2600000000>; opp-microvolt = <1000000>; };
 	};
 
 	cpucl2_opp_table: opp-table-cpucl2 {
 		compatible = "operating-points-v2";
 		opp-shared;
 
-		opp-700000000  { opp-hz = /bits/ 64 <700000000>; };
-		opp-1164000000 { opp-hz = /bits/ 64 <1164000000>; };
-		opp-1396000000 { opp-hz = /bits/ 64 <1396000000>; };
-		opp-1557000000 { opp-hz = /bits/ 64 <1557000000>; };
-		opp-1745000000 { opp-hz = /bits/ 64 <1745000000>; };
-		opp-1885000000 { opp-hz = /bits/ 64 <1885000000>; };
-		opp-1999000000 { opp-hz = /bits/ 64 <1999000000>; };
-		opp-2147000000 { opp-hz = /bits/ 64 <2147000000>; };
-		opp-2294000000 { opp-hz = /bits/ 64 <2294000000>; };
-		opp-2363000000 { opp-hz = /bits/ 64 <2363000000>; };
-		opp-2499000000 { opp-hz = /bits/ 64 <2499000000>; };
-		opp-2687000000 { opp-hz = /bits/ 64 <2687000000>; };
-		opp-2802000000 { opp-hz = /bits/ 64 <2802000000>; };
-		opp-2914000000 { opp-hz = /bits/ 64 <2914000000>; };
-		opp-2943000000 { opp-hz = /bits/ 64 <2943000000>; };
-		opp-2970000000 { opp-hz = /bits/ 64 <2970000000>; };
-		opp-3015000000 { opp-hz = /bits/ 64 <3015000000>; };
-		opp-3105000000 { opp-hz = /bits/ 64 <3105000000>; };
+		opp-700000000  { opp-hz = /bits/ 64 <700000000>;  opp-microvolt = <600000>; };
+		opp-1164000000 { opp-hz = /bits/ 64 <1164000000>; opp-microvolt = <640000>; };
+		opp-1396000000 { opp-hz = /bits/ 64 <1396000000>; opp-microvolt = <665000>; };
+		opp-1557000000 { opp-hz = /bits/ 64 <1557000000>; opp-microvolt = <690000>; };
+		opp-1745000000 { opp-hz = /bits/ 64 <1745000000>; opp-microvolt = <715000>; };
+		opp-1885000000 { opp-hz = /bits/ 64 <1885000000>; opp-microvolt = <740000>; };
+		opp-1999000000 { opp-hz = /bits/ 64 <1999000000>; opp-microvolt = <765000>; };
+		opp-2147000000 { opp-hz = /bits/ 64 <2147000000>; opp-microvolt = <790000>; };
+		opp-2294000000 { opp-hz = /bits/ 64 <2294000000>; opp-microvolt = <815000>; };
+		opp-2363000000 { opp-hz = /bits/ 64 <2363000000>; opp-microvolt = <840000>; };
+		opp-2499000000 { opp-hz = /bits/ 64 <2499000000>; opp-microvolt = <865000>; };
+		opp-2687000000 { opp-hz = /bits/ 64 <2687000000>; opp-microvolt = <900000>; };
+		opp-2802000000 { opp-hz = /bits/ 64 <2802000000>; opp-microvolt = <940000>; };
+		opp-2914000000 { opp-hz = /bits/ 64 <2914000000>; opp-microvolt = <975000>; };
+		opp-2943000000 { opp-hz = /bits/ 64 <2943000000>; opp-microvolt = <990000>; };
+		opp-2970000000 { opp-hz = /bits/ 64 <2970000000>; opp-microvolt = <1000000>; };
+		opp-3015000000 { opp-hz = /bits/ 64 <3015000000>; opp-microvolt = <1025000>; };
+		opp-3105000000 { opp-hz = /bits/ 64 <3105000000>; opp-microvolt = <1050000>; };
 	};
 
 	/*

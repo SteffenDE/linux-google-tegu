@@ -31,6 +31,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/workqueue.h>
 
 /*
  * Re-latch at most this often, so that reading all channels back-to-back
@@ -38,6 +39,15 @@
  * reported power is the average since the previous read pass.
  */
 #define S2MPG1X_METER_MIN_REFRESH_MS	100
+
+/*
+ * The 20-bit ACC_COUNT saturates after ~2.3 h at the 125 Hz internal rate, and
+ * once saturated the accumulator is stuck (ASYNC_RD can no longer restart it).
+ * A deadline timer re-latches once the meter has gone unread this long, so an
+ * idle meter never reaches saturation; active readers keep pushing the deadline
+ * out and so never trigger a redundant latch.
+ */
+#define S2MPG1X_METER_REFRESH_MS	(60 * 60 * 1000)
 
 struct s2mpg1x_meter_chan {
 	u8 muxsel;	/* rail mux selection */
@@ -56,6 +66,8 @@ struct s2mpg1x_meter {
 	s64 cache_uw[S2MPG14_METER_CHANNELS];
 	ktime_t last_refresh;
 	bool valid;
+	bool stopping;		/* gates the self-rearming refresh work */
+	struct delayed_work refresh_work;
 };
 
 /*
@@ -242,6 +254,43 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
 	m->last_refresh = now;
 	m->valid = true;
 	return 0;
+}
+
+/*
+ * Re-latch only if the meter has gone unread for the deadline, so an idle
+ * meter cannot saturate (see S2MPG1X_METER_REFRESH_MS).  A recent userspace
+ * read pushes the deadline out instead, so active polling never forces an
+ * extra latch.
+ */
+static void s2mpg1x_meter_refresh_work(struct work_struct *work)
+{
+	struct s2mpg1x_meter *m = container_of(to_delayed_work(work),
+					       struct s2mpg1x_meter, refresh_work);
+
+	scoped_guard(mutex, &m->lock) {
+		s64 idle_ms = ktime_ms_delta(ktime_get(), m->last_refresh);
+		unsigned long delay;
+
+		if (idle_ms >= S2MPG1X_METER_REFRESH_MS) {
+			s2mpg1x_meter_refresh(m);
+			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS);
+		} else {
+			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS - idle_ms);
+		}
+
+		/* Re-arm under the lock so stop() can race-free cancel us. */
+		if (!m->stopping)
+			schedule_delayed_work(&m->refresh_work, delay);
+	}
+}
+
+static void s2mpg1x_meter_stop(void *data)
+{
+	struct s2mpg1x_meter *m = data;
+
+	scoped_guard(mutex, &m->lock)
+		m->stopping = true;
+	cancel_delayed_work_sync(&m->refresh_work);
 }
 
 static int s2mpg1x_meter_read_raw(struct iio_dev *indio_dev,
@@ -489,6 +538,14 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 		if (!s2mpg1x_meter_latch(m))
 			m->last_refresh = ktime_get();
 	}
+
+	/* Keep the accumulator from saturating while userspace is not reading. */
+	INIT_DELAYED_WORK(&m->refresh_work, s2mpg1x_meter_refresh_work);
+	ret = devm_add_action_or_reset(dev, s2mpg1x_meter_stop, m);
+	if (ret)
+		return ret;
+	schedule_delayed_work(&m->refresh_work,
+			      msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS));
 
 	indio_dev->name = dev_name(dev);
 	indio_dev->info = &s2mpg1x_meter_info;

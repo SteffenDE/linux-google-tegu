@@ -19,6 +19,7 @@
 
 #include <linux/bitops.h>
 #include <linux/cleanup.h>
+#include <linux/delay.h>
 #include <linux/iio/iio.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
@@ -354,12 +355,32 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 	unsigned int i;
 	int ret;
 
-	/* Accumulate power (not current) on all 12 channels. */
+	/*
+	 * The main PMIC is always-on and powers the SoC, so its meter keeps
+	 * accumulating across AP reboots.  ACC_COUNT (20-bit) saturates after
+	 * ~2.3 h at 125 Hz, and ASYNC_RD only copies the accumulators -- it
+	 * cannot clear a saturated counter -- so a meter inherited from a prior
+	 * boot reads a frozen since-cold-boot average (ACC_DATA/ACC_COUNT with a
+	 * pinned count).  Soft-reset the accumulators so counting restarts from
+	 * zero before we configure and enable the meter.
+	 */
+	ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL5,
+				 S2MPG14_METER_SOFT_RST_MASK,
+				 S2MPG14_METER_SOFT_RST_MASK);
+	if (ret)
+		return ret;
+	usleep_range(2, 102);
+
+	/*
+	 * Accumulate power (not current) on all 12 channels; the same write
+	 * also clears the soft-reset bit so the meter can run.
+	 */
 	ret = regmap_write(m->regmap, S2MPG14_METER_CTRL4, 0x00);
 	if (ret)
 		return ret;
 	ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL5,
-				 S2MPG14_METER_ACC_MODE_HI_MASK, 0x00);
+				 S2MPG14_METER_ACC_MODE_HI_MASK |
+				 S2MPG14_METER_SOFT_RST_MASK, 0x00);
 	if (ret)
 		return ret;
 

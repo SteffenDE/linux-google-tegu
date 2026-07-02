@@ -19,12 +19,15 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/pcie-zumapro.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 
 #include "pcie-designware.h"
 
 #define to_zumapro_pcie(x)	dev_get_drvdata((x)->dev)
+
+static const struct of_device_id zumapro_pcie_of_match[];
 
 /* ELBI (app/controller) registers, relative to pci->elbi_base. */
 #define PCIE_APP_LTSSM_ENABLE		0x0054
@@ -487,6 +490,88 @@ static const struct dw_pcie_host_ops zumapro_pcie_host_ops = {
 	.init		= zumapro_pcie_host_init,
 	.post_init	= zumapro_pcie_host_post_init,
 };
+
+/*
+ * Modem (s5300) boot-assist hooks; see include/linux/pcie-zumapro.h.  Callers
+ * resolve the RC platform device from a DT phandle, so guard against being
+ * handed a device another driver owns.  Single-caller bring-up scaffolding:
+ * no locking against concurrent host operations.
+ */
+static struct zumapro_pcie *zumapro_pcie_from_dev(struct device *rc_dev)
+{
+	if (!rc_dev->driver ||
+	    rc_dev->driver->of_match_table != zumapro_pcie_of_match)
+		return NULL;
+
+	return dev_get_drvdata(rc_dev);
+}
+
+/*
+ * Point the iMSI-RX termination address at the modem's MSI carveout.  The
+ * default target (dw_pcie_msi_host_init() picks cfg0_base) is fine for pure
+ * MSI senders, but the s5300 mask ROM treats its MSI capability address as
+ * the base of a 4K status block and DMA-writes boot_stage and the boot-image
+ * descriptor response at offsets above it -- those writes pass the iMSI-RX
+ * address filter and hit the bus, so they must land in the dedicated
+ * carveout, not in the config window.  Mirrors downstream
+ * exynos_pcie_set_msi_ctrl_addr().  Must run before the endpoint's MSI
+ * vectors are allocated so the capability is composed with this address.
+ */
+int zumapro_pcie_set_msi_target(struct device *rc_dev, phys_addr_t target)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	zp->pci.pp.msi_data = target;
+	dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_LO, lower_32_bits(target));
+	dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_HI, upper_32_bits(target));
+
+	dev_info(rc_dev, "MSI target moved to %pap\n", &target);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_set_msi_target);
+
+/*
+ * Link bounce for the modem boot handshake: after the first-stage download
+ * the CP bootloader expects the link to drop and retrain (downstream
+ * start_normal_boot() runs poweroff/poweron between the boot_stage poll and
+ * the link-ack doorbell).  Only PERST# and the app-layer LTSSM enable are
+ * toggled -- the same minimal cycle the start_link() retry loop already uses
+ * on this hardware -- so the RC core config from dw_pcie_setup_rc() survives.
+ * If the bounce proves insufficient on hardware, the escalation path is the
+ * downstream full poweroff/poweron (PHY power cycle included).
+ */
+int zumapro_pcie_modem_link_down(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	writel(0, zp->pci.elbi_base + PCIE_APP_LTSSM_ENABLE);
+	gpiod_set_value_cansleep(zp->perst, 1);
+	usleep_range(1000, 2000);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_down);
+
+int zumapro_pcie_modem_link_up(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	gpiod_set_value_cansleep(zp->perst, 0);
+	usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
+
+	return zumapro_pcie_start_link(&zp->pci);
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_up);
 
 static int zumapro_pcie_probe(struct platform_device *pdev)
 {

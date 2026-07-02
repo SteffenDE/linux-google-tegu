@@ -468,7 +468,19 @@ static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
 static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
 	struct pci_dev *rp, *ep = NULL;
+
+	/*
+	 * Skip the ASPM/L1SS walk on the modem channel: the endpoint here is
+	 * the CP mask ROM parked mid-boot-protocol, and downstream keeps
+	 * L1SS off for the whole CP boot (s51xx_pcie_restore_state()) and
+	 * only enables L1.2 from complete_normal_boot() once the CP is
+	 * ONLINE.  Power management of the modem link is the modem driver's
+	 * business, not enumeration's.
+	 */
+	if (zp->cp_pwr)
+		return;
 
 	rp = pci_get_slot(pp->bridge->bus, PCI_DEVFN(0, 0));
 	if (rp && rp->subordinate)

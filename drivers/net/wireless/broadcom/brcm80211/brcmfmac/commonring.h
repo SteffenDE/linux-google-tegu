@@ -10,6 +10,7 @@ struct brcmf_commonring {
 	u16 r_ptr;
 	u16 w_ptr;
 	u16 f_ptr;
+	u32 seqnum;
 	u16 depth;
 	u16 item_len;
 

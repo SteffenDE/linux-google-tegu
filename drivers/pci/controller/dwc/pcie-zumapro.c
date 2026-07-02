@@ -300,6 +300,34 @@ static int zumapro_pcie_enable_aspm(struct pci_dev *pdev, void *userdata)
 }
 
 /*
+ * The endpoint reports the latencies from its LTR extended capability in the
+ * LTR messages it sends, and L1.2 entry requires the reported latency to be
+ * at or above the link's LTR_L1_2_THRESHOLD.  Nothing on a DT platform
+ * programs that capability (on ACPI systems the BIOS does), so it stays 0,
+ * the device reports "no latency tolerance", and the link never descends
+ * below L1.1 -- the WLAN module then idles well above its L1.2 power floor.
+ * Downstream bcmdhd writes 3 ms snoop/no-snoop before enabling L1SS
+ * (exynos_pcie_rc_set_l1ss(), WIFI_L1SS_LTR_LATENCY); mirror that.
+ */
+#define ZUMAPRO_PCIE_LTR_3MS	0x1003	/* scale 4 (~1.05 ms/unit), value 3 */
+
+static void zumapro_pcie_set_ep_ltr_latency(struct pci_dev *ep)
+{
+	int ltr = pci_find_ext_capability(ep, PCI_EXT_CAP_ID_LTR);
+
+	if (!ltr) {
+		pci_info(ep, "no LTR capability, L1.2 stays ineligible\n");
+		return;
+	}
+
+	pci_write_config_word(ep, ltr + PCI_LTR_MAX_SNOOP_LAT,
+			      ZUMAPRO_PCIE_LTR_3MS);
+	pci_write_config_word(ep, ltr + PCI_LTR_MAX_NOSNOOP_LAT,
+			      ZUMAPRO_PCIE_LTR_3MS);
+	pci_dbg(ep, "LTR max snoop/no-snoop latency set to 3 ms\n");
+}
+
+/*
  * The ASPM core enables the L1 PM Substates by writing PCI_L1SS_CTL1 through
  * normal config accesses, but the DWC root port's config space is read-only
  * unless DBI read-only-write is enabled, and dw_pcie_own_conf_map_bus() does
@@ -345,6 +373,10 @@ static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
 	rp = pci_get_slot(pp->bridge->bus, PCI_DEVFN(0, 0));
 	if (rp && rp->subordinate)
 		ep = pci_get_slot(rp->subordinate, PCI_DEVFN(0, 0));
+
+	/* Latency must be in place before LTR_EN/L1.2 get enabled below. */
+	if (ep)
+		zumapro_pcie_set_ep_ltr_latency(ep);
 
 	pci_walk_bus(pp->bridge->bus, zumapro_pcie_enable_aspm, NULL);
 

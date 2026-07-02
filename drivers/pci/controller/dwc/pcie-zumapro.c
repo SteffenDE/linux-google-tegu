@@ -94,7 +94,86 @@ struct zumapro_pcie {
 	struct phy		*phy;
 	struct gpio_desc	*perst;
 	phys_addr_t		pmu_phys;
+	/* Optional CP (modem) rail-sequencing lines; see cp_power_on(). */
+	struct gpio_desc	*cp_pda_active;
+	struct gpio_desc	*cp_wakeup;
+	struct gpio_desc	*cp_pm_wrst;
+	struct gpio_desc	*cp_pwr;
+	struct gpio_desc	*cp_nreset;
+	struct gpio_desc	*cp_wrst;
 };
+
+/*
+ * Bring-up scaffolding: power the Exynos Modem 5300 endpoint so its mask-ROM
+ * comes up PCIe-visible.  The sequence is the downstream
+ * modem_ctrl_s5100.c power_on_cp()/gpio_power_offon_cp() (non-WRESET_WA)
+ * path: assert pda_active, run the power-off half so a warm-rebooted CP
+ * reaches a clean cold state, then the rail power-on order, then the 200 ms
+ * ROM settle downstream applies before link-up (register_pcie()).  The ROM
+ * boots over PCIe and parks waiting for a boot-image doorbell, so nothing
+ * beyond link training and enumeration happens until a modem driver exists.
+ * This moves into that modem-control driver once the cpif port lands.
+ */
+static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp)
+{
+	dev_info(zp->pci.dev, "powering on the CP (modem) endpoint\n");
+
+	gpiod_direction_output(zp->cp_pda_active, 1);
+
+	/* power-off half: reach a clean cold state */
+	gpiod_direction_output(zp->cp_wakeup, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
+	gpiod_direction_output(zp->cp_nreset, 0);
+	gpiod_direction_output(zp->cp_wrst, 0);
+	gpiod_direction_output(zp->cp_pwr, 0);
+	msleep(30);
+	gpiod_direction_output(zp->cp_pm_wrst, 0);
+	msleep(50);
+
+	/* power-on half */
+	gpiod_set_value_cansleep(zp->cp_pm_wrst, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(zp->cp_pwr, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(zp->cp_nreset, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(zp->cp_wrst, 1);
+
+	/* ROM settle before link training */
+	msleep(200);
+}
+
+static int zumapro_pcie_cp_get_gpios(struct zumapro_pcie *zp)
+{
+	struct device *dev = zp->pci.dev;
+
+	/*
+	 * All lines are requested as-is: the power-on sequence sets each
+	 * direction and level in the downstream order, so requesting them
+	 * output-low here would drop a possibly-running CP's rails in
+	 * request order instead.
+	 */
+	zp->cp_pwr = devm_gpiod_get_optional(dev, "google,cp-pwr", GPIOD_ASIS);
+	if (IS_ERR(zp->cp_pwr))
+		return PTR_ERR(zp->cp_pwr);
+	if (!zp->cp_pwr)
+		return 0;
+
+	zp->cp_pda_active = devm_gpiod_get(dev, "google,cp-pda-active",
+					   GPIOD_ASIS);
+	zp->cp_wakeup = devm_gpiod_get(dev, "google,cp-wakeup", GPIOD_ASIS);
+	zp->cp_pm_wrst = devm_gpiod_get(dev, "google,cp-pm-wrst", GPIOD_ASIS);
+	zp->cp_nreset = devm_gpiod_get(dev, "google,cp-nreset", GPIOD_ASIS);
+	zp->cp_wrst = devm_gpiod_get(dev, "google,cp-wrst", GPIOD_ASIS);
+	if (IS_ERR(zp->cp_pda_active) || IS_ERR(zp->cp_wakeup) ||
+	    IS_ERR(zp->cp_pm_wrst) || IS_ERR(zp->cp_nreset) ||
+	    IS_ERR(zp->cp_wrst))
+		return dev_err_probe(dev, -EINVAL,
+				     "incomplete CP power-on GPIO set\n");
+
+	return 0;
+}
 
 /*
  * Controller reset and PMA reset pulse before PHY bring-up.  The PMA reset is
@@ -239,6 +318,10 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
 	int ret;
+
+	/* Power the modem endpoint before the link comes up (stub). */
+	if (zp->cp_pwr)
+		zumapro_pcie_cp_power_on(zp);
 
 	/* Release the PHY from PMU isolation. */
 	ret = phy_init(zp->phy);
@@ -442,6 +525,11 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 	if (IS_ERR(zp->perst))
 		return dev_err_probe(dev, PTR_ERR(zp->perst),
 				     "failed to get reset GPIO\n");
+
+	ret = zumapro_pcie_cp_get_gpios(zp);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to get CP power-on GPIOs\n");
 
 	ret = of_parse_phandle_with_fixed_args(np, "samsung,pmu-syscon",
 					       1, 0, &pmu_args);

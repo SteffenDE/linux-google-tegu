@@ -551,6 +551,12 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	if (!zp)
 		return -ENODEV;
 
+	/*
+	 * Downstream s5100_poweroff_pcie() deasserts AP2CP_WAKEUP before
+	 * dropping the link; the CP samples it to know the AP intends the
+	 * link to be down.  NULL-safe no-op when no CP lines exist (CH1).
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
 	writel(0, zp->pci.elbi_base + PCIE_APP_LTSSM_ENABLE);
 	gpiod_set_value_cansleep(zp->perst, 1);
 	usleep_range(1000, 2000);
@@ -566,6 +572,13 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 	if (!zp)
 		return -ENODEV;
 
+	/*
+	 * Downstream s5100_poweron_pcie() asserts AP2CP_WAKEUP before every
+	 * (re)train; the CP bootloader may gate its link participation on it.
+	 * Left asserted afterwards -- the downstream steady-state while the
+	 * link is up.
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 1);
 	gpiod_set_value_cansleep(zp->perst, 0);
 	usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
 

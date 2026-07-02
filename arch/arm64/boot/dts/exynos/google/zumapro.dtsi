@@ -728,6 +728,13 @@
 		 * span; without it of_translate_address() returns OF_BAD_ADDR for those.
 		 */
 		ranges = <0x0 0x0 0x0 0x40000000>,
+			 /*
+			  * PCIe CH0 (modem) outbound + ECAM window: the
+			  * pcie@12100000 "config" reg (0x40ffe000) and its
+			  * memory window (CPU 0x40000000 -> PCI 0x14e00000)
+			  * start exactly at the top of the first span.
+			  */
+			 <0x40000000 0x0 0x40000000 0x1000000>,
 			 <0x60000000 0x0 0x60000000 0x1000000>;
 
 		/*
@@ -1526,6 +1533,65 @@
 			clock-names = "ref_clk";
 			samsung,pmu-syscon = <&pmu_system_controller 0x3ec0>;
 			status = "okay";
+		};
+
+		/*
+		 * PCIe GEN3_0 (CH0/HSI1) root complex and PHY for the Exynos
+		 * Modem 5300 (Gen3 x2).  Addresses, interrupts and ranges are
+		 * from research/dumped.dts:8161-8198 (pcie@12100000); the PHY
+		 * regions are the controller's "phy"/"pcs"/"udbg"/"soc"
+		 * windows.  The outbound window is non-identity: PCI
+		 * 0x14e00000 maps to CPU 0x40000000 (the modem doorbell BAR
+		 * lives at PCI 0x14e60000).  Both nodes stay disabled here
+		 * and are enabled by the board once the endpoint's power-on
+		 * sequencing is in place.
+		 */
+		pcie0_phy: pcie-phy@12140000 {
+			compatible = "google,zumapro-pcie-x2-phy";
+			reg = <0x12140000 0x3000>,
+			      <0x12120000 0x5000>,
+			      <0x12130000 0xd000>,
+			      <0x12110000 0x5000>;
+			reg-names = "pma", "pcs", "pll", "soc";
+			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_PHY_REFCLK_IN>,
+				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK>,
+				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_UDBG_APB_PCLK>;
+			clock-names = "ref", "apb", "udbg";
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ec4>;
+			power-domains = <&pd_hsi1>;
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		pcie0: pcie@12100000 {
+			compatible = "google,zumapro-pcie";
+			reg = <0x12100000 0x2000>,
+			      <0x12400000 0x381000>,
+			      <0x40ffe000 0x2000>;
+			reg-names = "elbi", "dbi", "config";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			device_type = "pci";
+			interrupts = <GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 416 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "intr", "msi";
+			interrupt-map-mask = <0 0 0 0>;
+			interrupt-map = <0 0 0 0 &gic GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_DBI_ACLK>,
+				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_MSTR_ACLK>,
+				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_SLV_ACLK>,
+				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_DRIVER_APB_CLK>;
+			clock-names = "dbi", "mstr", "slv", "apb";
+			phys = <&pcie0_phy>;
+			phy-names = "pcie";
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ec4>;
+			num-lanes = <2>;
+			max-link-speed = <3>;
+			bus-range = <0x00 0xff>;
+			ranges = <0x82000000 0 0x14e00000 0x40000000 0 0xff0000>;
+			power-domains = <&pd_hsi1>;
+			status = "disabled";
 		};
 
 		/*

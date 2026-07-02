@@ -49,6 +49,22 @@ enum brcmf_pcie_state {
 	BRCMFMAC_PCIE_STATE_UP
 };
 
+/* In-band device-sleep handshake state (64-bit core, mailbox over the control
+ * ring).  The firmware micro-sleeps when idle; the host must wake it before
+ * touching a ring and may let it sleep again once idle.
+ */
+enum brcmf_pcie_inband_ds_state {
+	BRCMF_PCIE_DS_DISABLED,
+	BRCMF_PCIE_DS_ACTIVE,
+	BRCMF_PCIE_DS_DEV_SLEEP_PEND,
+	BRCMF_PCIE_DS_DEV_SLEEP,
+	BRCMF_PCIE_DS_DEV_WAKE,
+	BRCMF_PCIE_DS_DISABLED_WAIT,
+	BRCMF_PCIE_DS_HOST_SLEEP_WAIT,
+	BRCMF_PCIE_DS_HOST_SLEEP,
+	BRCMF_PCIE_DS_HOST_WAKE_WAIT,
+};
+
 BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
 BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
 BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
@@ -156,6 +172,11 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_64_PCIE2REG_MAILBOXMASK	0xC34
 #define BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_0	0xA20
 #define BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_1	0xA24
+
+/* H2D doorbell payload: 0xFF tag, ring index in [23:16], write pointer in
+ * [15:0] (downstream bcmdhd DHD_WRPTR_UPDATE_H2D_DB_MAGIC).
+ */
+#define BRCMF_PCIE_H2D_DB_WRPTR_MAGIC		0xFF000000
 
 #define BRCMF_PCIE2_INTA			0x01
 #define BRCMF_PCIE2_INTB			0x02
@@ -325,14 +346,18 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_D2H_DEV_D3_ACK			0x00000001
 #define BRCMF_D2H_DEV_DS_ENTER_REQ		0x00000002
 #define BRCMF_D2H_DEV_DS_EXIT_NOTE		0x00000004
+#define BRCMF_D2H_DEV_D0_ACK			0x00000008
 #define BRCMF_D2H_DEV_FWHALT			0x10000000
 
 #define BRCMF_H2D_HOST_D3_INFORM		0x00000001
 #define BRCMF_H2D_HOST_DS_ACK			0x00000002
 #define BRCMF_H2D_HOST_D0_INFORM_IN_USE		0x00000008
 #define BRCMF_H2D_HOST_D0_INFORM		0x00000010
+#define BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT	0x00000020
+#define BRCMF_H2D_HOST_DS_DEVICE_WAKE_ASSERT	0x00000040
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
+#define BRCMF_PCIE_DS_EXIT_TIMEOUT		msecs_to_jiffies(5000)
 
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
@@ -420,6 +445,14 @@ struct brcmf_pciedev_info {
 	struct brcmf_pcie_shared_info shared;
 	wait_queue_head_t mbdata_resp_wait;
 	bool mbdata_completed;
+	wait_queue_head_t ds_enter_wait;
+	wait_queue_head_t ds_exit_wait;
+	/* Protects the in-band device-sleep state machine. */
+	spinlock_t ds_lock;
+	enum brcmf_pcie_inband_ds_state ds_state;
+	atomic_t ds_active_count;
+	bool ds_exit_completed;
+	bool skip_ds_ack;
 	bool irq_allocated;
 	bool irq_ready;
 	bool have_msi;
@@ -951,6 +984,52 @@ static int brcmf_pcie_exit_download_state(struct brcmf_pciedev_info *devinfo,
 	return 0;
 }
 
+static const char *
+brcmf_pcie_ds_state_name(enum brcmf_pcie_inband_ds_state state)
+{
+	switch (state) {
+	case BRCMF_PCIE_DS_DISABLED:
+		return "DISABLED";
+	case BRCMF_PCIE_DS_ACTIVE:
+		return "ACTIVE";
+	case BRCMF_PCIE_DS_DEV_SLEEP_PEND:
+		return "DEV_SLEEP_PEND";
+	case BRCMF_PCIE_DS_DEV_SLEEP:
+		return "DEV_SLEEP";
+	case BRCMF_PCIE_DS_DEV_WAKE:
+		return "DEV_WAKE";
+	case BRCMF_PCIE_DS_DISABLED_WAIT:
+		return "DISABLED_WAIT";
+	case BRCMF_PCIE_DS_HOST_SLEEP_WAIT:
+		return "HOST_SLEEP_WAIT";
+	case BRCMF_PCIE_DS_HOST_SLEEP:
+		return "HOST_SLEEP";
+	case BRCMF_PCIE_DS_HOST_WAKE_WAIT:
+		return "HOST_WAKE_WAIT";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static const char *brcmf_pcie_h2d_mb_name(u32 data)
+{
+	switch (data) {
+	case BRCMF_H2D_HOST_D3_INFORM:
+		return "HOST_D3_INFORM";
+	case BRCMF_H2D_HOST_DS_ACK:
+		return "HOST_DS_ACK";
+	case BRCMF_H2D_HOST_D0_INFORM_IN_USE:
+		return "HOST_D0_INFORM_IN_USE";
+	case BRCMF_H2D_HOST_D0_INFORM:
+		return "HOST_D0_INFORM";
+	case BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT:
+		return "HOST_DS_DEVICE_WAKE_DEASSERT";
+	case BRCMF_H2D_HOST_DS_DEVICE_WAKE_ASSERT:
+		return "HOST_DS_DEVICE_WAKE_ASSERT";
+	default:
+		return "UNKNOWN";
+	}
+}
 
 static int
 brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
@@ -968,12 +1047,18 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 		struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
 		int ret;
 
+		brcmf_dbg(DS, "H2D_MB_DATA: 0x%04x %s via control ring\n",
+			  htod_mb_data, brcmf_pcie_h2d_mb_name(htod_mb_data));
+
 		ret = brcmf_msgbuf_h2d_mb_write(bus->drvr, htod_mb_data);
 		if (ret < 0)
 			brcmf_err(bus, "Failed to send H2D mailbox data (%d)\n",
 				  ret);
 		return ret;
 	}
+
+	brcmf_dbg(DS, "H2D_MB_DATA: 0x%04x %s via mailbox register\n",
+		  htod_mb_data, brcmf_pcie_h2d_mb_name(htod_mb_data));
 
 	addr = shared->htod_mb_data_addr;
 	cur_htod_mb_data = brcmf_pcie_read_tcm32(devinfo, addr);
@@ -1002,23 +1087,224 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	return 0;
 }
 
+/*
+ * The firmware only enters in-band deep sleep once it has advertised support
+ * (BRCMF_PCIE_SHARED_INBAND_DS) and the host has negotiated it in host_cap.
+ * It is reachable only on the rev6+ 64-bit core that exchanges mailbox data
+ * in-band over the control ring (mb_via_ctl).
+ */
+static bool brcmf_pcie_inband_ds(struct brcmf_pciedev_info *devinfo)
+{
+	struct brcmf_pcie_shared_info *shared = &devinfo->shared;
+
+	return shared->version >= 6 && shared->mb_via_ctl &&
+	       (shared->flags & BRCMF_PCIE_SHARED_INBAND_DS);
+}
+
+static enum brcmf_pcie_inband_ds_state
+brcmf_pcie_get_inband_ds_state(struct brcmf_pciedev_info *devinfo)
+{
+	enum brcmf_pcie_inband_ds_state state;
+	unsigned long flags;
+
+	spin_lock_irqsave(&devinfo->ds_lock, flags);
+	state = devinfo->ds_state;
+	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+	return state;
+}
+
+static void
+brcmf_pcie_set_inband_ds_state(struct brcmf_pciedev_info *devinfo,
+			       enum brcmf_pcie_inband_ds_state state)
+{
+	enum brcmf_pcie_inband_ds_state old_state;
+	unsigned long flags;
+	bool skip_ds_ack;
+	int active_count;
+
+	spin_lock_irqsave(&devinfo->ds_lock, flags);
+	old_state = devinfo->ds_state;
+	devinfo->ds_state = state;
+	skip_ds_ack = devinfo->skip_ds_ack;
+	active_count = atomic_read(&devinfo->ds_active_count);
+	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+	if (old_state != state)
+		brcmf_dbg(DS, "DS state: %s -> %s skip=%d active=%d\n",
+			  brcmf_pcie_ds_state_name(old_state),
+			  brcmf_pcie_ds_state_name(state), skip_ds_ack,
+			  active_count);
+}
+
+/* The IRQ thread reads skip_ds_ack under ds_lock; publish it the same way. */
+static void brcmf_pcie_set_skip_ds_ack(struct brcmf_pciedev_info *devinfo,
+				       bool skip)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&devinfo->ds_lock, flags);
+	devinfo->skip_ds_ack = skip;
+	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+}
+
+/*
+ * Acknowledge a pending device-sleep request, but only once the host has gone
+ * idle (no in-flight ring work), so the firmware never sleeps mid-transaction.
+ */
+static void brcmf_pcie_ack_pending_ds(struct brcmf_pciedev_info *devinfo)
+{
+	enum brcmf_pcie_inband_ds_state old_state;
+	enum brcmf_pcie_inband_ds_state new_state;
+	bool send_ds_ack = false;
+	unsigned long flags;
+	bool skip_ds_ack;
+	int active_count;
+	int err;
+
+	spin_lock_irqsave(&devinfo->ds_lock, flags);
+	old_state = devinfo->ds_state;
+	skip_ds_ack = devinfo->skip_ds_ack;
+	active_count = atomic_read(&devinfo->ds_active_count);
+	if (!skip_ds_ack &&
+	    old_state == BRCMF_PCIE_DS_DEV_SLEEP_PEND &&
+	    active_count == 0) {
+		devinfo->ds_state = BRCMF_PCIE_DS_DEV_SLEEP;
+		send_ds_ack = true;
+	}
+	new_state = devinfo->ds_state;
+	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+	if (send_ds_ack || old_state == BRCMF_PCIE_DS_DEV_SLEEP_PEND ||
+	    skip_ds_ack)
+		brcmf_dbg(DS,
+			  "DS ack_pending: %s -> %s skip=%d active=%d send=%d\n",
+			  brcmf_pcie_ds_state_name(old_state),
+			  brcmf_pcie_ds_state_name(new_state), skip_ds_ack,
+			  active_count, send_ds_ack);
+
+	if (!send_ds_ack)
+		return;
+
+	err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
+	if (err) {
+		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "failed to send in-band DS ack: %d\n", err);
+		return;
+	}
+
+	wake_up(&devinfo->ds_enter_wait);
+}
+
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
 {
-	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
-	if (data & BRCMF_D2H_DEV_DS_ENTER_REQ)  {
-		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP REQ\n");
-		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
-		brcmf_dbg(PCIE, "D2H_MB_DATA: sent DEEP SLEEP ACK\n");
+	enum brcmf_pcie_inband_ds_state old_state;
+	enum brcmf_pcie_inband_ds_state new_state;
+	bool wake_ds_exit = false;
+	bool send_deassert = false;
+	unsigned long flags;
+	bool skip_ds_ack;
+	int active_count;
+
+	brcmf_dbg(DS, "D2H_MB_DATA: 0x%04x\n", data);
+	if (data & BRCMF_D2H_DEV_DS_ENTER_REQ) {
+		spin_lock_irqsave(&devinfo->ds_lock, flags);
+		old_state = devinfo->ds_state;
+		skip_ds_ack = devinfo->skip_ds_ack;
+		active_count = atomic_read(&devinfo->ds_active_count);
+		if (old_state == BRCMF_PCIE_DS_ACTIVE)
+			devinfo->ds_state = BRCMF_PCIE_DS_DEV_SLEEP_PEND;
+		new_state = devinfo->ds_state;
+		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+		brcmf_dbg(DS,
+			  "D2H_MB_DATA: DEEP SLEEP REQ state %s -> %s skip=%d active=%d\n",
+			  brcmf_pcie_ds_state_name(old_state),
+			  brcmf_pcie_ds_state_name(new_state), skip_ds_ack,
+			  active_count);
+
+		brcmf_pcie_ack_pending_ds(devinfo);
 	}
-	if (data & BRCMF_D2H_DEV_DS_EXIT_NOTE)
-		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP EXIT\n");
+	if (data & BRCMF_D2H_DEV_DS_EXIT_NOTE) {
+		spin_lock_irqsave(&devinfo->ds_lock, flags);
+		old_state = devinfo->ds_state;
+		skip_ds_ack = devinfo->skip_ds_ack;
+		active_count = atomic_read(&devinfo->ds_active_count);
+		switch (old_state) {
+		case BRCMF_PCIE_DS_DISABLED_WAIT:
+			/*
+			 * Host asserted device-wake and is waiting for this.
+			 * Treat the assert as a momentary wake *pulse*, like
+			 * downstream bcmdhd (dhd_bus_handle_mb_data deasserts
+			 * from the exit handler on every DS_EXIT): release
+			 * device-wake right away.  The device stays awake for
+			 * the host's ring work via the ds_active_count gate
+			 * (ack_pending_ds refuses DS_ACK while count != 0), not
+			 * by holding the assert.  Go to ACTIVE under the lock
+			 * *before* sending the deassert: the pulse must be the
+			 * only deassert on the wire, and a woken waiter's
+			 * pm_leave observing a transient DEV_WAKE here would
+			 * send a second one (downstream never double-sends).
+			 */
+			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+			devinfo->ds_exit_completed = true;
+			wake_ds_exit = true;
+			send_deassert = true;
+			break;
+		case BRCMF_PCIE_DS_DEV_SLEEP:
+			/* Firmware woke on its own; release device-wake. */
+			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+			send_deassert = true;
+			break;
+		default:
+			break;
+		}
+		new_state = devinfo->ds_state;
+		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+		brcmf_dbg(DS,
+			  "D2H_MB_DATA: DEEP SLEEP EXIT state %s -> %s skip=%d active=%d wake_wait=%d deassert=%d\n",
+			  brcmf_pcie_ds_state_name(old_state),
+			  brcmf_pcie_ds_state_name(new_state), skip_ds_ack,
+			  active_count, wake_ds_exit, send_deassert);
+
+		if (wake_ds_exit)
+			wake_up(&devinfo->ds_exit_wait);
+
+		if (send_deassert &&
+		    brcmf_pcie_send_mb_data(devinfo,
+					    BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT))
+			/*
+			 * Pulse failed to go out; park in DEV_WAKE so
+			 * pm_leave_active retries the deassert.
+			 */
+			brcmf_pcie_set_inband_ds_state(devinfo,
+						       BRCMF_PCIE_DS_DEV_WAKE);
+
+		/*
+		 * bcmdhd runs its deassert path on every exit note; when the
+		 * exit lands in DEV_SLEEP_PEND with an idle host, that path
+		 * sends the DS_ACK right here, tightly paired with the exit.
+		 * Deferring the ACK to a later pm_leave means the firmware
+		 * receives it only after further host traffic, for a request
+		 * it may have meanwhile abandoned -- that stale ACK wedged it
+		 * unwakeably (wifilog16, 91.7s).
+		 */
+		brcmf_pcie_ack_pending_ds(devinfo);
+	}
 	if (data & BRCMF_D2H_DEV_D3_ACK) {
-		brcmf_dbg(PCIE, "D2H_MB_DATA: D3 ACK\n");
+		brcmf_dbg(DS, "D2H_MB_DATA: D3 ACK\n");
+		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_HOST_SLEEP);
 		devinfo->mbdata_completed = true;
 		wake_up(&devinfo->mbdata_resp_wait);
 	}
+	if (data & BRCMF_D2H_DEV_D0_ACK) {
+		brcmf_dbg(DS, "D2H_MB_DATA: D0 ACK\n");
+		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+	}
 	if (data & BRCMF_D2H_DEV_FWHALT) {
-		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
+		brcmf_dbg(DS, "D2H_MB_DATA: FW HALT\n");
 		brcmf_fw_crashed(&devinfo->pdev->dev);
 	}
 }
@@ -1049,6 +1335,246 @@ static void brcmf_pcie_d2h_mb_rx(struct device *dev, u32 data)
 	struct brcmf_pciedev *buspub = bus_if->bus_priv.pcie;
 
 	brcmf_pcie_handle_mb_data(buspub->devinfo, data);
+}
+
+/*
+ * Wait for a mailbox event (the device-wake exit note or the D3 ack).  The
+ * threaded PCIe IRQ delivers it via brcmf_pcie_handle_mb_data(); deliberately
+ * do NOT pump the RX ring here -- this runs inside the H2D submission paths, so
+ * re-entering RX processing would recurse back through the wake handshake.
+ */
+static int brcmf_pcie_wait_mbdata(wait_queue_head_t *wait, bool *completed,
+				  unsigned long timeout)
+{
+	if (wait_event_timeout(*wait, READ_ONCE(*completed), timeout))
+		return 0;
+
+	return READ_ONCE(*completed) ? 0 : -ETIMEDOUT;
+}
+
+/*
+ * Drive the host side of the in-band device-wake handshake.  Asserting wakes a
+ * micro-slept device; with @block the caller sleeps until the firmware
+ * acknowledges (DS_EXIT_NOTE).  The exit note is a control-ring completion
+ * delivered by the PCIe IRQ thread, so callers running on that thread (the rx
+ * buffer repost paths) must pass block=false or they deadlock against their
+ * own wait until it times out (downstream bcmdhd guards the same spot with
+ * CAN_SLEEP()).  Deasserting never blocks.  A no-op until in-band DS is
+ * negotiated.
+ */
+static int brcmf_pcie_inband_device_wake(struct brcmf_pciedev_info *devinfo,
+					 bool wake, bool block)
+{
+	enum brcmf_pcie_inband_ds_state new_state;
+	enum brcmf_pcie_inband_ds_state state;
+	unsigned long flags;
+	bool skip_ds_ack;
+	int active_count;
+	int err;
+
+	if (!brcmf_pcie_inband_ds(devinfo))
+		return 0;
+
+	if (wake) {
+		/*
+		 * Claim DEV_SLEEP -> DISABLED_WAIT atomically: an autonomous
+		 * DS_EXIT_NOTE racing this window must either land before (so we
+		 * observe we are already awake) or after (so the handler
+		 * completes our wait) -- never get consumed in between.
+		 */
+		spin_lock_irqsave(&devinfo->ds_lock, flags);
+		state = devinfo->ds_state;
+		skip_ds_ack = devinfo->skip_ds_ack;
+		active_count = atomic_read(&devinfo->ds_active_count);
+		if (state == BRCMF_PCIE_DS_DEV_SLEEP) {
+			/*
+			 * Send the assert while still holding ds_lock, like
+			 * bcmdhd sends under its inb_lock: if the state claim
+			 * and the send are not atomic against the
+			 * DS_EXIT_NOTE handler, an autonomous exit racing this
+			 * window gets consumed as our answer while the assert
+			 * still goes out stray, provoking a second exit that
+			 * lands in DEV_SLEEP_PEND (seen in wifilog16 right
+			 * before the firmware wedged).
+			 * brcmf_msgbuf_h2d_mb_write() only takes the
+			 * commonring spinlock and never sleeps.
+			 */
+			err = brcmf_pcie_send_mb_data(devinfo,
+					BRCMF_H2D_HOST_DS_DEVICE_WAKE_ASSERT);
+			if (err) {
+				spin_unlock_irqrestore(&devinfo->ds_lock,
+						       flags);
+				brcmf_dbg(DS, "DS wake assert send failed: %d\n",
+					  err);
+				return err;
+			}
+			devinfo->ds_exit_completed = false;
+			devinfo->ds_state = BRCMF_PCIE_DS_DISABLED_WAIT;
+		}
+		new_state = devinfo->ds_state;
+		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+		if (state != BRCMF_PCIE_DS_ACTIVE)
+			brcmf_dbg(DS,
+				  "DS wake assert request: %s -> %s skip=%d active=%d\n",
+				  brcmf_pcie_ds_state_name(state),
+				  brcmf_pcie_ds_state_name(new_state),
+				  skip_ds_ack, active_count);
+
+		if (state == BRCMF_PCIE_DS_DISABLED_WAIT) {
+			if (!block) {
+				brcmf_dbg(DS, "DS wake assert: exit note pending, not waiting\n");
+				return 0;
+			}
+			brcmf_dbg(DS, "DS wake assert: already waiting for exit note\n");
+			err = brcmf_pcie_wait_mbdata(&devinfo->ds_exit_wait,
+						     &devinfo->ds_exit_completed,
+						     BRCMF_PCIE_DS_EXIT_TIMEOUT);
+			brcmf_dbg(DS, "DS wake assert wait done: err=%d state=%s completed=%d\n",
+				  err,
+				  brcmf_pcie_ds_state_name(
+					brcmf_pcie_get_inband_ds_state(devinfo)),
+				  devinfo->ds_exit_completed);
+			return err;
+		}
+		if (state != BRCMF_PCIE_DS_DEV_SLEEP)
+			return 0;
+
+		/* The assert went out under ds_lock above. */
+		if (!block) {
+			/*
+			 * The submission that follows lands in host ring memory
+			 * with a DMA'd write index; the woken firmware picks it
+			 * up without a further doorbell, so not awaiting the
+			 * exit note here is safe.
+			 */
+			brcmf_dbg(DS, "DS wake assert sent, not waiting\n");
+			return 0;
+		}
+
+		brcmf_dbg(DS, "DS wake assert sent, waiting for exit note\n");
+
+		err = brcmf_pcie_wait_mbdata(&devinfo->ds_exit_wait,
+					     &devinfo->ds_exit_completed,
+					     BRCMF_PCIE_DS_EXIT_TIMEOUT);
+
+		brcmf_dbg(DS, "DS wake assert wait done: err=%d state=%s completed=%d\n",
+			  err,
+			  brcmf_pcie_ds_state_name(
+				brcmf_pcie_get_inband_ds_state(devinfo)),
+			  devinfo->ds_exit_completed);
+
+		return err;
+	}
+
+	state = brcmf_pcie_get_inband_ds_state(devinfo);
+	if (state == BRCMF_PCIE_DS_DISABLED_WAIT) {
+		/*
+		 * Wake handshake still in flight; the DS_EXIT_NOTE handler
+		 * sends the deassert pulse when the note lands.  Never wait
+		 * here -- this runs on the PCIe IRQ thread via the rx repost
+		 * paths.
+		 */
+		brcmf_dbg(DS, "DS wake deassert: exit pending, pulse will deassert\n");
+		return 0;
+	}
+
+	if (state != BRCMF_PCIE_DS_DEV_WAKE) {
+		if (state != BRCMF_PCIE_DS_ACTIVE)
+			brcmf_dbg(DS, "DS wake deassert skipped: state=%s\n",
+				  brcmf_pcie_ds_state_name(state));
+		return 0;
+	}
+
+	brcmf_dbg(DS, "DS wake deassert: state=%s\n",
+		  brcmf_pcie_ds_state_name(state));
+	err = brcmf_pcie_send_mb_data(devinfo,
+				      BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT);
+	if (!err)
+		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+	else
+		brcmf_dbg(DS, "DS wake deassert failed: err=%d\n", err);
+
+	return err;
+}
+
+/*
+ * Bracket every H2D ring submission: the first concurrent submitter wakes the
+ * device, the last one to leave lets it micro-sleep again.  Called from the
+ * msgbuf layer.
+ */
+static int __brcmf_pcie_pm_enter_active(struct brcmf_bus *bus, bool block)
+{
+	struct brcmf_pciedev_info *devinfo;
+	int err;
+
+	if (!bus || !bus->bus_priv.pcie)
+		return 0;
+
+	devinfo = bus->bus_priv.pcie->devinfo;
+	if (!brcmf_pcie_inband_ds(devinfo))
+		return 0;
+
+	atomic_inc(&devinfo->ds_active_count);
+
+	err = brcmf_pcie_inband_device_wake(devinfo, true, block);
+	if (err) {
+		atomic_dec(&devinfo->ds_active_count);
+		return err;
+	}
+
+	return 0;
+}
+
+int brcmf_pcie_pm_enter_active(struct brcmf_bus *bus)
+{
+	return __brcmf_pcie_pm_enter_active(bus, true);
+}
+
+/*
+ * For submissions issued from the PCIe IRQ thread (the rx buffer repost
+ * paths): send the wake assert but do not await the exit note, which only
+ * that thread can deliver.
+ */
+int brcmf_pcie_pm_enter_active_noblock(struct brcmf_bus *bus)
+{
+	return __brcmf_pcie_pm_enter_active(bus, false);
+}
+
+void brcmf_pcie_pm_leave_active(struct brcmf_bus *bus)
+{
+	struct brcmf_pciedev_info *devinfo;
+
+	if (!bus || !bus->bus_priv.pcie)
+		return;
+
+	devinfo = bus->bus_priv.pcie->devinfo;
+	if (!brcmf_pcie_inband_ds(devinfo))
+		return;
+
+	atomic_dec(&devinfo->ds_active_count);
+	brcmf_pcie_inband_device_wake(devinfo, false, false);
+	brcmf_pcie_ack_pending_ds(devinfo);
+}
+
+bool brcmf_pcie_pm_attach_hold(struct brcmf_bus *bus)
+{
+	struct brcmf_pciedev_info *devinfo;
+	unsigned long flags;
+	bool skip_ds_ack;
+
+	if (!bus || !bus->bus_priv.pcie)
+		return false;
+
+	devinfo = bus->bus_priv.pcie->devinfo;
+	if (!brcmf_pcie_inband_ds(devinfo))
+		return false;
+
+	spin_lock_irqsave(&devinfo->ds_lock, flags);
+	skip_ds_ack = devinfo->skip_ds_ack;
+	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+	return skip_ds_ack;
 }
 
 
@@ -1292,16 +1818,29 @@ static int brcmf_pcie_ring_mb_ring_bell(void *ctx)
 {
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
+	u32 db_val;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
 	brcmf_dbg(PCIE, "RING !\n");
-	/* Any arbitrary value will do, lets use 1 */
+	/*
+	 * Encode the ring index and write pointer in the doorbell value, like
+	 * downstream bcmdhd (DHD_WRPTR_UPDATE_H2D_DB_MAGIC), which lets the
+	 * firmware see which ring advanced without fetching the index array.
+	 * Not required for correctness (any value raises the doorbell
+	 * interrupt), but kept for parity with downstream.
+	 */
+	db_val = BRCMF_PCIE_H2D_DB_WRPTR_MAGIC |
+		 ((u32)ring->id << 16) | ring->commonring.w_ptr;
 	if (devinfo->shared.flags & BRCMF_PCIE_SHARED_DAR)
-		brcmf_pcie_write_pcie32(devinfo, BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_0, 1);
+		brcmf_pcie_write_pcie32(devinfo,
+					BRCMF_PCIE_64_PCIE2REG_H2D_MAILBOX_0,
+					db_val);
 	else
-		brcmf_pcie_write_pcie32(devinfo, BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_0, 1);
+		brcmf_pcie_write_pcie32(devinfo,
+					BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_0,
+					db_val);
 
 	return 0;
 }
@@ -1936,8 +2475,15 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	if (shared->flags & BRCMF_PCIE_SHARED_DAR)
 		host_cap |= BRCMF_HOSTCAP_H2D_DAR;
 
-	/* Disable DS: this is not currently properly supported */
+	/*
+	 * Advertise in-band device-wake DS so the firmware micro-sleeps when
+	 * idle.  The host drives the wake handshake around every H2D ring
+	 * access (brcmf_pcie_pm_enter_active() / brcmf_pcie_handle_mb_data());
+	 * without OOB device-wake hardware, keep NO_OOB_DW set too.
+	 */
 	host_cap |= BRCMF_HOSTCAP_DS_NO_OOB_DW;
+	if (brcmf_pcie_inband_ds(devinfo))
+		host_cap |= BRCMF_HOSTCAP_DS_INBAND_DW;
 
 	brcmf_pcie_write_tcm32(devinfo, sharedram_addr +
 			       BRCMF_SHARED_HOST_CAP_OFFSET, host_cap);
@@ -2596,6 +3142,9 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	struct brcmf_pciedev *pcie_bus_dev;
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_commonring **flowrings;
+	enum brcmf_pcie_inband_ds_state ds_state;
+	unsigned long flags;
+	int active_count;
 	u32 i, nvram_len;
 
 	bus = dev_get_drvdata(dev);
@@ -2674,10 +3223,42 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	bus->msgbuf->max_flowrings = devinfo->shared.max_flowrings;
 
 	init_waitqueue_head(&devinfo->mbdata_resp_wait);
+	init_waitqueue_head(&devinfo->ds_enter_wait);
+	init_waitqueue_head(&devinfo->ds_exit_wait);
+	spin_lock_init(&devinfo->ds_lock);
+	devinfo->ds_state = brcmf_pcie_inband_ds(devinfo) ?
+			    BRCMF_PCIE_DS_ACTIVE : BRCMF_PCIE_DS_DISABLED;
+	atomic_set(&devinfo->ds_active_count, 0);
+	devinfo->ds_exit_completed = false;
+	/*
+	 * Hold the device awake through bring-up: the firmware traps if it
+	 * micro-sleeps before CLM download / calibration finishes, and the
+	 * initial attach path can post H2D work before the stack is fully
+	 * ready to honor deep-sleep. Release it once attach has completed so
+	 * runtime traffic can let it micro-sleep (waking via device-wake
+	 * before each H2D submission).
+	 */
+	brcmf_pcie_set_skip_ds_ack(devinfo, true);
+	if (brcmf_pcie_inband_ds(devinfo))
+		brcmf_dbg(DS, "DS attach hold: state=%s skip=1 active=%d\n",
+			  brcmf_pcie_ds_state_name(devinfo->ds_state),
+			  atomic_read(&devinfo->ds_active_count));
 
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
+
+	if (brcmf_pcie_inband_ds(devinfo)) {
+		spin_lock_irqsave(&devinfo->ds_lock, flags);
+		devinfo->skip_ds_ack = false;
+		ds_state = devinfo->ds_state;
+		active_count = atomic_read(&devinfo->ds_active_count);
+		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
+
+		brcmf_dbg(DS, "DS attach release: state=%s skip=0 active=%d\n",
+			  brcmf_pcie_ds_state_name(ds_state), active_count);
+		brcmf_pcie_ack_pending_ds(devinfo);
+	}
 
 	brcmf_pcie_bus_console_read(devinfo, false);
 
@@ -3108,6 +3689,17 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
+	/*
+	 * With in-band DS the device may have micro-slept; wake it, release
+	 * device-wake, and stop acking new sleep requests so the D3 handshake
+	 * below is serviced from a known-awake state.
+	 */
+	if (brcmf_pcie_inband_ds(devinfo)) {
+		brcmf_pcie_set_skip_ds_ack(devinfo, true);
+		brcmf_pcie_inband_device_wake(devinfo, true, true);
+		brcmf_pcie_inband_device_wake(devinfo, false, false);
+	}
+
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
 
@@ -3116,6 +3708,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_pcie_set_skip_ds_ack(devinfo, false);
 		return -EIO;
 	}
 
@@ -3143,6 +3736,12 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
 		/* Set the device up, so we can write the MB data message in ring mode */
 		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+		if (brcmf_pcie_inband_ds(devinfo)) {
+			brcmf_pcie_set_skip_ds_ack(devinfo, false);
+			devinfo->ds_exit_completed = false;
+			brcmf_pcie_set_inband_ds_state(devinfo,
+						       BRCMF_PCIE_DS_ACTIVE);
+		}
 		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM))
 			goto cleanup;
 		brcmf_dbg(PCIE, "Hot resume, continue....\n");

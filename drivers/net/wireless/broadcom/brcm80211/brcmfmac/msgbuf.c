@@ -99,6 +99,8 @@
 
 #define BRCMF_MAX_TXSTATUS_WAIT_RETRIES		10
 
+#define BRCMF_H2D_EPOCH_MODULO			253
+
 struct msgbuf_common_hdr {
 	u8				msgtype;
 	u8				ifidx;
@@ -256,6 +258,15 @@ struct msgbuf_d2h_mailbox_data {
 	__le32				data;
 	__le32				rsvd0[2];
 };
+
+static u8 brcmf_msgbuf_next_h2d_epoch(struct brcmf_commonring *commonring)
+{
+	u8 epoch = commonring->seqnum % BRCMF_H2D_EPOCH_MODULO;
+
+	commonring->seqnum++;
+
+	return epoch;
+}
 
 struct brcmf_msgbuf_work_item {
 	struct list_head queue;
@@ -497,6 +508,7 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	request->msg.msgtype = MSGBUF_TYPE_IOCTLPTR_REQ;
 	request->msg.ifidx = (u8)ifidx;
 	request->msg.flags = 0;
+	request->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	request->msg.request_id = cpu_to_le32(BRCMF_IOCTL_REQ_PKTID);
 	request->cmd = cpu_to_le32(cmd);
 	request->output_buf_len = cpu_to_le16(len);
@@ -665,6 +677,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 	create = (struct msgbuf_tx_flowring_create_req *)ret_ptr;
 	create->msg.msgtype = MSGBUF_TYPE_FLOW_RING_CREATE;
 	create->msg.ifidx = work->ifidx;
+	create->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	create->msg.request_id = 0;
 	create->tid = brcmf_flowring_tid(msgbuf->flow, flowid);
 	create->flow_ring_id = cpu_to_le16(flowid +
@@ -788,6 +801,7 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 		tx_msghdr->msg.msgtype = MSGBUF_TYPE_TX_POST;
 		tx_msghdr->msg.request_id = cpu_to_le32(pktid + 1);
 		tx_msghdr->msg.ifidx = brcmf_flowring_ifidx_get(flow, flowid);
+		tx_msghdr->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 		tx_msghdr->flags = BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_3;
 		tx_msghdr->flags |= (skb->priority & 0x07) <<
 				    BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT;
@@ -1004,6 +1018,7 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 		}
 		rx_bufpost->msg.msgtype = MSGBUF_TYPE_RXBUF_POST;
 		rx_bufpost->msg.request_id = cpu_to_le32(pktid);
+		rx_bufpost->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 
 		address = (u64)physaddr;
 		rx_bufpost->data_buf_len = cpu_to_le16((u16)pktlen);
@@ -1104,6 +1119,7 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 			rx_bufpost->msg.msgtype =
 				MSGBUF_TYPE_IOCTLRESP_BUF_POST;
 		rx_bufpost->msg.request_id = cpu_to_le32(pktid);
+		rx_bufpost->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 
 		address = (u64)physaddr;
 		rx_bufpost->host_buf_len = cpu_to_le16((u16)pktlen);
@@ -1506,6 +1522,7 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 
 	delete->msg.msgtype = MSGBUF_TYPE_FLOW_RING_DELETE;
 	delete->msg.ifidx = ifidx;
+	delete->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	delete->msg.request_id = 0;
 
 	delete->flow_ring_id = cpu_to_le16(flowid +
@@ -1542,11 +1559,12 @@ int brcmf_msgbuf_h2d_mb_write(struct brcmf_pub *drvr, u32 data)
 	}
 
 	request = (struct msgbuf_h2d_mailbox_data *)ret_ptr;
+	memset(request, 0, sizeof(*request));
 	request->msg.msgtype = MSGBUF_TYPE_H2D_MAILBOX_DATA;
 	request->msg.ifidx = -1;
-	request->msg.flags = 0;
+	request->msg.rsvd0 = brcmf_msgbuf_next_h2d_epoch(commonring);
 	request->msg.request_id = 0;
-	request->data = data;
+	request->data = cpu_to_le32(data);
 
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);

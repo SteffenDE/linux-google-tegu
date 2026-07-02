@@ -45,6 +45,7 @@ void brcmf_commonring_config(struct brcmf_commonring *commonring, u16 depth,
 	if (commonring->cr_write_wptr)
 		commonring->cr_write_wptr(commonring->cr_ctx);
 	commonring->f_ptr = 0;
+	commonring->seqnum = 254;
 }
 
 

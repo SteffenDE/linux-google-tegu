@@ -23,6 +23,7 @@
 #include "flowring.h"
 #include "bus.h"
 #include "tracepoint.h"
+#include "pcie.h"
 
 
 #define MSGBUF_IOCTL_RESP_TIMEOUT		msecs_to_jiffies(2000)
@@ -325,6 +326,22 @@ struct brcmf_msgbuf {
 	struct list_head work_queue;
 };
 
+static int brcmf_msgbuf_pm_enter(struct brcmf_msgbuf *msgbuf)
+{
+	return brcmf_pcie_pm_enter_active(msgbuf->drvr->bus_if);
+}
+
+/* For the rx buffer repost paths, which run on the PCIe IRQ thread. */
+static int brcmf_msgbuf_pm_enter_noblock(struct brcmf_msgbuf *msgbuf)
+{
+	return brcmf_pcie_pm_enter_active_noblock(msgbuf->drvr->bus_if);
+}
+
+static void brcmf_msgbuf_pm_leave(struct brcmf_msgbuf *msgbuf)
+{
+	brcmf_pcie_pm_leave_active(msgbuf->drvr->bus_if);
+}
+
 struct brcmf_msgbuf_pktid {
 	atomic_t  allocated;
 	u16 data_offset;
@@ -493,13 +510,18 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	void *ret_ptr;
 	int err;
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
+		return err;
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 
 	msgbuf->reqid++;
@@ -526,6 +548,8 @@ static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *drvr, int ifidx,
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
 
+out:
+	brcmf_msgbuf_pm_leave(msgbuf);
 	return err;
 }
 
@@ -664,12 +688,19 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err) {
+		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+		return BRCMF_FLOWRING_INVALID_ID;
+	}
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
+		brcmf_msgbuf_pm_leave(msgbuf);
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
@@ -695,6 +726,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 	if (err) {
 		bphy_err(drvr, "Failed to write commonring\n");
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
@@ -764,10 +796,17 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	u32 pktid;
 	struct msgbuf_tx_msghdr *tx_msghdr;
 	u64 address;
+	int err;
 
 	commonring = msgbuf->flowrings[flowid];
-	if (!brcmf_commonring_write_available(commonring))
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err)
 		return;
+
+	if (!brcmf_commonring_write_available(commonring)) {
+		brcmf_msgbuf_pm_leave(msgbuf);
+		return;
+	}
 
 	brcmf_commonring_lock(commonring);
 
@@ -824,6 +863,7 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	if (count)
 		brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 }
 
 
@@ -970,15 +1010,24 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 	struct msgbuf_rx_bufpost *rx_bufpost;
 	u64 address;
 	u32 pktid;
-	u32 i;
+	u32 i = 0;
+	int err;
+	bool pm_active = false;
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_RXPOST_SUBMIT];
+	if (!brcmf_pcie_pm_attach_hold(msgbuf->drvr->bus_if)) {
+		err = brcmf_msgbuf_pm_enter_noblock(msgbuf);
+		if (err)
+			return 0;
+		pm_active = true;
+	}
+
 	ret_ptr = brcmf_commonring_reserve_for_write_multiple(commonring,
 							      count,
 							      &alloced);
 	if (!ret_ptr) {
 		brcmf_dbg(MSGBUF, "Failed to reserve space in commonring\n");
-		return 0;
+		goto out;
 	}
 
 	for (i = 0; i < alloced; i++) {
@@ -1033,6 +1082,9 @@ static u32 brcmf_msgbuf_rxbuf_data_post(struct brcmf_msgbuf *msgbuf, u32 count)
 	if (i)
 		brcmf_commonring_write_complete(commonring);
 
+out:
+	if (pm_active)
+		brcmf_msgbuf_pm_leave(msgbuf);
 	return i;
 }
 
@@ -1079,9 +1131,18 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 	struct msgbuf_rx_ioctl_resp_or_event *rx_bufpost;
 	u64 address;
 	u32 pktid;
-	u32 i;
+	u32 i = 0;
+	int err;
+	bool pm_active = false;
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
+	if (!brcmf_pcie_pm_attach_hold(msgbuf->drvr->bus_if)) {
+		err = brcmf_msgbuf_pm_enter_noblock(msgbuf);
+		if (err)
+			return 0;
+		pm_active = true;
+	}
+
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write_multiple(commonring,
 							      count,
@@ -1089,7 +1150,7 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 	if (!ret_ptr) {
 		bphy_err(drvr, "Failed to reserve space in commonring\n");
 		brcmf_commonring_unlock(commonring);
-		return 0;
+		goto out;
 	}
 
 	for (i = 0; i < alloced; i++) {
@@ -1136,6 +1197,9 @@ brcmf_msgbuf_rxbuf_ctrl_post(struct brcmf_msgbuf *msgbuf, bool event_buf,
 
 	brcmf_commonring_unlock(commonring);
 
+out:
+	if (pm_active)
+		brcmf_msgbuf_pm_leave(msgbuf);
 	return i;
 }
 
@@ -1506,12 +1570,19 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 		return;
 	}
 
+	err = brcmf_msgbuf_pm_enter(msgbuf);
+	if (err) {
+		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+		return;
+	}
+
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "FW unaware, flowring will be removed !!\n");
 		brcmf_commonring_unlock(commonring);
+		brcmf_msgbuf_pm_leave(msgbuf);
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
 		return;
 	}
@@ -1534,6 +1605,7 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 
 	err = brcmf_commonring_write_complete(commonring);
 	brcmf_commonring_unlock(commonring);
+	brcmf_msgbuf_pm_leave(msgbuf);
 	if (err) {
 		bphy_err(drvr, "Failed to submit RING_DELETE, flowring will be removed\n");
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);

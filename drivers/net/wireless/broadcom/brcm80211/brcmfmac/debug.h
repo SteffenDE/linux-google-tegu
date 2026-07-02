@@ -29,6 +29,7 @@
 #define BRCMF_MSGBUF_VAL	0x00040000
 #define BRCMF_PCIE_VAL		0x00080000
 #define BRCMF_FWCON_VAL		0x00100000
+#define BRCMF_DS_VAL		0x00200000
 
 /* set default print format */
 #undef pr_fmt
@@ -86,6 +87,7 @@ do {								\
 #define BRCMF_FWCON_ON()	(brcmf_msg_level & BRCMF_FWCON_VAL)
 #define BRCMF_SCAN_ON()		(brcmf_msg_level & BRCMF_SCAN_VAL)
 #define BRCMF_INFO_ON()		(brcmf_msg_level & BRCMF_INFO_VAL)
+#define BRCMF_DS_ON()		(brcmf_msg_level & BRCMF_DS_VAL)
 
 #else /* defined(DEBUG) || defined(CONFIG_BRCM_TRACING) */
 

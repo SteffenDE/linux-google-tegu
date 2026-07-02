@@ -177,8 +177,20 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 		writel(LTSSM_ENABLE, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
 
 		ret = zumapro_pcie_wait_link_up(pci);
-		if (!ret)
+		if (!ret) {
+			/*
+			 * config_elbi() asserted app_xfer_pending to hold the
+			 * link in L0 through bring-up; downstream clears it
+			 * once the link is established (steady state 0).
+			 * Left asserted it vetoes every ASPM L1 entry, so the
+			 * link never reaches the L1.x substates and CLKREQ#
+			 * stays asserted -- the WLAN module then idles ~120mW
+			 * above its floor even with the firmware in deep
+			 * sleep.
+			 */
+			writel(0, pci->elbi_base + PCIE_APP_XFER_PENDING);
 			return 0;
+		}
 
 		dev_info(pci->dev,
 			 "link training attempt %d timed out, retraining\n",
@@ -193,6 +205,8 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 
 	dev_err(pci->dev, "link failed to come up after %d attempts\n",
 		PCIE_LINK_TRAIN_RETRIES);
+	/* Downstream also releases the bring-up hold on the failure path. */
+	writel(0, pci->elbi_base + PCIE_APP_XFER_PENDING);
 	return -ETIMEDOUT;
 }
 

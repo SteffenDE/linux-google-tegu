@@ -1468,7 +1468,6 @@
 			compatible = "google,zumapro-hsi1-sysreg", "syscon";
 			reg = <0x12020000 0x2000>;
 			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_SYSREG_HSI1_PCLK>;
-			power-domains = <&pd_hsi1>;
 		};
 
 		/*

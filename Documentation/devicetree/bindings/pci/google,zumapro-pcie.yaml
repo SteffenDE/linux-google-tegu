@@ -65,6 +65,9 @@ properties:
     items:
       - const: pcie
 
+  power-domains:
+    maxItems: 1
+
   reset-gpios:
     maxItems: 1
     description: PERST# reset line to the endpoint.

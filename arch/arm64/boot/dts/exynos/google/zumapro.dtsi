@@ -692,6 +692,28 @@
 		status = "disabled";
 	};
 
+	/*
+	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
+	 * Downstream leaves its exynos-pd node disabled (the domain is never
+	 * kernel-managed there, and ACPM has a dedicated SYS_SLEEP_HSI1ON
+	 * suspend mode for when the modem link stays up), so model it
+	 * always-on: if the bootloader hands the domain over powered this is
+	 * a no-op, and if not, genpd powers it up before the CMU_HSI1/PCIe
+	 * probes touch the block.  PMU offset and secure ID are from
+	 * research/dumped.dts:2927-2936 (pd-hsi1@15462B00: need_smc
+	 * 0x12010204, cmu_id 0x12000000).
+	 */
+	pd_hsi1: power-domain@15462b00 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462b00 0x20>,
+		      <0x0 0x12000800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x12010204>;
+		samsung,always-on;
+		#power-domain-cells = <0>;
+		label = "HSI1";
+	};
+
 	soc: soc@0 {
 		compatible = "simple-bus";
 		#address-cells = <1>;
@@ -1409,6 +1431,37 @@
 					read-only;
 				};
 			};
+		};
+
+		/*
+		 * CMU_HSI1 clocks the modem's PCIe CH0 root complex (Gen3 x2,
+		 * pcie@12100000).  Base and feeds are from the downstream Zuma
+		 * cmucal-sfr.c/cmucal-node.c tables like CMU_HSI2 below; the
+		 * block sits in pd-hsi1.
+		 */
+		cmu_hsi1: clock-controller@12000000 {
+			compatible = "google,zumapro-cmu-hsi1";
+			reg = <0x12000000 0x10000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_HSI1_NOC>,
+				 <&cmu_top CLK_DOUT_CMU_HSI1_PCIE>;
+			clock-names = "oscclk", "bus", "pcie";
+			samsung,sysreg = <&sysreg_hsi1>;
+			power-domains = <&pd_hsi1>;
+		};
+
+		/*
+		 * SYSREG_HSI1: reg base/size from research/dumped.dts:8172
+		 * (the pcie@12100000 "sysreg" region).  Also the home of the
+		 * HSI1 shareability control (offset 0x704) the modem's
+		 * cache-coherent DMA setup will need later.
+		 */
+		sysreg_hsi1: syscon@12020000 {
+			compatible = "google,zumapro-hsi1-sysreg", "syscon";
+			reg = <0x12020000 0x2000>;
+			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_SYSREG_HSI1_PCLK>;
+			power-domains = <&pd_hsi1>;
 		};
 
 		/*

@@ -356,13 +356,25 @@
 		};
 
 		cp_rmem_reserved: cp-rmem@ea400000 {
-			/* Source: research/dumped.dts:1410-1414. */
+			/*
+			 * Source: research/dumped.dts:1410-1414.  no-map so the
+			 * modem driver can map it non-cached: the CP reads the
+			 * staged boot image and runs the IPC queues in here by
+			 * PCIe bus-mastering, and HSI1 IO-coherency is not set
+			 * up on mainline.
+			 */
 			reg = <0x0 0xea400000 0xc00000>;
+			no-map;
 		};
 
 		cp_msi_rmem_reserved: cp-msi-rmem@f6200000 {
-			/* Source: research/dumped.dts:1417-1421. */
+			/*
+			 * Source: research/dumped.dts:1417-1421.  no-map for
+			 * the same reason: the CP DMA-writes its boot progress
+			 * above the MSI termination address in this page.
+			 */
 			reg = <0x0 0xf6200000 0x1000>;
+			no-map;
 		};
 
 		abl_reserved: abl@f8800000 {
@@ -903,6 +915,26 @@
 	google,cp-wakeup-gpios = <&gpp16 0 GPIO_ACTIVE_HIGH>;
 	google,cp-pda-active-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
 	status = "okay";
+};
+
+/*
+ * Exynos Modem 5300 boot control.  Consumes the endpoint the CH0 RC
+ * enumerates: stages the first-stage CP bootloader in cp_rmem, points the
+ * RC's MSI target at cp_msi_rmem (the mask ROM reports boot progress above
+ * that address) and runs the shared-memory handshake to CP ONLINE.  The
+ * doorbell bus address and the CP2AP_WAKEUP line (gpa5-1) are from the
+ * downstream cpif node (research/dumped.dts:20516, 20632).
+ */
+/ {
+	modem {
+		compatible = "samsung,s5300-modem";
+		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>;
+		memory-region-names = "ipc", "msi";
+		firmware-name = "tegu/cp_pbl.bin";
+		google,pcie = <&pcie0>;
+		samsung,doorbell-addr = <0x14e60000>;
+		cp2ap-wakeup-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &pcie_phy {

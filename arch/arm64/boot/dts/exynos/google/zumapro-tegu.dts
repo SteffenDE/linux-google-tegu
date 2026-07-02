@@ -861,6 +861,50 @@
 	};
 };
 
+/*
+ * PCIe CH0 (HSI1): the Exynos Modem 5300.  PERST# is gph0-0 and CLKREQ# is
+ * gph0-1 (special function 2, pull-up) on the HSI1 GPIO pin controller at
+ * 0x12040000 (labelled pinctrl_hsi0 in this tree), from
+ * research/dumped.dts:4549-4565.  The CP rail-sequencing lines below are from
+ * the downstream cpif node (research/dumped.dts:20622-20632); they carry raw
+ * levels, so all are GPIO_ACTIVE_HIGH and the RC's bring-up stub writes the
+ * downstream values verbatim.
+ *
+ * The link is capped at Gen1 x1 for bring-up: downstream also trains the
+ * first boot-time link at GEN1 x1 (s5100_poweron_pcie(boot_on)) and only
+ * moves to Gen3 x2 with the link bounce after the boot-image download, which
+ * needs the modem driver.
+ */
+&pinctrl_hsi0 {
+	status = "okay";
+
+	pcie0_clkreq: pcie0-clkreq-pins {
+		samsung,pins = "gph0-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+};
+
+&pcie0_phy {
+	status = "okay";
+};
+
+&pcie0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie0_clkreq>;
+	reset-gpios = <&gph0 0 GPIO_ACTIVE_LOW>;
+	num-lanes = <1>;
+	max-link-speed = <1>;
+	google,cp-pwr-gpios = <&gpp12 2 GPIO_ACTIVE_HIGH>;
+	google,cp-nreset-gpios = <&gpp12 3 GPIO_ACTIVE_HIGH>;
+	google,cp-pm-wrst-gpios = <&gpp8 3 GPIO_ACTIVE_HIGH>;
+	google,cp-wrst-gpios = <&gpp16 3 GPIO_ACTIVE_HIGH>;
+	google,cp-wakeup-gpios = <&gpp16 0 GPIO_ACTIVE_HIGH>;
+	google,cp-pda-active-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
 &pcie_phy {
 	status = "okay";
 };

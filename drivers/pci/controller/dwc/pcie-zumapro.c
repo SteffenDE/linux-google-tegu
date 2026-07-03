@@ -21,6 +21,7 @@
 #include <linux/of_address.h>
 #include <linux/pcie-zumapro.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-zumapro-pcie.h>
 #include <linux/platform_device.h>
 
 #include "pcie-designware.h"
@@ -286,11 +287,20 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 			 "link training attempt %d timed out, retraining\n",
 			 try + 1);
 
+		/*
+		 * The endpoint may have stopped driving CLKREQ# by now (a
+		 * crashed CP bootloader did on hardware, wedging the whole
+		 * interconnect on the next ELBI write); park the sub-block
+		 * clock on the OSC for the dead-link window and only return
+		 * to HW mode for the retrain itself.
+		 */
+		zumapro_pcie_phy_safe_clk(zp->phy, true);
 		writel(0, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
 		gpiod_set_value_cansleep(zp->perst, 1);
 		usleep_range(1000, 2000);
 		gpiod_set_value_cansleep(zp->perst, 0);
 		usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
+		zumapro_pcie_phy_safe_clk(zp->phy, false);
 	}
 
 	dev_err(pci->dev, "link failed to come up after %d attempts\n",
@@ -577,6 +587,14 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	 * link to be down.  NULL-safe no-op when no CP lines exist (CH1).
 	 */
 	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
+	/*
+	 * Downstream switches the sub-block onto the OSC before every
+	 * intentional link drop ("level clk switching for stability"): with
+	 * the link down the CP may stop driving CLKREQ#, and an ELBI access
+	 * on the gated clock stalls the interconnect (seen on hardware when
+	 * a cold CP's bootloader died during the bounce).
+	 */
+	zumapro_pcie_phy_safe_clk(zp->phy, true);
 	writel(0, zp->pci.elbi_base + PCIE_APP_LTSSM_ENABLE);
 	gpiod_set_value_cansleep(zp->perst, 1);
 	usleep_range(1000, 2000);
@@ -588,6 +606,7 @@ EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_down);
 int zumapro_pcie_modem_link_up(struct device *rc_dev)
 {
 	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	int ret;
 
 	if (!zp)
 		return -ENODEV;
@@ -602,7 +621,12 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 	gpiod_set_value_cansleep(zp->perst, 0);
 	usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
 
-	return zumapro_pcie_start_link(&zp->pci);
+	/* Back to HW mode for training; re-park if the link never comes. */
+	zumapro_pcie_phy_safe_clk(zp->phy, false);
+	ret = zumapro_pcie_start_link(&zp->pci);
+	if (ret)
+		zumapro_pcie_phy_safe_clk(zp->phy, true);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_up);
 

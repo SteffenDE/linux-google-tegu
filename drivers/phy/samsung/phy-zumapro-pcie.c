@@ -24,6 +24,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-zumapro-pcie.h>
 #include <linux/platform_device.h>
 
 /*
@@ -241,6 +242,26 @@ static int zumapro_pcie_phy_ext_pll(struct zumapro_pcie_phy *phy)
 
 	return 0;
 }
+
+/*
+ * Switch the PCIe sub-block clock between HW mode (following the PHY/link,
+ * value 0x15 as programmed at power-on) and SW mode on the always-on OSC.
+ * Downstream flips to OSC before every intentional link drop ("level clk
+ * switching for stability", exynos_pcie_rc_poweroff()): with the link dead
+ * the endpoint may stop driving CLKREQ#, and an ELBI/DBI access on the
+ * gated clock stalls the whole interconnect.
+ */
+void zumapro_pcie_phy_safe_clk(struct phy *p, bool safe)
+{
+	struct zumapro_pcie_phy *phy = phy_get_drvdata(p);
+
+	if (safe)
+		writel(readl(phy->soc + SOC_PHY_CLK_MODE) & ~0x3,
+		       phy->soc + SOC_PHY_CLK_MODE);
+	else
+		writel(0x15, phy->soc + SOC_PHY_CLK_MODE);
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_phy_safe_clk);
 
 /* Release (active) or re-assert PHY isolation via the secure PMU RMW. */
 static int zumapro_pcie_phy_set_isolation(struct zumapro_pcie_phy *phy, bool active)

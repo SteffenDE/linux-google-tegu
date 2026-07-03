@@ -145,6 +145,14 @@ static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp)
 
 	/* ROM settle before link training */
 	msleep(200);
+
+	/*
+	 * Downstream raises AP2CP_WAKEUP before every link-up, including
+	 * this first ROM-phase one (s5100_poweron_pcie()); the CP only
+	 * keeps its end of the link fully awake while it is high.
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 1);
+	msleep(5);
 }
 
 static int zumapro_pcie_cp_get_gpios(struct zumapro_pcie *zp)

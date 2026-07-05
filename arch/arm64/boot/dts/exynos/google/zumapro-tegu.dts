@@ -348,6 +348,12 @@
 		cp_rmem_1_reserved: cp-rmem-1@e8000000 {
 			/* Source: research/dumped.dts:1424-1428. */
 			reg = <0x0 0xe8000000 0x2000000>;
+			/*
+			 * Like the other CP carveouts: keep it out of the
+			 * linear map so the modem driver picks the mapping
+			 * attributes (ioremap_wc refuses System RAM pfns).
+			 */
+			no-map;
 		};
 
 		cp_aoc_rmem_reserved: cp-aoc-rmem@197fd000 {
@@ -914,6 +920,12 @@
 	google,cp-wrst-gpios = <&gpp16 3 GPIO_ACTIVE_HIGH>;
 	google,cp-wakeup-gpios = <&gpp16 0 GPIO_ACTIVE_HIGH>;
 	google,cp-pda-active-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+	/*
+	 * Source: dumped.dts gpio_ap2cp_dump_noti (gpp16-1).  Downstream
+	 * power_on_cp() drives it low before the rails; left floating, CP
+	 * MAIN may boot into dump mode instead of normal IPC.
+	 */
+	google,cp-dump-noti-gpios = <&gpp16 1 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
 
@@ -928,12 +940,21 @@
 / {
 	modem {
 		compatible = "samsung,s5300-modem";
-		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>;
-		memory-region-names = "ipc", "msi";
+		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
+				<&cp_rmem_1_reserved>;
+		memory-region-names = "ipc", "msi", "pktproc";
 		firmware-name = "tegu/cp_pbl.bin";
 		google,pcie = <&pcie0>;
 		samsung,doorbell-addr = <0x14e60000>;
 		cp2ap-wakeup-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;
+		/*
+		 * CP liveness inputs (dumped.dts gpio_cp2ap_phone_active /
+		 * gpio_cp2ap_cp_ps_hold, alive bank): phone_active goes high
+		 * once CP MAIN runs and drops on a CP crash; ps_hold tracks
+		 * the CP power state.  Read-only boot diagnostics.
+		 */
+		cp2ap-active-gpios = <&gpa5 2 GPIO_ACTIVE_HIGH>;
+		cp2ap-ps-hold-gpios = <&gpa5 0 GPIO_ACTIVE_HIGH>;
 	};
 };
 

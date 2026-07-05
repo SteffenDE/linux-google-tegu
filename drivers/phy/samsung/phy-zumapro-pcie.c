@@ -254,12 +254,18 @@ static int zumapro_pcie_phy_ext_pll(struct zumapro_pcie_phy *phy)
 void zumapro_pcie_phy_safe_clk(struct phy *p, bool safe)
 {
 	struct zumapro_pcie_phy *phy = phy_get_drvdata(p);
+	u32 val;
 
+	pr_err("BRK safe_clk(%d): rd soc+0x4000\n", safe);
+	val = readl(phy->soc + SOC_PHY_CLK_MODE);
+	pr_err("BRK safe_clk: got %#x, wr\n", val);
 	if (safe)
-		writel(readl(phy->soc + SOC_PHY_CLK_MODE) & ~0x3,
-		       phy->soc + SOC_PHY_CLK_MODE);
+		writel(val & ~0x3, phy->soc + SOC_PHY_CLK_MODE);
 	else
 		writel(0x15, phy->soc + SOC_PHY_CLK_MODE);
+	pr_err("BRK safe_clk: done; pcs150 %#x engaged %#x extlock %#x\n",
+	       readl(phy->pcs + 0x150), readl(phy->pma + PMA_PLL_ENGAGED),
+	       readl(phy->pll + PLL_EXT_LOCK_X2));
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_phy_safe_clk);
 
@@ -407,6 +413,16 @@ static int zumapro_pcie_phy_calibrate(struct phy *p)
 		 */
 		writel(readl(phy->pll + PLL_PWR_GATING) & ~(0x3 << 5),
 		       phy->pll + PLL_PWR_GATING);
+		/*
+		 * "PLL & BIAS always on": downstream pins this at the end of
+		 * every CH0 poweron so the PLLs only gate under explicit
+		 * control (pwrdn writes 0x300d9/0x300de).  Left at its
+		 * default, the PCS auto-gates the PLL on L2/link-down; with a
+		 * dead endpoint never re-asserting CLKREQ#, the gated pclk
+		 * wedged the interconnect on the next ELBI read (hw-observed
+		 * in the modem boot link bounce).
+		 */
+		writel(0x300d5, phy->pcs + 0x150);
 	}
 
 	writel(0x0, phy->pma + PMA_PHY_INPUT_CLK);

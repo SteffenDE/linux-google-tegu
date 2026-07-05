@@ -81,9 +81,26 @@
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
 #define S5300_IPC_CP2AP_STATUS		0x80c
+#define S5300_IPC_HANDOVER		0x82c
 
 #define S5300_IPC_SRINFO_OFFSET		0x400000
-#define S5300_IPC_MAGIC_VALUE		0xaa	/* SIT protocol magic */
+#define S5300_IPC_MAGIC_VALUE		0xaa	/* SHM_IPC_MAGIC, live IPC */
+/*
+ * SHM_BOOT_MAGIC (PROTOCOL_SIT flavor): downstream link_start_normal_boot()
+ * publishes this in the magic word BEFORE the CP boots and only switches to
+ * the IPC magic at PHONE_START; CP MAIN polls it on startup and stays silent
+ * without it (hw-observed: boot_stage DONE, link re-trained, cp2ap forever 0).
+ */
+#define S5300_IPC_BOOT_MAGIC		0xbdbd
+
+/*
+ * ap2cp_united_status ds_det field (tegu DT sbi_ds_det_pos/mask); value 1 =
+ * downstream get_ds_detect() default (dual-SIM detect 2 - 1).  The only
+ * united-status field downstream populates before the CP boots
+ * (init_control_messages()).
+ */
+#define S5300_STATUS_DS_DET_POS		14
+#define S5300_STATUS_DS_DET		1
 
 /* Interrupt-word encoding (downstream link_device_memory.h). */
 #define S5300_INT_VALID			BIT(7)
@@ -112,17 +129,111 @@
 /* PHONE_START handshake timeout, downstream MIF_INIT_TIMEOUT. */
 #define S5300_INIT_TIMEOUT		(15 * HZ)
 
+/*
+ * Four MSI vectors, matching downstream (s51xx_pcie_request_msi_int(pdev, 4)).
+ * The mask ROM only tolerates this width: requesting eight to reach vector 4
+ * sets MME=3 and aborts the PBL download (boot_stage 0x1ff, err_report 0x1000).
+ * The CP signals the AP on MSI message-data base 4 (m1n1 trace of a working
+ * downstream boot: EP data 4, RC iMSI-RX ENABLE 0xf1 / MASK 0xffffff0c,
+ * INIT_START and every MAIN-phase interrupt on bit 4).  We reproduce that by
+ * having the RC reserve MSI vectors 0-3 (zumapro_pcie_reserve_msi_base) so this
+ * four-vector request lands at base 4 -- our vector 0 is then hwirq 4, the
+ * CP's IPC/INIT_START vector, with MME=2.
+ */
+#define S5300_MSI_VECTORS		4
+
+/*
+ * ap2cp handover block (downstream struct t_handover_block_info), written by
+ * cbd through IOCTL_HANDOVER_BLOCK_INFO before every CP boot.  Contents
+ * captured verbatim from an instrumented downstream boot of this device;
+ * cpid[] holds the two IMEIs and cpsig a signature blob, so the values are
+ * device-specific and must eventually come from NV storage, never a commit.
+ */
+struct s5300_handover_info {
+	u32 version;
+	u32 project_id;
+	u32 revision;
+	u32 major_id;
+	u32 minor_id;
+	u32 modem_sku;
+	u32 modem_hw;
+	u32 cpinfo[3];
+	u32 rf_sub;
+	u32 rf_config;
+	u32 reserved[4];
+	char cpid[2][16];
+	char cpsig[65];
+} __packed;
+
+static const struct s5300_handover_info s5300_handover = {
+	.version = 1,
+	.project_id = 6,
+	.major_id = 1,
+	.modem_sku = 2,
+	.reserved = { 0x0b, 0x06, 0x00, 0x6816544d },
+	.cpid = { "357281833466068", "357281833466076" },
+	.cpsig = "1e11532b2e65dc9bb6f2c36dfa300e61864ba7ed05cb6f8e39048de7d6c9fee2",
+};
+
+/*
+ * PKTPROC info regions (cp_rmem_1, bus 0xE8000000 = CP address 0x20000000).
+ * Downstream pktproc_create()/pktproc_create_ul() seed these two pages at
+ * module probe, i.e. before every CP boot including fully-cold AP boots (the
+ * desc/buff regions stay uninitialized pre-boot there, so only the info
+ * pages matter to the CP before INIT_START).  Header and queue geometry
+ * captured verbatim from the instrumented downstream boot.
+ *
+ * DL header bitfield: num_queues=4, desc_mode=1 (SKTBUF), irq_mode=1
+ * (exclusive), max_packet_size=0x630.  UL header: num_queues=2, the other
+ * fields are CP-written at runtime (garbage-tolerated pre-boot downstream).
+ */
+#define S5300_PKTPROC_UL_INFO_OFFSET	0x1c00000
+
+struct s5300_pktproc_q_info {
+	u32 cp_desc_pbase;
+	u32 num_desc;
+	u32 cp_buff_pbase;
+	u32 fore_ptr;
+	u32 rear_ptr;
+} __packed;
+
+static const u32 s5300_pktproc_dl_hdr = 0x63054;
+static const struct s5300_pktproc_q_info s5300_pktproc_dl_q[4] = {
+	{ 0x20001000, 3456, 0x20100000 },
+	{ 0x2000e800, 3456, 0x207c0000 },
+	{ 0x2001c000, 3456, 0x20e80000 },
+	{ 0x20029800, 3456, 0x21540000 },
+};
+
+static const u32 s5300_pktproc_ul_hdr[2] = { 2, 0 };	/* num_queues, quota */
+static const struct s5300_pktproc_q_info s5300_pktproc_ul_q[2] = {
+	{ 0x21c01000, 1760, 0x21c90000 },
+	{ 0x21c0ec00,  880, 0x21e48000 },
+};
+
+static const char * const s5300_msi_names[S5300_MSI_VECTORS] = {
+	"s5300-ipc",		/* base vector (hwirq 4): the CP's INIT_START */
+	"s5300-status",
+	"s5300-pktproc0",
+	"s5300-pktproc1",
+};
+
 struct s5300_modem {
 	struct device		*dev;
 	struct device		*rc_dev;
 	struct pci_dev		*pdev;
 	struct gpio_desc	*cp2ap_wakeup;
+	struct gpio_desc	*cp2ap_active;	/* phone_active, diagnostics */
+	struct gpio_desc	*cp2ap_ps_hold;	/* CP power state, diagnostics */
 
 	phys_addr_t		ipc_phys;
 	resource_size_t		ipc_size;
 	void __iomem		*ipc;
+	void __iomem		*ipc_wb;	/* 4K WB alias, diagnostics only */
 	phys_addr_t		msi_phys;
 	void __iomem		*msi;
+	phys_addr_t		pktproc_phys;
+	void __iomem		*pktproc;
 
 	u32			db_bus_addr;
 	void __iomem		*doorbell;
@@ -131,6 +242,7 @@ struct s5300_modem {
 	struct work_struct	boot_work;
 	struct completion	init_done;
 	spinlock_t		lock;	/* orders ap2cp_msg word + doorbell */
+	int			irq_count;
 	bool			online;
 };
 
@@ -243,8 +355,22 @@ static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 	u16 cmd;
 
 	for (try = 0; try < 10; try++) {
+		u32 rb, bar0 = 0;
+		u16 c = 0;
+
 		writel(val, sm->doorbell);
-		if (readl(sm->doorbell) != 0xffffffff)
+		rb = readl(sm->doorbell);
+		/*
+		 * Mirror downstream s51xx_pcie_send_doorbell_int's
+		 * TEGU_CP_TRACE line for a byte-for-byte log diff (int_num,
+		 * readback, EP cmd, BAR0).
+		 */
+		pci_read_config_word(sm->pdev, PCI_COMMAND, &c);
+		pci_read_config_dword(sm->pdev, PCI_BASE_ADDRESS_0, &bar0);
+		dev_info(sm->dev,
+			 "TEGU_CP_TRACE doorbell int_num=%#x readback=%#x cmd=%#06x bar0=%#x try=%d\n",
+			 val, rb, c, bar0, try);
+		if (rb != 0xffffffff)
 			return;
 
 		pci_read_config_word(sm->pdev, PCI_COMMAND, &cmd);
@@ -305,6 +431,25 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 {
 	int i;
 
+	/*
+	 * Downstream link_start_normal_boot(): init_legacy_link() clears the
+	 * queue pointers and finishes with mem_access = 1, then the boot magic
+	 * overwrites the IPC magic.  The pre-boot state the CP sees is boot
+	 * magic + access 1 (hw-captured: word 0x04 reads 1 in the instrumented
+	 * downstream dumps both before the PBL kick and after the re-link).
+	 */
+	writel(S5300_IPC_BOOT_MAGIC, sm->ipc + S5300_IPC_MAGIC);
+	writel(1, sm->ipc + S5300_IPC_ACCESS);
+	/*
+	 * Zero the whole header, not just the FMT/RAW head/tail words at
+	 * 0x08/0x18: the golden pre-boot image (instrumented downstream dump)
+	 * is all-zero up to the capability words except the two offset
+	 * pointers written below, while live-IPC leftovers survive a warm
+	 * reboot (hw-observed stale 0x3c) and must not reach the CP.
+	 */
+	for (i = S5300_IPC_Q_HEAD_TAIL; i < S5300_IPC_CAP_BASE; i += 4)
+		writel(0, sm->ipc + i);
+
 	writel(S5300_IPC_SRINFO_OFFSET, sm->ipc + S5300_IPC_SRINFO_OFS_PTR);
 	writel(S5300_IPC_CAP_BASE, sm->ipc + S5300_IPC_CAP_OFS_PTR);
 	/*
@@ -314,10 +459,79 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 	 */
 	writel(0, sm->ipc + S5300_IPC_AP2CP_MSG);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_MSG);
-	writel(0, sm->ipc + S5300_IPC_AP2CP_STATUS);
+	writel(S5300_STATUS_DS_DET << S5300_STATUS_DS_DET_POS,
+	       sm->ipc + S5300_IPC_AP2CP_STATUS);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_STATUS);
 	for (i = 0; i < S5300_IPC_CAP_WORDS; i++)
 		writel(0, sm->ipc + S5300_IPC_CAP_BASE + 4 * i);
+
+	memcpy_toio(sm->ipc + S5300_IPC_HANDOVER, &s5300_handover,
+		    sizeof(s5300_handover));
+}
+
+static void s5300_init_pktproc_info(struct s5300_modem *sm)
+{
+	memcpy_toio(sm->pktproc, &s5300_pktproc_dl_hdr,
+		    sizeof(s5300_pktproc_dl_hdr));
+	memcpy_toio(sm->pktproc + sizeof(s5300_pktproc_dl_hdr),
+		    s5300_pktproc_dl_q, sizeof(s5300_pktproc_dl_q));
+
+	memcpy_toio(sm->pktproc + S5300_PKTPROC_UL_INFO_OFFSET,
+		    s5300_pktproc_ul_hdr, sizeof(s5300_pktproc_ul_hdr));
+	memcpy_toio(sm->pktproc + S5300_PKTPROC_UL_INFO_OFFSET +
+		    sizeof(s5300_pktproc_ul_hdr),
+		    s5300_pktproc_ul_q, sizeof(s5300_pktproc_ul_q));
+}
+
+static void s5300_disable_link_pm(struct pci_dev *pdev)
+{
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	int l1ss;
+
+	pcie_capability_clear_word(pdev, PCI_EXP_LNKCTL,
+				   PCI_EXP_LNKCTL_ASPMC |
+				   PCI_EXP_LNKCTL_CLKREQ_EN);
+	l1ss = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_L1SS);
+	if (l1ss)
+		pci_clear_and_set_config_dword(pdev, l1ss + PCI_L1SS_CTL1,
+					       PCI_L1SS_CTL1_L1SS_MASK, 0);
+
+	if (!bridge)
+		return;
+
+	pcie_capability_clear_word(bridge, PCI_EXP_LNKCTL,
+				   PCI_EXP_LNKCTL_ASPMC |
+				   PCI_EXP_LNKCTL_CLKREQ_EN);
+	l1ss = pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_L1SS);
+	if (l1ss)
+		pci_clear_and_set_config_dword(bridge, l1ss + PCI_L1SS_CTL1,
+					       PCI_L1SS_CTL1_L1SS_MASK, 0);
+}
+
+static void s5300_unmask_msi_vectors(struct s5300_modem *sm)
+{
+	u32 mask;
+	u16 flags;
+	int mask_off;
+
+	if (!sm->pdev->msi_cap)
+		return;
+
+	pci_read_config_word(sm->pdev, sm->pdev->msi_cap + PCI_MSI_FLAGS,
+			     &flags);
+	if (!(flags & PCI_MSI_FLAGS_MASKBIT))
+		return;
+
+	mask_off = (flags & PCI_MSI_FLAGS_64BIT) ? PCI_MSI_MASK_64 :
+		   PCI_MSI_MASK_32;
+	pci_read_config_dword(sm->pdev, sm->pdev->msi_cap + mask_off, &mask);
+	dev_info(sm->dev, "MSI mask before unmasking vectors 0-%d: %#010x\n",
+		 S5300_MSI_VECTORS - 1, mask);
+	mask &= ~GENMASK(S5300_MSI_VECTORS - 1, 0);
+	pci_write_config_dword(sm->pdev, sm->pdev->msi_cap + mask_off, mask);
+	pci_read_config_dword(sm->pdev, sm->pdev->msi_cap + mask_off, &mask);
+	dev_info(sm->dev, "MSI mask after unmasking vectors 0-%d: %#010x\n",
+		 S5300_MSI_VECTORS - 1, mask);
 }
 
 /*
@@ -346,9 +560,20 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 static irqreturn_t s5300_irq_handler(int irq, void *data)
 {
 	struct s5300_modem *sm = data;
-	u32 val, cmd;
+	int vector;
+	u32 val, status, cmd;
 
 	val = readl(sm->ipc + S5300_IPC_CP2AP_MSG);
+	status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
+	for (vector = 0; vector < sm->irq_count; vector++)
+		if (pci_irq_vector(sm->pdev, vector) == irq)
+			break;
+	if (vector == sm->irq_count)
+		vector = -1;
+
+	/* Bring-up diagnostic: date every MSI and what the mailbox held. */
+	dev_info(sm->dev, "MSI vector %d irq %d (cp2ap %#x status %#x)\n",
+		 vector, irq, val, status);
 	if (!(val & S5300_INT_VALID))
 		return IRQ_HANDLED;
 
@@ -478,16 +703,106 @@ static int s5300_poll_cp_wakeup(struct s5300_modem *sm)
 	return -ETIMEDOUT;
 }
 
+/*
+ * Undo the pre-bounce D3hot/disable on a failure path, leaving the endpoint
+ * enabled in D0.  Between the disable at the bounce point and the re-enable on
+ * the far side the device is powered down and off the enable_cnt; an early
+ * return there would leave s5300_remove()'s pci_disable_device() to underflow
+ * the count.  Best-effort -- these are already error returns.
+ */
+static void s5300_abort_bounce(struct pci_dev *pdev)
+{
+	int ret;
+
+	pci_set_power_state(pdev, PCI_D0);
+	ret = pci_enable_device(pdev);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "re-enable after aborted bounce failed: %d\n", ret);
+}
+
+/*
+ * CP liveness lines (alive bank, readable any time): phone_active goes high
+ * once CP MAIN runs and drops on a CP crash; ps_hold tracks the CP power
+ * state.  Downstream only attaches interrupts to them after ONLINE, but the
+ * levels discriminate "MAIN never started" from "MAIN started and died"
+ * during the INIT_START wait.
+ */
+static void s5300_log_cp_lines(struct s5300_modem *sm, const char *tag)
+{
+	dev_info(sm->dev, "%s: cp2ap wakeup %d active %d ps_hold %d\n", tag,
+		 gpiod_get_value_cansleep(sm->cp2ap_wakeup),
+		 sm->cp2ap_active ?
+			gpiod_get_value_cansleep(sm->cp2ap_active) : -1,
+		 sm->cp2ap_ps_hold ?
+			gpiod_get_value_cansleep(sm->cp2ap_ps_hold) : -1);
+}
+
+/*
+ * Dual-view diagnostic: the IPC header words the CP consults at startup, read
+ * through the WC mapping (the DRAM view -- what a non-snooping CP read
+ * returns) and through the WB alias (the coherent-domain view -- where an
+ * IO-coherent CP write would land).  Divergence tells us on which side of the
+ * cache hierarchy the data is hiding.
+ */
+static void s5300_dump_views(struct s5300_modem *sm, const char *tag)
+{
+	dev_info(sm->dev,
+		 "%s WC: magic %#x acc %#x a2c %#x c2a %#x ast %#x cst %#x ho %#x\n",
+		 tag,
+		 readl(sm->ipc + S5300_IPC_MAGIC),
+		 readl(sm->ipc + S5300_IPC_ACCESS),
+		 readl(sm->ipc + S5300_IPC_AP2CP_MSG),
+		 readl(sm->ipc + S5300_IPC_CP2AP_MSG),
+		 readl(sm->ipc + S5300_IPC_AP2CP_STATUS),
+		 readl(sm->ipc + S5300_IPC_CP2AP_STATUS),
+		 readl(sm->ipc + S5300_IPC_HANDOVER));
+	if (!sm->ipc_wb)
+		return;
+	dev_info(sm->dev,
+		 "%s WB: magic %#x acc %#x a2c %#x c2a %#x ast %#x cst %#x ho %#x\n",
+		 tag,
+		 readl(sm->ipc_wb + S5300_IPC_MAGIC),
+		 readl(sm->ipc_wb + S5300_IPC_ACCESS),
+		 readl(sm->ipc_wb + S5300_IPC_AP2CP_MSG),
+		 readl(sm->ipc_wb + S5300_IPC_CP2AP_MSG),
+		 readl(sm->ipc_wb + S5300_IPC_AP2CP_STATUS),
+		 readl(sm->ipc_wb + S5300_IPC_CP2AP_STATUS),
+		 readl(sm->ipc_wb + S5300_IPC_HANDOVER));
+}
+
 static void s5300_boot_work(struct work_struct *work)
 {
 	struct s5300_modem *sm = container_of(work, struct s5300_modem,
 					      boot_work);
 	struct pci_dev *pdev = sm->pdev;
-	int ret;
+	int ret, sec;
+	/*
+	 * Heavy bounce (full PERST + PHY re-cal + RC re-setup): the only cycle
+	 * that reliably retrains the post-PBL x2/Gen3 link on this hardware.
+	 * The light experiments proved a bare-PERST/PHY-alive relink cannot
+	 * train past detect, so this is the shippable path.  New this cycle:
+	 * modem_link_down snapshots the RC iMSI-RX enable/mask and modem_link_up
+	 * restores them after dw_pcie_setup_rc, so the CP's post-link-ack notify
+	 * MSI (message 4) is no longer dropped by a core-reset-zeroed ENABLE.
+	 */
+	bool light = false;
+
+	/*
+	 * Diagnostic: dump the control block before touching it.  AP DRAM
+	 * often retains across a warm reboot, so this can recover what the
+	 * previous downstream boot wrote (notably the ap2cp handover block
+	 * at 0x82c, whose full contents only cbd knows).
+	 */
+	for (ret = 0x7f0; ret < 0x860; ret += 16)
+		dev_info(sm->dev, "shmem %#05x: %08x %08x %08x %08x\n", ret,
+			 readl(sm->ipc + ret), readl(sm->ipc + ret + 4),
+			 readl(sm->ipc + ret + 8), readl(sm->ipc + ret + 12));
 
 	/* Publish the PBL location through the MSI block. */
 	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
 	s5300_init_control_messages(sm);
+	s5300_init_pktproc_info(sm);
 	memcpy_toio(sm->ipc + S5300_BOOT_IMG_OFFSET, sm->pbl->data,
 		    sm->pbl->size);
 	writel(lower_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
@@ -502,7 +817,12 @@ static void s5300_boot_work(struct work_struct *work)
 	/* The ROM reads these on the doorbell; make sure the writes stuck. */
 	s5300_verify_msi_target(sm);
 
-	/* Config state (forced BAR0, MSI capability) must survive the bounce. */
+	/*
+	 * Config state (forced BAR0, MSI capability) must survive the bounce.
+	 * Downstream also snapshots here (first_save_s51xx_status); the
+	 * re-save at the bounce point below (with bus-master cleared, matching
+	 * s51xx_pcie_save_state()) supersedes this as the restored state.
+	 */
 	pci_save_state(pdev);
 
 	dev_info(sm->dev, "starting first-stage download (%#x bytes at %pap+%#x)\n",
@@ -513,12 +833,44 @@ static void s5300_boot_work(struct work_struct *work)
 	 * the writel() barrier inside send_doorbell orders them ahead of the
 	 * doorbell trigger.
 	 */
+	s5300_dump_views(sm, "pre-doorbell");
 	s5300_send_doorbell(sm, S5300_DB_MSG);
 
 	ret = s5300_poll_boot_stage(sm);
 	if (ret)
 		return;
 	dev_info(sm->dev, "first-stage bootloader up, bouncing the link\n");
+	s5300_log_cp_lines(sm, "post-pbl");
+
+	/*
+	 * Downstream settles after boot_stage DONE before the link drop:
+	 * s5100_poweroff_pcie() always sleeps 30 ms, and check_cp_status()
+	 * adds a 20 ms guard when DONE hit on its very first poll.  50 ms
+	 * unconditionally is a superset of that.
+	 */
+	msleep(50);
+
+	zumapro_pcie_modem_set_light(sm->rc_dev, light);
+
+	/*
+	 * D3hot the endpoint before the bounce, mirroring the save half of
+	 * s51xx_pcie_save_state() (clear bus-master, re-save the BME-cleared
+	 * config, disable, D3hot), paired with the D0/restore/enable/
+	 * set_master block after link-up.  Both bounce modes assert PERST,
+	 * which resets EP config, so both need this.
+	 */
+	pci_clear_master(pdev);
+	pci_save_state(pdev);
+	pci_disable_device(pdev);
+	pci_wake_from_d3(pdev, false);
+	if (pci_set_power_state(pdev, PCI_D3hot))
+		dev_warn(sm->dev, "could not put endpoint in D3hot before bounce\n");
+	if (pdev->pm_cap) {
+		u16 pmcsr = 0;
+
+		pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmcsr);
+		dev_info(sm->dev, "EP PMCSR after D3hot: %#06x\n", pmcsr);
+	}
 
 	/*
 	 * The CP bootloader expects a link drop and retrain before the ack
@@ -526,17 +878,35 @@ static void s5300_boot_work(struct work_struct *work)
 	 * is ready to re-link.
 	 */
 	ret = zumapro_pcie_modem_link_down(sm->rc_dev);
-	if (ret)
+	if (ret) {
+		s5300_abort_bounce(pdev);
 		return;
+	}
 	ret = s5300_poll_cp_wakeup(sm);
-	if (ret)
+	if (ret) {
+		s5300_abort_bounce(pdev);
 		return;
+	}
 	ret = zumapro_pcie_modem_link_up(sm->rc_dev);
 	if (ret) {
 		dev_err(sm->dev, "link retrain after bounce failed: %d\n", ret);
+		s5300_abort_bounce(pdev);
 		return;
 	}
+
+	/*
+	 * Restore half of s51xx_pcie_restore_state(): D0, reload the
+	 * BME-cleared config, re-enable, set bus-master.
+	 */
+	if (pci_set_power_state(pdev, PCI_D0))
+		dev_warn(sm->dev,
+			 "could not bring endpoint back to D0 after bounce\n");
 	pci_restore_state(pdev);
+	ret = pci_enable_device(pdev);
+	if (ret)
+		dev_warn(sm->dev, "pci_enable_device after bounce failed: %d\n",
+			 ret);
+	pci_set_master(pdev);
 	/*
 	 * Downstream does not trust restore for the forced BAR: it re-reads
 	 * and rewrites it after every link-up (s51xx_pcie_restore_state()).
@@ -545,14 +915,126 @@ static void s5300_boot_work(struct work_struct *work)
 	s5300_program_doorbell_bar(sm);
 	s5300_open_bridge_window(sm);
 	s5300_verify_msi_target(sm);
+	/*
+	 * Skip the L1SS enable in light mode: its L1-exit dance perturbs the
+	 * link, and downstream only enables L1.2 once the CP is ONLINE anyway.
+	 */
+	if (!light) {
+		ret = zumapro_pcie_modem_enable_l1ss(sm->rc_dev, pdev);
+		if (ret)
+			dev_warn(sm->dev,
+				 "post-bounce modem L1SS enable failed: %d\n", ret);
+	}
 
+	s5300_dump_views(sm, "pre-link-ack");
+	s5300_log_cp_lines(sm, "pre-link-ack");
+	zumapro_pcie_modem_msi_status(sm->rc_dev);
 	s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
 
-	if (!wait_for_completion_timeout(&sm->init_done, S5300_INIT_TIMEOUT)) {
-		dev_err(sm->dev, "CP handshake timed out (cp2ap %#x boot_stage %#x err %#x)\n",
+	/*
+	 * Downstream INIT_START arrives ~2 s after the link-ack.  While
+	 * waiting, log the CP liveness lines once a second and re-ring the
+	 * link-ack a few times: the golden m1n1 boot carried three link-acks
+	 * (retry cycles), so a repeat is protocol-safe if BL1's mailbox
+	 * missed our single edge during its own link recovery.
+	 */
+	for (sec = 0; sec < S5300_INIT_TIMEOUT / HZ; sec++) {
+		if (wait_for_completion_timeout(&sm->init_done, HZ))
+			break;
+		s5300_log_cp_lines(sm, "waiting");
+		zumapro_pcie_modem_msi_status(sm->rc_dev);
+		if (sec == 2 || sec == 5 || sec == 9) {
+			dev_info(sm->dev, "re-ringing link-ack (t+%ds)\n",
+				 sec + 1);
+			s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
+		}
+	}
+
+	if (sec == S5300_INIT_TIMEOUT / HZ) {
+		int off, hits = 0;
+
+		/*
+		 * cp2ap_united_status discriminates the silence: CP MAIN sets
+		 * its status bits there early, so nonzero = MAIN runs but the
+		 * handshake is gated; zero = the CP never got past BL1.
+		 */
+		dev_err(sm->dev, "CP handshake timed out (cp2ap %#x status %#x boot_stage %#x err %#x)\n",
 			readl(sm->ipc + S5300_IPC_CP2AP_MSG),
+			readl(sm->ipc + S5300_IPC_CP2AP_STATUS),
 			readl(sm->msi + S5300_MSI_BOOT_STAGE),
 			readl(sm->msi + S5300_MSI_ERR_REPORT));
+		s5300_dump_views(sm, "timeout");
+		/*
+		 * Diagnostic: any CP write ANYWHERE in the first 4K shows
+		 * whether the CP spoke at an offset our layout model missed.
+		 */
+		for (off = 0; off < SZ_4K && hits < 32; off += 4) {
+			u32 val = readl(sm->ipc + off);
+
+			if (val)
+				dev_err(sm->dev, "  shmem %#05x = %#010x\n",
+					off, val), hits++;
+		}
+
+		/*
+		 * Post-bounce EP config dump.  The PBL disassembly
+		 * (research/modem-pbl-re.md) proved BL1 polls a CP-internal
+		 * ELBI bit set by the doorbell write and never re-arms across a
+		 * link-down; the leading fix candidate is that the ROM armed the
+		 * inbound path through an extended-config VSEC our pci_restore
+		 * does not replay.  Diff this against the golden post-restore EP
+		 * config (out/ubports-modem-pcie-hsi1-mmio-trace.log, offsets
+		 * 0x40ffeXXX): 0x104=0, 0x108=0x400000, 0x10c=0x462030,
+		 * 0x110=0, 0x114=0xe000, 0x118=0xa0, 0x004=0x0506, 0x052=0x01ab.
+		 */
+		for (off = 0; off <= 0x11c; off += 0x10) {
+			u32 a = 0, b = 0, c = 0, d = 0;
+
+			pci_read_config_dword(pdev, off, &a);
+			pci_read_config_dword(pdev, off + 4, &b);
+			pci_read_config_dword(pdev, off + 8, &c);
+			pci_read_config_dword(pdev, off + 0xc, &d);
+			dev_err(sm->dev, "  epcfg %#05x: %08x %08x %08x %08x\n",
+				off, a, b, c, d);
+		}
+
+		/*
+		 * Post-mortem doorbell-delivery probe.  A bare msg re-ring
+		 * showed nothing on hardware, but that is ambiguous: BL1 is
+		 * past the download stage, so its msg handler may be idle even
+		 * if the interrupt still arrives.  Disambiguate by first
+		 * zeroing the BL1-owned boot_stage word (downstream
+		 * clear_boot_stage() does exactly this at power-on): the PBL is
+		 * still staged in the IPC region and its descriptor in the MSI
+		 * block survived the bounce (AP DRAM is untouched), so a LIVE
+		 * doorbell makes BL1 re-DMA and climb boot_stage back toward
+		 * 0x3fff; a DEAD one leaves it pinned at 0.  That splits
+		 * "doorbell IRQ dead post-PERST" from "handler idle post-DONE".
+		 */
+		writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
+		dev_err(sm->dev,
+			"post-mortem: boot_stage cleared to %#x, re-ringing msg doorbell\n",
+			readl(sm->msi + S5300_MSI_BOOT_STAGE));
+		s5300_send_doorbell(sm, S5300_DB_MSG);
+		/*
+		 * Log the raw doorbell read-back.  Per the PBL disassembly the
+		 * CP write-1-clears its ELBI trigger bit once serviced; if this
+		 * register is that view, a self-clearing read-back (not the
+		 * written 0x10000) would mean BL1 is polling and alive.  A plain
+		 * latch just echoes the write, so this only informs, not proves.
+		 */
+		msleep(20);
+		dev_err(sm->dev, "post-mortem: doorbell reads back %#010x\n",
+			readl(sm->doorbell));
+		for (sec = 0; sec < 3; sec++) {
+			msleep(1000);
+			dev_err(sm->dev,
+				"post-mortem +%ds: boot_stage %#x err %#x cp2ap %#x\n",
+				sec + 1,
+				readl(sm->msi + S5300_MSI_BOOT_STAGE),
+				readl(sm->msi + S5300_MSI_ERR_REPORT),
+				readl(sm->ipc + S5300_IPC_CP2AP_MSG));
+		}
 		return;
 	}
 
@@ -560,8 +1042,8 @@ static void s5300_boot_work(struct work_struct *work)
 }
 
 static int s5300_map_region(struct s5300_modem *sm, const char *name,
-			    phys_addr_t *phys, resource_size_t *size,
-			    void __iomem **map)
+			    bool cached, phys_addr_t *phys,
+			    resource_size_t *size, void __iomem **map)
 {
 	struct device_node *np;
 	struct reserved_mem *rmem;
@@ -583,10 +1065,26 @@ static int s5300_map_region(struct s5300_modem *sm, const char *name,
 	if (size)
 		*size = rmem->size;
 	/*
-	 * Non-cached: the CP reads the staged PBL and writes boot/IPC state
-	 * by PCIe DMA, and the HSI1 IO-coherency plumbing is not set up yet.
+	 * Downstream cp_shmem maps the IPC region cached (region,cached=1,
+	 * plain phys_to_virt) and the MSI region non-cached, so mirror that
+	 * split.  The rationale is that the CP's inbound IPC writes are
+	 * IO-coherent and land in the CPU-visible cache hierarchy (a non-cached
+	 * mapping would read stale DRAM), while the mask ROM's boot_stage
+	 * writes in the MSI region are non-coherent and need the NC view.
+	 * Whether mainline CH0 inbound traffic is actually IO-coherent is
+	 * UNVERIFIED: our RC does no IOCC programming yet (downstream enables it
+	 * via DBI 0x8E8 plus sysreg shareability with use-cache-coherency=true),
+	 * and no INIT_START has ever reached mainline to confirm the cached view.
 	 */
-	*map = devm_ioremap_wc(sm->dev, rmem->base, rmem->size);
+	if (cached) {
+		*map = (void __iomem __force *)
+			devm_memremap(sm->dev, rmem->base, rmem->size,
+				      MEMREMAP_WB);
+		if (IS_ERR(*map))
+			return PTR_ERR((void *)*map);
+	} else {
+		*map = devm_ioremap_wc(sm->dev, rmem->base, rmem->size);
+	}
 	if (!*map)
 		return -ENOMEM;
 
@@ -601,7 +1099,7 @@ static int s5300_probe(struct platform_device *pdev)
 	struct s5300_modem *sm;
 	const char *fw_name;
 	u16 cmd;
-	int ret;
+	int i, ret;
 
 	sm = devm_kzalloc(dev, sizeof(*sm), GFP_KERNEL);
 	if (!sm)
@@ -640,15 +1138,60 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_rc;
 	}
 
-	ret = s5300_map_region(sm, "ipc", &sm->ipc_phys, &sm->ipc_size,
+	/* Liveness diagnostics only: warn and carry on without them. */
+	sm->cp2ap_active = devm_gpiod_get_optional(dev, "cp2ap-active",
+						   GPIOD_IN);
+	if (IS_ERR(sm->cp2ap_active)) {
+		dev_warn(dev, "no CP2AP_CP_ACTIVE line: %ld\n",
+			 PTR_ERR(sm->cp2ap_active));
+		sm->cp2ap_active = NULL;
+	}
+	sm->cp2ap_ps_hold = devm_gpiod_get_optional(dev, "cp2ap-ps-hold",
+						    GPIOD_IN);
+	if (IS_ERR(sm->cp2ap_ps_hold)) {
+		dev_warn(dev, "no CP2AP_PS_HOLD line: %ld\n",
+			 PTR_ERR(sm->cp2ap_ps_hold));
+		sm->cp2ap_ps_hold = NULL;
+	}
+
+	/*
+	 * EXPERIMENT (cache matrix, 2026-07-04): map IPC and PKTPROC
+	 * write-combined for this boot.  Downstream maps them cached, but it
+	 * also programs the RC for IO coherency (set_iocc: DBI 0x8E8 + sysreg
+	 * shareability), which our RC does not do yet -- and the cached
+	 * mapping has only ever been tested together with the base-4 MSI fix,
+	 * while every visible-writes (WC) boot ran under the old base-0 MSI
+	 * misrouting.  WC guarantees the boot magic/handover block reach DRAM
+	 * before the CP can look.  Revert to cached + RC IOCC once the
+	 * INIT_START blocker is found.
+	 */
+	ret = s5300_map_region(sm, "ipc", false, &sm->ipc_phys, &sm->ipc_size,
 			       &sm->ipc);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to map IPC carveout\n");
 		goto err_rc;
 	}
-	ret = s5300_map_region(sm, "msi", &sm->msi_phys, NULL, &sm->msi);
+	/*
+	 * Cacheable 4K alias of the IPC header, read-only, for the dual-view
+	 * diagnostics: shows what the coherent domain holds next to the DRAM
+	 * view above (mismatched-attribute alias, never written through).
+	 */
+	sm->ipc_wb = (void __iomem __force *)
+		devm_memremap(dev, sm->ipc_phys, SZ_4K, MEMREMAP_WB);
+	if (IS_ERR(sm->ipc_wb))
+		sm->ipc_wb = NULL;
+	ret = s5300_map_region(sm, "msi", false, &sm->msi_phys, NULL,
+			       &sm->msi);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to map MSI carveout\n");
+		goto err_rc;
+	}
+
+	/* Downstream cp_shmem: PKTPROC cached=1; WC here, see the IPC note. */
+	ret = s5300_map_region(sm, "pktproc", false, &sm->pktproc_phys, NULL,
+			       &sm->pktproc);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to map PKTPROC carveout\n");
 		goto err_rc;
 	}
 
@@ -683,15 +1226,11 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "CP endpoint %s\n", pci_name(sm->pdev));
 
 	/*
-	 * Downstream keeps every form of link PM off for the whole CP boot
-	 * (L1SS only comes on from complete_normal_boot(), and its config
-	 * accessors pin the link at L0 for each access).  The core enabled
-	 * ASPM L1 at enumeration; take it back out before poking config
-	 * space -- the mask ROM's config emulation has been seen returning
-	 * garbled completions to rapid access bursts.
+	 * Keep link PM off while talking to the ROM, but do not call
+	 * pci_disable_link_state(): this experiment enables the downstream-style
+	 * CP L1SS/ASPM state after the BL1 bounce, before the link-ack doorbell.
 	 */
-	pci_disable_link_state(sm->pdev, PCIE_LINK_STATE_L0S |
-			       PCIE_LINK_STATE_L1 | PCIE_LINK_STATE_CLKPM);
+	s5300_disable_link_pm(sm->pdev);
 
 	/* Before MSI allocation: the EP capability must carry the carveout. */
 	ret = zumapro_pcie_set_msi_target(sm->rc_dev, sm->msi_phys);
@@ -745,28 +1284,66 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Downstream allocates 4 vectors: 0 = IPC message/command, 1 = TX
-	 * flow control, 2..3 spare for pktproc queues.  Only vector 0 matters
-	 * until the data path exists.
+	 * Reserve RC vectors 0-3 so this four-vector request lands at base 4,
+	 * where the CP fires INIT_START and every MAIN-phase interrupt (see
+	 * S5300_MSI_VECTORS).  Leaving the allocation at base 0, as before, put
+	 * the CP's vector-4 interrupt outside our range -- the most likely
+	 * reason the CP looked silent after the bounce.
 	 */
-	ret = pci_alloc_irq_vectors(sm->pdev, 1, 4, PCI_IRQ_MSI);
+	ret = zumapro_pcie_reserve_msi_base(sm->rc_dev, S5300_MSI_VECTORS);
+	if (ret)
+		dev_warn(dev, "MSI base reservation failed: %d (CP vector 4 may miss)\n",
+			 ret);
+
+	ret = pci_alloc_irq_vectors(sm->pdev, S5300_MSI_VECTORS,
+				    S5300_MSI_VECTORS, PCI_IRQ_MSI);
 	if (ret < 0) {
 		dev_err(dev, "MSI alloc: %d (power state %d, msi_cap %#x)\n",
 			ret, sm->pdev->current_state, sm->pdev->msi_cap);
 		goto err_disable;
 	}
-	dev_info(dev, "%d MSI vector(s)\n", ret);
+	sm->irq_count = ret;
+	dev_info(dev, "%d MSI vector(s)\n", sm->irq_count);
 
-	ret = request_irq(pci_irq_vector(sm->pdev, 0), s5300_irq_handler, 0,
-			  "s5300-ipc", sm);
-	if (ret)
-		goto err_vectors;
+	/*
+	 * The CP's vector-4 interrupt only reaches us if this allocation landed
+	 * at base 4, i.e. the EP message-data base reads 4 and the control word
+	 * shows MME=2 (0x40).  Log both so the bring-up test can confirm the
+	 * reservation took; MME=3 (0x60) means we regressed to the ROM-breaking
+	 * eight-vector width.
+	 */
+	if (sm->pdev->msi_cap) {
+		u16 ctrl, data = 0;
+		int data_off;
+
+		pci_read_config_word(sm->pdev,
+				     sm->pdev->msi_cap + PCI_MSI_FLAGS, &ctrl);
+		data_off = (ctrl & PCI_MSI_FLAGS_64BIT) ? PCI_MSI_DATA_64 :
+							  PCI_MSI_DATA_32;
+		pci_read_config_word(sm->pdev, sm->pdev->msi_cap + data_off,
+				     &data);
+		dev_info(dev,
+			 "EP MSI ctrl %#06x data base %#06x (CP fires vector 4; want base 4, MME=2)\n",
+			 ctrl, data);
+	}
+
+	for (i = 0; i < sm->irq_count; i++) {
+		ret = request_irq(pci_irq_vector(sm->pdev, i),
+				  s5300_irq_handler, 0, s5300_msi_names[i], sm);
+		if (ret)
+			goto err_irqs;
+		dev_info(dev, "requested MSI vector %d irq %d (%s)\n", i,
+			 pci_irq_vector(sm->pdev, i), s5300_msi_names[i]);
+	}
+	s5300_unmask_msi_vectors(sm);
 
 	schedule_work(&sm->boot_work);
 
 	return 0;
 
-err_vectors:
+err_irqs:
+	while (i--)
+		free_irq(pci_irq_vector(sm->pdev, i), sm);
 	pci_free_irq_vectors(sm->pdev);
 err_disable:
 	pci_disable_device(sm->pdev);
@@ -782,10 +1359,12 @@ err_rc:
 static void s5300_remove(struct platform_device *pdev)
 {
 	struct s5300_modem *sm = platform_get_drvdata(pdev);
+	int i;
 
 	cancel_work_sync(&sm->boot_work);
 	release_firmware(sm->pbl);
-	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	for (i = 0; i < sm->irq_count; i++)
+		free_irq(pci_irq_vector(sm->pdev, i), sm);
 	pci_free_irq_vectors(sm->pdev);
 	pci_disable_device(sm->pdev);
 	pci_dev_put(sm->pdev);

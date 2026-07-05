@@ -14,14 +14,33 @@
 #include <linux/types.h>
 
 struct device;
+struct pci_dev;
 
 #if IS_ENABLED(CONFIG_PCIE_ZUMAPRO)
 int zumapro_pcie_set_msi_target(struct device *rc_dev, phys_addr_t target);
+int zumapro_pcie_reserve_msi_base(struct device *rc_dev, unsigned int count);
+int zumapro_pcie_modem_set_light(struct device *rc_dev, bool light);
+int zumapro_pcie_modem_msi_status(struct device *rc_dev);
 int zumapro_pcie_modem_link_down(struct device *rc_dev);
 int zumapro_pcie_modem_link_up(struct device *rc_dev);
+int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev, struct pci_dev *ep);
 #else
 static inline int zumapro_pcie_set_msi_target(struct device *rc_dev,
 					      phys_addr_t target)
+{
+	return -ENODEV;
+}
+static inline int zumapro_pcie_reserve_msi_base(struct device *rc_dev,
+						unsigned int count)
+{
+	return -ENODEV;
+}
+static inline int zumapro_pcie_modem_set_light(struct device *rc_dev,
+					       bool light)
+{
+	return -ENODEV;
+}
+static inline int zumapro_pcie_modem_msi_status(struct device *rc_dev)
 {
 	return -ENODEV;
 }
@@ -30,6 +49,11 @@ static inline int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	return -ENODEV;
 }
 static inline int zumapro_pcie_modem_link_up(struct device *rc_dev)
+{
+	return -ENODEV;
+}
+static inline int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev,
+						 struct pci_dev *ep)
 {
 	return -ENODEV;
 }

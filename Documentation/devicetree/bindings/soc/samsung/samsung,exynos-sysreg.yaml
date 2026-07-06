@@ -22,6 +22,7 @@ properties:
               - google,gs101-peric0-sysreg
               - google,gs101-peric1-sysreg
               - google,zumapro-disp-sysreg
+              - google,zumapro-hsi1-sysreg
               - google,zumapro-hsi2-sysreg
               - google,zumapro-peric0-sysreg
               - google,zumapro-peric1-sysreg
@@ -104,6 +105,7 @@ allOf:
               - google,gs101-peric0-sysreg
               - google,gs101-peric1-sysreg
               - google,zumapro-disp-sysreg
+              - google,zumapro-hsi1-sysreg
               - google,zumapro-hsi2-sysreg
               - samsung,exynos850-cmgp-sysreg
               - samsung,exynos850-peri-sysreg

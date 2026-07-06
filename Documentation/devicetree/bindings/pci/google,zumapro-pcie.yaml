@@ -10,9 +10,10 @@ maintainers:
   - Steffen Deusch <steffen@deusch.me>
 
 description:
-  PCIe root complex for the GEN3A_1 controller of the Google Zumapro
-  (Tensor G4) SoC, used for the on-board WiFi.  It is based on the Synopsys
-  DesignWare PCIe IP and inherits the common properties from snps,dw-pcie.yaml.
+  PCIe root complexes of the Google Zumapro (Tensor G4) SoC, based on the
+  Synopsys DesignWare PCIe IP, inheriting the common properties from
+  snps,dw-pcie.yaml.  The GEN3A_1 controller on HSI2 (x1) serves the on-board
+  WiFi; the GEN3_0 controller on HSI1 (x2) serves the Exynos modem.
 
 allOf:
   - $ref: /schemas/pci/snps,dw-pcie.yaml#
@@ -64,6 +65,9 @@ properties:
     items:
       - const: pcie
 
+  power-domains:
+    maxItems: 1
+
   reset-gpios:
     maxItems: 1
     description: PERST# reset line to the endpoint.
@@ -80,7 +84,42 @@ properties:
       Phandle/offset pair for the PMU register controlling the PCIe block.
 
   num-lanes:
-    const: 1
+    enum: [1, 2]
+
+  google,cp-pwr-gpios:
+    maxItems: 1
+    description: CP (modem) power-on line (AP2CP_CP_PWR_ON).
+
+  google,cp-pda-active-gpios:
+    maxItems: 1
+    description: CP PDA_ACTIVE handshake line.
+
+  google,cp-wakeup-gpios:
+    maxItems: 1
+    description: AP2CP wakeup line.
+
+  google,cp-pm-wrst-gpios:
+    maxItems: 1
+    description: CP PMIC warm-reset line (raw level, deasserted high).
+
+  google,cp-nreset-gpios:
+    maxItems: 1
+    description: CP reset line (raw level, deasserted high).
+
+  google,cp-wrst-gpios:
+    maxItems: 1
+    description: CP warm-reset line (raw level, deasserted high).
+
+dependentRequired:
+  # Bring-up scaffolding for the modem endpoint on the HSI1 controller: the
+  # root complex sequences the CP rails before link training so the modem
+  # mask-ROM enumerates.  Moves to the modem-control driver once one exists.
+  google,cp-pwr-gpios:
+    - google,cp-pda-active-gpios
+    - google,cp-wakeup-gpios
+    - google,cp-pm-wrst-gpios
+    - google,cp-nreset-gpios
+    - google,cp-wrst-gpios
 
 required:
   - compatible

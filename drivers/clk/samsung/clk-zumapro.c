@@ -18,10 +18,11 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_MISC_NOC + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI1_PCIE + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI10_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
+#define CLKS_NR_HSI1		(CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK + 1)
 #define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USB32DRD_LINK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
@@ -48,6 +49,8 @@
 
 /* Register offsets for CMU_TOP (0x26040000) */
 #define CLK_CON_CMU_TOP_CONTROLLER_OPTION	0x0800
+#define CLK_CON_MUX_MUX_CLKCMU_HSI1_NOC		0x10a4
+#define CLK_CON_MUX_MUX_CLKCMU_HSI1_PCIE	0x10a8
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD	0x10ac
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_NOC		0x10b0
 #define CLK_CON_MUX_MUX_CLKCMU_HSI2_PCIE	0x10b4
@@ -56,6 +59,8 @@
 #define CLK_CON_MUX_MUX_CLKCMU_PERIC0_NOC	0x10f0
 #define CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP	0x10f4
 #define CLK_CON_MUX_MUX_CLKCMU_PERIC1_NOC	0x10f8
+#define CLK_CON_DIV_CLKCMU_HSI1_NOC		0x189c
+#define CLK_CON_DIV_CLKCMU_HSI1_PCIE		0x18a0
 #define CLK_CON_DIV_CLKCMU_HSI2_MMC_CARD	0x18a4
 #define CLK_CON_DIV_CLKCMU_HSI2_NOC		0x18a8
 #define CLK_CON_DIV_CLKCMU_HSI2_PCIE		0x18ac
@@ -64,6 +69,8 @@
 #define CLK_CON_DIV_CLKCMU_PERIC0_NOC		0x18e8
 #define CLK_CON_DIV_CLKCMU_PERIC1_IP		0x18ec
 #define CLK_CON_DIV_CLKCMU_PERIC1_NOC		0x18f0
+#define CLK_CON_GAT_GATE_CLKCMU_HSI1_NOC	0x20cc
+#define CLK_CON_GAT_GATE_CLKCMU_HSI1_PCIE	0x20d0
 #define CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD	0x20d4
 #define CLK_CON_GAT_GATE_CLKCMU_HSI2_NOC	0x20d8
 #define CLK_CON_GAT_GATE_CLKCMU_HSI2_PCIE	0x20dc
@@ -100,6 +107,8 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_DPUF1_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_HSI1_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_HSI1_PCIE,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_HSI2_PCIE,
@@ -108,6 +117,8 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_PERIC0_NOC,
 	CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP,
 	CLK_CON_MUX_MUX_CLKCMU_PERIC1_NOC,
+	CLK_CON_DIV_CLKCMU_HSI1_NOC,
+	CLK_CON_DIV_CLKCMU_HSI1_PCIE,
 	CLK_CON_DIV_CLKCMU_HSI2_MMC_CARD,
 	CLK_CON_DIV_CLKCMU_HSI2_NOC,
 	CLK_CON_DIV_CLKCMU_HSI2_PCIE,
@@ -124,6 +135,8 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_HSI1_NOC,
+	CLK_CON_GAT_GATE_CLKCMU_HSI1_PCIE,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_HSI2_PCIE,
@@ -164,6 +177,12 @@ PNAME(mout_cmu_pericx_p) = {
 	"fout_shared0_d4", "fout_shared2_d2",
 	"fout_shared3_d2", "fout_spare_pll",
 };
+PNAME(mout_cmu_hsi1_noc_p) = {
+	"fout_shared0_d4", "fout_shared1_d4",
+	"fout_shared2_d2", "fout_shared3_d2",
+	"fout_spare_pll", "oscclk", "oscclk", "oscclk",
+};
+PNAME(mout_cmu_hsi1_pcie_p) = { "oscclk", "fout_shared2_d2" };
 PNAME(mout_cmu_hsi2_mmc_card_p) = {
 	"fout_shared2_d1", "fout_shared3_d1",
 	"fout_shared0_d4", "fout_spare_pll",
@@ -207,6 +226,10 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_dpu_noc_p, CLK_CON_MUX_MUX_CLKCMU_DPUF0_NOC, 0, 3),
 	MUX(CLK_MOUT_CMU_DPUF1_NOC, "mout_cmu_dpuf1_noc",
 	    mout_cmu_dpu_noc_p, CLK_CON_MUX_MUX_CLKCMU_DPUF1_NOC, 0, 3),
+	MUX(CLK_MOUT_CMU_HSI1_NOC, "mout_cmu_hsi1_noc",
+	    mout_cmu_hsi1_noc_p, CLK_CON_MUX_MUX_CLKCMU_HSI1_NOC, 0, 3),
+	MUX(CLK_MOUT_CMU_HSI1_PCIE, "mout_cmu_hsi1_pcie",
+	    mout_cmu_hsi1_pcie_p, CLK_CON_MUX_MUX_CLKCMU_HSI1_PCIE, 0, 1),
 	MUX(CLK_MOUT_CMU_HSI2_MMC_CARD, "mout_cmu_hsi2_mmc_card",
 	    mout_cmu_hsi2_mmc_card_p, CLK_CON_MUX_MUX_CLKCMU_HSI2_MMC_CARD,
 	    0, 2),
@@ -257,6 +280,13 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_CMU_DPUF1_NOC, "gout_cmu_dpuf1_noc",
 	     "mout_cmu_dpuf1_noc", CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC,
 	     21, 0, 0),
+	/* HSI1 fabric + PCIe reference (modem PCIe CH0 root complex). */
+	GATE(CLK_GOUT_CMU_HSI1_NOC, "gout_cmu_hsi1_noc",
+	     "mout_cmu_hsi1_noc", CLK_CON_GAT_GATE_CLKCMU_HSI1_NOC,
+	     21, 0, 0),
+	GATE(CLK_GOUT_CMU_HSI1_PCIE, "gout_cmu_hsi1_pcie",
+	     "mout_cmu_hsi1_pcie", CLK_CON_GAT_GATE_CLKCMU_HSI1_PCIE,
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_HSI2_MMC_CARD, "gout_cmu_hsi2_mmc_card",
 	     "mout_cmu_hsi2_mmc_card", CLK_CON_GAT_GATE_CLKCMU_HSI2_MMC_CARD,
 	     21, 0, 0),
@@ -306,6 +336,10 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_dpuf0_noc", CLK_CON_DIV_CLKCMU_DPUF0_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_DPUF1_NOC, "dout_cmu_dpuf1_noc",
 	    "gout_cmu_dpuf1_noc", CLK_CON_DIV_CLKCMU_DPUF1_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_HSI1_NOC, "dout_cmu_hsi1_noc",
+	    "gout_cmu_hsi1_noc", CLK_CON_DIV_CLKCMU_HSI1_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_HSI1_PCIE, "dout_cmu_hsi1_pcie",
+	    "gout_cmu_hsi1_pcie", CLK_CON_DIV_CLKCMU_HSI1_PCIE, 0, 3),
 	DIV(CLK_DOUT_CMU_HSI2_MMC_CARD, "dout_cmu_hsi2_mmc_card",
 	    "gout_cmu_hsi2_mmc_card", CLK_CON_DIV_CLKCMU_HSI2_MMC_CARD,
 	    0, 9),
@@ -646,6 +680,130 @@ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
 	.auto_clock_gate = true,
 	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
 	.option_offset	= CLK_CON_CMU_PERIC1_CONTROLLER_OPTION,
+	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
+};
+
+/* ---- CMU_HSI1 ----------------------------------------------------------- */
+
+/*
+ * Register offsets for CMU_HSI1 (0x12000000).
+ *
+ * BLK_HSI1 hosts the modem's PCIe CH0 root complex (pcie@12100000, Gen3 x2,
+ * downstream IP name PCIE_GEN3_0 / PAMIR_G3X2).  Offsets are from the
+ * downstream Zuma cmucal-sfr.c tables like the CMU_HSI2 slice below; the block
+ * sits in the pd-hsi1 power domain (PMU HSI1_CONFIGURATION 0x15462b00).
+ */
+#define CLK_CON_CMU_HSI1_CONTROLLER_OPTION		0x0800
+#define PLL_CON0_MUX_CLKCMU_HSI1_NOC_USER		0x0600
+#define PLL_CON0_MUX_CLKCMU_HSI1_PCIE_USER		0x0610
+#define CLK_CON_GAT_CLK_BLK_HSI1_UID_HSI1_CMU_HSI1_IPCLKPORT_PCLK \
+								0x2004
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_GPIO_HSI1_IPCLKPORT_PCLK	0x205c
+#define QCH_CON_GPIO_HSI1_QCH				0x303c
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_SYSREG_HSI1_IPCLKPORT_PCLK \
+								0x20d4
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PHY_REFCLK_IN	0x208c
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DBI_ACLK	0x2068
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_MSTR_ACLK	0x206c
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_SLV_ACLK	0x2070
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DRIVER_APB_CLK	0x2074
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_UDBG_APB_PCLK	0x2090
+#define CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PIPE_PAL_APB_PCLK	0x2094
+
+static const unsigned long hsi1_clk_regs[] __initconst = {
+	CLK_CON_CMU_HSI1_CONTROLLER_OPTION,
+	PLL_CON0_MUX_CLKCMU_HSI1_NOC_USER,
+	PLL_CON0_MUX_CLKCMU_HSI1_PCIE_USER,
+	CLK_CON_GAT_CLK_BLK_HSI1_UID_HSI1_CMU_HSI1_IPCLKPORT_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_GPIO_HSI1_IPCLKPORT_PCLK,
+	QCH_CON_GPIO_HSI1_QCH,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_SYSREG_HSI1_IPCLKPORT_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PHY_REFCLK_IN,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DBI_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_MSTR_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_SLV_ACLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DRIVER_APB_CLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_UDBG_APB_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PIPE_PAL_APB_PCLK,
+};
+
+PNAME(mout_hsi1_noc_user_p) = { "oscclk", "dout_cmu_hsi1_noc" };
+PNAME(mout_hsi1_pcie_user_p) = { "oscclk", "dout_cmu_hsi1_pcie" };
+
+static const struct samsung_mux_clock hsi1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_HSI1_NOC_USER, "mout_hsi1_noc_user",
+	    mout_hsi1_noc_user_p, PLL_CON0_MUX_CLKCMU_HSI1_NOC_USER,
+	    4, 1),
+	MUX(CLK_MOUT_HSI1_PCIE_USER, "mout_hsi1_pcie_user",
+	    mout_hsi1_pcie_user_p, PLL_CON0_MUX_CLKCMU_HSI1_PCIE_USER,
+	    4, 1),
+};
+
+static const struct samsung_gate_clock hsi1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_HSI1_CMU_HSI1_PCLK,
+	     "gout_hsi1_cmu_hsi1_pclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_CLK_BLK_HSI1_UID_HSI1_CMU_HSI1_IPCLKPORT_PCLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_GPIO_HSI1_QCH,
+	     "gout_hsi1_gpio_hsi1_qch", "mout_hsi1_noc_user",
+	     QCH_CON_GPIO_HSI1_QCH, 0, 0, 0),
+	GATE(CLK_GOUT_HSI1_GPIO_HSI1_PCLK,
+	     "gout_hsi1_gpio_hsi1_pclk", "gout_hsi1_gpio_hsi1_qch",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_GPIO_HSI1_IPCLKPORT_PCLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_SYSREG_HSI1_PCLK,
+	     "gout_hsi1_sysreg_hsi1_pclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_SYSREG_HSI1_IPCLKPORT_PCLK,
+	     21, 0, 0),
+	/*
+	 * PCIe GEN3_0 (modem).  Only the PHY reference runs off the dedicated
+	 * pcie_user mux; the controller AXI/APB clocks share the HSI1 bus mux,
+	 * matching the CMU_HSI2 GEN3A_1 layout.
+	 */
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_PHY_REFCLK_IN,
+	     "gout_hsi1_pcie_gen3_0_phy_refclk_in", "mout_hsi1_pcie_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PHY_REFCLK_IN,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_DBI_ACLK,
+	     "gout_hsi1_pcie_gen3_0_dbi_aclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DBI_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_MSTR_ACLK,
+	     "gout_hsi1_pcie_gen3_0_mstr_aclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_MSTR_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_SLV_ACLK,
+	     "gout_hsi1_pcie_gen3_0_slv_aclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_SLV_ACLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_DRIVER_APB_CLK,
+	     "gout_hsi1_pcie_gen3_0_driver_apb_clk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_DRIVER_APB_CLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_UDBG_APB_PCLK,
+	     "gout_hsi1_pcie_gen3_0_udbg_apb_pclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_UDBG_APB_PCLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK,
+	     "gout_hsi1_pcie_gen3_0_pipe_pal_apb_pclk", "mout_hsi1_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI1_UID_PCIE_GEN3_0_PIPE_PAL_APB_PCLK,
+	     21, 0, 0),
+};
+
+static const struct samsung_cmu_info hsi1_cmu_info __initconst = {
+	.mux_clks	= hsi1_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(hsi1_mux_clks),
+	.gate_clks	= hsi1_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(hsi1_gate_clks),
+	.nr_clk_ids	= CLKS_NR_HSI1,
+	.clk_regs	= hsi1_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(hsi1_clk_regs),
+	.sysreg_clk_regs = zumapro_dcrg_sysreg,
+	.nr_sysreg_clk_regs = ARRAY_SIZE(zumapro_dcrg_sysreg),
+	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= CLK_CON_CMU_HSI1_CONTROLLER_OPTION,
 	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
 };
 
@@ -1301,6 +1459,9 @@ static const struct of_device_id zumapro_cmu_of_match[] = {
 	}, {
 		.compatible = "google,zumapro-cmu-peric1",
 		.data = &peric1_cmu_info,
+	}, {
+		.compatible = "google,zumapro-cmu-hsi1",
+		.data = &hsi1_cmu_info,
 	}, {
 		.compatible = "google,zumapro-cmu-hsi2",
 		.data = &hsi2_cmu_info,

@@ -914,6 +914,12 @@
 	google,cp-wrst-gpios = <&gpp16 3 GPIO_ACTIVE_HIGH>;
 	google,cp-wakeup-gpios = <&gpp16 0 GPIO_ACTIVE_HIGH>;
 	google,cp-pda-active-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+	/*
+	 * Source: dumped.dts gpio_ap2cp_dump_noti (gpp16-1).  Downstream
+	 * power_on_cp() drives it low before the rails; left floating, CP MAIN
+	 * may boot into dump mode instead of normal IPC.
+	 */
+	google,cp-dump-noti-gpios = <&gpp16 1 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
 

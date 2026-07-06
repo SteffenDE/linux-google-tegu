@@ -85,6 +85,15 @@
 #define S5300_BOOT_STAGE_DONE		0x3fff
 
 /*
+ * The mask ROM only tolerates MME=2 (4 vectors); the RC reserves vectors 0-3
+ * for itself first (zumapro_pcie_reserve_msi_base) so the modem lands at data
+ * base 4.  MAIN fires its post-link-ack notify on message 4 = the EP's vector
+ * 0, so request_irq() on vector 0 catches both the ROM ack and MAIN's
+ * INIT_START.
+ */
+#define S5300_MSI_VECTORS		4
+
+/*
  * IPC region layout (downstream create_legacy_link_device() with tegu's DT
  * offsets, and the DRAM_V1 control-message words).
  */
@@ -1210,11 +1219,22 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Downstream allocates 4 vectors: 0 = IPC message/command, 1 = TX flow
-	 * control, 2..3 spare for pktproc queues.  Only vector 0 matters until
-	 * the data path exists.
+	 * Reserve the RC's own vectors 0-3 so the modem's 4 vectors land at data
+	 * base 4 (MME=2), matching downstream byte-for-byte.  MAIN's INIT_START
+	 * MSI (message 4) then lands on the EP's vector 0.
 	 */
-	ret = pci_alloc_irq_vectors(sm->pdev, 1, 4, PCI_IRQ_MSI);
+	ret = zumapro_pcie_reserve_msi_base(sm->rc_dev, S5300_MSI_VECTORS);
+	if (ret)
+		goto err_disable;
+
+	/*
+	 * Exactly 4 vectors: the mask ROM aborts the PBL download at any other
+	 * MME (8 vectors -> MME=3 regressed boot_stage to 0x1ff on hardware).
+	 * Vector 0 = IPC message/command; 1 = TX flow control; 2..3 spare for
+	 * pktproc.  Only vector 0 matters until the data path exists.
+	 */
+	ret = pci_alloc_irq_vectors(sm->pdev, S5300_MSI_VECTORS,
+				    S5300_MSI_VECTORS, PCI_IRQ_MSI);
 	if (ret < 0) {
 		dev_err(dev, "MSI alloc: %d (power state %d, msi_cap %#x)\n",
 			ret, sm->pdev->current_state, sm->pdev->msi_cap);

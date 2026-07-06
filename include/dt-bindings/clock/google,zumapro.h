@@ -73,6 +73,18 @@
 #define CLK_DOUT_CMU_MISC_NOC			56
 
 /*
+ * CMU_TOP HSI1 feeds.  BLK_HSI1 carries the modem's PCIe CH0 root complex
+ * (Gen3 x2, pcie@12100000); the NOC feed clocks the block fabric and the PCIE
+ * feed is the PHY reference the CMU_HSI1 PCIE USER mux selects.
+ */
+#define CLK_MOUT_CMU_HSI1_NOC			57
+#define CLK_GOUT_CMU_HSI1_NOC			58
+#define CLK_DOUT_CMU_HSI1_NOC			59
+#define CLK_MOUT_CMU_HSI1_PCIE			60
+#define CLK_GOUT_CMU_HSI1_PCIE			61
+#define CLK_DOUT_CMU_HSI1_PCIE			62
+
+/*
  * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
  * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
  * brought up.
@@ -153,6 +165,25 @@
 #define CLK_GOUT_HSI2_PCIE_GEN3A_1_PIPE_PAL_APB_PCLK	20
 #define CLK_GOUT_HSI2_GPIO_HSI2_PCLK			21
 #define CLK_GOUT_HSI2_GPIO_HSI2_QCH			22
+
+/* CMU_HSI1 muxes */
+#define CLK_MOUT_HSI1_NOC_USER			1
+#define CLK_MOUT_HSI1_PCIE_USER			2
+
+/* CMU_HSI1 gates */
+#define CLK_GOUT_HSI1_CMU_HSI1_PCLK		3
+#define CLK_GOUT_HSI1_GPIO_HSI1_QCH		4
+#define CLK_GOUT_HSI1_GPIO_HSI1_PCLK		5
+#define CLK_GOUT_HSI1_SYSREG_HSI1_PCLK		6
+
+/* CMU_HSI1 PCIe GEN3_0 gates (modem root complex, Gen3 x2) */
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_PHY_REFCLK_IN		7
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_DBI_ACLK		8
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_MSTR_ACLK		9
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_SLV_ACLK		10
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_DRIVER_APB_CLK	11
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_UDBG_APB_PCLK		12
+#define CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK	13
 
 /*
  * CMU_HSI0 (USB) clocks.

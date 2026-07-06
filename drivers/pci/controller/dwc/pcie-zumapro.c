@@ -10,6 +10,8 @@
  */
 
 #include <linux/arm-smccc.h>
+#include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -19,20 +21,28 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/pcie-zumapro.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-zumapro-pcie.h>
 #include <linux/platform_device.h>
 
 #include "pcie-designware.h"
 
 #define to_zumapro_pcie(x)	dev_get_drvdata((x)->dev)
 
+static const struct of_device_id zumapro_pcie_of_match[];
+
 /* ELBI (app/controller) registers, relative to pci->elbi_base. */
+#define PCIE_IRQ0			0x0000
+#define   IRQ_RADM_PM_TO_ACK		BIT(29)
 #define PCIE_APP_LTSSM_ENABLE		0x0054
 #define   LTSSM_ENABLE			0x1
+#define PCIE_APP_REQ_EXIT_L1		0x006c
 #define PCIE_APP_XFER_PENDING		0x0074
 #define   APP_XFER_PENDING		0x1
 #define PCIE_DEVICE_TYPE		0x0080
 #define   DEVICE_TYPE_RC		0x4
+#define PCIE_XMIT_PME_TURNOFF		0x0118
 #define PCIE_ELBI_RDLH_LINKUP		0x02c8
 #define   LTSSM_STATE_MASK		0x3f
 /*
@@ -46,11 +56,14 @@
 #define   LTSSM_STATE_RCVRY_LOCK	0x0d
 #define   LTSSM_STATE_L0		0x11
 #define   LTSSM_STATE_L1_IDLE		0x14
+#define   LTSSM_STATE_L2_IDLE		0x15
 #define PCIE_LINKDOWN_RST_CTRL_SEL	0x03a0
 #define   LINKDOWN_RST_MANUAL		BIT(1)
 #define PCIE_SOFT_RESET			0x03a4
 #define   SOFT_RESET_ALL		0xf
 #define   SOFT_RESET_PWR_PULSE		0xd	/* SOFT_RESET_ALL with PWR bit low */
+#define   SOFT_PWR_RESET		BIT(1)	/* active-low: 1 released, 0 asserted */
+#define   SOFT_NON_STICKY_RESET		BIT(3)	/* active-low, as above */
 #define PCIE_QCH_SEL			0x03a8
 #define   CLOCK_GATING_AXI_MASK		(0xf << 0)
 #define   CLOCK_GATING_APB_MASK		(0xf << 4)
@@ -86,6 +99,11 @@
 #define PCIE_LINK_WAIT_US		50000
 #define PCIE_LINK_WAIT_STEP_US		10
 #define PCIE_LINK_TRAIN_RETRIES		10
+#define PCIE_L1_EXIT_WAIT_US		3000
+#define PCIE_L1_EXIT_WAIT_STEP_US	10
+/* PME_Turn_Off / L2 entry poll budget: downstream MAX_L2_TIMEOUT (2000) x 10 us. */
+#define PCIE_L2_ENTER_WAIT_US		20000
+#define PCIE_L2_ENTER_WAIT_STEP_US	10
 
 struct zumapro_pcie {
 	struct dw_pcie		pci;
@@ -94,7 +112,147 @@ struct zumapro_pcie {
 	struct phy		*phy;
 	struct gpio_desc	*perst;
 	phys_addr_t		pmu_phys;
+	/* Optional CP (modem) rail-sequencing lines; see cp_power_on(). */
+	struct gpio_desc	*cp_pda_active;
+	struct gpio_desc	*cp_dump_noti;
+	struct gpio_desc	*cp_wakeup;
+	struct gpio_desc	*cp_pm_wrst;
+	struct gpio_desc	*cp_pwr;
+	struct gpio_desc	*cp_nreset;
+	struct gpio_desc	*cp_wrst;
+	/* PHY was powered down by modem_link_down; link_up skips its off. */
+	bool			cp_phy_off;
+	/* Experiment: light bounce (LTSSM-only, no PERST/PHY reset). */
+	/*
+	 * iMSI-RX enable/mask/target snapshot taken in modem_link_down before
+	 * SOFT_PWR_RESET wipes the controller core, restored in modem_link_up
+	 * after dw_pcie_setup_rc().  The generic DWC MSI domain only writes the
+	 * per-message ENABLE bits from the irq-chip unmask at request time, so a
+	 * mid-boot bounce that resets the core would otherwise drop every modem
+	 * MSI (the CP fires its post-link-ack notify on message 4).
+	 */
+	u32			saved_msi_enable;
+	u32			saved_msi_mask;
+	u32			saved_msi_addr_lo;
+	u32			saved_msi_addr_hi;
+	bool			msi_saved;
 };
+
+static struct zumapro_pcie *zumapro_pcie_from_dev(struct device *rc_dev);
+
+/*
+ * Bring-up scaffolding: power the Exynos Modem 5300 endpoint so its mask-ROM
+ * comes up PCIe-visible.  The sequence is the downstream
+ * modem_ctrl_s5100.c power_on_cp()/gpio_power_offon_cp() (non-WRESET_WA)
+ * path: assert pda_active, run the power-off half so a warm-rebooted CP
+ * reaches a clean cold state, then the rail power-on order, then the 200 ms
+ * ROM settle downstream applies before link-up (register_pcie()).  The ROM
+ * boots over PCIe and parks waiting for a boot-image doorbell, so nothing
+ * beyond link training and enumeration happens until a modem driver exists.
+ * This moves into that modem-control driver once the cpif port lands.
+ */
+/*
+ * Downstream modem_ctrl_s5100.c power_on_cp() -> gpio_power_offon_cp()
+ * (non-WRESET_WA): assert pda_active, run the power-off half then the power-on
+ * order, then the 200 ms ROM settle before link-up.  The cp_pwr line is a soft
+ * control -- the modem PMIC self-refreshes CP DRAM across it -- so this cycle
+ * does NOT wipe the resident MAIN image (downstream warm-boots with only the
+ * 92 KB PBL every time, which proves MAIN survives).
+ */
+static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp)
+{
+	dev_info(zp->pci.dev, "powering on the CP (modem) endpoint\n");
+
+	gpiod_direction_output(zp->cp_pda_active, 1);
+	/*
+	 * Downstream power_on_cp() drives DUMP_NOTI low before the rails; a
+	 * floating line risks CP MAIN booting into dump mode.  Optional so
+	 * old DTBs keep working.
+	 */
+	if (zp->cp_dump_noti)
+		gpiod_direction_output(zp->cp_dump_noti, 0);
+
+	gpiod_direction_output(zp->cp_wakeup, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
+	/*
+	 * WARM reset (downstream gpio_power_wreset_cp, confirmed on the live
+	 * device): hold cp_pwr/cp_nreset HIGH and pulse ONLY pm_wrst + cp_wrst.
+	 * The full mainline-vs-downstream log diff isolated this cold
+	 * cp_pwr/cp_nreset cycle as the SOLE remaining AP-side difference vs a
+	 * working boot; cp_pwr is a soft power control (DRAM self-refreshes
+	 * across it) so the cold drop plausibly power-cycles the CP PCIe
+	 * controller and clears the sticky state that lets the doorbell-generate
+	 * decode survive the later PERST bounce -- which the warm path keeps.
+	 *
+	 * Differs from the reverted "wrst-only" attempt (which pulsed cp_wrst
+	 * alone and regressed the PBL download to 0x1ff): downstream pulses BOTH
+	 * pm_wrst and cp_wrst, 50ms/10ms.  Caveat: if the bootloader left cp_pwr
+	 * LOW (cold CP), forcing it high here is a fresh power-on, not a warm
+	 * reset -- but on a warm boot after downstream it is already high.
+	 * Risk: if this regresses the download to 0x1ff, the CP needs a graceful
+	 * halt (cp2ap_cp_wrst handshake) first; revert to the cold cycle then.
+	 */
+	dev_info(zp->pci.dev, "TEGU_CP_TRACE gpio PWR=1 NRESET=1 (warm, held high)\n");
+	gpiod_direction_output(zp->cp_pwr, 1);
+	gpiod_direction_output(zp->cp_nreset, 1);
+	dev_info(zp->pci.dev, "TEGU_CP_TRACE gpio CP_WRST=0\n");
+	gpiod_direction_output(zp->cp_wrst, 0);
+	dev_info(zp->pci.dev, "TEGU_CP_TRACE gpio PM_WRST=0\n");
+	gpiod_direction_output(zp->cp_pm_wrst, 0);
+	msleep(50);
+	dev_info(zp->pci.dev, "TEGU_CP_TRACE gpio PM_WRST=1\n");
+	gpiod_set_value_cansleep(zp->cp_pm_wrst, 1);
+	msleep(10);
+	dev_info(zp->pci.dev, "TEGU_CP_TRACE gpio CP_WRST=1\n");
+	gpiod_set_value_cansleep(zp->cp_wrst, 1);
+
+	/* ROM settle before link training */
+	msleep(200);
+
+	/*
+	 * Downstream raises AP2CP_WAKEUP before every link-up, including
+	 * this first ROM-phase one (s5100_poweron_pcie()); the CP only
+	 * keeps its end of the link fully awake while it is high.
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 1);
+	msleep(5);
+}
+
+static int zumapro_pcie_cp_get_gpios(struct zumapro_pcie *zp)
+{
+	struct device *dev = zp->pci.dev;
+
+	/*
+	 * All lines are requested as-is: the power-on sequence sets each
+	 * direction and level in the downstream order, so requesting them
+	 * output-low here would drop a possibly-running CP's rails in
+	 * request order instead.
+	 */
+	zp->cp_pwr = devm_gpiod_get_optional(dev, "google,cp-pwr", GPIOD_ASIS);
+	if (IS_ERR(zp->cp_pwr))
+		return PTR_ERR(zp->cp_pwr);
+	if (!zp->cp_pwr)
+		return 0;
+
+	zp->cp_pda_active = devm_gpiod_get(dev, "google,cp-pda-active",
+					   GPIOD_ASIS);
+	zp->cp_dump_noti = devm_gpiod_get_optional(dev, "google,cp-dump-noti",
+						   GPIOD_ASIS);
+	if (IS_ERR(zp->cp_dump_noti))
+		return PTR_ERR(zp->cp_dump_noti);
+	zp->cp_wakeup = devm_gpiod_get(dev, "google,cp-wakeup", GPIOD_ASIS);
+	zp->cp_pm_wrst = devm_gpiod_get(dev, "google,cp-pm-wrst", GPIOD_ASIS);
+	zp->cp_nreset = devm_gpiod_get(dev, "google,cp-nreset", GPIOD_ASIS);
+	zp->cp_wrst = devm_gpiod_get(dev, "google,cp-wrst", GPIOD_ASIS);
+	if (IS_ERR(zp->cp_pda_active) || IS_ERR(zp->cp_wakeup) ||
+	    IS_ERR(zp->cp_pm_wrst) || IS_ERR(zp->cp_nreset) ||
+	    IS_ERR(zp->cp_wrst))
+		return dev_err_probe(dev, -EINVAL,
+				     "incomplete CP power-on GPIO set\n");
+
+	return 0;
+}
 
 /*
  * Controller reset and PMA reset pulse before PHY bring-up.  The PMA reset is
@@ -124,6 +282,47 @@ static void zumapro_pcie_assert_phy_reset(struct zumapro_pcie *zp)
 	writel(1, elbi + PCIE_PMA_RST_0);
 
 	writel(1, elbi + PCIE_SLV_PEND_SEL_NAK);
+}
+
+/*
+ * Post-PLL-lock controller reset profile, replayed verbatim from downstream
+ * establish_link() (pcie-exynos-rc.c: a SOFT_PWR_RESET pulse then a
+ * SOFT_NON_STICKY_RESET pulse, both run *after* phy_config/PLL-lock and
+ * *before* the app-layer ELBI config).  The from-scratch bring-up omitted the
+ * NON_STICKY pulse entirely and only pulsed SOFT_PWR_RESET for udelay(10)
+ * inside assert_phy_reset (pre-PLL).  Restoring the exact downstream
+ * reset/clock profile matters because the modem's PERST-domain doorbell-generate
+ * decode must survive the bounce, and its survival depends on precisely this
+ * profile -- see research/modem-issues.md ("2026-07-06 prior-art deep-dive") and
+ * research/prior-art/findings/A-rc-bounce.md.  Bits are active-low (1 released,
+ * 0 asserted); downstream RMWs single bits and holds the assert for mdelay(1).
+ */
+static void zumapro_pcie_controller_reset_pulse(struct zumapro_pcie *zp)
+{
+	void __iomem *elbi = zp->pci.elbi_base;
+	u32 val;
+
+	/* SOFT_PWR_RESET pulse (assert held mdelay(1)). */
+	val = readl(elbi + PCIE_SOFT_RESET);
+	val &= ~SOFT_PWR_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	mdelay(1);
+	val |= SOFT_PWR_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+
+	/* Downstream re-asserts DEVICE_TYPE=RC here, after the power reset. */
+	writel(DEVICE_TYPE_RC, elbi + PCIE_DEVICE_TYPE);
+
+	/* SOFT_NON_STICKY_RESET pulse (release, settle, assert mdelay(1), release). */
+	val = readl(elbi + PCIE_SOFT_RESET);
+	val |= SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	usleep_range(10, 12);
+	val &= ~SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	mdelay(1);
+	val |= SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
 }
 
 /* ELBI app-layer configuration done after the PHY is locked. */
@@ -196,11 +395,20 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 			 "link training attempt %d timed out, retraining\n",
 			 try + 1);
 
+		/*
+		 * The endpoint may have stopped driving CLKREQ# by now (a
+		 * crashed CP bootloader did on hardware, wedging the whole
+		 * interconnect on the next ELBI write); park the sub-block
+		 * clock on the OSC for the dead-link window and only return
+		 * to HW mode for the retrain itself.
+		 */
+		zumapro_pcie_phy_safe_clk(zp->phy, true);
 		writel(0, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
 		gpiod_set_value_cansleep(zp->perst, 1);
 		usleep_range(1000, 2000);
 		gpiod_set_value_cansleep(zp->perst, 0);
 		usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
+		zumapro_pcie_phy_safe_clk(zp->phy, false);
 	}
 
 	dev_err(pci->dev, "link failed to come up after %d attempts\n",
@@ -239,6 +447,10 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
 	int ret;
+
+	/* Power the modem endpoint before the link comes up (stub). */
+	if (zp->cp_pwr)
+		zumapro_pcie_cp_power_on(zp);
 
 	/* Release the PHY from PMU isolation. */
 	ret = phy_init(zp->phy);
@@ -325,6 +537,13 @@ static int zumapro_pcie_enable_aspm(struct pci_dev *pdev, void *userdata)
  */
 #define ZUMAPRO_PCIE_LTR_3MS	0x1003	/* scale 4 (~1.05 ms/unit), value 3 */
 
+/* Downstream CP L1SS programming values. */
+#define ZUMAPRO_PCIE_CP_TCOMMON_32US		(0x20 << 8)
+#define ZUMAPRO_PCIE_CP_TPOWERON_200US		0xa1
+#define ZUMAPRO_PCIE_ACK_F_ASPM_CONTROL		0x70c
+#define ZUMAPRO_PCIE_L1_ENTRANCE_LATENCY	GENMASK(29, 27)
+#define ZUMAPRO_PCIE_L1_ENTRANCE_LATENCY_64US	FIELD_PREP(GENMASK(29, 27), 7)
+
 static void zumapro_pcie_set_ep_ltr_latency(struct pci_dev *ep)
 {
 	int ltr = pci_find_ext_capability(ep, PCI_EXT_CAP_ID_LTR);
@@ -382,7 +601,20 @@ static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
 static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
 	struct pci_dev *rp, *ep = NULL;
+
+	/*
+	 * Skip the ASPM/L1SS walk on the modem channel: the endpoint here is
+	 * the CP mask ROM parked mid-boot-protocol.  Power management of the
+	 * modem link is the modem driver's business, not enumeration's -- it
+	 * enables CP L1SS itself right after the post-bounce restore
+	 * (s51xx_pcie_restore_state(boot_on=false), before the link-ack
+	 * doorbell; complete_normal_boot()'s later enable is a redundant
+	 * second call).
+	 */
+	if (zp->cp_pwr)
+		return;
 
 	rp = pci_get_slot(pp->bridge->bus, PCI_DEVFN(0, 0));
 	if (rp && rp->subordinate)
@@ -404,6 +636,383 @@ static const struct dw_pcie_host_ops zumapro_pcie_host_ops = {
 	.init		= zumapro_pcie_host_init,
 	.post_init	= zumapro_pcie_host_post_init,
 };
+
+/*
+ * Modem (s5300) boot-assist hooks; see include/linux/pcie-zumapro.h.  Callers
+ * resolve the RC platform device from a DT phandle, so guard against being
+ * handed a device another driver owns.  Single-caller bring-up scaffolding:
+ * no locking against concurrent host operations.
+ */
+static struct zumapro_pcie *zumapro_pcie_from_dev(struct device *rc_dev)
+{
+	if (!rc_dev->driver ||
+	    rc_dev->driver->of_match_table != zumapro_pcie_of_match)
+		return NULL;
+
+	return dev_get_drvdata(rc_dev);
+}
+
+/*
+ * Point the iMSI-RX termination address at the modem's MSI carveout.  The
+ * default target (dw_pcie_msi_host_init() picks cfg0_base) is fine for pure
+ * MSI senders, but the s5300 mask ROM treats its MSI capability address as
+ * the base of a 4K status block and DMA-writes boot_stage and the boot-image
+ * descriptor response at offsets above it -- those writes pass the iMSI-RX
+ * address filter and hit the bus, so they must land in the dedicated
+ * carveout, not in the config window.  Mirrors downstream
+ * exynos_pcie_set_msi_ctrl_addr().  Must run before the endpoint's MSI
+ * vectors are allocated so the capability is composed with this address.
+ */
+int zumapro_pcie_set_msi_target(struct device *rc_dev, phys_addr_t target)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	zp->pci.pp.msi_data = target;
+	dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_LO, lower_32_bits(target));
+	dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_HI, upper_32_bits(target));
+
+	dev_info(rc_dev, "MSI target moved to %pap\n", &target);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_set_msi_target);
+
+/*
+ * Reserve the first @count MSI vectors on this root complex so the next
+ * endpoint allocation lands above them.  The s5300 CP signals the AP on MSI
+ * message-data base 4 (m1n1 trace of a working downstream boot: EP data 4, RC
+ * iMSI-RX ENABLE 0xf1 / MASK 0xffffff0c, INIT_START and every MAIN-phase
+ * interrupt on bit 4).  The generic DWC MSI domain otherwise hands out the
+ * lowest free region (base 0); reserving vectors 0-3 makes the modem's
+ * four-vector request land at base 4 with MME=2 -- the width the mask ROM
+ * tolerates (requesting eight to reach bit 4 sets MME=3 and aborts the PBL
+ * download at boot_stage 0x1ff / err 0x1000).  Must run before the endpoint's
+ * MSI vectors are allocated.
+ */
+int zumapro_pcie_reserve_msi_base(struct device *rc_dev, unsigned int count)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+	if (!count || count > zp->pci.pp.num_vectors)
+		return -EINVAL;
+
+	bitmap_set(zp->pci.pp.msi_irq_in_use, 0, count);
+	dev_info(rc_dev, "reserved MSI vectors 0-%u so the modem lands at base %u\n",
+		 count - 1, count);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_reserve_msi_base);
+
+/*
+ * Link bounce for the modem boot handshake: after the first-stage download
+ * the CP bootloader expects the link to drop and retrain (downstream
+ * start_normal_boot() runs poweroff/poweron between the boot_stage poll and
+ * the link-ack doorbell).  Only PERST# and the app-layer LTSSM enable are
+ * toggled -- the same minimal cycle the start_link() retry loop already uses
+ * on this hardware -- so the RC core config from dw_pcie_setup_rc() survives.
+ * If the bounce proves insufficient on hardware, the escalation path is the
+ * downstream full poweroff/poweron (PHY power cycle included).
+ */
+int zumapro_pcie_modem_link_down(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	void __iomem *elbi;
+	u32 val, mode;
+	int ret;
+
+	if (!zp)
+		return -ENODEV;
+	elbi = zp->pci.elbi_base;
+
+	/*
+	 * Keep the CP's PCIe refclk alive across the bounce: the PMA lanes are
+	 * power-cycled (so the link retrains), but phy_power_off/on leave the
+	 * external PLL and PHY block clocks up so the discrete CP never loses its
+	 * reference clock (downstream phy_all_pwrdn keeps them up too).  Cleared
+	 * once the link is back up in modem_link_up().
+	 */
+	zumapro_pcie_phy_keep_refclk(zp->phy, true);
+
+	/*
+	 * Downstream s5100_poweroff_pcie() deasserts AP2CP_WAKEUP before
+	 * dropping the link (mif_gpio_set_value(..., 0, 5): drop then settle
+	 * 5 ms); the CP samples it to know the AP intends the link to be down.
+	 * NULL-safe no-op when no CP lines exist (CH1).
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
+	usleep_range(5000, 6000);
+
+	/*
+	 * PME_Turn_Off handshake while the link is still up, mirroring
+	 * exynos_pcie_rc_send_pme_turn_off(): pulse the turn-off, take the
+	 * PM_TO_ACK, then WAIT FOR THE LINK TO ENTER L2_IDLE before tearing
+	 * down.  The golden trace reaches RDLH 0x15 (S_L2_IDLE) at t=265.99
+	 * before the relink -- an orderly L2/L3 power-down.  The PBL
+	 * disassembly (research/modem-pbl-re.md) proved BL1 never rebuilds its
+	 * inbound doorbell decode after a link event, so that decode (in the
+	 * PERST-reset 0x14E00000 controller) must survive the bounce; the
+	 * working theory is it survives an orderly L2 entry but not a surprise
+	 * PERST-at-L1.  An earlier build that polled for L2 saw only L0, but
+	 * that was before D3hot + wakeup-low dropped the link to L1 pre-PME;
+	 * from L1 the PME should now complete to L2.  ELBI accesses are safe
+	 * here -- the link is up and the EP is still driving CLKREQ#.
+	 */
+	val = readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK;
+	if (val < LTSSM_STATE_RCVRY_LOCK || val > LTSSM_STATE_L1_IDLE) {
+		dev_info(zp->pci.dev,
+			 "link not up (ltssm %#x), skipping PME_Turn_Off\n", val);
+	} else {
+		/*
+		 * PCIE_IRQ0 is write-1-to-clear (establish_link reads it and
+		 * writes the value straight back); clear any stale PM_TO_ACK
+		 * latch first so the poll below observes this handshake, and
+		 * log the raw state so a pre-latched bit 29 (which would make
+		 * the ack poll pass vacuously) is visible in the boot log.
+		 */
+		val = readl(elbi + PCIE_IRQ0);
+		writel(val, elbi + PCIE_IRQ0);
+		dev_info(zp->pci.dev,
+			 "pre-PME ltssm %#x irq0 %#010x (%#010x after clear)\n",
+			 readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK,
+			 val, readl(elbi + PCIE_IRQ0));
+
+		writel(1, elbi + PCIE_APP_REQ_EXIT_L1);
+		mode = readl(elbi + PCIE_APP_REQ_EXIT_L1_MODE);
+		mode &= ~APP_REQ_EXIT_L1_MODE;
+		mode |= L1_REQ_NAK_CTRL_MASTER;
+		writel(mode, elbi + PCIE_APP_REQ_EXIT_L1_MODE);
+
+		writel(1, elbi + PCIE_XMIT_PME_TURNOFF);
+		ret = readl_poll_timeout(elbi + PCIE_IRQ0, val,
+					 val & IRQ_RADM_PM_TO_ACK,
+					 PCIE_L2_ENTER_WAIT_STEP_US,
+					 PCIE_L2_ENTER_WAIT_US);
+		if (ret)
+			dev_warn(zp->pci.dev,
+				 "no PM_TO_ACK from endpoint (irq0 %#x)\n", val);
+		else
+			dev_info(zp->pci.dev, "PM_TO_ACK (irq0 %#010x)\n", val);
+		udelay(10);
+		writel(0, elbi + PCIE_XMIT_PME_TURNOFF);
+
+		/*
+		 * Let the EP send Enter_L23_Ready and the link settle into
+		 * L2_IDLE before PERST -- the orderly power-down the golden
+		 * trace shows and the CP controller's inbound decode likely
+		 * depends on.  Proceed on timeout like downstream, but log the
+		 * achieved state: reaching 0x15 here is the whole point of this
+		 * experiment.
+		 */
+		ret = readl_poll_timeout(elbi + PCIE_ELBI_RDLH_LINKUP, val,
+					 (val & LTSSM_STATE_MASK) ==
+					 LTSSM_STATE_L2_IDLE,
+					 PCIE_L2_ENTER_WAIT_STEP_US,
+					 PCIE_L2_ENTER_WAIT_US);
+		if (ret)
+			dev_warn(zp->pci.dev,
+				 "link did not reach L2_IDLE before PERST (ltssm %#x)\n",
+				 val & LTSSM_STATE_MASK);
+		else
+			dev_info(zp->pci.dev, "link reached L2_IDLE, orderly down\n");
+	}
+
+	/*
+	 * Teardown in the order the downstream trace executes: assert PERST,
+	 * switch the sub-block onto the OSC ("level clk switching for
+	 * stability" -- with the link down the CP may stop driving CLKREQ#,
+	 * and an ELBI access on the gated clock stalls the interconnect, seen
+	 * on hardware when a cold CP's bootloader died during the bounce),
+	 * disable the LTSSM, pulse SOFT_PWR_RESET, then power the PHY fully
+	 * down (downstream phy_all_pwrdn).  The PHY-off matters to the CP:
+	 * downstream's lanes are electrically dead for the whole
+	 * CP2AP_WAKEUP wait, ours used to stay terminated until link_up.
+	 */
+	/*
+	 * Snapshot the iMSI-RX enable/mask/target while the controller core is
+	 * still live -- SOFT_PWR_RESET below zeroes them, and dw_pcie_setup_rc()
+	 * on the way up does not re-arm the per-message ENABLE bits (the DWC MSI
+	 * irq-chip only writes them from unmask, which already ran at probe).
+	 * Without restoring these the CP's post-link-ack MSI (message 4) is
+	 * silently dropped by the RC, indistinguishable from a dead doorbell.
+	 */
+	zp->saved_msi_enable = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_ENABLE);
+	zp->saved_msi_mask = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_MASK);
+	zp->saved_msi_addr_lo = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_ADDR_LO);
+	zp->saved_msi_addr_hi = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_ADDR_HI);
+	zp->msi_saved = true;
+	dev_info(zp->pci.dev,
+		 "iMSI-RX snapshot: en %#x mask %#x addr %#x:%#x\n",
+		 zp->saved_msi_enable, zp->saved_msi_mask,
+		 zp->saved_msi_addr_hi, zp->saved_msi_addr_lo);
+
+	gpiod_set_value_cansleep(zp->perst, 1);
+	zumapro_pcie_phy_safe_clk(zp->phy, true);
+	writel(0, elbi + PCIE_APP_LTSSM_ENABLE);
+	writel(SOFT_RESET_PWR_PULSE, elbi + PCIE_SOFT_RESET);
+	udelay(20);
+	writel(SOFT_RESET_ALL, elbi + PCIE_SOFT_RESET);
+	phy_power_off(zp->phy);
+	zp->cp_phy_off = true;
+	usleep_range(1000, 2000);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_down);
+
+int zumapro_pcie_modem_link_up(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	void __iomem *elbi;
+	int try, ret;
+
+	if (!zp)
+		return -ENODEV;
+	elbi = zp->pci.elbi_base;
+
+	/*
+	 * Downstream s5100_poweron_pcie() asserts AP2CP_WAKEUP before every
+	 * (re)train; the CP bootloader may gate its link participation on it.
+	 * Left asserted afterwards -- the downstream steady-state while the
+	 * link is up.
+	 */
+	gpiod_set_value_cansleep(zp->cp_wakeup, 1);
+
+	/*
+	 * Downstream re-links with the full poweron sequence and its
+	 * establish_link retry label re-runs PHY re-config, controller
+	 * soft reset, ELBI re-config and RC re-setup before EVERY training
+	 * attempt.  Retraining the half-dead core with a bare PERST cycle
+	 * wedged the interconnect on the second attempt's LTSSM-state read
+	 * (hw-observed), so mirror the heavyweight loop here.
+	 *
+	 * The post-PBL bootloader is a 2-lane endpoint (the mask ROM is x1)
+	 * and downstream re-links this phase at x2 (s5100_poweron_pcie()
+	 * width argument).  With the PHY terminating both lanes but the MAC
+	 * in x1 mode, the EP waits for training sets on lane 1 forever --
+	 * hw-observed as the LTSSM parking in Polling.Configuration (0x04).
+	 * Drive both lanes for the re-link; the mask-ROM link keeps the
+	 * board's x1 setting.
+	 *
+	 * Downstream also re-links this phase at GEN3 (poweron speed
+	 * argument, LNKCTL2 TLS on the RC; the PHY config is speed-agnostic)
+	 * and PERST-retries until the negotiated speed reaches the target,
+	 * so the CP firmware only ever sees a Gen3 x2 link here -- it may
+	 * gate the IPC start on it.  dw_pcie_setup_rc() arms the directed
+	 * speed change, so training completes at Gen1 and upshifts.
+	 */
+	zp->pci.num_lanes = 2;
+	zp->pci.max_link_speed = 3;
+	for (try = 0; try < PCIE_LINK_TRAIN_RETRIES; try++) {
+		gpiod_set_value_cansleep(zp->perst, 1);
+		usleep_range(1000, 2000);
+
+		/*
+		 * modem_link_down already parked the sub-block clock and
+		 * powered the PHY off before the CP2AP_WAKEUP wait; skip both
+		 * then (safe_clk's debug reads touch PMA/PCS registers, which
+		 * need the PHY clocks that phy_power_off disabled).
+		 */
+		if (!zp->cp_phy_off) {
+			zumapro_pcie_phy_safe_clk(zp->phy, true);
+			phy_power_off(zp->phy);
+		}
+		zp->cp_phy_off = false;
+		zumapro_pcie_assert_phy_reset(zp);
+		ret = phy_power_on(zp->phy);
+		if (ret)
+			return ret;
+		phy_calibrate(zp->phy);
+		zumapro_pcie_controller_reset_pulse(zp);
+		zumapro_pcie_config_elbi(zp);
+		zumapro_pcie_pmu_rmw(zp->pmu_phys, PCIE_PMU_WAKE_CTRL,
+				     PCIE_PMU_WAKE_CTRL);
+
+		gpiod_set_value_cansleep(zp->perst, 0);
+		usleep_range(PCIE_PERST_DELAY_US, PCIE_PERST_DELAY_US + 2000);
+
+		dw_pcie_setup_rc(&zp->pci.pp);
+
+		/*
+		 * Re-arm the iMSI-RX enable/mask/target snapshotted before the
+		 * core reset.  dw_pcie_setup_rc() re-inits the MSI target from
+		 * pp.msi_data but leaves ENABLE zeroed, so without this the RC
+		 * drops the CP's post-link-ack MSI (message 4) and the boot
+		 * stalls looking exactly like a doorbell that never landed.
+		 */
+		if (zp->msi_saved) {
+			dev_info(zp->pci.dev,
+				 "iMSI-RX post-setup_rc: en %#x mask %#x -> restoring en %#x mask %#x\n",
+				 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_ENABLE),
+				 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_MASK),
+				 zp->saved_msi_enable, zp->saved_msi_mask);
+			dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_LO,
+					   zp->saved_msi_addr_lo);
+			dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_ADDR_HI,
+					   zp->saved_msi_addr_hi);
+			dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_INTR0_ENABLE,
+					   zp->saved_msi_enable);
+			dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_INTR0_MASK,
+					   zp->saved_msi_mask);
+		}
+
+		/*
+		 * Downstream writes GEN3_RELATED (0x890) = 0x12000 ("EQ Off")
+		 * before every PERST release; Gen3 training on this PHY runs
+		 * without equalization phases 2/3.
+		 */
+		dw_pcie_writel_dbi(&zp->pci, 0x890, 0x12000);
+
+		writel(LTSSM_ENABLE, elbi + PCIE_APP_LTSSM_ENABLE);
+		usleep_range(1000, 1500);
+		ret = zumapro_pcie_wait_link_up(&zp->pci);
+		if (!ret) {
+			u8 cap = dw_pcie_find_capability(&zp->pci,
+							 PCI_CAP_ID_EXP);
+			u16 lnksta;
+
+			/* Downstream settles 3ms for the Gen1->Gen3 directed
+			 * speed change before judging the result.
+			 */
+			usleep_range(2800, 3000);
+			lnksta = dw_pcie_readw_dbi(&zp->pci,
+						   cap + PCI_EXP_LNKSTA);
+			dev_info(zp->pci.dev,
+				 "bounce retrain succeeded on attempt %d (Gen%u x%u)\n",
+				 try + 1,
+				 FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta),
+				 FIELD_GET(PCI_EXP_LNKSTA_NLW, lnksta));
+			/*
+			 * Below-target link: PERST-retry like downstream
+			 * (up to the loop limit, then proceed with what
+			 * trained -- downstream accepts after 10 tries too).
+			 */
+			if (FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta) < 3 &&
+			    try < PCIE_LINK_TRAIN_RETRIES - 1) {
+				dev_info(zp->pci.dev,
+					 "link below target speed, retraining\n");
+				continue;
+			}
+			writel(0, elbi + PCIE_APP_XFER_PENDING);
+			zumapro_pcie_phy_keep_refclk(zp->phy, false);
+			return 0;
+		}
+		dev_info(zp->pci.dev,
+			 "bounce retrain attempt %d timed out (rdlh %#x)\n",
+			 try + 1, readl(elbi + PCIE_ELBI_RDLH_LINKUP));
+	}
+
+	/* Dead link: park the sub-block clock so the RC stays touchable. */
+	zumapro_pcie_phy_keep_refclk(zp->phy, false);
+	zumapro_pcie_phy_safe_clk(zp->phy, true);
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_up);
 
 static int zumapro_pcie_probe(struct platform_device *pdev)
 {
@@ -442,6 +1051,11 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 	if (IS_ERR(zp->perst))
 		return dev_err_probe(dev, PTR_ERR(zp->perst),
 				     "failed to get reset GPIO\n");
+
+	ret = zumapro_pcie_cp_get_gpios(zp);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to get CP power-on GPIOs\n");
 
 	ret = of_parse_phandle_with_fixed_args(np, "samsung,pmu-syscon",
 					       1, 0, &pmu_args);

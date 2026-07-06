@@ -37,6 +37,13 @@
  *     returns them (link header stripped).
  *  6. IOCTL_COMPLETE_NORMAL_BOOTUP waits for the CP's INIT_START/PHONE_START
  *     handshake; once MAIN is running the CP goes ONLINE (status 4).
+ *
+ * Once ONLINE the CP speaks the SIT control protocol on the legacy FMT queue
+ * (downstream io-device umts_ipc0, channel 0xF5).  That is exposed as a WWAN
+ * SIT port: userspace (a RIL/ModemManager plugin) writes and reads bare SIT
+ * app messages, and this driver wraps them in the 12-byte EXYNOS link header,
+ * moves them across the FMT ring and rings the CP's data doorbell.  The bulk
+ * data path (PKTPROC rings -> netdev) is still to come.
  */
 
 #include <linux/completion.h>
@@ -58,8 +65,10 @@
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/sizes.h>
+#include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/wwan.h>
 
 #define S5300_PCI_VENDOR_ID		0x144d
 #define S5300_PCI_DEVICE_ID		0xa5a5
@@ -133,6 +142,24 @@
 #define S5300_RAW_RXQ_SIZE		0x200000
 
 /*
+ * Legacy FMT queue, the runtime SIT control channel (downstream
+ * create_legacy_link_device() with tegu's legacy_fmt_* offsets).  Same ring
+ * shape as NORM_RAW, its own 4K TX/RX buffers just below the RAW buffers.
+ */
+#define S5300_FMT_TXQ_HEAD		0x08
+#define S5300_FMT_TXQ_TAIL		0x0c
+#define S5300_FMT_RXQ_HEAD		0x10
+#define S5300_FMT_RXQ_TAIL		0x14
+#define S5300_FMT_TXQ_OFFSET		0x1000
+#define S5300_FMT_TXQ_SIZE		0x1000
+#define S5300_FMT_RXQ_OFFSET		0x2000
+#define S5300_FMT_RXQ_SIZE		0x1000
+#define S5300_FMT_CH			0xf5	/* EXYNOS_CH_ID_FMT_0 (umts_ipc0) */
+
+/* Largest SIT app message the corpus shows is the 983-byte setup-data-call. */
+#define S5300_FMT_MAX			SZ_2K
+
+/*
  * EXYNOS link header (downstream include/exynos_ipc.h struct
  * exynos_link_header).  12 bytes, single-frame config, boot channel 0xF1.
  */
@@ -152,6 +179,16 @@
 #define S5300_CMD_PHONE_START		0x8
 #define S5300_CMD_CRASH_EXIT		0x9
 #define S5300_CMD_PIF_INIT_DONE		0xd
+
+/*
+ * Non-command interrupt word: a queue-has-data / flow-control mask OR'd with
+ * INT_VALID (downstream mask2int()).  Only the FMT bits are used here; RAW
+ * data goes through PKTPROC once the data path lands.
+ */
+#define S5300_MASK_REQ_ACK_FMT		0x0020
+#define S5300_MASK_RES_ACK_FMT		0x0008
+#define S5300_MASK_SEND_FMT		0x0002
+#define S5300_MASK(x)			(S5300_INT_VALID | (x))
 
 /* Doorbell values: bit 16 triggers, low bits select the mailbox index. */
 #define S5300_DB_TRIGGER		BIT(16)
@@ -222,6 +259,12 @@ struct s5300_modem {
 	void __iomem		*doorbell;
 
 	struct miscdevice	miscdev;
+
+	/* Runtime SIT control channel on the legacy FMT queue (post-ONLINE). */
+	struct wwan_port	*ctrl_port;
+	u16			fmt_frame_seq;
+	u8			fmt_ch_seq;
+	u8			*fmt_tx_buf;	/* header + one SIT app msg + pad */
 
 	/* EXYNOS link-header sequence counters (reset per boot). */
 	u16			frame_seq;
@@ -495,6 +538,9 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 	u32 magic, access;
 	int i;
 
+	sm->fmt_frame_seq = 0;
+	sm->fmt_ch_seq = 0;
+
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
 	for (i = 0; i < S5300_IPC_Q_WORDS; i++)
@@ -577,6 +623,88 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 		wake_up_interruptible(&sm->read_wq);
 }
 
+/*
+ * Drain SIT control frames the CP left on the FMT rxq: strip the 12-byte link
+ * header and hand each app message to the WWAN port.  Runs from the MSI
+ * handler once the CP is ONLINE.  Queues are drained by head!=tail rather than
+ * by the interrupt mask, so a missed SEND_FMT bit cannot strand a frame; if
+ * the CP asked for a receive ack (REQ_ACK_FMT) answer with RES_ACK_FMT.
+ */
+static void s5300_drain_fmt_rxq(struct s5300_modem *sm, u32 intval)
+{
+	void __iomem *buff = sm->ipc + S5300_FMT_RXQ_OFFSET;
+	bool had_data;
+	u32 in, out;
+
+	in = readl(sm->ipc + S5300_FMT_RXQ_HEAD);
+	out = readl(sm->ipc + S5300_FMT_RXQ_TAIL);
+
+	if (in >= S5300_FMT_RXQ_SIZE || out >= S5300_FMT_RXQ_SIZE) {
+		dev_err(sm->dev, "fmt rxq pointers out of range (in %#x out %#x)\n",
+			in, out);
+		return;
+	}
+
+	had_data = (in != out);
+
+	while (in != out) {
+		u32 rest = s5300_circ_usage(S5300_FMT_RXQ_SIZE, in, out);
+		u32 flen, total, payload;
+		u8 hdr[S5300_HDR_SIZE];
+		struct sk_buff *skb;
+
+		if (rest < S5300_HDR_SIZE)
+			break;
+
+		s5300_circ_read(hdr, buff, S5300_FMT_RXQ_SIZE, out, S5300_HDR_SIZE);
+		if (hdr[0] != (S5300_HDR_SYNC & 0xff) ||
+		    hdr[1] != (S5300_HDR_SYNC >> 8)) {
+			dev_err(sm->dev, "fmt rxq bad sync %#04x, flushing\n",
+				hdr[0] | (hdr[1] << 8));
+			out = in;
+			break;
+		}
+
+		flen = hdr[6] | (hdr[7] << 8);
+		total = round_up(flen, 8);
+		if (flen < S5300_HDR_SIZE || total > rest) {
+			dev_err(sm->dev, "fmt rxq bad len %u (rest %u)\n", flen,
+				rest);
+			out = in;
+			break;
+		}
+		payload = flen - S5300_HDR_SIZE;
+
+		if (payload) {
+			skb = alloc_skb(payload, GFP_ATOMIC);
+			if (!skb) {
+				dev_warn(sm->dev,
+					 "fmt rxq alloc_skb(%u) failed, dropping\n",
+					 payload);
+			} else {
+				s5300_circ_read(skb_put(skb, payload), buff,
+						S5300_FMT_RXQ_SIZE,
+						s5300_circ_new(S5300_FMT_RXQ_SIZE,
+							       out, S5300_HDR_SIZE),
+						payload);
+				wwan_port_rx(sm->ctrl_port, skb);
+			}
+		}
+
+		out = s5300_circ_new(S5300_FMT_RXQ_SIZE, out, total);
+	}
+
+	writel(out, sm->ipc + S5300_FMT_RXQ_TAIL);
+
+	/*
+	 * Ack once the ring is drained (tail advanced), not per delivered skb:
+	 * a dropped (OOM) or header-only frame is still consumed from the ring,
+	 * and the CP's REQ_ACK_FMT only wants confirmation the AP drained it.
+	 */
+	if (had_data && (intval & S5300_MASK_REQ_ACK_FMT))
+		s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_RES_ACK_FMT));
+}
+
 static irqreturn_t s5300_irq_handler(int irq, void *data)
 {
 	struct s5300_modem *sm = data;
@@ -586,6 +714,11 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	s5300_drain_rxq(sm);
 
 	val = readl(sm->ipc + S5300_IPC_CP2AP_MSG);
+
+	/* Once ONLINE the SIT control channel delivers on the FMT rxq. */
+	if (READ_ONCE(sm->online))
+		s5300_drain_fmt_rxq(sm, val);
+
 	if (!(val & S5300_INT_VALID))
 		return IRQ_HANDLED;
 
@@ -603,9 +736,10 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 		break;
 	case S5300_CMD_PHONE_START:
 		dev_info(sm->dev, "CP PHONE_START\n");
-		if (!sm->online) {
+		if (!READ_ONCE(sm->online)) {
 			s5300_init_ipc_queues(sm);
-			sm->online = true;
+			/* Publish only after the FMT ring is armed (magic 0xAA). */
+			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
 		}
 		/* Re-entrant PHONE_START just gets the INIT_END again. */
@@ -712,7 +846,7 @@ static int s5300_power_on(struct s5300_modem *sm)
 	unsigned long flags;
 
 	reinit_completion(&sm->init_done);
-	sm->online = false;
+	WRITE_ONCE(sm->online, false);
 	sm->cp_status = S5300_STATE_OFFLINE;
 	spin_lock_irqsave(&sm->rx_lock, flags);
 	kfifo_reset(&sm->rx_fifo);
@@ -1039,6 +1173,99 @@ static const struct file_operations s5300_fops = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
+/* --- SIT control port (runtime FMT queue) -------------------------------- */
+
+/*
+ * Wrap one SIT app message in the 12-byte EXYNOS link header (single frame,
+ * 8-byte padded, channel 0xF5), copy it onto the FMT txq, then ring the CP's
+ * FMT data doorbell.  Serialised by the WWAN port ops_lock, so the head
+ * pointer and the staging buffer are ours alone.
+ */
+static int s5300_fmt_tx(struct s5300_modem *sm, const u8 *data, u32 len)
+{
+	void __iomem *txq = sm->ipc + S5300_FMT_TXQ_OFFSET;
+	u32 flen, total, pad, in, out, space;
+	u8 *frame = sm->fmt_tx_buf;
+	u16 seq;
+
+	if (!READ_ONCE(sm->online))
+		return -ENODEV;
+	if (len == 0 || len > S5300_FMT_MAX)
+		return -EMSGSIZE;
+
+	flen = S5300_HDR_SIZE + len;
+	total = round_up(flen, 8);
+	pad = total - flen;
+
+	seq = ++sm->fmt_frame_seq;
+	frame[0] = S5300_HDR_SYNC & 0xff;
+	frame[1] = S5300_HDR_SYNC >> 8;
+	frame[2] = seq & 0xff;
+	frame[3] = seq >> 8;
+	frame[4] = S5300_HDR_CFG_SINGLE & 0xff;
+	frame[5] = S5300_HDR_CFG_SINGLE >> 8;
+	frame[6] = flen & 0xff;
+	frame[7] = flen >> 8;
+	frame[8] = S5300_FMT_CH;
+	frame[9] = ++sm->fmt_ch_seq;
+	frame[10] = 0;
+	frame[11] = 0;
+	memcpy(frame + S5300_HDR_SIZE, data, len);
+	if (pad)
+		memset(frame + flen, 0, pad);
+
+	in = readl(sm->ipc + S5300_FMT_TXQ_HEAD);
+	out = readl(sm->ipc + S5300_FMT_TXQ_TAIL);
+	if (in >= S5300_FMT_TXQ_SIZE || out >= S5300_FMT_TXQ_SIZE) {
+		dev_err(sm->dev, "fmt txq pointers out of range (in %#x out %#x)\n",
+			in, out);
+		return -EIO;
+	}
+	space = s5300_circ_space(S5300_FMT_TXQ_SIZE, in, out);
+	if (space < total) {
+		dev_warn(sm->dev, "fmt txq full (space %u need %u)\n", space, total);
+		return -EBUSY;
+	}
+
+	s5300_circ_write(txq, frame, S5300_FMT_TXQ_SIZE, in, total);
+	/* Order the payload store ahead of the head advance the CP reads. */
+	wmb();
+	writel(s5300_circ_new(S5300_FMT_TXQ_SIZE, in, total),
+	       sm->ipc + S5300_FMT_TXQ_HEAD);
+
+	s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_SEND_FMT));
+	return 0;
+}
+
+static int s5300_ctrl_start(struct wwan_port *port)
+{
+	return 0;
+}
+
+static void s5300_ctrl_stop(struct wwan_port *port)
+{
+}
+
+static int s5300_ctrl_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct s5300_modem *sm = wwan_port_get_drvdata(port);
+	int ret;
+
+	/* Linear: the port is created with caps=NULL, so frag_len is SIZE_MAX. */
+	ret = s5300_fmt_tx(sm, skb->data, skb->len);
+	if (ret)
+		return ret;
+
+	consume_skb(skb);
+	return 0;
+}
+
+static const struct wwan_port_ops s5300_ctrl_ops = {
+	.start	= s5300_ctrl_start,
+	.stop	= s5300_ctrl_stop,
+	.tx	= s5300_ctrl_tx,
+};
+
 /* --- probe / remove ------------------------------------------------------ */
 
 static int s5300_map_region(struct s5300_modem *sm, const char *name,
@@ -1099,6 +1326,10 @@ static int s5300_probe(struct platform_device *pdev)
 
 	sm->tx_buf = devm_kmalloc(dev, S5300_TX_BUF_SIZE, GFP_KERNEL);
 	if (!sm->tx_buf)
+		return -ENOMEM;
+	sm->fmt_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_FMT_MAX + 8,
+				      GFP_KERNEL);
+	if (!sm->fmt_tx_buf)
 		return -ENOMEM;
 	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
 	if (ret)
@@ -1257,9 +1488,24 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_irq;
 	}
 
+	/*
+	 * The SIT control port for post-ONLINE traffic.  It is created up front
+	 * so userspace can open it, but s5300_fmt_tx() rejects writes and the
+	 * IRQ only drains the FMT rxq once the CP has reached ONLINE.
+	 */
+	sm->ctrl_port = wwan_create_port(dev, WWAN_PORT_SIT, &s5300_ctrl_ops,
+					 NULL, sm);
+	if (IS_ERR(sm->ctrl_port)) {
+		ret = PTR_ERR(sm->ctrl_port);
+		dev_err(dev, "wwan_create_port: %d\n", ret);
+		goto err_misc;
+	}
+
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_misc:
+	misc_deregister(&sm->miscdev);
 err_irq:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 err_vectors:
@@ -1279,8 +1525,14 @@ static void s5300_remove(struct platform_device *pdev)
 {
 	struct s5300_modem *sm = platform_get_drvdata(pdev);
 
-	misc_deregister(&sm->miscdev);
+	/*
+	 * Free the IRQ first: it synchronises in-flight handlers, so no MSI can
+	 * run s5300_drain_fmt_rxq() -> wwan_port_rx() against a port that
+	 * wwan_remove_port() is about to free.
+	 */
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	wwan_remove_port(sm->ctrl_port);
+	misc_deregister(&sm->miscdev);
 	pci_free_irq_vectors(sm->pdev);
 	pci_disable_device(sm->pdev);
 	pci_dev_put(sm->pdev);

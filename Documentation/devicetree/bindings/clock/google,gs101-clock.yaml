@@ -41,6 +41,7 @@ properties:
       - google,zumapro-cmu-dpuf1
       - google,zumapro-cmu-hsi0
       - google,zumapro-cmu-top
+      - google,zumapro-cmu-hsi1
       - google,zumapro-cmu-hsi2
       - google,zumapro-cmu-misc
       - google,zumapro-cmu-peric0
@@ -193,6 +194,26 @@ allOf:
           items:
             - const: oscclk
             - const: noc
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: google,zumapro-cmu-hsi1
+
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock (24.576 MHz)
+            - description: High Speed Interface 1 bus clock (from CMU_TOP)
+            - description: High Speed Interface 1 pcie clock (from CMU_TOP)
+
+        clock-names:
+          items:
+            - const: oscclk
+            - const: bus
+            - const: pcie
 
   - if:
       properties:

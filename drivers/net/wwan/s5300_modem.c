@@ -1,46 +1,65 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Samsung Exynos Modem 5300 PCIe boot driver (Google Tensor G4 boards).
+ * Samsung Exynos Modem 5300 PCIe boot transport (Google Tensor G4 boards).
  *
- * Bring-up scope: boots the CP to its ONLINE state and answers the shared
- * memory command handshake.  No IPC ports or data path yet -- those follow
- * once the boot handshake is hardware-proven.  The protocol is ported from
- * the downstream GPL cpif driver (google-modules/radio/samsung/s5300,
- * modem_ctrl_s5100.c start_normal_boot()/link_device.c command handlers).
+ * This driver is the *transport* half of the CP boot: it owns the PCIe
+ * endpoint, the doorbell, the MSI carveout and the shared-memory download
+ * ring, and exposes them through /dev/umts_boot0.  It carries bytes; it does
+ * not parse firmware.  A userspace helper (cbd / cbd-lite) sources the factory
+ * image and the per-device NV/handover from the vendor partitions and speaks
+ * the SIT "std_dl" download protocol over the chardev.  The split matches
+ * downstream cpif (google-modules/radio/samsung/s5300): the kernel adds the
+ * 12-byte EXYNOS link header and manages the ring; userspace builds every
+ * std_dl frame (including the MAIN CRC-verify frame).
  *
- * Boot flow (all steps observed on downstream hardware traces):
- *  1. The RC driver has already rail-cycled the CP and trained the link; the
- *     mask ROM enumerates as 144d:a5a5 and parks in WAIT_DOORBELL.
- *  2. Move the RC's MSI target into the MSI carveout, allocate the EP's MSI
- *     vectors (the ROM reads the MSI capability address and DMA-writes its
- *     boot progress at fixed offsets above it).
- *  3. Stage the first-stage bootloader (PBL, "BOOT" TOC entry of the factory
- *     modem.bin) at IPC-carveout+0x10000, publish the address through the
- *     MSI block, ring the message doorbell, poll boot_stage to DONE (the CP
- *     verifies the image internally -- no AP-side security call).
- *  4. Bounce the link (the CP bootloader re-links; CP2AP_WAKEUP signals
- *     readiness), restore EP config, ring the link-ack doorbell.
- *  5. Answer the shared-memory command handshake: INIT_START -> PIF_INIT_DONE,
- *     PHONE_START -> (queue init) INIT_END.  The main CP image is never
- *     transferred: it persists in the modem's self-powered DRAM.
+ * The whole ~100 MB firmware is streamed on every cold boot -- MAIN is not
+ * resident in the modem's DRAM.  (An earlier assumption that MAIN persisted
+ * across boots was a wrong-instrumentation artifact: only the one-shot PBL
+ * load was counted, never the std_dl stream.)
+ *
+ * Boot flow (userspace drives each step; the kernel executes it):
+ *  1. The RC driver has rail-cycled the CP and trained the link; the mask ROM
+ *     enumerates as 144d:a5a5 and parks waiting for the doorbell.  probe()
+ *     claims the endpoint, forces the doorbell BAR, moves the RC MSI target
+ *     into the carveout, allocates the EP MSI vectors and registers /dev.
+ *  2. IOCTL_HANDOVER_BLOCK_INFO stages the 161-byte handover block (IMEIs +
+ *     signature) the CP reads during boot.
+ *  3. IOCTL_POWER_ON publishes the srinfo/capability pointers and clears the
+ *     control words.
+ *  4. IOCTL_LOAD_CP_IMAGE copies the first-stage bootloader (PBL) into the IPC
+ *     carveout.  IOCTL_START_CP_BOOTLOADER arms the boot ring (magic 0xBDBD),
+ *     publishes the PBL address through the MSI block, rings the doorbell,
+ *     polls boot_stage to DONE, then bounces the link so the CP's BL1 download
+ *     server comes up.
+ *  5. write()/read() stream the std_dl frames: each write() is one frame that
+ *     the kernel wraps in an EXYNOS header and copies onto the NORM_RAW txq;
+ *     the CP writes 4-byte acks onto the rxq and raises MSI, and read()
+ *     returns them (link header stripped).
+ *  6. IOCTL_COMPLETE_NORMAL_BOOTUP waits for the CP's INIT_START/PHONE_START
+ *     handshake; once MAIN is running the CP goes ONLINE (status 4).
  */
 
 #include <linux/completion.h>
 #include <linux/delay.h>
-#include <linux/firmware.h>
+#include <linux/fs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/kfifo.h>
+#include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/pci.h>
 #include <linux/pcie-zumapro.h>
 #include <linux/platform_device.h>
+#include <linux/poll.h>
 #include <linux/sizes.h>
-#include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #define S5300_PCI_VENDOR_ID		0x144d
 #define S5300_PCI_DEVICE_ID		0xa5a5
@@ -81,9 +100,37 @@
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
 #define S5300_IPC_CP2AP_STATUS		0x80c
+/* ap2cp_handover_block_info = <DRAM_V1 2092> (zuma-cp-s5300-sit.dtsi). */
+#define S5300_IPC_HANDOVER		0x82c
+#define S5300_HANDOVER_SIZE		161	/* sizeof(t_handover_block_info) */
 
 #define S5300_IPC_SRINFO_OFFSET		0x400000
-#define S5300_IPC_MAGIC_VALUE		0xaa	/* SIT protocol magic */
+#define S5300_IPC_MAGIC_ONLINE		0xaa	/* SHM_IPC_MAGIC (running) */
+#define S5300_IPC_MAGIC_BOOT		0xbdbd	/* SHM_BOOT_MAGIC (download) */
+
+/*
+ * NORM_RAW legacy ring, the boot std_dl channel (downstream
+ * create_legacy_link_device() with tegu's legacy_raw_* offsets).  head/tail
+ * are byte offsets into the respective buffer.  txq is AP->CP (head owned by
+ * AP), rxq is CP->AP (head owned by CP).
+ */
+#define S5300_RAW_TXQ_HEAD		0x18
+#define S5300_RAW_TXQ_TAIL		0x1c
+#define S5300_RAW_RXQ_HEAD		0x20
+#define S5300_RAW_RXQ_TAIL		0x24
+#define S5300_RAW_BUF_OFFSET		0x3000
+#define S5300_RAW_TXQ_SIZE		0x1fd000
+#define S5300_RAW_RXQ_OFFSET		(S5300_RAW_BUF_OFFSET + S5300_RAW_TXQ_SIZE)
+#define S5300_RAW_RXQ_SIZE		0x200000
+
+/*
+ * EXYNOS link header (downstream include/exynos_ipc.h struct
+ * exynos_link_header).  12 bytes, single-frame config, boot channel 0xF1.
+ */
+#define S5300_HDR_SIZE			12
+#define S5300_HDR_SYNC			0xabcd	/* EXYNOS_START_MASK */
+#define S5300_HDR_CFG_SINGLE		0xc000	/* EXYNOS_SINGLE_MASK << 8 */
+#define S5300_BOOT_CH			0xf1	/* EXYNOS_CH_ID_BOOT */
 
 /* Interrupt-word encoding (downstream link_device_memory.h). */
 #define S5300_INT_VALID			BIT(7)
@@ -112,6 +159,44 @@
 /* PHONE_START handshake timeout, downstream MIF_INIT_TIMEOUT. */
 #define S5300_INIT_TIMEOUT		(15 * HZ)
 
+/* enum modem_state (downstream modem_prj.h); userspace polls for ONLINE. */
+#define S5300_STATE_OFFLINE		0
+#define S5300_STATE_BOOTING		3
+#define S5300_STATE_ONLINE		4
+
+/*
+ * Largest single std_dl frame userspace writes is one 0xC000 data chunk plus
+ * its 12-byte std_dl header; cap generously and keep a resident TX staging
+ * buffer (writes are serialised by io_lock).
+ */
+#define S5300_TX_MAX			0xf000
+#define S5300_TX_BUF_SIZE		(S5300_HDR_SIZE + S5300_TX_MAX + 8)
+#define S5300_RX_FIFO_SIZE		4096
+
+/* First-stage bootloader (BOOT TOC entry); <= 0x16800 in practice. */
+#define S5300_PBL_MAX			0x20000
+
+/* Boot chardev ABI (magic 'o'), downstream-compatible for same-binary A/B. */
+struct s5300_cp_image {
+	__u64	binary;
+	__u32	size;
+	__u32	m_offset;
+	__u32	b_offset;
+	__u32	mode;
+	__u32	len;
+} __packed;
+
+struct s5300_boot_mode {
+	int	idx;
+};
+
+#define IOCTL_POWER_ON			_IO('o', 0x19)
+#define IOCTL_START_CP_BOOTLOADER	_IOW('o', 0x22, struct s5300_boot_mode)
+#define IOCTL_COMPLETE_NORMAL_BOOTUP	_IO('o', 0x23)
+#define IOCTL_GET_CP_STATUS		_IO('o', 0x27)
+#define IOCTL_LOAD_CP_IMAGE		_IOW('o', 0x40, struct s5300_cp_image)
+#define IOCTL_HANDOVER_BLOCK_INFO	_IO('o', 0x57)
+
 struct s5300_modem {
 	struct device		*dev;
 	struct device		*rc_dev;
@@ -127,19 +212,84 @@ struct s5300_modem {
 	u32			db_bus_addr;
 	void __iomem		*doorbell;
 
-	const struct firmware	*pbl;
-	struct work_struct	boot_work;
+	struct miscdevice	miscdev;
+
+	/* EXYNOS link-header sequence counters (reset per boot). */
+	u16			frame_seq;
+	u8			ch_seq;
+	u8			*tx_buf;	/* header + one std_dl frame + pad */
+
+	/* CP->AP std_dl acks, filled by the IRQ, drained by read(). */
+	struct kfifo		rx_fifo;
+	spinlock_t		rx_lock;	/* protects rx_fifo */
+	wait_queue_head_t	read_wq;
+
+	u32			pbl_size;	/* staged by LOAD, published by START */
 	struct completion	init_done;
-	spinlock_t		lock;	/* orders ap2cp_msg word + doorbell */
+	struct mutex		io_lock;	/* serialises ioctl/write sequencing */
+	spinlock_t		lock;		/* orders ap2cp_msg word + doorbell */
+	int			cp_status;	/* enum modem_state */
 	bool			online;
 };
 
+/* --- circular-ring helpers (downstream include/circ_queue.h) ------------- */
+
+static inline u32 s5300_circ_space(u32 qsize, u32 in, u32 out)
+{
+	return (in < out) ? (out - in - 1) : (qsize + out - in - 1);
+}
+
+static inline u32 s5300_circ_usage(u32 qsize, u32 in, u32 out)
+{
+	return (in >= out) ? (in - out) : (qsize - out + in);
+}
+
+static inline u32 s5300_circ_new(u32 qsize, u32 p, u32 len)
+{
+	u32 np = p + len;
+
+	while (np >= qsize)
+		np -= qsize;
+	return np;
+}
+
+static void s5300_circ_write(void __iomem *buff, const u8 *src, u32 qsize,
+			     u32 in, u32 len)
+{
+	if (in + len < qsize) {
+		memcpy_toio(buff + in, src, len);
+	} else {
+		u32 first = qsize - in;
+
+		memcpy_toio(buff + in, src, first);
+		memcpy_toio(buff, src + first, len - first);
+	}
+}
+
+static void s5300_circ_read(u8 *dst, void __iomem *buff, u32 qsize, u32 out,
+			    u32 len)
+{
+	if (out + len <= qsize) {
+		memcpy_fromio(dst, buff + out, len);
+	} else {
+		u32 first = qsize - out;
+
+		memcpy_fromio(dst, buff + out, first);
+		memcpy_fromio(dst + first, buff, len - first);
+	}
+}
+
+/* --- doorbell / MSI plumbing --------------------------------------------- */
+
 /*
- * Program the doorbell BAR and read it back, like downstream does (it
- * computes the doorbell offset from what actually landed, and its restore
- * path runs a "BAR0 value correction" rewrite).  The ROM-phase BAR is 1M
- * so the hardware aligns the programmed address down; any base that still
- * decodes the doorbell bus address is fine.
+ * Force BAR0 to decode the doorbell page.  The write is deliberately not
+ * 1M-aligned: whatever BAR0 size the current boot stage exposes, the hardware
+ * aligns the value down, and the doorbell always decodes at the DT bus address
+ * (downstream programs the same value through both boot phases).  Programmed
+ * behind the PCI core's back -- the core saw unassignable ROM BARs anyway.
+ * The read-back loop is belt-and-braces: once the identically-IDed root port
+ * stops squatting the window (s5300_open_bridge_window) the BAR sticks on the
+ * first try.
  */
 static int s5300_program_doorbell_bar(struct s5300_modem *sm)
 {
@@ -169,15 +319,13 @@ static int s5300_program_doorbell_bar(struct s5300_modem *sm)
 }
 
 /*
- * Memory TLPs are address-routed: the root port only forwards them
- * downstream inside its type-1 memory window, and because the doorbell BAR
- * is programmed behind the PCI core's back (no child resource was ever
- * assigned) the core leaves that window closed -- every doorbell access
- * dies at the root port with the EP config-reachable but memory-dead.
- * Downstream opens it implicitly by routing its 4K BAR through
- * pci_assign_resource(); open it explicitly over the doorbell's 1M-aligned
- * range instead.  The root port is the RC's own DBI, not the flaky ROM, so
- * a single verified write suffices.
+ * Memory TLPs are address-routed: the root port only forwards them downstream
+ * inside its type-1 memory window, and because the doorbell BAR is programmed
+ * behind the PCI core's back (no child resource was ever assigned) the core
+ * leaves that window closed -- every doorbell access dies at the root port
+ * with the EP config-reachable but memory-dead.  Open it explicitly over the
+ * doorbell's 1M-aligned range, and evict the root port's own BAR0 from that
+ * range (TLPs matching an RP BAR are consumed by the port, not forwarded).
  */
 static int s5300_open_bridge_window(struct s5300_modem *sm)
 {
@@ -205,12 +353,6 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
 		}
 	}
 
-	/*
-	 * The core re-assigns the root port's own (dummy, dw_pcie_setup_rc
-	 * zeroes it) BAR0 into the bottom of the translation window at
-	 * enumeration; TLPs matching an RP BAR are consumed by the port,
-	 * not forwarded, so evict it from the doorbell range.
-	 */
 	pci_read_config_dword(bridge, PCI_BASE_ADDRESS_0, &val);
 	if ((val & PCI_BASE_ADDRESS_MEM_MASK) >= base &&
 	    (val & PCI_BASE_ADDRESS_MEM_MASK) <= limit) {
@@ -232,10 +374,10 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
 
 /*
  * Ring the doorbell with the downstream retry shape: right after a (re)train
- * the EP's memory decode may not be settled yet, so an all-ones read-back
- * gets the command register and doorbell BAR repaired and the write retried
- * (downstream s51xx_pcie_send_doorbell_int() retries at 1 ms up to 100x;
- * keep it short here because the IPC path rings from hard-IRQ context).
+ * the EP's memory decode may not be settled yet, so an all-ones read-back gets
+ * the command register and doorbell BAR repaired and the write retried
+ * (downstream s51xx_pcie_send_doorbell_int() retries at 1 ms up to 100x; keep
+ * it short here because the IPC path can ring from hard-IRQ context).
  */
 static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 {
@@ -298,8 +440,8 @@ static void s5300_send_ipc_irq(struct s5300_modem *sm, u32 val)
 
 /*
  * Downstream init_control_messages(): publish the srinfo and capability
- * offsets and zero the status/capability words before the CP boots.  The
- * AP capability words stay zero (tegu DT: ap_capability_0/1 = 0).
+ * offsets and zero the status/capability words before the CP boots.  The AP
+ * capability words stay zero (tegu DT: ap_capability_0/1 = 0).
  */
 static void s5300_init_control_messages(struct s5300_modem *sm)
 {
@@ -307,11 +449,6 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 
 	writel(S5300_IPC_SRINFO_OFFSET, sm->ipc + S5300_IPC_SRINFO_OFS_PTR);
 	writel(S5300_IPC_CAP_BASE, sm->ipc + S5300_IPC_CAP_OFS_PTR);
-	/*
-	 * Message words included (downstream init_ctrl_msg() in power_on_cp):
-	 * stale VALID bits from a previous boot must not be readable once the
-	 * MSI handler is live.
-	 */
 	writel(0, sm->ipc + S5300_IPC_AP2CP_MSG);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_MSG);
 	writel(0, sm->ipc + S5300_IPC_AP2CP_STATUS);
@@ -321,8 +458,28 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 }
 
 /*
- * Downstream init_legacy_link(), run from the PHONE_START handler: clear the
- * queue pointers, then advertise the magic and access-enable words.
+ * Downstream link_start_normal_boot() -> init_legacy_link(): clear the queue
+ * pointers, enable memory access, then stamp the boot magic.  Run before the
+ * std_dl stream so the CP's download server sees empty rings.
+ */
+static void s5300_init_boot_ring(struct s5300_modem *sm)
+{
+	int i;
+
+	sm->frame_seq = 0;
+	sm->ch_seq = 0;
+
+	writel(0, sm->ipc + S5300_IPC_MAGIC);
+	writel(0, sm->ipc + S5300_IPC_ACCESS);
+	for (i = 0; i < S5300_IPC_Q_WORDS; i++)
+		writel(0, sm->ipc + S5300_IPC_Q_HEAD_TAIL + 4 * i);
+	writel(1, sm->ipc + S5300_IPC_ACCESS);
+	writel(S5300_IPC_MAGIC_BOOT, sm->ipc + S5300_IPC_MAGIC);
+}
+
+/*
+ * Downstream init_legacy_link() from the PHONE_START handler: swap the boot
+ * magic for the running magic once the CP asks to start IPC.
  */
 static void s5300_init_ipc_queues(struct s5300_modem *sm)
 {
@@ -333,14 +490,82 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
 	for (i = 0; i < S5300_IPC_Q_WORDS; i++)
 		writel(0, sm->ipc + S5300_IPC_Q_HEAD_TAIL + 4 * i);
-	writel(S5300_IPC_MAGIC_VALUE, sm->ipc + S5300_IPC_MAGIC);
+	writel(S5300_IPC_MAGIC_ONLINE, sm->ipc + S5300_IPC_MAGIC);
 	writel(1, sm->ipc + S5300_IPC_ACCESS);
 
 	magic = readl(sm->ipc + S5300_IPC_MAGIC);
 	access = readl(sm->ipc + S5300_IPC_ACCESS);
-	if (magic != S5300_IPC_MAGIC_VALUE || access != 1)
+	if (magic != S5300_IPC_MAGIC_ONLINE || access != 1)
 		dev_err(sm->dev, "IPC init readback failed: magic %#x access %u\n",
 			magic, access);
+}
+
+/*
+ * Drain std_dl ack frames the CP left on the NORM_RAW rxq, strip the 12-byte
+ * link header, and hand the payload to read().  Runs from the MSI handler.
+ */
+static void s5300_drain_rxq(struct s5300_modem *sm)
+{
+	void __iomem *buff = sm->ipc + S5300_RAW_RXQ_OFFSET;
+	bool woke = false;
+	u32 in, out;
+
+	in = readl(sm->ipc + S5300_RAW_RXQ_HEAD);
+	out = readl(sm->ipc + S5300_RAW_RXQ_TAIL);
+
+	if (in >= S5300_RAW_RXQ_SIZE || out >= S5300_RAW_RXQ_SIZE) {
+		dev_err(sm->dev, "rxq pointers out of range (in %#x out %#x)\n",
+			in, out);
+		return;
+	}
+
+	while (in != out) {
+		u8 frame[S5300_HDR_SIZE + 64];
+		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
+		u32 flen, total, payload;
+		u8 hdr[S5300_HDR_SIZE];
+
+		if (rest < S5300_HDR_SIZE)
+			break;
+
+		s5300_circ_read(hdr, buff, S5300_RAW_RXQ_SIZE, out,
+				S5300_HDR_SIZE);
+		if (hdr[0] != (S5300_HDR_SYNC & 0xff) ||
+		    hdr[1] != (S5300_HDR_SYNC >> 8)) {
+			dev_err(sm->dev, "rxq bad sync %#04x, flushing\n",
+				hdr[0] | (hdr[1] << 8));
+			out = in;
+			break;
+		}
+
+		flen = hdr[6] | (hdr[7] << 8);		/* header + payload */
+		total = round_up(flen, 8);		/* CP writes 8-aligned */
+		if (flen < S5300_HDR_SIZE || total > rest) {
+			dev_err(sm->dev, "rxq bad len %u (rest %u)\n", flen,
+				rest);
+			out = in;
+			break;
+		}
+		payload = flen - S5300_HDR_SIZE;
+
+		if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
+			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out,
+					flen);
+			kfifo_in_spinlocked(&sm->rx_fifo, frame + S5300_HDR_SIZE,
+					    payload, &sm->rx_lock);
+			woke = true;
+		} else if (payload) {
+			dev_warn(sm->dev, "rxq oversized frame payload %u\n",
+				 payload);
+		}
+
+		out = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, total);
+	}
+
+	writel(out, sm->ipc + S5300_RAW_RXQ_TAIL);
+
+	if (woke)
+		wake_up_interruptible(&sm->read_wq);
 }
 
 static irqreturn_t s5300_irq_handler(int irq, void *data)
@@ -348,12 +573,15 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	struct s5300_modem *sm = data;
 	u32 val, cmd;
 
+	/* std_dl acks (and any CP->AP data) ride the NORM_RAW rxq. */
+	s5300_drain_rxq(sm);
+
 	val = readl(sm->ipc + S5300_IPC_CP2AP_MSG);
 	if (!(val & S5300_INT_VALID))
 		return IRQ_HANDLED;
 
 	if (!(val & S5300_CMD_VALID)) {
-		/* Plain data notification; no consumers yet. */
+		/* Plain data notification; the rxq drain above handled it. */
 		dev_dbg(sm->dev, "IPC data interrupt %#x\n", val);
 		return IRQ_HANDLED;
 	}
@@ -369,6 +597,7 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 		if (!sm->online) {
 			s5300_init_ipc_queues(sm);
 			sm->online = true;
+			sm->cp_status = S5300_STATE_ONLINE;
 		}
 		/* Re-entrant PHONE_START just gets the INIT_END again. */
 		s5300_send_ipc_irq(sm, S5300_CMD(S5300_CMD_INIT_END));
@@ -378,6 +607,7 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	case S5300_CMD_CRASH_EXIT:
 		dev_err(sm->dev, "CP crash notification %#x (err_report %#x)\n",
 			cmd, readl(sm->msi + S5300_MSI_ERR_REPORT));
+		sm->cp_status = S5300_STATE_OFFLINE;
 		break;
 	default:
 		dev_warn(sm->dev, "unknown CP command %#x\n", cmd);
@@ -387,34 +617,22 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-/*
- * Force BAR0 to the doorbell page the downstream stack uses.  The write is
- * deliberately not 1M-aligned: whatever BAR0 size the current CP boot stage
- * exposes, the hardware aligns the value down to its own size, and the
- * doorbell register always decodes at bus address 0x14e60000 (downstream
- * pci_db_addr; its driver likewise programs this value into BAR0 and rings
- * that bus address through both boot phases).  Written behind the PCI core's
- * back (the core saw unassignable ROM BARs anyway); the modem never runs
- * with core-managed BARs downstream either.
- */
 static int s5300_setup_doorbell(struct s5300_modem *sm)
 {
 	struct pci_bus_region region;
 	/*
-	 * pcibios_bus_to_resource() matches host-bridge windows by the
-	 * resource type of the passed-in res, so it must be pre-typed MEM --
-	 * zero flags match no window and the bus address comes back
-	 * untranslated (seen on hardware as "cpu [??? 0x14e60000...]").
+	 * pcibios_bus_to_resource() matches host-bridge windows by the resource
+	 * type of the passed-in res, so it must be pre-typed MEM -- zero flags
+	 * match no window and the bus address comes back untranslated.
 	 */
 	struct resource res = { .flags = IORESOURCE_MEM };
 	int i, ret;
 
 	/*
-	 * The PCI core could not place the mask ROM's six 1M BARs in the
-	 * small CH0 window; drop them from resource management entirely so
-	 * pci_enable_device() has nothing unclaimed to trip over, then
-	 * program BAR0 directly (downstream s51xx_pcie_probe() does the
-	 * same).
+	 * The PCI core could not place the mask ROM's six 1M BARs in the small
+	 * CH0 window; drop them from resource management entirely so
+	 * pci_enable_device() has nothing unclaimed to trip over, then program
+	 * BAR0 directly (downstream s51xx_pcie_probe() does the same).
 	 */
 	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 		sm->pdev->resource[i].start = 0;
@@ -478,26 +696,91 @@ static int s5300_poll_cp_wakeup(struct s5300_modem *sm)
 	return -ETIMEDOUT;
 }
 
-static void s5300_boot_work(struct work_struct *work)
+/* --- boot ioctls --------------------------------------------------------- */
+
+static int s5300_power_on(struct s5300_modem *sm)
 {
-	struct s5300_modem *sm = container_of(work, struct s5300_modem,
-					      boot_work);
+	unsigned long flags;
+
+	reinit_completion(&sm->init_done);
+	sm->online = false;
+	sm->cp_status = S5300_STATE_OFFLINE;
+	spin_lock_irqsave(&sm->rx_lock, flags);
+	kfifo_reset(&sm->rx_fifo);
+	spin_unlock_irqrestore(&sm->rx_lock, flags);
+
+	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
+	s5300_init_control_messages(sm);
+
+	dev_info(sm->dev, "power on: control messages published\n");
+	return 0;
+}
+
+static int s5300_load_cp_image(struct s5300_modem *sm, void __user *arg)
+{
+	struct s5300_cp_image img;
+	void *buf;
+	u32 dst;
+	int ret = 0;
+
+	if (copy_from_user(&img, arg, sizeof(img)))
+		return -EFAULT;
+
+	/*
+	 * The first-stage image lands in the IPC carveout at boot_img_offset +
+	 * m_offset (downstream link_load_cp_image() PCIE path); START then
+	 * points the ROM at boot_img_offset.  cbd sends the whole PBL in one
+	 * call, but honour chunked loads too.  The PBL is its own size domain
+	 * (up to ~0x16800, larger than a std_dl frame), so bounce it through a
+	 * dedicated buffer rather than the TX frame staging.
+	 */
+	dst = S5300_BOOT_IMG_OFFSET + img.m_offset;
+	if (!img.len || img.len > S5300_PBL_MAX ||
+	    (u64)dst + img.len > sm->ipc_size) {
+		dev_err(sm->dev, "PBL chunk out of range (dst %#x len %u)\n",
+			dst, img.len);
+		return -EINVAL;
+	}
+	if (img.m_offset)
+		dev_warn(sm->dev, "PBL m_offset %#x (START publishes base only)\n",
+			 img.m_offset);
+
+	buf = kmalloc(img.len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (copy_from_user(buf, u64_to_user_ptr(img.binary), img.len)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	memcpy_toio(sm->ipc + dst, buf, img.len);
+	sm->pbl_size = img.size;
+
+	dev_info(sm->dev, "staged PBL chunk: %u bytes at ipc+%#x (total %u)\n",
+		 img.len, dst, img.size);
+out:
+	kfree(buf);
+	return ret;
+}
+
+static int s5300_start_bootloader(struct s5300_modem *sm)
+{
 	struct pci_dev *pdev = sm->pdev;
 	int ret;
 
+	if (!sm->pbl_size)
+		return dev_err_probe(sm->dev, -EINVAL, "no PBL staged\n");
+
+	sm->cp_status = S5300_STATE_BOOTING;
+
+	/* Arm the download ring (magic 0xBDBD) before the first-stage kick. */
+	s5300_init_boot_ring(sm);
+
 	/* Publish the PBL location through the MSI block. */
-	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
-	s5300_init_control_messages(sm);
-	memcpy_toio(sm->ipc + S5300_BOOT_IMG_OFFSET, sm->pbl->data,
-		    sm->pbl->size);
 	writel(lower_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
 	       sm->msi + S5300_MSI_IMG_ADDR_LO);
 	writel(upper_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
 	       sm->msi + S5300_MSI_IMG_ADDR_HI);
-	writel(sm->pbl->size, sm->msi + S5300_MSI_IMG_SIZE);
-
-	release_firmware(sm->pbl);
-	sm->pbl = NULL;
+	writel(sm->pbl_size, sm->msi + S5300_MSI_IMG_SIZE);
 
 	/* The ROM reads these on the doorbell; make sure the writes stuck. */
 	s5300_verify_msi_target(sm);
@@ -505,42 +788,36 @@ static void s5300_boot_work(struct work_struct *work)
 	/* Config state (forced BAR0, MSI capability) must survive the bounce. */
 	pci_save_state(pdev);
 
-	dev_info(sm->dev, "starting first-stage download (%#x bytes at %pap+%#x)\n",
-		 readl(sm->msi + S5300_MSI_IMG_SIZE), &sm->ipc_phys,
-		 S5300_BOOT_IMG_OFFSET);
-	/*
-	 * The image/descriptor stores above target write-combined mappings;
-	 * the writel() barrier inside send_doorbell orders them ahead of the
-	 * doorbell trigger.
-	 */
+	dev_info(sm->dev, "first-stage download (%u bytes at %pap+%#x)\n",
+		 sm->pbl_size, &sm->ipc_phys, S5300_BOOT_IMG_OFFSET);
 	s5300_send_doorbell(sm, S5300_DB_MSG);
 
 	ret = s5300_poll_boot_stage(sm);
 	if (ret)
-		return;
+		return ret;
 	dev_info(sm->dev, "first-stage bootloader up, bouncing the link\n");
 
 	/*
-	 * The CP bootloader expects a link drop and retrain before the ack
-	 * doorbell (downstream start_normal_boot()); CP2AP_WAKEUP signals it
-	 * is ready to re-link.
+	 * The CP bootloader expects a link drop and retrain before it serves
+	 * the download (downstream start_normal_boot()); CP2AP_WAKEUP signals
+	 * it is ready to re-link.
 	 */
 	ret = zumapro_pcie_modem_link_down(sm->rc_dev);
 	if (ret)
-		return;
+		return ret;
 	ret = s5300_poll_cp_wakeup(sm);
 	if (ret)
-		return;
+		return ret;
 	ret = zumapro_pcie_modem_link_up(sm->rc_dev);
 	if (ret) {
 		dev_err(sm->dev, "link retrain after bounce failed: %d\n", ret);
-		return;
+		return ret;
 	}
 	pci_restore_state(pdev);
 	/*
-	 * Downstream does not trust restore for the forced BAR: it re-reads
-	 * and rewrites it after every link-up (s51xx_pcie_restore_state()).
-	 * Re-verify the BAR, bridge window and MSI target on the fresh link.
+	 * Downstream does not trust restore for the forced BAR: it re-reads and
+	 * rewrites it after every link-up.  Re-verify the BAR, bridge window
+	 * and MSI target on the fresh link.
 	 */
 	s5300_program_doorbell_bar(sm);
 	s5300_open_bridge_window(sm);
@@ -548,16 +825,212 @@ static void s5300_boot_work(struct work_struct *work)
 
 	s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
 
+	dev_info(sm->dev, "CP download server up, awaiting std_dl stream\n");
+	return 0;
+}
+
+static int s5300_handover_block(struct s5300_modem *sm, void __user *arg)
+{
+	u8 buf[S5300_HANDOVER_SIZE];
+
+	if (copy_from_user(buf, arg, sizeof(buf)))
+		return -EFAULT;
+
+	memcpy_toio(sm->ipc + S5300_IPC_HANDOVER, buf, sizeof(buf));
+	dev_info(sm->dev, "staged %zu-byte handover block\n", sizeof(buf));
+	return 0;
+}
+
+static int s5300_complete_boot(struct s5300_modem *sm)
+{
 	if (!wait_for_completion_timeout(&sm->init_done, S5300_INIT_TIMEOUT)) {
-		dev_err(sm->dev, "CP handshake timed out (cp2ap %#x boot_stage %#x err %#x)\n",
+		dev_err(sm->dev,
+			"CP handshake timed out (cp2ap %#x boot_stage %#x err %#x)\n",
 			readl(sm->ipc + S5300_IPC_CP2AP_MSG),
 			readl(sm->msi + S5300_MSI_BOOT_STAGE),
 			readl(sm->msi + S5300_MSI_ERR_REPORT));
-		return;
+		return -ETIMEDOUT;
 	}
 
 	dev_info(sm->dev, "CP is ONLINE\n");
+	return 0;
 }
+
+/* --- chardev fops -------------------------------------------------------- */
+
+static int s5300_dev_open(struct inode *inode, struct file *file)
+{
+	struct s5300_modem *sm = container_of(file->private_data,
+					      struct s5300_modem, miscdev);
+
+	file->private_data = sm;
+	return 0;
+}
+
+/*
+ * One write() is one std_dl frame.  Prepend the 12-byte EXYNOS link header,
+ * 8-byte pad the frame (BOOT_ALIGNED), and copy it onto the NORM_RAW txq.  No
+ * per-frame doorbell: the CP's download server polls the ring (downstream
+ * xmit_to_legacy_link()).
+ */
+static ssize_t s5300_dev_write(struct file *file, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	struct s5300_modem *sm = file->private_data;
+	void __iomem *txq = sm->ipc + S5300_RAW_BUF_OFFSET;
+	u32 flen, total, pad, in, out, space;
+	u8 *frame = sm->tx_buf;
+	u16 seq;
+	int ret;
+
+	if (count == 0)
+		return 0;
+	if (count > S5300_TX_MAX)
+		return -EMSGSIZE;
+
+	flen = S5300_HDR_SIZE + count;
+	total = round_up(flen, 8);
+	pad = total - flen;
+
+	ret = mutex_lock_interruptible(&sm->io_lock);
+	if (ret)
+		return ret;
+
+	seq = ++sm->frame_seq;
+	frame[0] = S5300_HDR_SYNC & 0xff;
+	frame[1] = S5300_HDR_SYNC >> 8;
+	frame[2] = seq & 0xff;
+	frame[3] = seq >> 8;
+	frame[4] = S5300_HDR_CFG_SINGLE & 0xff;
+	frame[5] = S5300_HDR_CFG_SINGLE >> 8;
+	frame[6] = flen & 0xff;
+	frame[7] = flen >> 8;
+	frame[8] = S5300_BOOT_CH;
+	frame[9] = ++sm->ch_seq;
+	frame[10] = 0;
+	frame[11] = 0;
+
+	if (copy_from_user(frame + S5300_HDR_SIZE, buf, count)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (pad)
+		memset(frame + flen, 0, pad);
+
+	in = readl(sm->ipc + S5300_RAW_TXQ_HEAD);
+	out = readl(sm->ipc + S5300_RAW_TXQ_TAIL);
+	if (in >= S5300_RAW_TXQ_SIZE || out >= S5300_RAW_TXQ_SIZE) {
+		dev_err(sm->dev, "txq pointers out of range (in %#x out %#x)\n",
+			in, out);
+		ret = -EIO;
+		goto out;
+	}
+	space = s5300_circ_space(S5300_RAW_TXQ_SIZE, in, out);
+	if (space < total) {
+		dev_err(sm->dev, "txq full (space %u need %u)\n", space, total);
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	s5300_circ_write(txq, frame, S5300_RAW_TXQ_SIZE, in, total);
+	/* Order the payload store ahead of the head advance the CP polls. */
+	wmb();
+	writel(s5300_circ_new(S5300_RAW_TXQ_SIZE, in, total),
+	       sm->ipc + S5300_RAW_TXQ_HEAD);
+
+	ret = count;
+out:
+	mutex_unlock(&sm->io_lock);
+	return ret;
+}
+
+static ssize_t s5300_dev_read(struct file *file, char __user *buf,
+			      size_t count, loff_t *ppos)
+{
+	struct s5300_modem *sm = file->private_data;
+	unsigned int copied = 0;
+	int ret;
+
+	if (count == 0)
+		return 0;
+
+	if (kfifo_is_empty(&sm->rx_fifo)) {
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		ret = wait_event_interruptible(sm->read_wq,
+					       !kfifo_is_empty(&sm->rx_fifo));
+		if (ret)
+			return ret;
+	}
+
+	ret = kfifo_to_user(&sm->rx_fifo, buf, count, &copied);
+	if (ret)
+		return ret;
+	return copied;
+}
+
+static __poll_t s5300_dev_poll(struct file *file, poll_table *wait)
+{
+	struct s5300_modem *sm = file->private_data;
+
+	poll_wait(file, &sm->read_wq, wait);
+	if (!kfifo_is_empty(&sm->rx_fifo))
+		return EPOLLIN | EPOLLRDNORM;
+	return 0;
+}
+
+static long s5300_dev_ioctl(struct file *file, unsigned int cmd,
+			    unsigned long arg)
+{
+	struct s5300_modem *sm = file->private_data;
+	void __user *uarg = (void __user *)arg;
+	int ret;
+
+	switch (cmd) {
+	case IOCTL_GET_CP_STATUS:
+		return sm->cp_status;
+	case IOCTL_COMPLETE_NORMAL_BOOTUP:
+		/* Blocks on the handshake; must not hold io_lock. */
+		return s5300_complete_boot(sm);
+	}
+
+	ret = mutex_lock_interruptible(&sm->io_lock);
+	if (ret)
+		return ret;
+
+	switch (cmd) {
+	case IOCTL_HANDOVER_BLOCK_INFO:
+		ret = s5300_handover_block(sm, uarg);
+		break;
+	case IOCTL_POWER_ON:
+		ret = s5300_power_on(sm);
+		break;
+	case IOCTL_LOAD_CP_IMAGE:
+		ret = s5300_load_cp_image(sm, uarg);
+		break;
+	case IOCTL_START_CP_BOOTLOADER:
+		ret = s5300_start_bootloader(sm);
+		break;
+	default:
+		ret = -ENOTTY;
+		break;
+	}
+
+	mutex_unlock(&sm->io_lock);
+	return ret;
+}
+
+static const struct file_operations s5300_fops = {
+	.owner		= THIS_MODULE,
+	.open		= s5300_dev_open,
+	.read		= s5300_dev_read,
+	.write		= s5300_dev_write,
+	.poll		= s5300_dev_poll,
+	.unlocked_ioctl	= s5300_dev_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+/* --- probe / remove ------------------------------------------------------ */
 
 static int s5300_map_region(struct s5300_modem *sm, const char *name,
 			    phys_addr_t *phys, resource_size_t *size,
@@ -583,8 +1056,8 @@ static int s5300_map_region(struct s5300_modem *sm, const char *name,
 	if (size)
 		*size = rmem->size;
 	/*
-	 * Non-cached: the CP reads the staged PBL and writes boot/IPC state
-	 * by PCIe DMA, and the HSI1 IO-coherency plumbing is not set up yet.
+	 * Non-cached: the CP reads the staged PBL and writes boot/IPC state by
+	 * PCIe DMA, and the HSI1 IO-coherency plumbing is not set up yet.
 	 */
 	*map = devm_ioremap_wc(sm->dev, rmem->base, rmem->size);
 	if (!*map)
@@ -599,7 +1072,6 @@ static int s5300_probe(struct platform_device *pdev)
 	struct platform_device *rc_pdev;
 	struct device_node *rc_node;
 	struct s5300_modem *sm;
-	const char *fw_name;
 	u16 cmd;
 	int ret;
 
@@ -609,17 +1081,31 @@ static int s5300_probe(struct platform_device *pdev)
 
 	sm->dev = dev;
 	spin_lock_init(&sm->lock);
+	spin_lock_init(&sm->rx_lock);
+	mutex_init(&sm->io_lock);
 	init_completion(&sm->init_done);
-	INIT_WORK(&sm->boot_work, s5300_boot_work);
+	init_waitqueue_head(&sm->read_wq);
+	sm->cp_status = S5300_STATE_OFFLINE;
 	platform_set_drvdata(pdev, sm);
 
+	sm->tx_buf = devm_kmalloc(dev, S5300_TX_BUF_SIZE, GFP_KERNEL);
+	if (!sm->tx_buf)
+		return -ENOMEM;
+	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
+	if (ret)
+		return ret;
+
 	rc_node = of_parse_phandle(dev->of_node, "google,pcie", 0);
-	if (!rc_node)
-		return dev_err_probe(dev, -EINVAL, "missing google,pcie\n");
+	if (!rc_node) {
+		ret = dev_err_probe(dev, -EINVAL, "missing google,pcie\n");
+		goto err_fifo;
+	}
 	rc_pdev = of_find_device_by_node(rc_node);
 	of_node_put(rc_node);
-	if (!rc_pdev)
-		return -EPROBE_DEFER;
+	if (!rc_pdev) {
+		ret = -EPROBE_DEFER;
+		goto err_fifo;
+	}
 	sm->rc_dev = &rc_pdev->dev;
 	if (!sm->rc_dev->driver) {
 		ret = -EPROBE_DEFER;
@@ -652,22 +1138,10 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_rc;
 	}
 
-	if (of_property_read_string(dev->of_node, "firmware-name", &fw_name))
-		fw_name = "tegu/cp_pbl.bin";
-	ret = request_firmware(&sm->pbl, fw_name, dev);
-	if (ret) {
-		dev_err_probe(dev, ret, "failed to load %s\n", fw_name);
-		goto err_rc;
-	}
-	if (sm->pbl->size > sm->ipc_size - S5300_BOOT_IMG_OFFSET) {
-		ret = dev_err_probe(dev, -EFBIG, "PBL too large\n");
-		goto err_fw;
-	}
-
 	/*
 	 * The zumapro root port carries the same 144d:a5a5 ID as the modem
-	 * endpoint, and it registers first -- a bare first-match lookup
-	 * returns the root port.  Match the endpoint by port type.
+	 * endpoint, and it registers first -- a bare first-match lookup returns
+	 * the root port.  Match the endpoint by port type.
 	 */
 	sm->pdev = NULL;
 	while ((sm->pdev = pci_get_device(S5300_PCI_VENDOR_ID,
@@ -676,19 +1150,16 @@ static int s5300_probe(struct platform_device *pdev)
 			break;
 	}
 	if (!sm->pdev) {
-		ret = dev_err_probe(dev, -ENODEV,
-				    "CP endpoint not enumerated\n");
-		goto err_fw;
+		ret = dev_err_probe(dev, -ENODEV, "CP endpoint not enumerated\n");
+		goto err_rc;
 	}
 	dev_info(dev, "CP endpoint %s\n", pci_name(sm->pdev));
 
 	/*
-	 * Downstream keeps every form of link PM off for the whole CP boot
-	 * (L1SS only comes on from complete_normal_boot(), and its config
-	 * accessors pin the link at L0 for each access).  The core enabled
-	 * ASPM L1 at enumeration; take it back out before poking config
-	 * space -- the mask ROM's config emulation has been seen returning
-	 * garbled completions to rapid access bursts.
+	 * Downstream keeps every form of link PM off for the whole CP boot; the
+	 * core enabled ASPM L1 at enumeration, so take it back out before
+	 * poking config space (the mask ROM's config emulation has been seen
+	 * returning garbled completions to rapid access bursts).
 	 */
 	pci_disable_link_state(sm->pdev, PCIE_LINK_STATE_L0S |
 			       PCIE_LINK_STATE_L1 | PCIE_LINK_STATE_CLKPM);
@@ -713,9 +1184,9 @@ static int s5300_probe(struct platform_device *pdev)
 	pci_write_config_word(sm->pdev, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY);
 
 	/*
-	 * The core caches the MSI capability offset at enumeration time; if
-	 * the mask ROM exposed its capability list late, re-look it up so
-	 * vector allocation does not fail on a stale zero.
+	 * The core caches the MSI capability offset at enumeration time; if the
+	 * mask ROM exposed its capability list late, re-look it up so vector
+	 * allocation does not fail on a stale zero.
 	 */
 	if (!sm->pdev->msi_cap) {
 		sm->pdev->msi_cap = pci_find_capability(sm->pdev,
@@ -723,12 +1194,6 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_warn(dev, "MSI capability re-lookup: %#x\n",
 			 sm->pdev->msi_cap);
 	}
-
-	/*
-	 * Dormant belt-and-braces: if the walk still comes up empty, probe
-	 * the DW-default offset downstream hardcodes (print_msi_register())
-	 * and install it directly, logging what the raw reads see.
-	 */
 	if (!sm->pdev->msi_cap) {
 		u16 w40, w50, w52;
 		u32 hdr;
@@ -745,9 +1210,9 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Downstream allocates 4 vectors: 0 = IPC message/command, 1 = TX
-	 * flow control, 2..3 spare for pktproc queues.  Only vector 0 matters
-	 * until the data path exists.
+	 * Downstream allocates 4 vectors: 0 = IPC message/command, 1 = TX flow
+	 * control, 2..3 spare for pktproc queues.  Only vector 0 matters until
+	 * the data path exists.
 	 */
 	ret = pci_alloc_irq_vectors(sm->pdev, 1, 4, PCI_IRQ_MSI);
 	if (ret < 0) {
@@ -762,20 +1227,31 @@ static int s5300_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_vectors;
 
-	schedule_work(&sm->boot_work);
+	sm->miscdev.minor = MISC_DYNAMIC_MINOR;
+	sm->miscdev.name = "umts_boot0";
+	sm->miscdev.fops = &s5300_fops;
+	sm->miscdev.parent = dev;
+	ret = misc_register(&sm->miscdev);
+	if (ret) {
+		dev_err(dev, "misc_register: %d\n", ret);
+		goto err_irq;
+	}
 
+	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_irq:
+	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
 err_disable:
 	pci_disable_device(sm->pdev);
 err_pci:
 	pci_dev_put(sm->pdev);
-err_fw:
-	release_firmware(sm->pbl);
 err_rc:
 	put_device(sm->rc_dev);
+err_fifo:
+	kfifo_free(&sm->rx_fifo);
 	return ret;
 }
 
@@ -783,13 +1259,13 @@ static void s5300_remove(struct platform_device *pdev)
 {
 	struct s5300_modem *sm = platform_get_drvdata(pdev);
 
-	cancel_work_sync(&sm->boot_work);
-	release_firmware(sm->pbl);
+	misc_deregister(&sm->miscdev);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	pci_free_irq_vectors(sm->pdev);
 	pci_disable_device(sm->pdev);
 	pci_dev_put(sm->pdev);
 	put_device(sm->rc_dev);
+	kfifo_free(&sm->rx_fifo);
 }
 
 static const struct of_device_id s5300_of_match[] = {
@@ -808,5 +1284,5 @@ static struct platform_driver s5300_driver = {
 };
 module_platform_driver(s5300_driver);
 
-MODULE_DESCRIPTION("Samsung Exynos Modem 5300 PCIe boot driver");
+MODULE_DESCRIPTION("Samsung Exynos Modem 5300 PCIe boot transport");
 MODULE_LICENSE("GPL");

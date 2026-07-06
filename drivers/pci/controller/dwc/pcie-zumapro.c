@@ -62,6 +62,8 @@ static const struct of_device_id zumapro_pcie_of_match[];
 #define PCIE_SOFT_RESET			0x03a4
 #define   SOFT_RESET_ALL		0xf
 #define   SOFT_RESET_PWR_PULSE		0xd	/* SOFT_RESET_ALL with PWR bit low */
+#define   SOFT_PWR_RESET		BIT(1)	/* active-low: 1 released, 0 asserted */
+#define   SOFT_NON_STICKY_RESET		BIT(3)	/* active-low, as above */
 #define PCIE_QCH_SEL			0x03a8
 #define   CLOCK_GATING_AXI_MASK		(0xf << 0)
 #define   CLOCK_GATING_APB_MASK		(0xf << 4)
@@ -281,6 +283,47 @@ static void zumapro_pcie_assert_phy_reset(struct zumapro_pcie *zp)
 	writel(1, elbi + PCIE_PMA_RST_0);
 
 	writel(1, elbi + PCIE_SLV_PEND_SEL_NAK);
+}
+
+/*
+ * Post-PLL-lock controller reset profile, replayed verbatim from downstream
+ * establish_link() (pcie-exynos-rc.c: a SOFT_PWR_RESET pulse then a
+ * SOFT_NON_STICKY_RESET pulse, both run *after* phy_config/PLL-lock and
+ * *before* the app-layer ELBI config).  The from-scratch bring-up omitted the
+ * NON_STICKY pulse entirely and only pulsed SOFT_PWR_RESET for udelay(10)
+ * inside assert_phy_reset (pre-PLL).  Restoring the exact downstream
+ * reset/clock profile matters because the modem's PERST-domain doorbell-generate
+ * decode must survive the bounce, and its survival depends on precisely this
+ * profile -- see research/modem-issues.md ("2026-07-06 prior-art deep-dive") and
+ * research/prior-art/findings/A-rc-bounce.md.  Bits are active-low (1 released,
+ * 0 asserted); downstream RMWs single bits and holds the assert for mdelay(1).
+ */
+static void zumapro_pcie_controller_reset_pulse(struct zumapro_pcie *zp)
+{
+	void __iomem *elbi = zp->pci.elbi_base;
+	u32 val;
+
+	/* SOFT_PWR_RESET pulse (assert held mdelay(1)). */
+	val = readl(elbi + PCIE_SOFT_RESET);
+	val &= ~SOFT_PWR_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	mdelay(1);
+	val |= SOFT_PWR_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+
+	/* Downstream re-asserts DEVICE_TYPE=RC here, after the power reset. */
+	writel(DEVICE_TYPE_RC, elbi + PCIE_DEVICE_TYPE);
+
+	/* SOFT_NON_STICKY_RESET pulse (release, settle, assert mdelay(1), release). */
+	val = readl(elbi + PCIE_SOFT_RESET);
+	val |= SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	usleep_range(10, 12);
+	val &= ~SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
+	mdelay(1);
+	val |= SOFT_NON_STICKY_RESET;
+	writel(val, elbi + PCIE_SOFT_RESET);
 }
 
 /* ELBI app-layer configuration done after the PHY is locked. */
@@ -905,6 +948,17 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	elbi = zp->pci.elbi_base;
 
 	/*
+	 * Keep the CP's PCIe refclk alive across the heavy bounce: the PMA lanes
+	 * are still power-cycled (retrain works, unlike the cp_light path that
+	 * cannot re-detect), but phy_power_off/on leave the external PLL and PHY
+	 * block clocks up so the discrete CP never loses its reference clock --
+	 * the suspected doorbell-decode killer (downstream phy_all_pwrdn keeps
+	 * them up too; see research/prior-art/findings/A-rc-bounce.md #3).
+	 * Cleared once the link is back up in modem_link_up().
+	 */
+	zumapro_pcie_phy_keep_refclk(zp->phy, true);
+
+	/*
 	 * Downstream s5100_poweroff_pcie() deasserts AP2CP_WAKEUP before
 	 * dropping the link (mif_gpio_set_value(..., 0, 5): drop then settle
 	 * 5 ms); the CP samples it to know the AP intends the link to be down.
@@ -1165,6 +1219,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 		if (ret)
 			return ret;
 		phy_calibrate(zp->phy);
+		zumapro_pcie_controller_reset_pulse(zp);
 		zumapro_pcie_config_elbi(zp);
 		zumapro_pcie_pmu_rmw(zp->pmu_phys, PCIE_PMU_WAKE_CTRL,
 				     PCIE_PMU_WAKE_CTRL);
@@ -1240,6 +1295,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 				continue;
 			}
 			writel(0, elbi + PCIE_APP_XFER_PENDING);
+			zumapro_pcie_phy_keep_refclk(zp->phy, false);
 			return 0;
 		}
 		dev_info(zp->pci.dev,
@@ -1248,6 +1304,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 	}
 
 	/* Dead link: park the sub-block clock so the RC stays touchable. */
+	zumapro_pcie_phy_keep_refclk(zp->phy, false);
 	zumapro_pcie_phy_safe_clk(zp->phy, true);
 	return -ETIMEDOUT;
 }

@@ -12,8 +12,12 @@ struct phy;
 
 #if IS_ENABLED(CONFIG_PHY_ZUMAPRO_PCIE)
 void zumapro_pcie_phy_safe_clk(struct phy *phy, bool safe);
+void zumapro_pcie_phy_keep_refclk(struct phy *phy, bool keep);
 #else
 static inline void zumapro_pcie_phy_safe_clk(struct phy *phy, bool safe)
+{
+}
+static inline void zumapro_pcie_phy_keep_refclk(struct phy *phy, bool keep)
 {
 }
 #endif

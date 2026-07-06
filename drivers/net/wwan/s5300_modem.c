@@ -40,6 +40,8 @@
 #include <linux/pcie-zumapro.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #define S5300_PCI_VENDOR_ID		0x144d
@@ -128,6 +130,41 @@
 
 /* PHONE_START handshake timeout, downstream MIF_INIT_TIMEOUT. */
 #define S5300_INIT_TIMEOUT		(15 * HZ)
+
+/*
+ * Main-firmware download after START_CP_BOOTLOADER.  The CP services SIT std_dl
+ * frames on the legacy NORM_RAW ring: for each section a START handshake,
+ * data frames each with a per-frame ack, an optional CRC frame (MAIN), and a
+ * DONE handshake, ending with a finish terminator (cbd std_boot_load_cp_images).
+ *
+ * The ring lives in the IPC region (downstream create_legacy_link_device():
+ * mld->base == our sm->ipc == cp_rmem == CP 0xEA400000), NOT pktproc.  The
+ * offsets below are the tegu DT's legacy_raw_* values relative to sm->ipc
+ * (head_tail 0x18, buffer 0x3000, txq_size 0x1fd000, rxq_size 0x200000).  The
+ * BL1 cold server additionally polls a separate Mode word at CP 0x20000000 (==
+ * pktproc+0) and hangs unless it reads 0xBDBD (PBL RE FUN_0201c134); that Mode
+ * check and the frame ring are in different regions.  Frames carry 0xABCD sync.
+ */
+#define S5300_SIT_RING_MODE		0xbdbd		/* pktproc+0 Mode word */
+#define S5300_RAW_TXQ_HEAD		0x18
+#define S5300_RAW_TXQ_TAIL		0x1c
+#define S5300_RAW_TXQ_BUFF		0x3000
+#define S5300_RAW_TXQ_SIZE		0x1fd000
+/* The CP posts its per-frame std_dl acks on the RAW RX ring. */
+#define S5300_RAW_RXQ_HEAD		0x20
+#define S5300_RAW_RXQ_TAIL		0x24
+#define S5300_RAW_RXQ_BUFF		0x200000	/* buff + txq_size */
+#define S5300_RAW_RXQ_SIZE		0x200000
+
+/* Exynos SIT link header, prepended to every boot frame. */
+#define S5300_SIT_HDR			12
+#define S5300_SIT_SYNC			0xabcd
+#define S5300_SIT_CFG_SINGLE		0xc000		/* single (non-frag) */
+#define S5300_SIT_CH_BOOT		0xf1
+
+/* Samsung std_dl download header + max payload per frame. */
+#define S5300_DL_HDR			12
+#define S5300_DL_CHUNK			0xc000		/* 49152 bytes */
 
 /*
  * Four MSI vectors, matching downstream (s51xx_pcie_request_msi_int(pdev, 4)).
@@ -237,8 +274,13 @@ struct s5300_modem {
 
 	u32			db_bus_addr;
 	void __iomem		*doorbell;
+	void __iomem		*ctrl;		/* CP PCIe controller regs via BAR0 */
 
-	const struct firmware	*pbl;
+	const struct firmware	*pbl;	/* full modem.bin (TOC + sections) */
+	size_t			boot_off;	/* BOOT section offset within pbl */
+	size_t			boot_size;	/* BOOT section length */
+	u16			frame_seq;	/* SIT frame counter (download) */
+	u8			ch_seq;		/* SIT per-channel counter */
 	struct work_struct	boot_work;
 	struct completion	init_done;
 	spinlock_t		lock;	/* orders ap2cp_msg word + doorbell */
@@ -349,10 +391,27 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
  * (downstream s51xx_pcie_send_doorbell_int() retries at 1 ms up to 100x;
  * keep it short here because the IPC path rings from hard-IRQ context).
  */
-static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
+static void s5300_send_doorbell(struct s5300_modem *sm, u32 val, bool clear_first)
 {
 	int try;
 	u16 cmd;
+	u32 pre = readl(sm->doorbell);
+
+	/*
+	 * Both doorbells carry the same trigger bit (S5300_DB_TRIGGER, bit16);
+	 * the msg (0x10000) and link-ack (0x1000e) differ only in the index
+	 * nibble.  If the bounce leaves the previous msg doorbell latched here,
+	 * the link-ack write never produces a bit16 0->1 edge -- log the prior
+	 * value, and for the link-ack clear it first so an edge-triggered CP
+	 * decode sees a clean transition.
+	 */
+	dev_info(sm->dev, "doorbell %#x: reg held %#x before ring%s\n",
+		 val, pre, clear_first ? " (clearing first)" : "");
+	if (clear_first) {
+		writel(0, sm->doorbell);
+		readl(sm->doorbell);
+		udelay(10);
+	}
 
 	for (try = 0; try < 10; try++) {
 		u32 rb, bar0 = 0;
@@ -418,7 +477,7 @@ static void s5300_send_ipc_irq(struct s5300_modem *sm, u32 val)
 
 	spin_lock_irqsave(&sm->lock, flags);
 	writel(val, sm->ipc + S5300_IPC_AP2CP_MSG);
-	s5300_send_doorbell(sm, S5300_DB_MSG);
+	s5300_send_doorbell(sm, S5300_DB_MSG, false);
 	spin_unlock_irqrestore(&sm->lock, flags);
 }
 
@@ -669,7 +728,53 @@ static int s5300_setup_doorbell(struct s5300_modem *sm)
 	dev_info(sm->dev, "doorbell at bus %#x, cpu %pR\n", sm->db_bus_addr,
 		 &res);
 
+	/*
+	 * The doorbell sits at BAR0+0x60000 in the CP's 0x14e00000 PCIe
+	 * controller register block, which is AP-reachable through BAR0 (the
+	 * doorbell readback proves it).  Map from the controller base so we can
+	 * read the inbound-decode / doorbell-generate config (see
+	 * s5300_dump_ctrl); res.start is the CPU address for bus 0x14e60000.
+	 */
+	sm->ctrl = devm_ioremap(sm->dev, res.start - 0x60000, SZ_512K);
+	if (!sm->ctrl)
+		return -ENOMEM;
+
 	return 0;
+}
+
+/*
+ * Read the CP PCIe controller's inbound-decode / doorbell-generate config
+ * through EP BAR0.  These are the registers the CP ROM programs during the PBL
+ * download (RE'd in research/modem-pbl-re.md Q-B: 0x14e00000 enable, the
+ * 0x14e20000 region-select block, 0x14e40110 inbound-window ctrl, 0x14e64000
+ * doorbell-BAR program).  The doorbell WRITE lands post-bounce but its generate
+ * decode is dead; comparing the armed (pre-bounce) vs dead (post-link-ack)
+ * state of these registers shows whether the bounce wipes the decode config,
+ * and if so exactly what to re-arm from the AP.  Read-only, only the registers
+ * the ROM actually programs (avoids poking undecoded offsets -> SError).
+ */
+static void s5300_dump_ctrl(struct s5300_modem *sm, const char *tag)
+{
+	if (!sm->ctrl)
+		return;
+	/*
+	 * One readl per printk: if an offset does not decode and the read
+	 * async-aborts (SError), the earlier lines have already printed so we
+	 * still learn which register wedged.  The doorbell (0x60000) is
+	 * known-good (its readback works) -- read it first as a canary.
+	 */
+	dev_info(sm->dev, "ctrl %s db@0x60000  = %#x (canary)\n", tag,
+		 readl(sm->ctrl + 0x60000));
+	dev_info(sm->dev, "ctrl %s en@0x00000  = %#x\n", tag,
+		 readl(sm->ctrl + 0x00000));
+	dev_info(sm->dev, "ctrl %s rgn@0x20000 = %#x\n", tag,
+		 readl(sm->ctrl + 0x20000));
+	dev_info(sm->dev, "ctrl %s rgnc@0x20388= %#x\n", tag,
+		 readl(sm->ctrl + 0x20388));
+	dev_info(sm->dev, "ctrl %s inw@0x40110 = %#x\n", tag,
+		 readl(sm->ctrl + 0x40110));
+	dev_info(sm->dev, "ctrl %s dbbar@0x64000=%#x\n", tag,
+		 readl(sm->ctrl + 0x64000));
 }
 
 static int s5300_poll_boot_stage(struct s5300_modem *sm)
@@ -771,6 +876,386 @@ static void s5300_dump_views(struct s5300_modem *sm, const char *tag)
 		 readl(sm->ipc_wb + S5300_IPC_HANDOVER));
 }
 
+/*
+ * The CP firmware ships as a factory image (modem.bin) led by a table of
+ * contents: 32-byte records { name[12], offset, load_addr, size, crc, misc },
+ * the first of which ("TOC") spans the table.  BOOT is the first-stage
+ * bootloader staged before the bounce; MAIN/VSS/APM are streamed to the CP
+ * afterwards.  A file that is not a TOC (an already-extracted BOOT blob) is
+ * staged whole.  (Ported from Trijal08 kernel-mainline 398ff28 + c1ae893;
+ * tegu section names/tags from research/modem.md.)
+ */
+struct s5300_toc_entry {
+	char	name[12];
+	__le32	offset;
+	__le32	load_addr;
+	__le32	size;
+	__le32	crc;
+	__le32	misc;
+};
+
+static void s5300_find_boot(struct s5300_modem *sm)
+{
+	const struct firmware *fw = sm->pbl;
+	const struct s5300_toc_entry *toc = (const void *)fw->data;
+	size_t i, n;
+
+	/* Default: the file is already the raw BOOT image. */
+	sm->boot_off = 0;
+	sm->boot_size = fw->size;
+
+	if (fw->size < sizeof(*toc) || strncmp(toc[0].name, "TOC", 4))
+		return;
+
+	n = min_t(size_t, le32_to_cpu(toc[0].size) / sizeof(*toc), 64);
+	for (i = 0; i < n; i++) {
+		size_t off, size;
+
+		if (strncmp(toc[i].name, "BOOT", 5))
+			continue;
+		off = le32_to_cpu(toc[i].offset);
+		size = le32_to_cpu(toc[i].size);
+		if (off <= fw->size && size <= fw->size - off) {
+			sm->boot_off = off;
+			sm->boot_size = size;
+			dev_info(sm->dev,
+				 "modem.bin TOC: BOOT at +%#zx, %#zx bytes\n",
+				 off, size);
+		}
+		return;
+	}
+	dev_warn(sm->dev, "no BOOT entry in TOC; staging the whole image\n");
+}
+
+/* Locate a TOC section by name; report file offset, size, std_dl tag and crc. */
+static bool s5300_find_section(struct s5300_modem *sm, const char *name,
+			       size_t *off, size_t *size, u8 *tag, u32 *crc)
+{
+	const struct firmware *fw = sm->pbl;
+	const struct s5300_toc_entry *toc = (const void *)fw->data;
+	size_t i, n, o, s;
+
+	if (fw->size < sizeof(*toc) || strncmp(toc[0].name, "TOC", 4))
+		return false;
+	n = min_t(size_t, le32_to_cpu(toc[0].size) / sizeof(*toc), 64);
+	for (i = 0; i < n; i++) {
+		if (strncmp(toc[i].name, name, sizeof(toc[i].name)))
+			continue;
+		o = le32_to_cpu(toc[i].offset);
+		s = le32_to_cpu(toc[i].size);
+		if (!o || !s || o > fw->size || s > fw->size - o)
+			return false;
+		*off = o;
+		*size = s;
+		/* std_dl tag = TOC record index, carried in the misc field. */
+		*tag = le32_to_cpu(toc[i].misc) & 0xf;
+		*crc = le32_to_cpu(toc[i].crc);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * The std_dl frames ride the legacy NORM_RAW ring, which downstream
+ * create_legacy_link_device() places in the IPC region (mld->base == our
+ * sm->ipc == cp_rmem == CP 0xEA400000) at mld->base + legacy_raw_buffer_offset,
+ * NOT in pktproc: the DT's legacy_raw_{head_tail_offset 0x18, buffer_offset
+ * 0x3000, txq_size 0x1fd000, rxq_size 0x200000} are relative to sm->ipc.  The
+ * BL1 cold server's Mode word is the separate CP 0x20000000 (== pktproc+0)
+ * check; the frame ring itself is here.
+ */
+#define S5300_RING	(sm->ipc)
+
+/*
+ * Snapshot the ring the CP drives while downloading: the Mode word at
+ * pktproc+0 (BL1 hangs on "Unknown" unless it reads 0xBDBD) plus the NORM_RAW
+ * TX/RX head/tail in the IPC region (the CP advances the TX tail as it consumes
+ * our frames and the RX head as it posts per-frame acks), plus the first bytes
+ * at the RX buffer.  If the CP is cold-serving it drains TX and posts RX; if it
+ * warm-jumped to resident MAIN or is parked in the doorbell poll, every word
+ * stays as s5300_arm_sit_ring() left it.
+ */
+static void s5300_dump_ring(struct s5300_modem *sm, const char *tag)
+{
+	u8 rx[16];
+	int i;
+
+	for (i = 0; i < (int)sizeof(rx); i++)
+		rx[i] = readb(S5300_RING + S5300_RAW_RXQ_BUFF + i);
+	dev_info(sm->dev,
+		 "ring %s: mode %#x txh %#x txt %#x rxh %#x rxt %#x rx %*ph\n",
+		 tag, readl(sm->pktproc + 0),
+		 readl(S5300_RING + S5300_RAW_TXQ_HEAD),
+		 readl(S5300_RING + S5300_RAW_TXQ_TAIL),
+		 readl(S5300_RING + S5300_RAW_RXQ_HEAD),
+		 readl(S5300_RING + S5300_RAW_RXQ_TAIL),
+		 (int)sizeof(rx), rx);
+}
+
+/*
+ * Insert len bytes into the NORM_RAW TX ring, blocking on the CP's tail so the
+ * head never laps it (vendor xmit_to_legacy_link's -ENOSPC retry).
+ */
+static int s5300_ring_push(struct s5300_modem *sm, const void *buf, u32 len)
+{
+	u32 in, out, space, first;
+	int spins = 2000;
+
+	for (;;) {
+		in = readl(S5300_RING + S5300_RAW_TXQ_HEAD);
+		out = readl(S5300_RING + S5300_RAW_TXQ_TAIL);
+		space = (in >= out) ? S5300_RAW_TXQ_SIZE - (in - out) - 1
+				    : out - in - 1;
+		if (space >= len)
+			break;
+		if (!spins--)
+			return -ETIMEDOUT;
+		usleep_range(1000, 2000);
+	}
+
+	first = min_t(u32, len, S5300_RAW_TXQ_SIZE - in);
+	memcpy_toio(S5300_RING + S5300_RAW_TXQ_BUFF + in, buf, first);
+	if (first < len)
+		memcpy_toio(S5300_RING + S5300_RAW_TXQ_BUFF, buf + first,
+			    len - first);
+	/* order the payload ahead of the head update the CP polls */
+	dma_wmb();
+	writel((in + len) % S5300_RAW_TXQ_SIZE,
+	       S5300_RING + S5300_RAW_TXQ_HEAD);
+	return 0;
+}
+
+/* Fill the 12-byte SIT link header at the head of a frame. */
+static void s5300_sit_header(struct s5300_modem *sm, u8 *f, u32 frame_len)
+{
+	put_unaligned_le16(S5300_SIT_SYNC, f + 0);
+	put_unaligned_le16(sm->frame_seq++, f + 2);
+	put_unaligned_le16(S5300_SIT_CFG_SINGLE, f + 4);
+	put_unaligned_le16(frame_len, f + 6);
+	f[8] = S5300_SIT_CH_BOOT;
+	f[9] = sm->ch_seq++;
+	f[10] = 0;
+	f[11] = 0;
+}
+
+/*
+ * Read one SIT response frame the CP posts on the RAW RX ring and return its
+ * 4-byte std_dl ack word.  This ack read IS the download flow control: the CP
+ * blocks on its RX ring, so failing to drain it (as a fire-and-forget push
+ * does) backs the CP up and stalls the whole transfer.
+ */
+static int s5300_ring_resp(struct s5300_modem *sm, u32 *resp)
+{
+	u32 head, tail, flen;
+	int spins = 20000, i;
+	u8 f[16];
+
+	for (;;) {
+		head = readl(S5300_RING + S5300_RAW_RXQ_HEAD);
+		tail = readl(S5300_RING + S5300_RAW_RXQ_TAIL);
+		if (head != tail)
+			break;
+		if (!spins--) {
+			s5300_dump_ring(sm, "resp timeout");
+			return -ETIMEDOUT;
+		}
+		/* Periodic snapshot: is the CP draining TX / posting RX at all? */
+		if (spins % 5000 == 0)
+			s5300_dump_ring(sm, "resp waiting");
+		usleep_range(100, 300);
+	}
+
+	for (i = 0; i < (int)sizeof(f); i++)
+		f[i] = readb(S5300_RING + S5300_RAW_RXQ_BUFF +
+			     ((tail + i) % S5300_RAW_RXQ_SIZE));
+
+	if (get_unaligned_le16(f) != S5300_SIT_SYNC) {
+		dev_err(sm->dev, "RX bad sync %#06x (tail %#x head %#x)\n",
+			get_unaligned_le16(f), tail, head);
+		return -EPROTO;
+	}
+	flen = get_unaligned_le16(f + 6);
+	*resp = get_unaligned_le32(f + S5300_SIT_HDR);
+	writel((tail + ALIGN(flen, 8)) % S5300_RAW_RXQ_SIZE,
+	       S5300_RING + S5300_RAW_RXQ_TAIL);
+	return 0;
+}
+
+/* Push an n-word SIT-framed control frame onto the TX ring. */
+static int s5300_sit_ctrl(struct s5300_modem *sm, u8 *scratch,
+			  const u32 *w, int n)
+{
+	u32 flen = S5300_SIT_HDR + 4 * n;
+	int i;
+
+	s5300_sit_header(sm, scratch, flen);
+	for (i = 0; i < n; i++)
+		put_unaligned_le32(w[i], scratch + S5300_SIT_HDR + 4 * i);
+	memset(scratch + flen, 0, ALIGN(flen, 8) - flen);
+	return s5300_ring_push(sm, scratch, ALIGN(flen, 8));
+}
+
+/* Optionally send an n-word control, then read+verify the CP's ack word. */
+static int s5300_sit_xchg(struct s5300_modem *sm, u8 *scratch,
+			  const u32 *w, int n, u32 expect)
+{
+	u32 resp;
+	int ret;
+
+	if (n) {
+		ret = s5300_sit_ctrl(sm, scratch, w, n);
+		if (ret)
+			return ret;
+	}
+	ret = s5300_ring_resp(sm, &resp);
+	if (ret)
+		return ret;
+	if (resp != expect) {
+		dev_err(sm->dev, "SIT ack %#x, expected %#x\n", resp, expect);
+		return -EPROTO;
+	}
+	return 0;
+}
+
+/* One std_dl data frame + its mandatory per-frame ack. */
+static int s5300_send_chunk(struct s5300_modem *sm, u8 *scratch, u32 cmd,
+			    u32 total, u32 off, const u8 *payload, u32 plen)
+{
+	u32 flen = S5300_SIT_HDR + S5300_DL_HDR + plen;
+	u8 *dl = scratch + S5300_SIT_HDR;
+	int ret;
+
+	s5300_sit_header(sm, scratch, flen);
+	put_unaligned_le16(0xa10b | cmd, dl);
+	put_unaligned_le16(plen + 8, dl + 2);
+	put_unaligned_le32(total, dl + 4);
+	put_unaligned_le32(off, dl + 8);
+	memcpy(dl + S5300_DL_HDR, payload, plen);
+	memset(scratch + flen, 0, ALIGN(flen, 8) - flen);
+	ret = s5300_ring_push(sm, scratch, ALIGN(flen, 8));
+	if (ret)
+		return ret;
+	return s5300_sit_xchg(sm, scratch, NULL, 0, 0xc10b | cmd);
+}
+
+/*
+ * Stream one firmware section over the SIT std_dl protocol (cbd
+ * std_boot_load_cp_images): START handshake, chunked data frames each with a
+ * per-frame ack, an optional CRC frame (MAIN), then the DONE handshake.
+ */
+static int s5300_dl_section(struct s5300_modem *sm, u8 *scratch, u8 tag,
+			    u32 crc, bool do_crc, bool first,
+			    const u8 *data, u32 total)
+{
+	u32 cmd = (u32)tag << 4;
+	u32 off = 0, w[2];
+	int ret;
+
+	w[0] = 0xa100 | cmd;
+	ret = s5300_sit_xchg(sm, scratch, w, 1, 0xc100 | cmd);	/* START */
+	if (ret)
+		return ret;
+
+	while (off < total) {
+		u32 plen = min_t(u32, total - off, S5300_DL_CHUNK);
+
+		ret = s5300_send_chunk(sm, scratch, cmd, total, off,
+				       data + off, plen);
+		if (ret)
+			return ret;
+		off += plen;
+	}
+
+	if (do_crc) {						/* MAIN carries a CRC */
+		w[0] = 0xa301 | cmd;
+		w[1] = crc;
+		ret = s5300_sit_xchg(sm, scratch, w, 2, 0xc300 | cmd);
+		if (ret)
+			return ret;
+	}
+
+	if (first) {						/* DONE handshake */
+		w[0] = (cmd & 0x5ff0) | 0xa00b;
+		return s5300_sit_xchg(sm, scratch, w, 1, (cmd & 0x3ff0) | 0xc00b);
+	}
+	w[0] = (cmd & 0x5ef0) | 0xa10d;
+	return s5300_sit_xchg(sm, scratch, w, 1, (cmd & 0x3ef0) | 0xc10d);
+}
+
+/*
+ * Arm the cold-boot SIT download ring BEFORE the link-ack: the moment the
+ * link-ack releases BL1's doorbell poll it enters the SIT server, reads the
+ * Mode word at pktproc+0, and hangs forever if it is not 0xBDBD (PBL RE).  The
+ * NORM_RAW frame queues the server then drains live in the IPC region
+ * (S5300_RING); zero their head/tail so the first frame starts at 0.  Both must
+ * be in place when the doorbell fires.
+ */
+static void s5300_arm_sit_ring(struct s5300_modem *sm)
+{
+	writel(S5300_SIT_RING_MODE, sm->pktproc + 0);
+	writel(0, S5300_RING + S5300_RAW_TXQ_HEAD);
+	writel(0, S5300_RING + S5300_RAW_TXQ_TAIL);
+	writel(0, S5300_RING + S5300_RAW_RXQ_HEAD);
+	writel(0, S5300_RING + S5300_RAW_RXQ_TAIL);
+	sm->frame_seq = 0;
+	sm->ch_seq = 0;
+}
+
+/*
+ * After START_CP_BOOTLOADER the on-CP bootloader waits for the main firmware
+ * over the NORM_RAW ring (cbd's "MAIN link SHMEM" path).  Stream the payload
+ * sections MAIN/VSS/APM, then the finish handshake.
+ */
+static int s5300_download_main(struct s5300_modem *sm)
+{
+	static const struct { const char *name; bool crc; } secs[] = {
+		{ "MAIN", true }, { "VSS", false }, { "APM", false },
+	};
+	u8 *scratch;
+	u32 w;
+	int i, ret = 0;
+
+	scratch = kmalloc(S5300_SIT_HDR + S5300_DL_HDR + S5300_DL_CHUNK + 8,
+			  GFP_KERNEL);
+	if (!scratch)
+		return -ENOMEM;
+
+	/* Baseline before the first frame: what did arming + the link-ack leave? */
+	s5300_dump_ring(sm, "download start");
+
+	for (i = 0; i < ARRAY_SIZE(secs); i++) {
+		size_t off, size;
+		u32 crc;
+		u8 tag;
+
+		if (!s5300_find_section(sm, secs[i].name, &off, &size, &tag,
+					&crc)) {
+			dev_warn(sm->dev, "%s not in TOC; skipping\n",
+				 secs[i].name);
+			continue;
+		}
+		dev_info(sm->dev, "streaming %s (tag %u, %#zx bytes)\n",
+			 secs[i].name, tag, size);
+		ret = s5300_dl_section(sm, scratch, tag, crc, secs[i].crc,
+				       i == 0, sm->pbl->data + off, size);
+		if (ret) {
+			dev_err(sm->dev, "%s stream failed: %d\n",
+				secs[i].name, ret);
+			goto out;
+		}
+		dev_info(sm->dev, "%s streamed\n", secs[i].name);
+	}
+
+	/* Terminator stage (id 0xf): finish handshake. */
+	w = 0xa400;
+	ret = s5300_sit_xchg(sm, scratch, &w, 1, 0xc400);
+	if (ret)
+		dev_err(sm->dev, "finish handshake failed: %d\n", ret);
+out:
+	kfree(scratch);
+	return ret;
+}
+
 static void s5300_boot_work(struct work_struct *work)
 {
 	struct s5300_modem *sm = container_of(work, struct s5300_modem,
@@ -803,16 +1288,19 @@ static void s5300_boot_work(struct work_struct *work)
 	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
 	s5300_init_control_messages(sm);
 	s5300_init_pktproc_info(sm);
-	memcpy_toio(sm->ipc + S5300_BOOT_IMG_OFFSET, sm->pbl->data,
-		    sm->pbl->size);
+	memcpy_toio(sm->ipc + S5300_BOOT_IMG_OFFSET,
+		    sm->pbl->data + sm->boot_off, sm->boot_size);
 	writel(lower_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
 	       sm->msi + S5300_MSI_IMG_ADDR_LO);
 	writel(upper_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
 	       sm->msi + S5300_MSI_IMG_ADDR_HI);
-	writel(sm->pbl->size, sm->msi + S5300_MSI_IMG_SIZE);
+	writel(sm->boot_size, sm->msi + S5300_MSI_IMG_SIZE);
 
-	release_firmware(sm->pbl);
-	sm->pbl = NULL;
+	/*
+	 * Keep the firmware mapped past the bounce: the MAIN/VSS/APM sections
+	 * stream into the CP over the NORM_RAW ring after the link-ack.  An
+	 * early error return leaves it for s5300_remove() to release.
+	 */
 
 	/* The ROM reads these on the doorbell; make sure the writes stuck. */
 	s5300_verify_msi_target(sm);
@@ -834,13 +1322,14 @@ static void s5300_boot_work(struct work_struct *work)
 	 * doorbell trigger.
 	 */
 	s5300_dump_views(sm, "pre-doorbell");
-	s5300_send_doorbell(sm, S5300_DB_MSG);
+	s5300_send_doorbell(sm, S5300_DB_MSG, false);
 
 	ret = s5300_poll_boot_stage(sm);
 	if (ret)
 		return;
 	dev_info(sm->dev, "first-stage bootloader up, bouncing the link\n");
 	s5300_log_cp_lines(sm, "post-pbl");
+	s5300_dump_ctrl(sm, "pre-bounce armed");
 
 	/*
 	 * Downstream settles after boot_stage DONE before the link drop:
@@ -928,8 +1417,26 @@ static void s5300_boot_work(struct work_struct *work)
 
 	s5300_dump_views(sm, "pre-link-ack");
 	s5300_log_cp_lines(sm, "pre-link-ack");
+	s5300_dump_ctrl(sm, "post-bounce pre-link-ack");
 	zumapro_pcie_modem_msi_status(sm->rc_dev);
-	s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
+	/* Arm the SIT ring so BL1 finds Mode 0xBDBD the instant it wakes. */
+	s5300_arm_sit_ring(sm);
+	s5300_send_doorbell(sm, S5300_DB_LINK_ACK, true);
+	s5300_dump_ctrl(sm, "post-link-ack");
+
+	/*
+	 * The cold CP bootloader now drains the NORM_RAW ring for the main
+	 * firmware; stream MAIN/VSS/APM, then release the (large) modem.bin.
+	 */
+	dev_info(sm->dev, "downloading main firmware\n");
+	ret = s5300_download_main(sm);
+	release_firmware(sm->pbl);
+	sm->pbl = NULL;
+	if (ret) {
+		dev_err(sm->dev, "main firmware download failed: %d\n", ret);
+		return;
+	}
+	dev_info(sm->dev, "main firmware streamed; waiting for CP\n");
 
 	/*
 	 * Downstream INIT_START arrives ~2 s after the link-ack.  While
@@ -946,7 +1453,7 @@ static void s5300_boot_work(struct work_struct *work)
 		if (sec == 2 || sec == 5 || sec == 9) {
 			dev_info(sm->dev, "re-ringing link-ack (t+%ds)\n",
 				 sec + 1);
-			s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
+			s5300_send_doorbell(sm, S5300_DB_LINK_ACK, true);
 		}
 	}
 
@@ -1015,7 +1522,7 @@ static void s5300_boot_work(struct work_struct *work)
 		dev_err(sm->dev,
 			"post-mortem: boot_stage cleared to %#x, re-ringing msg doorbell\n",
 			readl(sm->msi + S5300_MSI_BOOT_STAGE));
-		s5300_send_doorbell(sm, S5300_DB_MSG);
+		s5300_send_doorbell(sm, S5300_DB_MSG, false);
 		/*
 		 * Log the raw doorbell read-back.  Per the PBL disassembly the
 		 * CP write-1-clears its ELBI trigger bit once serviced; if this
@@ -1196,13 +1703,14 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	if (of_property_read_string(dev->of_node, "firmware-name", &fw_name))
-		fw_name = "tegu/cp_pbl.bin";
+		fw_name = "tegu/modem.bin";
 	ret = request_firmware(&sm->pbl, fw_name, dev);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to load %s\n", fw_name);
 		goto err_rc;
 	}
-	if (sm->pbl->size > sm->ipc_size - S5300_BOOT_IMG_OFFSET) {
+	s5300_find_boot(sm);
+	if (sm->boot_size > sm->ipc_size - S5300_BOOT_IMG_OFFSET) {
 		ret = dev_err_probe(dev, -EFBIG, "PBL too large\n");
 		goto err_fw;
 	}

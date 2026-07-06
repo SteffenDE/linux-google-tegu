@@ -943,7 +943,7 @@
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
 				<&cp_rmem_1_reserved>;
 		memory-region-names = "ipc", "msi", "pktproc";
-		firmware-name = "tegu/cp_pbl.bin";
+		firmware-name = "tegu/modem.bin";
 		google,pcie = <&pcie0>;
 		samsung,doorbell-addr = <0x14e60000>;
 		cp2ap-wakeup-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;

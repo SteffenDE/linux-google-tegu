@@ -82,6 +82,13 @@ struct zumapro_pcie_phy {
 	void __iomem		*soc;
 	struct clk_bulk_data	clks[PCIE_PHY_NUM_CLKS];
 	phys_addr_t		pmu_phys;
+	/*
+	 * When set, power_off/on keep the external PLL and PHY block clocks
+	 * running (the PMA lanes are still fully cycled).  A discrete endpoint
+	 * that runs off this PHY's refclk -- the modem CP -- then keeps its PCIe
+	 * reference clock across a link bounce.  See zumapro_pcie_phy_keep_refclk.
+	 */
+	bool			keep_refclk;
 };
 
 struct zumapro_pcie_phy_reg {
@@ -269,6 +276,23 @@ void zumapro_pcie_phy_safe_clk(struct phy *p, bool safe)
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_phy_safe_clk);
 
+/*
+ * Keep the external PLL and PHY block clocks running across a power_off/on
+ * cycle so a discrete endpoint that runs off this PHY's refclk (the modem CP)
+ * does not lose its PCIe reference clock during a link bounce.  The PMA lanes
+ * are still fully power-cycled, so RX re-detection works on retrain -- this
+ * mirrors downstream phy_all_pwrdn, which powers the lanes down but leaves the
+ * external PLL/refclk up (tegu's power_off additionally gates them).  The RC
+ * driver arms this for the modem bounce window only.
+ */
+void zumapro_pcie_phy_keep_refclk(struct phy *p, bool keep)
+{
+	struct zumapro_pcie_phy *phy = phy_get_drvdata(p);
+
+	phy->keep_refclk = keep;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_phy_keep_refclk);
+
 /* Release (active) or re-assert PHY isolation via the secure PMU RMW. */
 static int zumapro_pcie_phy_set_isolation(struct zumapro_pcie_phy *phy, bool active)
 {
@@ -302,9 +326,12 @@ static int zumapro_pcie_phy_power_on(struct phy *p)
 	unsigned int lane;
 	int ret;
 
-	ret = clk_bulk_prepare_enable(PCIE_PHY_NUM_CLKS, phy->clks);
-	if (ret)
-		return ret;
+	/* In keep_refclk mode the block clocks were never gated (see power_off). */
+	if (!phy->keep_refclk) {
+		ret = clk_bulk_prepare_enable(PCIE_PHY_NUM_CLKS, phy->clks);
+		if (ret)
+			return ret;
+	}
 
 	/* Put the SoC PHY clock mux into SW mode before the PLL select. */
 	writel(0x15, phy->soc + SOC_PHY_CLK_MODE);
@@ -345,7 +372,8 @@ static int zumapro_pcie_phy_power_on(struct phy *p)
 	return 0;
 
 err_clk:
-	clk_bulk_disable_unprepare(PCIE_PHY_NUM_CLKS, phy->clks);
+	if (!phy->keep_refclk)
+		clk_bulk_disable_unprepare(PCIE_PHY_NUM_CLKS, phy->clks);
 	return ret;
 }
 
@@ -493,10 +521,16 @@ static int zumapro_pcie_phy_power_off(struct phy *p)
 			goto out_clk;
 		}
 
-		/* Gate the external PLL (x2 wiring uses 0xc700 bit 1). */
-		writel(readl(phy->pll + PLL_EXT_CTRL) | BIT(1),
-		       phy->pll + PLL_EXT_CTRL);
-		udelay(10);
+		/*
+		 * Gate the external PLL (x2 wiring uses 0xc700 bit 1) -- skipped
+		 * in keep_refclk mode so the modem CP's refclk survives the
+		 * bounce.  The PMA lanes above are still powered down regardless.
+		 */
+		if (!phy->keep_refclk) {
+			writel(readl(phy->pll + PLL_EXT_CTRL) | BIT(1),
+			       phy->pll + PLL_EXT_CTRL);
+			udelay(10);
+		}
 	} else {
 		udelay(50);
 		writel(readl(phy->pll + PLL_EXT_CTRL) & ~BIT(0),
@@ -505,7 +539,8 @@ static int zumapro_pcie_phy_power_off(struct phy *p)
 	}
 
 out_clk:
-	clk_bulk_disable_unprepare(PCIE_PHY_NUM_CLKS, phy->clks);
+	if (!phy->keep_refclk)
+		clk_bulk_disable_unprepare(PCIE_PHY_NUM_CLKS, phy->clks);
 
 	return 0;
 }

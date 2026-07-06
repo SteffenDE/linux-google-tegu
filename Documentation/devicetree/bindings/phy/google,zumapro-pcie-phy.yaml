@@ -10,17 +10,21 @@ maintainers:
   - Steffen Deusch <steffen@deusch.me>
 
 description:
-  PCIe PHY (PMA + PCS) for the GEN3A_1 root complex of the Google Zumapro
-  (Tensor G4) SoC, used for the on-board WiFi controller.  The PHY is driven by
-  an external PLL reached through the udbg register block and is brought out of
-  isolation through a PMU PCIE_PHY_CONTROL register.
+  PCIe PHY (PMA + PCS) for the root complexes of the Google Zumapro
+  (Tensor G4) SoC. The single-lane GEN3A_1 instance on HSI2 serves the
+  on-board WiFi controller; the two-lane PCIE_GEN3_0 (SF_PCIEPHY_X2) instance
+  on HSI1 serves the modem.  The PHY is driven by an external PLL reached
+  through the udbg register block and is brought out of isolation through a
+  PMU PCIE_PHY_CONTROL register.
 
 properties:
   "#phy-cells":
     const: 0
 
   compatible:
-    const: google,zumapro-pcie-phy
+    enum:
+      - google,zumapro-pcie-phy
+      - google,zumapro-pcie-x2-phy
 
   reg:
     maxItems: 4
@@ -43,6 +47,9 @@ properties:
       - const: ref
       - const: apb
       - const: udbg
+
+  power-domains:
+    maxItems: 1
 
   samsung,pmu-syscon:
     $ref: /schemas/types.yaml#/definitions/phandle-array

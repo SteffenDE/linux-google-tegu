@@ -573,6 +573,22 @@ static void s5300_relink_restore(struct s5300_modem *sm)
 	s5300_verify_msi_target(sm);
 }
 
+#define S5300_PARK_SETTLE_MS	30
+
+/*
+ * True while the CP still owes us: any legacy txq (FMT or RAW) with head != tail
+ * is an AP->CP frame the CP has not yet consumed.  Mirrors downstream
+ * check_mem_link_tx_pending() / check_legacy_tx_pending().  readl() only, so it
+ * is safe to call under sm->lock.
+ */
+static bool s5300_tx_pending(struct s5300_modem *sm)
+{
+	return readl(sm->ipc + S5300_FMT_TXQ_HEAD) !=
+			readl(sm->ipc + S5300_FMT_TXQ_TAIL) ||
+	       readl(sm->ipc + S5300_RAW_TXQ_HEAD) !=
+			readl(sm->ipc + S5300_RAW_TXQ_TAIL);
+}
+
 /*
  * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
  * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
@@ -600,27 +616,62 @@ static void s5300_pm_work(struct work_struct *work)
 			dev_err(sm->dev, "CP wakeup: relink failed\n");
 		}
 	} else if (!want_up && sm->link_up) {
+		bool park;
+
 		/*
-		 * Clear link_up *before* the teardown so a concurrent
-		 * s5300_send_ipc_irq() reserves its doorbell instead of ringing it
-		 * into an endpoint that is about to be held in PERST.
+		 * Don't park while the CP still owes us -- port of downstream
+		 * s5100_poweroff_pcie(force_off=false): settle, then abort the
+		 * teardown if the CP re-asserted CP2AP_WAKEUP, an AP->CP frame is
+		 * still un-drained (txq head != tail), or a doorbell is reserved.
+		 * Tearing down (full PERST + PHY off) on the CP2AP_WAKEUP falling
+		 * edge with a request in flight drops it -- the source of the
+		 * control-channel flakiness.  A later falling edge retries the park.
+		 *
+		 * Read the (possibly sleeping) GPIO outside sm->lock; commit
+		 * link_up=false only under the lock and only when actually parking,
+		 * so a concurrent send either rings while the link is genuinely up
+		 * or reserves once we've decided to tear down.
 		 */
-		spin_lock_irqsave(&sm->lock, flags);
-		sm->link_up = false;
-		spin_unlock_irqrestore(&sm->lock, flags);
-		zumapro_pcie_modem_link_down(sm->rc_dev);
-		dev_dbg(sm->dev, "CP sleep: link down\n");
+		msleep(S5300_PARK_SETTLE_MS);
+
+		if (gpiod_get_value_cansleep(sm->cp2ap_wakeup)) {
+			dev_dbg(sm->dev, "CP sleep: park deferred (CP re-asserted)\n");
+		} else {
+			spin_lock_irqsave(&sm->lock, flags);
+			park = !s5300_tx_pending(sm) && !sm->db_reserved;
+			if (park)
+				sm->link_up = false;
+			spin_unlock_irqrestore(&sm->lock, flags);
+
+			if (park) {
+				zumapro_pcie_modem_link_down(sm->rc_dev);
+				dev_dbg(sm->dev, "CP sleep: link down\n");
+			} else {
+				dev_dbg(sm->dev, "CP sleep: park deferred (tx pending)\n");
+			}
+		}
 	}
 
 	mutex_unlock(&sm->pcie_onoff_lock);
 
-	/* Flush a doorbell a tx deferred while the link was parked. */
 	spin_lock_irqsave(&sm->lock, flags);
-	if (sm->link_up && sm->db_reserved) {
+	if (sm->db_reserved && sm->link_up) {
+		/* Link is up -- deliver the doorbell a tx deferred. */
 		sm->db_reserved = false;
 		s5300_send_doorbell(sm, S5300_DB_MSG);
+		spin_unlock_irqrestore(&sm->lock, flags);
+	} else if (sm->db_reserved) {
+		/*
+		 * Parked with a tx still pending: the tx nudged AP2CP_WAKEUP but
+		 * the teardown drove it low, clobbering the wake edge.  Re-drive it
+		 * so the CP wakes and the next pm_work flushes the reserved
+		 * doorbell, instead of stranding it until the next send.
+		 */
+		spin_unlock_irqrestore(&sm->lock, flags);
+		zumapro_pcie_modem_wake(sm->rc_dev);
+	} else {
+		spin_unlock_irqrestore(&sm->lock, flags);
 	}
-	spin_unlock_irqrestore(&sm->lock, flags);
 }
 
 static irqreturn_t s5300_cp2ap_wakeup_irq(int irq, void *data)

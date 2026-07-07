@@ -496,9 +496,12 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
  * the EP's memory decode may not be settled yet, so an all-ones read-back gets
  * the command register and doorbell BAR repaired and the write retried
  * (downstream s51xx_pcie_send_doorbell_int() retries at 1 ms up to 100x; keep
- * it short here because the IPC path can ring from hard-IRQ context).
+ * it short here because the IPC path can ring from hard-IRQ context).  Returns
+ * true if the write took.  If config space itself reads 0xffff the link is
+ * *physically* down (the CP parked it): reprogramming BARs cannot revive that,
+ * so bail and let the caller escalate to a relink.
  */
-static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
+static bool s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 {
 	int try;
 	u16 cmd;
@@ -506,11 +509,22 @@ static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 	for (try = 0; try < 10; try++) {
 		writel(val, sm->doorbell);
 		if (readl(sm->doorbell) != 0xffffffff)
-			return;
+			return true;
 
 		pci_read_config_word(sm->pdev, PCI_COMMAND, &cmd);
-		if (cmd != 0xffff &&
-		    (cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
+		if (cmd == 0xffff) {
+			/*
+			 * Config space unreadable = the link is physically down
+			 * (the CP parked it, link_up was stale-true).  Reprogramming
+			 * BARs cannot revive that and hammering it on a dead link
+			 * can wedge the CP, so bail immediately and let the caller
+			 * escalate to a relink.
+			 */
+			dev_dbg(sm->dev, "doorbell %#x: link down, need relink\n",
+				val);
+			return false;
+		}
+		if ((cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
 		    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
 			pci_write_config_word(sm->pdev, PCI_COMMAND, cmd |
 					      PCI_COMMAND_MEMORY |
@@ -521,6 +535,7 @@ static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 	}
 
 	dev_err(sm->dev, "doorbell %#x kept reading back all-ones\n", val);
+	return false;
 }
 
 /*
@@ -562,10 +577,18 @@ static void s5300_send_ipc_irq(struct s5300_modem *sm, u32 val)
 
 	spin_lock_irqsave(&sm->lock, flags);
 	writel(val, sm->ipc + S5300_IPC_AP2CP_MSG);
-	if (sm->link_up) {
+	if (sm->link_up && s5300_send_doorbell(sm, S5300_DB_MSG)) {
 		sm->db_reserved = false;
-		s5300_send_doorbell(sm, S5300_DB_MSG);
 	} else {
+		/*
+		 * The CP has parked (link_up already false) or the link is
+		 * physically down despite link_up (doorbell read back all-ones,
+		 * e.g. the CP dropped the link mid-transfer without the GPIO
+		 * park handshake).  Either way clear link_up so s5300_pm_work()
+		 * relinks, keep the doorbell reserved, and nudge AP2CP_WAKEUP so
+		 * the CP answers on CP2AP_WAKEUP; the relink then flushes it.
+		 */
+		sm->link_up = false;
 		sm->db_reserved = true;
 		wake = true;
 	}
@@ -672,18 +695,21 @@ static void s5300_pm_work(struct work_struct *work)
 	mutex_unlock(&sm->pcie_onoff_lock);
 
 	spin_lock_irqsave(&sm->lock, flags);
-	if (sm->db_reserved && sm->link_up) {
-		/* Link is up -- deliver the doorbell a tx deferred. */
+	if (sm->db_reserved && sm->link_up &&
+	    s5300_send_doorbell(sm, S5300_DB_MSG)) {
+		/* Link is up -- delivered the doorbell a tx had reserved. */
 		sm->db_reserved = false;
-		s5300_send_doorbell(sm, S5300_DB_MSG);
 		spin_unlock_irqrestore(&sm->lock, flags);
 	} else if (sm->db_reserved) {
 		/*
-		 * Parked with a tx still pending: the tx nudged AP2CP_WAKEUP but
-		 * the teardown drove it low, clobbering the wake edge.  Re-drive it
-		 * so the CP wakes and the next pm_work flushes the reserved
-		 * doorbell, instead of stranding it until the next send.
+		 * Either parked (link_up false) or the relink came back but the
+		 * doorbell still read all-ones (link_up stale-true, physically
+		 * down).  In the latter case clear link_up so the next wake
+		 * actually relinks instead of retrying a dead BAR.  Re-drive
+		 * AP2CP_WAKEUP so the CP answers and the next pm_work flushes the
+		 * still-reserved doorbell, rather than stranding it.
 		 */
+		sm->link_up = false;
 		spin_unlock_irqrestore(&sm->lock, flags);
 		zumapro_pcie_modem_wake(sm->rc_dev);
 	} else {

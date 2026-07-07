@@ -765,7 +765,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	 */
 	val = readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK;
 	if (val < LTSSM_STATE_RCVRY_LOCK || val > LTSSM_STATE_L1_IDLE) {
-		dev_info(zp->pci.dev,
+		dev_dbg(zp->pci.dev,
 			 "link not up (ltssm %#x), skipping PME_Turn_Off\n", val);
 	} else {
 		/*
@@ -777,7 +777,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 		 */
 		val = readl(elbi + PCIE_IRQ0);
 		writel(val, elbi + PCIE_IRQ0);
-		dev_info(zp->pci.dev,
+		dev_dbg(zp->pci.dev,
 			 "pre-PME ltssm %#x irq0 %#010x (%#010x after clear)\n",
 			 readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK,
 			 val, readl(elbi + PCIE_IRQ0));
@@ -797,7 +797,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 			dev_warn(zp->pci.dev,
 				 "no PM_TO_ACK from endpoint (irq0 %#x)\n", val);
 		else
-			dev_info(zp->pci.dev, "PM_TO_ACK (irq0 %#010x)\n", val);
+			dev_dbg(zp->pci.dev, "PM_TO_ACK (irq0 %#010x)\n", val);
 		udelay(10);
 		writel(0, elbi + PCIE_XMIT_PME_TURNOFF);
 
@@ -819,7 +819,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 				 "link did not reach L2_IDLE before PERST (ltssm %#x)\n",
 				 val & LTSSM_STATE_MASK);
 		else
-			dev_info(zp->pci.dev, "link reached L2_IDLE, orderly down\n");
+			dev_dbg(zp->pci.dev, "link reached L2_IDLE, orderly down\n");
 	}
 
 	/*
@@ -846,7 +846,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	zp->saved_msi_addr_lo = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_ADDR_LO);
 	zp->saved_msi_addr_hi = dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_ADDR_HI);
 	zp->msi_saved = true;
-	dev_info(zp->pci.dev,
+	dev_dbg(zp->pci.dev,
 		 "iMSI-RX snapshot: en %#x mask %#x addr %#x:%#x\n",
 		 zp->saved_msi_enable, zp->saved_msi_mask,
 		 zp->saved_msi_addr_hi, zp->saved_msi_addr_lo);
@@ -946,7 +946,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 		 * stalls looking exactly like a doorbell that never landed.
 		 */
 		if (zp->msi_saved) {
-			dev_info(zp->pci.dev,
+			dev_dbg(zp->pci.dev,
 				 "iMSI-RX post-setup_rc: en %#x mask %#x -> restoring en %#x mask %#x\n",
 				 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_ENABLE),
 				 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_MASK),
@@ -982,7 +982,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 			usleep_range(2800, 3000);
 			lnksta = dw_pcie_readw_dbi(&zp->pci,
 						   cap + PCI_EXP_LNKSTA);
-			dev_info(zp->pci.dev,
+			dev_dbg(zp->pci.dev,
 				 "bounce retrain succeeded on attempt %d (Gen%u x%u)\n",
 				 try + 1,
 				 FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta),
@@ -994,7 +994,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 			 */
 			if (FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta) < 3 &&
 			    try < PCIE_LINK_TRAIN_RETRIES - 1) {
-				dev_info(zp->pci.dev,
+				dev_dbg(zp->pci.dev,
 					 "link below target speed, retraining\n");
 				continue;
 			}
@@ -1002,7 +1002,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 			zumapro_pcie_phy_keep_refclk(zp->phy, false);
 			return 0;
 		}
-		dev_info(zp->pci.dev,
+		dev_dbg(zp->pci.dev,
 			 "bounce retrain attempt %d timed out (rdlh %#x)\n",
 			 try + 1, readl(elbi + PCIE_ELBI_RDLH_LINKUP));
 	}
@@ -1013,6 +1013,31 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 	return -ETIMEDOUT;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_up);
+
+/*
+ * Nudge AP2CP_WAKEUP so a parked CP raises CP2AP_WAKEUP and the modem driver's
+ * wakeup IRQ can relink (downstream s5100_try_gpio_cp_wakeup(), the AP-initiated
+ * half of pcie_send_ap2cp_irq()).  Only the GPIO edge is driven here -- the
+ * actual relink runs from modem_link_up() once the CP answers -- so this is a
+ * cheap, non-blocking poke the send path can issue while the link is down.  The
+ * line is left asserted; modem_link_down() drops it again when the CP parks.
+ */
+int zumapro_pcie_modem_wake(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	/*
+	 * gpiod_set_value (not _cansleep): the modem send path reaches this from
+	 * the MSI hard-IRQ handler, and cp_wakeup is a memory-mapped SoC GPIO that
+	 * never sleeps.
+	 */
+	gpiod_set_value(zp->cp_wakeup, 1);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_wake);
 
 static int zumapro_pcie_probe(struct platform_device *pdev)
 {

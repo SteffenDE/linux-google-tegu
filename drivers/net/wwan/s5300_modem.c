@@ -114,6 +114,30 @@
 #define S5300_IPC_CAP_OFS_PTR		0x70
 #define S5300_IPC_CAP_BASE		0xa0
 #define S5300_IPC_CAP_WORDS		4	/* AP cap x2, CP cap x2 */
+
+/*
+ * AP/CP capability words at capability_offset (dumped.dts capability_offset =
+ * 0xa0), interleaved [ap0][cp0][ap1][cp1] (downstream layout,
+ * AP_CP_CAP_PART_LEN*2*part + {0, PART_LEN}).  The CP negotiates against these:
+ * observed on downstream, the CP only starts servicing runtime IPC (sending on
+ * umts_ipc0, draining the FMT ring) after INIT_START publishes them.
+ */
+#define S5300_IPC_CAP_AP0		(S5300_IPC_CAP_BASE + 0x0)
+#define S5300_IPC_CAP_CP0		(S5300_IPC_CAP_BASE + 0x4)
+#define S5300_IPC_CAP_AP1		(S5300_IPC_CAP_BASE + 0x8)
+#define S5300_IPC_CAP_CP1		(S5300_IPC_CAP_BASE + 0xc)
+
+/*
+ * AP capability part 0 (downstream set_ap_capabilities()): bit0 PKTPROC_UL,
+ * bit1 CH_EXTENSION, bit2 PKTPROC_36BIT.  Downstream sets 0x3 (PKTPROC_UL |
+ * CH_EXTENSION), but we must NOT advertise PKTPROC_UL until the pktproc UL
+ * rings + PCIe IOMMU are set up: the CP takes the bit as "AP does UL over
+ * pktproc" and DMAs into rings that do not exist, which drops the link.  Until
+ * the data path lands, advertise only CH_EXTENSION (a channel-numbering hint
+ * with no DMA implication); the CP (0x7) is still a superset so the crash-check
+ * passes.
+ */
+#define S5300_AP_CAPABILITY_0		0x2
 #define S5300_IPC_AP2CP_MSG		0x800
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
@@ -510,6 +534,37 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 }
 
 /*
+ * Downstream set_ap_capabilities(): publish the AP capability words before
+ * answering INIT_START with PIF_INIT_DONE, so the CP can read them as it comes
+ * up.  The CP will not enable its runtime IPC until this handshake completes.
+ */
+static void s5300_set_ap_capabilities(struct s5300_modem *sm)
+{
+	writel(S5300_AP_CAPABILITY_0, sm->ipc + S5300_IPC_CAP_AP0);
+	writel(0, sm->ipc + S5300_IPC_CAP_AP1);
+	dev_info(sm->dev, "AP capability part0 %#x\n", S5300_AP_CAPABILITY_0);
+}
+
+/*
+ * Downstream cmd_phone_start_handler() capability check: read what the CP
+ * advertised (it fills these once it has read ours) and warn if the CP is
+ * missing a bit the AP claims -- downstream crashes the CP on that; we only log
+ * (no crash recovery yet).  init_ap_capabilities() itself is a no-op here (it
+ * only sets up PKTPROC_UL, deferred to the data path).
+ */
+static void s5300_check_cp_capabilities(struct s5300_modem *sm)
+{
+	u32 ap0 = S5300_AP_CAPABILITY_0;
+	u32 cp0 = readl(sm->ipc + S5300_IPC_CAP_CP0);
+	u32 cp1 = readl(sm->ipc + S5300_IPC_CAP_CP1);
+
+	dev_info(sm->dev, "capability AP %#x CP %#x/%#x\n", ap0, cp0, cp1);
+	if ((ap0 ^ cp0) & ap0)
+		dev_warn(sm->dev, "CP lacks AP capability bits %#x\n",
+			 (ap0 ^ cp0) & ap0);
+}
+
+/*
  * Downstream link_start_normal_boot() -> init_legacy_link(): clear the queue
  * pointers, enable memory access, then stamp the boot magic.  Run before the
  * std_dl stream so the CP's download server sees empty rings.
@@ -732,11 +787,13 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	switch (cmd) {
 	case S5300_CMD_INIT_START:
 		dev_info(sm->dev, "CP INIT_START\n");
+		s5300_set_ap_capabilities(sm);
 		s5300_send_ipc_irq(sm, S5300_CMD(S5300_CMD_PIF_INIT_DONE));
 		break;
 	case S5300_CMD_PHONE_START:
 		dev_info(sm->dev, "CP PHONE_START\n");
 		if (!READ_ONCE(sm->online)) {
+			s5300_check_cp_capabilities(sm);
 			s5300_init_ipc_queues(sm);
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);

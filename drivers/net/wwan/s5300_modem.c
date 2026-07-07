@@ -197,6 +197,14 @@
 #define S5300_FMT_MAX			SZ_2K
 
 /*
+ * RFS file channel (EXYNOS_CH_ID_RFS_0, umts_rfs0) transported on the NORM_RAW
+ * ring post-ONLINE.  Frames are single-fragment; the biggest the corpus shows
+ * is a ~2 KB READ_RESP/WRITE chunk (downstream rfsd reads 0x840 at a time).
+ */
+#define S5300_RFS_CH			0x29	/* EXYNOS_CH_ID_RFS_0 */
+#define S5300_RFS_MAX			SZ_4K
+
+/*
  * EXYNOS link header (downstream include/exynos_ipc.h struct
  * exynos_link_header).  12 bytes, single-frame config, boot channel 0xF1.
  */
@@ -219,12 +227,16 @@
 
 /*
  * Non-command interrupt word: a queue-has-data / flow-control mask OR'd with
- * INT_VALID (downstream mask2int()).  Only the FMT bits are used here; RAW
- * data goes through PKTPROC once the data path lands.
+ * INT_VALID (downstream mask2int()).  FMT carries the SIT control channel and
+ * the NORM_RAW ring carries the RFS file channel post-ONLINE; bulk PS data
+ * goes through PKTPROC once the data path lands.
  */
 #define S5300_MASK_REQ_ACK_FMT		0x0020
 #define S5300_MASK_RES_ACK_FMT		0x0008
 #define S5300_MASK_SEND_FMT		0x0002
+#define S5300_MASK_REQ_ACK_RAW		0x0010
+#define S5300_MASK_RES_ACK_RAW		0x0004
+#define S5300_MASK_SEND_RAW		0x0001
 #define S5300_MASK(x)			(S5300_INT_VALID | (x))
 
 /* Doorbell values: bit 16 triggers, low bits select the mailbox index. */
@@ -302,6 +314,11 @@ struct s5300_modem {
 	u16			fmt_frame_seq;
 	u8			fmt_ch_seq;
 	u8			*fmt_tx_buf;	/* header + one SIT app msg + pad */
+
+	/* RFS file channel on the NORM_RAW ring (post-ONLINE). */
+	struct wwan_port	*rfs_port;
+	u8			rfs_ch_seq;
+	u8			*rfs_tx_buf;	/* header + one RFS frame + pad */
 
 	/*
 	 * CP-driven runtime PCIe power management (post-ONLINE): the CP parks
@@ -773,6 +790,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 
 	sm->fmt_frame_seq = 0;
 	sm->fmt_ch_seq = 0;
+	sm->rfs_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
@@ -789,13 +807,17 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 }
 
 /*
- * Drain std_dl ack frames the CP left on the NORM_RAW rxq, strip the 12-byte
- * link header, and hand the payload to read().  Runs from the MSI handler.
+ * Drain the NORM_RAW rxq and strip the 12-byte link header.  Two channels ride
+ * this ring: boot std_dl acks (handed to read() on /dev/umts_boot0) and, once
+ * ONLINE, the RFS file channel (ch 0x29, handed to the RFS control port).  The
+ * two are temporally disjoint, so demuxing on the header channel id is safe.
+ * Runs from the MSI handler; if the CP asked for a receive ack on the RFS
+ * frames (REQ_ACK_RAW) answer with RES_ACK_RAW like the FMT path.
  */
-static void s5300_drain_rxq(struct s5300_modem *sm)
+static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 {
 	void __iomem *buff = sm->ipc + S5300_RAW_RXQ_OFFSET;
-	bool woke = false;
+	bool woke = false, had_rfs = false;
 	u32 in, out;
 
 	in = readl(sm->ipc + S5300_RAW_RXQ_HEAD);
@@ -810,7 +832,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 	while (in != out) {
 		u8 frame[S5300_HDR_SIZE + 64];
 		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
-		u32 flen, total, payload;
+		u32 flen, total, payload, body;
 		u8 hdr[S5300_HDR_SIZE];
 
 		if (rest < S5300_HDR_SIZE)
@@ -835,8 +857,27 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			break;
 		}
 		payload = flen - S5300_HDR_SIZE;
+		body = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, S5300_HDR_SIZE);
 
-		if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
+		if (hdr[8] == S5300_RFS_CH) {
+			struct sk_buff *skb = NULL;
+
+			/* Cap the atomic alloc: the RE'd protocol is single-frame
+			 * and the ring is 2 MB, so bound a corrupt CP length.
+			 */
+			if (payload && payload <= S5300_RFS_MAX && sm->rfs_port)
+				skb = alloc_skb(payload, GFP_ATOMIC);
+			if (skb) {
+				s5300_circ_read(skb_put(skb, payload), buff,
+						S5300_RAW_RXQ_SIZE, body,
+						payload);
+				wwan_port_rx(sm->rfs_port, skb);
+			} else if (payload) {
+				dev_warn(sm->dev, "rfs rxq drop payload %u\n",
+					 payload);
+			}
+			had_rfs = true;
+		} else if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
 			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out,
 					flen);
 			kfifo_in_spinlocked(&sm->rx_fifo, frame + S5300_HDR_SIZE,
@@ -854,6 +895,9 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 
 	if (woke)
 		wake_up_interruptible(&sm->read_wq);
+
+	if (had_rfs && (intval & S5300_MASK_REQ_ACK_RAW))
+		s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_RES_ACK_RAW));
 }
 
 /*
@@ -943,10 +987,10 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	struct s5300_modem *sm = data;
 	u32 val, cmd;
 
-	/* std_dl acks (and any CP->AP data) ride the NORM_RAW rxq. */
-	s5300_drain_rxq(sm);
-
 	val = readl(sm->ipc + S5300_IPC_CP2AP_MSG);
+
+	/* std_dl boot acks and the RFS file channel ride the NORM_RAW rxq. */
+	s5300_drain_rxq(sm, val);
 
 	/* Once ONLINE the SIT control channel delivers on the FMT rxq. */
 	if (READ_ONCE(sm->online))
@@ -1532,6 +1576,99 @@ static const struct wwan_port_ops s5300_ctrl_ops = {
 	.tx	= s5300_ctrl_tx,
 };
 
+/* --- RFS file port (runtime NORM_RAW ring) ------------------------------- */
+
+/*
+ * Wrap one RFS frame in the 12-byte EXYNOS link header (single frame, channel
+ * 0x29 = EXYNOS_CH_ID_RFS_0), copy it onto the NORM_RAW txq (shared with the
+ * boot std_dl path, idle once ONLINE), then ring the CP's RAW data doorbell.
+ * Serialised by the RFS WWAN port ops_lock, so the head pointer and the staging
+ * buffer are ours alone; the boot std_dl writer is quiescent post-ONLINE.
+ */
+static int s5300_rfs_tx(struct s5300_modem *sm, const u8 *data, u32 len)
+{
+	void __iomem *txq = sm->ipc + S5300_RAW_BUF_OFFSET;
+	u32 flen, total, pad, in, out, space;
+	u8 *frame = sm->rfs_tx_buf;
+	u16 seq;
+
+	if (!READ_ONCE(sm->online))
+		return -ENODEV;
+	if (len == 0 || len > S5300_RFS_MAX)
+		return -EMSGSIZE;
+
+	flen = S5300_HDR_SIZE + len;
+	total = round_up(flen, 8);
+	pad = total - flen;
+
+	seq = ++sm->frame_seq;
+	frame[0] = S5300_HDR_SYNC & 0xff;
+	frame[1] = S5300_HDR_SYNC >> 8;
+	frame[2] = seq & 0xff;
+	frame[3] = seq >> 8;
+	frame[4] = S5300_HDR_CFG_SINGLE & 0xff;
+	frame[5] = S5300_HDR_CFG_SINGLE >> 8;
+	frame[6] = flen & 0xff;
+	frame[7] = flen >> 8;
+	frame[8] = S5300_RFS_CH;
+	frame[9] = ++sm->rfs_ch_seq;
+	frame[10] = 0;
+	frame[11] = 0;
+	memcpy(frame + S5300_HDR_SIZE, data, len);
+	if (pad)
+		memset(frame + flen, 0, pad);
+
+	in = readl(sm->ipc + S5300_RAW_TXQ_HEAD);
+	out = readl(sm->ipc + S5300_RAW_TXQ_TAIL);
+	if (in >= S5300_RAW_TXQ_SIZE || out >= S5300_RAW_TXQ_SIZE) {
+		dev_err(sm->dev, "raw txq pointers out of range (in %#x out %#x)\n",
+			in, out);
+		return -EIO;
+	}
+	space = s5300_circ_space(S5300_RAW_TXQ_SIZE, in, out);
+	if (space < total) {
+		dev_warn(sm->dev, "raw txq full (space %u need %u)\n", space, total);
+		return -EBUSY;
+	}
+
+	s5300_circ_write(txq, frame, S5300_RAW_TXQ_SIZE, in, total);
+	/* Order the payload store ahead of the head advance the CP reads. */
+	wmb();
+	writel(s5300_circ_new(S5300_RAW_TXQ_SIZE, in, total),
+	       sm->ipc + S5300_RAW_TXQ_HEAD);
+
+	s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_SEND_RAW));
+	return 0;
+}
+
+static int s5300_rfs_start(struct wwan_port *port)
+{
+	return 0;
+}
+
+static void s5300_rfs_stop(struct wwan_port *port)
+{
+}
+
+static int s5300_rfs_port_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct s5300_modem *sm = wwan_port_get_drvdata(port);
+	int ret;
+
+	ret = s5300_rfs_tx(sm, skb->data, skb->len);
+	if (ret)
+		return ret;
+
+	consume_skb(skb);
+	return 0;
+}
+
+static const struct wwan_port_ops s5300_rfs_ops = {
+	.start	= s5300_rfs_start,
+	.stop	= s5300_rfs_stop,
+	.tx	= s5300_rfs_port_tx,
+};
+
 /* --- probe / remove ------------------------------------------------------ */
 
 static int s5300_map_region(struct s5300_modem *sm, const char *name,
@@ -1599,6 +1736,10 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->fmt_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_FMT_MAX + 8,
 				      GFP_KERNEL);
 	if (!sm->fmt_tx_buf)
+		return -ENOMEM;
+	sm->rfs_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_RFS_MAX + 8,
+				      GFP_KERNEL);
+	if (!sm->rfs_tx_buf)
 		return -ENOMEM;
 	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
 	if (ret)
@@ -1794,9 +1935,24 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_misc;
 	}
 
+	/*
+	 * The RFS file port, on which a userspace server answers the CP's NV and
+	 * carrier-config file requests (ch 0x29 on the NORM_RAW ring).  Like the
+	 * SIT port it is created up front but only carries traffic once ONLINE.
+	 */
+	sm->rfs_port = wwan_create_port(dev, WWAN_PORT_RFS, &s5300_rfs_ops,
+					NULL, sm);
+	if (IS_ERR(sm->rfs_port)) {
+		ret = PTR_ERR(sm->rfs_port);
+		dev_err(dev, "wwan_create_port(rfs): %d\n", ret);
+		goto err_ctrl_port;
+	}
+
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_ctrl_port:
+	wwan_remove_port(sm->ctrl_port);
 err_misc:
 	misc_deregister(&sm->miscdev);
 err_cp2ap:
@@ -1833,10 +1989,11 @@ static void s5300_remove(struct platform_device *pdev)
 
 	/*
 	 * Free the IRQ first: it synchronises in-flight handlers, so no MSI can
-	 * run s5300_drain_fmt_rxq() -> wwan_port_rx() against a port that
-	 * wwan_remove_port() is about to free.
+	 * run s5300_drain_fmt_rxq()/s5300_drain_rxq() -> wwan_port_rx() against a
+	 * port that wwan_remove_port() is about to free.
 	 */
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	wwan_remove_port(sm->rfs_port);
 	wwan_remove_port(sm->ctrl_port);
 	misc_deregister(&sm->miscdev);
 	pci_free_irq_vectors(sm->pdev);

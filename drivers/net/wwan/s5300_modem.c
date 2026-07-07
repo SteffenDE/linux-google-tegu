@@ -205,6 +205,18 @@
 #define S5300_RFS_MAX			SZ_4K
 
 /*
+ * Vendor AT/router channel (EXYNOS_CH_ID_BT_DUN, downstream io-device
+ * umts_router) transported on the NORM_RAW ring post-ONLINE.  A raw text
+ * byte-stream -- AT command lines out, response/URC lines in -- with no framing
+ * beyond the 12-byte link header.  Exposed as a diagnostic WWAN AT port for an
+ * encoding-independent radio cross-check; the SIT channel stays the RIL control
+ * plane (research/modem-at-commands.md).  AT lines are small, so bound a corrupt
+ * CP length tightly.
+ */
+#define S5300_AT_CH			0x15	/* EXYNOS_CH_ID_BT_DUN (umts_router) */
+#define S5300_AT_MAX			SZ_2K
+
+/*
  * EXYNOS link header (downstream include/exynos_ipc.h struct
  * exynos_link_header).  12 bytes, single-frame config, boot channel 0xF1.
  */
@@ -319,6 +331,19 @@ struct s5300_modem {
 	struct wwan_port	*rfs_port;
 	u8			rfs_ch_seq;
 	u8			*rfs_tx_buf;	/* header + one RFS frame + pad */
+
+	/* Vendor AT/router channel on the NORM_RAW ring (post-ONLINE). */
+	struct wwan_port	*at_port;
+	u8			at_ch_seq;
+	u8			*at_tx_buf;	/* header + one AT frame + pad */
+
+	/*
+	 * Serialises the two post-ONLINE writers of the shared NORM_RAW txq:
+	 * the RFS and AT ports have independent WWAN ops_locks, so their head
+	 * RMW and the frame_seq counter would otherwise race.  The boot std_dl
+	 * writer uses the same ring but is temporally disjoint (io_lock).
+	 */
+	struct mutex		raw_tx_lock;
 
 	/*
 	 * CP-driven runtime PCIe power management (post-ONLINE): the CP parks
@@ -817,6 +842,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 	sm->fmt_frame_seq = 0;
 	sm->fmt_ch_seq = 0;
 	sm->rfs_ch_seq = 0;
+	sm->at_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
@@ -833,17 +859,18 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 }
 
 /*
- * Drain the NORM_RAW rxq and strip the 12-byte link header.  Two channels ride
- * this ring: boot std_dl acks (handed to read() on /dev/umts_boot0) and, once
- * ONLINE, the RFS file channel (ch 0x29, handed to the RFS control port).  The
- * two are temporally disjoint, so demuxing on the header channel id is safe.
- * Runs from the MSI handler; if the CP asked for a receive ack on the RFS
- * frames (REQ_ACK_RAW) answer with RES_ACK_RAW like the FMT path.
+ * Drain the NORM_RAW rxq and strip the 12-byte link header.  Three channels
+ * ride this ring: boot std_dl acks (handed to read() on /dev/umts_boot0) and,
+ * once ONLINE, the RFS file channel (ch 0x29, to the RFS port) and the vendor
+ * AT/router channel (ch 0x15, to the AT port).  Boot is temporally disjoint
+ * from the two runtime channels, so demuxing on the header channel id is safe.
+ * Runs from the MSI handler; if the CP asked for a receive ack on a runtime raw
+ * frame (REQ_ACK_RAW) answer with RES_ACK_RAW like the FMT path.
  */
 static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 {
 	void __iomem *buff = sm->ipc + S5300_RAW_RXQ_OFFSET;
-	bool woke = false, had_rfs = false;
+	bool woke = false, had_raw = false;
 	u32 in, out;
 
 	in = readl(sm->ipc + S5300_RAW_RXQ_HEAD);
@@ -902,7 +929,23 @@ static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 				dev_warn(sm->dev, "rfs rxq drop payload %u\n",
 					 payload);
 			}
-			had_rfs = true;
+			had_raw = true;
+		} else if (hdr[8] == S5300_AT_CH) {
+			struct sk_buff *skb = NULL;
+
+			/* Single-frame raw text; bound a corrupt CP length. */
+			if (payload && payload <= S5300_AT_MAX && sm->at_port)
+				skb = alloc_skb(payload, GFP_ATOMIC);
+			if (skb) {
+				s5300_circ_read(skb_put(skb, payload), buff,
+						S5300_RAW_RXQ_SIZE, body,
+						payload);
+				wwan_port_rx(sm->at_port, skb);
+			} else if (payload) {
+				dev_warn(sm->dev, "at rxq drop payload %u\n",
+					 payload);
+			}
+			had_raw = true;
 		} else if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
 			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out,
 					flen);
@@ -922,7 +965,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 	if (woke)
 		wake_up_interruptible(&sm->read_wq);
 
-	if (had_rfs && (intval & S5300_MASK_REQ_ACK_RAW))
+	if (had_raw && (intval & S5300_MASK_REQ_ACK_RAW))
 		s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_RES_ACK_RAW));
 }
 
@@ -1602,30 +1645,36 @@ static const struct wwan_port_ops s5300_ctrl_ops = {
 	.tx	= s5300_ctrl_tx,
 };
 
-/* --- RFS file port (runtime NORM_RAW ring) ------------------------------- */
+/* --- shared NORM_RAW ring TX (RFS + AT, post-ONLINE) --------------------- */
 
 /*
- * Wrap one RFS frame in the 12-byte EXYNOS link header (single frame, channel
- * 0x29 = EXYNOS_CH_ID_RFS_0), copy it onto the NORM_RAW txq (shared with the
- * boot std_dl path, idle once ONLINE), then ring the CP's RAW data doorbell.
- * Serialised by the RFS WWAN port ops_lock, so the head pointer and the staging
- * buffer are ours alone; the boot std_dl writer is quiescent post-ONLINE.
+ * Wrap one frame in the 12-byte EXYNOS link header (single frame, @ch), copy it
+ * onto the NORM_RAW txq and ring the CP's RAW data doorbell.  Both post-ONLINE
+ * raw writers -- the RFS file channel (0x29) and the vendor AT/router channel
+ * (0x15) -- funnel through here, so the txq head RMW and the frame_seq counter
+ * are serialised by raw_tx_lock; each caller owns its @staging buffer and
+ * @ch_seq.  The boot std_dl writer shares the ring but is temporally disjoint
+ * (pre-ONLINE) and io_lock-serialised.
  */
-static int s5300_rfs_tx(struct s5300_modem *sm, const u8 *data, u32 len)
+static int s5300_raw_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
+			     u8 *ch_seq, u32 max, const u8 *data, u32 len)
 {
 	void __iomem *txq = sm->ipc + S5300_RAW_BUF_OFFSET;
 	u32 flen, total, pad, in, out, space;
-	u8 *frame = sm->rfs_tx_buf;
+	u8 *frame = staging;
 	u16 seq;
+	int ret;
 
 	if (!READ_ONCE(sm->online))
 		return -ENODEV;
-	if (len == 0 || len > S5300_RFS_MAX)
+	if (len == 0 || len > max)
 		return -EMSGSIZE;
 
 	flen = S5300_HDR_SIZE + len;
 	total = round_up(flen, 8);
 	pad = total - flen;
+
+	mutex_lock(&sm->raw_tx_lock);
 
 	seq = ++sm->frame_seq;
 	frame[0] = S5300_HDR_SYNC & 0xff;
@@ -1636,8 +1685,8 @@ static int s5300_rfs_tx(struct s5300_modem *sm, const u8 *data, u32 len)
 	frame[5] = S5300_HDR_CFG_SINGLE >> 8;
 	frame[6] = flen & 0xff;
 	frame[7] = flen >> 8;
-	frame[8] = S5300_RFS_CH;
-	frame[9] = ++sm->rfs_ch_seq;
+	frame[8] = ch;
+	frame[9] = ++*ch_seq;
 	frame[10] = 0;
 	frame[11] = 0;
 	memcpy(frame + S5300_HDR_SIZE, data, len);
@@ -1649,12 +1698,14 @@ static int s5300_rfs_tx(struct s5300_modem *sm, const u8 *data, u32 len)
 	if (in >= S5300_RAW_TXQ_SIZE || out >= S5300_RAW_TXQ_SIZE) {
 		dev_err(sm->dev, "raw txq pointers out of range (in %#x out %#x)\n",
 			in, out);
-		return -EIO;
+		ret = -EIO;
+		goto out_unlock;
 	}
 	space = s5300_circ_space(S5300_RAW_TXQ_SIZE, in, out);
 	if (space < total) {
 		dev_warn(sm->dev, "raw txq full (space %u need %u)\n", space, total);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto out_unlock;
 	}
 
 	s5300_circ_write(txq, frame, S5300_RAW_TXQ_SIZE, in, total);
@@ -1664,8 +1715,13 @@ static int s5300_rfs_tx(struct s5300_modem *sm, const u8 *data, u32 len)
 	       sm->ipc + S5300_RAW_TXQ_HEAD);
 
 	s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_SEND_RAW));
-	return 0;
+	ret = 0;
+out_unlock:
+	mutex_unlock(&sm->raw_tx_lock);
+	return ret;
 }
+
+/* --- RFS file port (runtime NORM_RAW ring) ------------------------------- */
 
 static int s5300_rfs_start(struct wwan_port *port)
 {
@@ -1681,7 +1737,9 @@ static int s5300_rfs_port_tx(struct wwan_port *port, struct sk_buff *skb)
 	struct s5300_modem *sm = wwan_port_get_drvdata(port);
 	int ret;
 
-	ret = s5300_rfs_tx(sm, skb->data, skb->len);
+	ret = s5300_raw_ring_tx(sm, sm->rfs_tx_buf, S5300_RFS_CH,
+				&sm->rfs_ch_seq, S5300_RFS_MAX,
+				skb->data, skb->len);
 	if (ret)
 		return ret;
 
@@ -1693,6 +1751,38 @@ static const struct wwan_port_ops s5300_rfs_ops = {
 	.start	= s5300_rfs_start,
 	.stop	= s5300_rfs_stop,
 	.tx	= s5300_rfs_port_tx,
+};
+
+/* --- vendor AT/router port (runtime NORM_RAW ring) ----------------------- */
+
+static int s5300_at_start(struct wwan_port *port)
+{
+	return 0;
+}
+
+static void s5300_at_stop(struct wwan_port *port)
+{
+}
+
+static int s5300_at_port_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct s5300_modem *sm = wwan_port_get_drvdata(port);
+	int ret;
+
+	ret = s5300_raw_ring_tx(sm, sm->at_tx_buf, S5300_AT_CH,
+				&sm->at_ch_seq, S5300_AT_MAX,
+				skb->data, skb->len);
+	if (ret)
+		return ret;
+
+	consume_skb(skb);
+	return 0;
+}
+
+static const struct wwan_port_ops s5300_at_ops = {
+	.start	= s5300_at_start,
+	.stop	= s5300_at_stop,
+	.tx	= s5300_at_port_tx,
 };
 
 /* --- probe / remove ------------------------------------------------------ */
@@ -1749,6 +1839,7 @@ static int s5300_probe(struct platform_device *pdev)
 	spin_lock_init(&sm->rx_lock);
 	mutex_init(&sm->io_lock);
 	mutex_init(&sm->pcie_onoff_lock);
+	mutex_init(&sm->raw_tx_lock);
 	INIT_WORK(&sm->pm_work, s5300_pm_work);
 	init_completion(&sm->init_done);
 	init_waitqueue_head(&sm->read_wq);
@@ -1766,6 +1857,10 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->rfs_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_RFS_MAX + 8,
 				      GFP_KERNEL);
 	if (!sm->rfs_tx_buf)
+		return -ENOMEM;
+	sm->at_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_AT_MAX + 8,
+				     GFP_KERNEL);
+	if (!sm->at_tx_buf)
 		return -ENOMEM;
 	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
 	if (ret)
@@ -1974,9 +2069,24 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_ctrl_port;
 	}
 
+	/*
+	 * The vendor AT/router port (ch 0x15 on the NORM_RAW ring): a raw
+	 * diagnostic AT byte-stream.  Created up front like the others; only
+	 * carries traffic once ONLINE.
+	 */
+	sm->at_port = wwan_create_port(dev, WWAN_PORT_AT, &s5300_at_ops,
+				       NULL, sm);
+	if (IS_ERR(sm->at_port)) {
+		ret = PTR_ERR(sm->at_port);
+		dev_err(dev, "wwan_create_port(at): %d\n", ret);
+		goto err_rfs_port;
+	}
+
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_rfs_port:
+	wwan_remove_port(sm->rfs_port);
 err_ctrl_port:
 	wwan_remove_port(sm->ctrl_port);
 err_misc:
@@ -2019,6 +2129,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 * port that wwan_remove_port() is about to free.
 	 */
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	wwan_remove_port(sm->at_port);
 	wwan_remove_port(sm->rfs_port);
 	wwan_remove_port(sm->ctrl_port);
 	misc_deregister(&sm->miscdev);

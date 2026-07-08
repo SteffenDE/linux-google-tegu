@@ -227,6 +227,16 @@
 #define S5300_AT_MAX			SZ_2K
 
 /*
+ * Diagnostic monitor channel (EXYNOS_CH_ID_CPLOG, downstream io-device
+ * umts_dm0) transported on the NORM_RAW ring post-ONLINE.  DMD treats it as a
+ * framed byte stream and reads up to 0xffff bytes at a time; userspace owns the
+ * DM framing and logging policy.  The EXYNOS link header length is u16 and
+ * includes the 12-byte transport header, so cap the payload below that.
+ */
+#define S5300_DM_CH			0x51	/* EXYNOS_CH_ID_CPLOG (umts_dm0) */
+#define S5300_DM_MAX			(0xffff - S5300_HDR_SIZE)
+
+/*
  * rmnet PDP data channels: EXYNOS_CH_EX_ID_PDP_0 (181) through +29 (210) =
  * rmnet0..29.  The CP places small DL packets (e.g. DNS replies) on the legacy
  * NORM_RAW ring on these channels instead of PKTPROC; both feed the data netdev.
@@ -443,9 +453,14 @@ struct s5300_modem {
 	u8			at_ch_seq;
 	u8			*at_tx_buf;	/* header + one AT frame + pad */
 
+	/* Diagnostic monitor channel on the NORM_RAW ring (post-ONLINE). */
+	struct wwan_port	*dm_port;
+	u8			dm_ch_seq;
+	u8			*dm_tx_buf;	/* header + one DM frame + pad */
+
 	/*
-	 * Serialises the two post-ONLINE writers of the shared NORM_RAW txq:
-	 * the RFS and AT ports have independent WWAN ops_locks, so their head
+	 * Serialises the post-ONLINE writers of the shared NORM_RAW txq:
+	 * the RFS, AT, and DM ports have independent WWAN ops_locks, so their head
 	 * RMW and the frame_seq counter would otherwise race.  The boot std_dl
 	 * writer uses the same ring but is temporally disjoint (io_lock).
 	 */
@@ -1119,6 +1134,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 	sm->fmt_ch_seq = 0;
 	sm->rfs_ch_seq = 0;
 	sm->at_ch_seq = 0;
+	sm->dm_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
@@ -1135,11 +1151,12 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 }
 
 /*
- * Drain the NORM_RAW rxq and strip the 12-byte link header.  Three channels
+ * Drain the NORM_RAW rxq and strip the 12-byte link header.  Four channels
  * ride this ring: boot std_dl acks (handed to read() on /dev/umts_boot0) and,
  * once ONLINE, the RFS file channel (ch 0x29, to the RFS port) and the vendor
- * AT/router channel (ch 0x15, to the AT port).  Boot is temporally disjoint
- * from the two runtime channels, so demuxing on the header channel id is safe.
+ * AT/router channel (ch 0x15, to the AT port), and the diagnostic monitor
+ * channel (ch 0x51, to the DM port).  Boot is temporally disjoint from the
+ * runtime channels, so demuxing on the header channel id is safe.
  * Runs from the MSI handler; if the CP asked for a receive ack on a runtime raw
  * frame (REQ_ACK_RAW) answer with RES_ACK_RAW like the FMT path.
  */
@@ -1219,6 +1236,21 @@ static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 				wwan_port_rx(sm->at_port, skb);
 			} else if (payload) {
 				dev_warn(sm->dev, "at rxq drop payload %u\n",
+					 payload);
+			}
+			had_raw = true;
+		} else if (hdr[8] == S5300_DM_CH) {
+			struct sk_buff *skb = NULL;
+
+			if (payload && payload <= S5300_DM_MAX && sm->dm_port)
+				skb = alloc_skb(payload, GFP_ATOMIC);
+			if (skb) {
+				s5300_circ_read(skb_put(skb, payload), buff,
+						S5300_RAW_RXQ_SIZE, body,
+						payload);
+				wwan_port_rx(sm->dm_port, skb);
+			} else if (payload) {
+				dev_warn(sm->dev, "dm rxq drop payload %u\n",
 					 payload);
 			}
 			had_raw = true;
@@ -2001,16 +2033,16 @@ static const struct wwan_port_ops s5300_ctrl_ops = {
 	.tx	= s5300_ctrl_tx,
 };
 
-/* --- shared NORM_RAW ring TX (RFS + AT, post-ONLINE) --------------------- */
+/* --- shared NORM_RAW ring TX (RFS + AT + DM, post-ONLINE) ---------------- */
 
 /*
  * Wrap one frame in the 12-byte EXYNOS link header (single frame, @ch), copy it
  * onto the NORM_RAW txq and ring the CP's RAW data doorbell.  Both post-ONLINE
- * raw writers -- the RFS file channel (0x29) and the vendor AT/router channel
- * (0x15) -- funnel through here, so the txq head RMW and the frame_seq counter
- * are serialised by raw_tx_lock; each caller owns its @staging buffer and
- * @ch_seq.  The boot std_dl writer shares the ring but is temporally disjoint
- * (pre-ONLINE) and io_lock-serialised.
+ * raw writers -- RFS (0x29), vendor AT/router (0x15), and DM (0x51) -- funnel
+ * through here, so the txq head RMW and the frame_seq counter are serialised by
+ * raw_tx_lock; each caller owns its @staging buffer and @ch_seq.  The boot
+ * std_dl writer shares the ring but is temporally disjoint (pre-ONLINE) and
+ * io_lock-serialised.
  */
 static int s5300_raw_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 			     u8 *ch_seq, u32 max, const u8 *data, u32 len)
@@ -2139,6 +2171,38 @@ static const struct wwan_port_ops s5300_at_ops = {
 	.start	= s5300_at_start,
 	.stop	= s5300_at_stop,
 	.tx	= s5300_at_port_tx,
+};
+
+/* --- diagnostic monitor port (runtime NORM_RAW ring) --------------------- */
+
+static int s5300_dm_start(struct wwan_port *port)
+{
+	return 0;
+}
+
+static void s5300_dm_stop(struct wwan_port *port)
+{
+}
+
+static int s5300_dm_port_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct s5300_modem *sm = wwan_port_get_drvdata(port);
+	int ret;
+
+	ret = s5300_raw_ring_tx(sm, sm->dm_tx_buf, S5300_DM_CH,
+				&sm->dm_ch_seq, S5300_DM_MAX,
+				skb->data, skb->len);
+	if (ret)
+		return ret;
+
+	consume_skb(skb);
+	return 0;
+}
+
+static const struct wwan_port_ops s5300_dm_ops = {
+	.start	= s5300_dm_start,
+	.stop	= s5300_dm_stop,
+	.tx	= s5300_dm_port_tx,
 };
 
 /* --- probe / remove ------------------------------------------------------ */
@@ -2534,6 +2598,10 @@ static int s5300_probe(struct platform_device *pdev)
 				     GFP_KERNEL);
 	if (!sm->at_tx_buf)
 		return -ENOMEM;
+	sm->dm_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_DM_MAX + 8,
+				     GFP_KERNEL);
+	if (!sm->dm_tx_buf)
+		return -ENOMEM;
 	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
 	if (ret)
 		return ret;
@@ -2769,6 +2837,19 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
+	 * The diagnostic monitor channel (ch 0x51 on the NORM_RAW ring):
+	 * downstream exposes it as /dev/umts_dm0 and DMD treats it as a framed
+	 * byte stream.  Created up front like the other runtime channels.
+	 */
+	sm->dm_port = wwan_create_port(dev, WWAN_PORT_DM, &s5300_dm_ops,
+				       NULL, sm);
+	if (IS_ERR(sm->dm_port)) {
+		ret = PTR_ERR(sm->dm_port);
+		dev_err(dev, "wwan_create_port(dm): %d\n", ret);
+		goto err_at_port;
+	}
+
+	/*
 	 * The raw-IP PS-data netdev.  Created up front; the DL ring is armed at
 	 * INIT_START and drained once ONLINE.  Userspace assigns the address the
 	 * CP returns from SETUP_DATA_CALL and brings it up.
@@ -2777,7 +2858,7 @@ static int s5300_probe(struct platform_device *pdev)
 				NET_NAME_ENUM, s5300_netdev_setup);
 	if (!sm->ndev) {
 		ret = -ENOMEM;
-		goto err_at_port;
+		goto err_dm_port;
 	}
 	*(struct s5300_modem **)netdev_priv(sm->ndev) = sm;
 	SET_NETDEV_DEV(sm->ndev, dev);
@@ -2785,7 +2866,7 @@ static int s5300_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dev, "register_netdev: %d\n", ret);
 		free_netdev(sm->ndev);
-		goto err_at_port;
+		goto err_dm_port;
 	}
 
 	/*
@@ -2798,7 +2879,7 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_err(dev, "register DL ISR: %d\n", ret);
 		unregister_netdev(sm->ndev);
 		free_netdev(sm->ndev);
-		goto err_at_port;
+		goto err_dm_port;
 	}
 
 	/*
@@ -2814,6 +2895,8 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_dm_port:
+	wwan_remove_port(sm->dm_port);
 err_at_port:
 	wwan_remove_port(sm->at_port);
 err_rfs_port:
@@ -2866,6 +2949,7 @@ static void s5300_remove(struct platform_device *pdev)
 	zumapro_pcie_unregister_dl_isr(sm->rc_dev);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	unregister_netdev(sm->ndev);
+	wwan_remove_port(sm->dm_port);
 	wwan_remove_port(sm->at_port);
 	wwan_remove_port(sm->rfs_port);
 	wwan_remove_port(sm->ctrl_port);

@@ -346,8 +346,18 @@
 #endif
 
 		cp_rmem_1_reserved: cp-rmem-1@e8000000 {
-			/* Source: research/dumped.dts:1424-1428. */
+			/*
+			 * Source: research/dumped.dts:1424-1428.  The PKTPROC
+			 * DL/UL data rings + buffers; the CP addresses it at
+			 * pktproc_cp_base 0x20000000 and self-translates to this
+			 * AP-phys before the TLP, so no AP-side window is needed
+			 * (research/pktproc-plan.md "Risk #1").  no-map for the
+			 * same reason as cp_rmem: the driver maps it non-cached
+			 * and the CP DMAs into it (HSI1 IO-coherency is not set
+			 * up on mainline).
+			 */
 			reg = <0x0 0xe8000000 0x2000000>;
+			no-map;
 		};
 
 		cp_aoc_rmem_reserved: cp-aoc-rmem@197fd000 {
@@ -934,8 +944,9 @@
 / {
 	modem {
 		compatible = "samsung,s5300-modem";
-		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>;
-		memory-region-names = "ipc", "msi";
+		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
+				<&cp_rmem_1_reserved>;
+		memory-region-names = "ipc", "msi", "pktproc";
 		firmware-name = "tegu/cp_pbl.bin";
 		google,pcie = <&pcie0>;
 		samsung,doorbell-addr = <0x14e60000>;

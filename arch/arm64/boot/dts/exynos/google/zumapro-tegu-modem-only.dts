@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Modem-only bring-up variant of the tegu board DT, for m1n1 HV tracing of the
+ * CH0 Exynos-5300 modem link bounce in isolation.
+ *
+ * Boots the same kernel and initramfs as zumapro-tegu.dtb but disables WiFi
+ * (CH1/HSI2 PCIe), USB, the display pipeline and the GPU so only the modem RC
+ * (pcie0@12100000) and the s5300 driver probe.  In the full boot the WiFi PCIe
+ * L1SS churn keeps the interconnect busy and the modem probes late; under m1n1
+ * tracing (~30x slowdown) that stretches the post-PBL link bounce past the CP
+ * bootloader's re-link window, so the retrain never trains (LTSSM stuck in
+ * POLLING).  A quiet, early modem probe gives the bounce its best chance to
+ * complete while traced -- and lets a trace finally reach the post-link-ack
+ * window where the CP goes silent.
+ *
+ * EXPERIMENT SCAFFOLDING -- not part of the patch queue, do not export.
+ */
+
+#include "zumapro-tegu.dts"
+
+/* WiFi: BCM4383 over the CH1/HSI2 PCIe root complex. */
+&pcie {
+	status = "disabled";
+};
+
+&pcie_phy {
+	status = "disabled";
+};
+
+/* USB: dwusb3 wrapper + USB3.2 combo PHY + eUSB2 PHY. */
+&usb {
+	status = "disabled";
+};
+
+&usb32drd {
+	status = "disabled";
+};
+
+&usb_hsphy {
+	status = "disabled";
+};
+
+/* Display pipeline: DECON / DPP / DSI + MIPI D-PHY. */
+&decon0 {
+	status = "disabled";
+};
+
+&dpp0 {
+	status = "disabled";
+};
+
+&dsi0 {
+	status = "disabled";
+};
+
+&mipi_phy_dsim0 {
+	status = "disabled";
+};
+
+/* GPU. */
+&gpu {
+	status = "disabled";
+};

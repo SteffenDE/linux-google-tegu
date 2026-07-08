@@ -16,6 +16,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
@@ -35,6 +36,15 @@ static const struct of_device_id zumapro_pcie_of_match[];
 /* ELBI (app/controller) registers, relative to pci->elbi_base. */
 #define PCIE_IRQ0			0x0000
 #define   IRQ_RADM_PM_TO_ACK		BIT(29)
+#define PCIE_IRQ1			0x0004
+#define   IRQ_LINK_DOWN_ASSERT		BIT(10)
+#define PCIE_IRQ2			0x0008
+#define   IRQ_RADM_CPL_TIMEOUT_ASSERT	BIT(24)
+#define PCIE_IRQ0_EN			0x0010
+#define PCIE_IRQ1_EN			0x0014
+#define   IRQ_LINK_DOWN_ENABLE		BIT(10)
+#define PCIE_IRQ2_EN			0x0018
+#define   IRQ_RADM_CPL_TIMEOUT_ENABLE	BIT(24)
 #define PCIE_APP_LTSSM_ENABLE		0x0054
 #define   LTSSM_ENABLE			0x1
 #define PCIE_APP_REQ_EXIT_L1		0x006c
@@ -105,6 +115,9 @@ static const struct of_device_id zumapro_pcie_of_match[];
 #define PCIE_L2_ENTER_WAIT_US		20000
 #define PCIE_L2_ENTER_WAIT_STEP_US	10
 
+/* iMSI-RX groups 1-4 = the four modem PKTPROC DL-queue "separated" MSIs. */
+#define ZUMAPRO_PCIE_SEP_MSI_NUM	4
+
 struct zumapro_pcie {
 	struct dw_pcie		pci;
 	struct clk_bulk_data	*clks;
@@ -136,9 +149,39 @@ struct zumapro_pcie {
 	u32			saved_msi_addr_lo;
 	u32			saved_msi_addr_hi;
 	bool			msi_saved;
+
+	/*
+	 * Separated MSI (modem PKTPROC DL, exclusive irq_mode): the CP fires a
+	 * per-queue MSI on iMSI-RX groups 1-4 (data 32/64/96/128), each routed to
+	 * its own GIC line.  The modem driver registers one drain callback; each
+	 * group's handler clears its status and calls it.  Re-enabled on every
+	 * relink (PERST wipes the group ENABLE/MASK, like group 0).
+	 */
+	void			(*dl_isr)(void *data);
+	void			*dl_isr_data;
+	struct zumapro_sep_msi {
+		struct zumapro_pcie *zp;
+		int		group;		/* iMSI-RX group 1-4 */
+	}			sep_msi[ZUMAPRO_PCIE_SEP_MSI_NUM];
+
+	/*
+	 * Sudden link-down / completion-timeout recovery: the CP can yank its
+	 * PCIe side without raising CP2AP_WAKEUP (the 0x5-race wedge), leaving
+	 * the AP with no GPIO edge to relink on.  The ELBI aggregated "intr" IRQ
+	 * latches IRQ_LINK_DOWN_ASSERT / IRQ_RADM_CPL_TIMEOUT_ASSERT on that
+	 * event; we forward it to the modem driver, which drives a bounded
+	 * AP-initiated relink.  Disarmed across our own graceful park
+	 * (modem_link_down) so the orderly teardown does not self-trigger,
+	 * mirroring downstream's PCIE_IRQ1_EN clear before PME_Turn_Off.
+	 */
+	void			(*linkdown_cb)(void *data);
+	void			*linkdown_data;
+	int			intr_irq;
 };
 
 static struct zumapro_pcie *zumapro_pcie_from_dev(struct device *rc_dev);
+static void zumapro_pcie_enable_sep_msi(struct zumapro_pcie *zp);
+static void zumapro_pcie_arm_linkdown_irq(struct zumapro_pcie *zp, bool on);
 
 /*
  * Bring-up scaffolding: power the Exynos Modem 5300 endpoint so its mask-ROM
@@ -592,29 +635,16 @@ static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
 }
 
 /*
- * Runs after pci_host_probe() has enumerated the endpoint.  The DWC core only
- * leaves the RC's L1 PM Substate capability advertised because probe() sets
- * pci->l1ss_support (see dw_pcie_hide_unsupported_l1ss()); with the capability
- * visible on both ends, walking the hierarchy and enabling the link states
- * lets the ASPM core do the actual L1SS/LTR register programming.
+ * Enable ASPM (L1.1/L1.2) across the link: set the endpoint LTR latency, let
+ * the generic ASPM core program the L1SS/LTR registers via a hierarchy walk,
+ * then re-apply the enable bits to the DWC root port (whose config space the
+ * core cannot write).  Shared by the WLAN channel's post-init and the modem
+ * channel's post-boot enable.
  */
-static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
+static void zumapro_pcie_enable_link_l1ss(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
-	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
 	struct pci_dev *rp, *ep = NULL;
-
-	/*
-	 * Skip the ASPM/L1SS walk on the modem channel: the endpoint here is
-	 * the CP mask ROM parked mid-boot-protocol.  Power management of the
-	 * modem link is the modem driver's business, not enumeration's -- it
-	 * enables CP L1SS itself right after the post-bounce restore
-	 * (s51xx_pcie_restore_state(boot_on=false), before the link-ack
-	 * doorbell; complete_normal_boot()'s later enable is a redundant
-	 * second call).
-	 */
-	if (zp->cp_pwr)
-		return;
 
 	rp = pci_get_slot(pp->bridge->bus, PCI_DEVFN(0, 0));
 	if (rp && rp->subordinate)
@@ -630,6 +660,31 @@ static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
 		zumapro_pcie_fixup_rc_l1ss(pci, ep);
 	pci_dev_put(ep);
 	pci_dev_put(rp);
+}
+
+/*
+ * Runs after pci_host_probe() has enumerated the endpoint.  The DWC core only
+ * leaves the RC's L1 PM Substate capability advertised because probe() sets
+ * pci->l1ss_support (see dw_pcie_hide_unsupported_l1ss()); with the capability
+ * visible on both ends, walking the hierarchy and enabling the link states
+ * lets the ASPM core do the actual L1SS/LTR register programming.
+ */
+static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
+{
+	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
+
+	/*
+	 * Skip the ASPM/L1SS walk on the modem channel: the endpoint here is
+	 * the CP mask ROM parked mid-boot-protocol, which garbles config bursts
+	 * if the link dips into L1.  The modem driver holds the link in L0 for
+	 * the whole boot and calls zumapro_pcie_modem_enable_l1ss() once the CP
+	 * is ONLINE (mirroring downstream complete_normal_boot()).
+	 */
+	if (zp->cp_pwr)
+		return;
+
+	zumapro_pcie_enable_link_l1ss(pp);
 }
 
 static const struct dw_pcie_host_ops zumapro_pcie_host_ops = {
@@ -719,7 +774,7 @@ EXPORT_SYMBOL_GPL(zumapro_pcie_reserve_msi_base);
  * If the bounce proves insufficient on hardware, the escalation path is the
  * downstream full poweroff/poweron (PHY power cycle included).
  */
-int zumapro_pcie_modem_link_down(struct device *rc_dev)
+int zumapro_pcie_modem_link_down(struct device *rc_dev, bool guarded)
 {
 	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
 	void __iomem *elbi;
@@ -729,6 +784,36 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 	if (!zp)
 		return -ENODEV;
 	elbi = zp->pci.elbi_base;
+
+	/*
+	 * Runtime park only (guarded): refuse to tear down a link that is in
+	 * recovery, i.e. the CP is actively using it (traffic in flight).
+	 * PME_Turn_Off from recovery collapses the link to Polling and the
+	 * following PERST then bricks the CP (hw-observed "did not reach L2_IDLE
+	 * ... ltssm 0x5", never wakes again).  Only park from a stable idle state
+	 * (L0/L1); a busy CP drops CP2AP_WAKEUP again once genuinely idle and the
+	 * caller keeps the link up.  The boot bounce passes guarded=false -- it
+	 * must always tear down (the CP expects the retrain).
+	 */
+	if (guarded) {
+		val = readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK;
+		if (val >= LTSSM_STATE_RCVRY_LOCK && val < LTSSM_STATE_L0) {
+			dev_dbg(zp->pci.dev,
+				"link in recovery (ltssm %#x), aborting park\n", val);
+			return -EBUSY;
+		}
+	}
+
+	/*
+	 * Disarm the sudden-linkdown IRQ before our own orderly teardown: the
+	 * PME_Turn_Off -> L2 -> PERST sequence below drops the link deliberately
+	 * and would otherwise latch IRQ_LINK_DOWN_ASSERT and self-trigger a
+	 * relink (downstream clears PCIE_IRQ1_EN right before its PME_Turn_Off
+	 * for the same reason).  After the recovery-abort guard so an aborted
+	 * park leaves it armed.  modem_link_up() re-arms once the link is back.
+	 */
+	if (zp->linkdown_cb)
+		zumapro_pcie_arm_linkdown_irq(zp, false);
 
 	/*
 	 * Keep the CP's PCIe refclk alive across the bounce: the PMA lanes are
@@ -851,6 +936,24 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev)
 		 zp->saved_msi_enable, zp->saved_msi_mask,
 		 zp->saved_msi_addr_hi, zp->saved_msi_addr_lo);
 
+	/*
+	 * DIAGNOSTIC (separated-MSI bring-up): the CP-visible pktproc info block
+	 * runs irq_mode=exclusive, so once ONLINE the CP should fire a per-queue
+	 * MSI (data 32/64/96/128 -> iMSI-RX groups 1-4).  Nothing in this driver
+	 * clears those groups' STATUS (the sep ISR never fired: 0 GIC counts), so
+	 * a park that follows DL traffic latches here iff the CP actually fired
+	 * separated -- distinguishing "delivery/level bug" (sts != 0) from "CP
+	 * never fires separated" (sts == 0).  en/mask g1 confirm our arm stuck.
+	 */
+	dev_info(zp->pci.dev,
+		 "iMSI-RX sep @park sts g1-4 %#x %#x %#x %#x (g1 en %#x mask %#x)\n",
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_STATUS + 1 * MSI_REG_CTRL_BLOCK_SIZE),
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_STATUS + 2 * MSI_REG_CTRL_BLOCK_SIZE),
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_STATUS + 3 * MSI_REG_CTRL_BLOCK_SIZE),
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_STATUS + 4 * MSI_REG_CTRL_BLOCK_SIZE),
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_ENABLE + 1 * MSI_REG_CTRL_BLOCK_SIZE),
+		 dw_pcie_readl_dbi(&zp->pci, PCIE_MSI_INTR0_MASK + 1 * MSI_REG_CTRL_BLOCK_SIZE));
+
 	gpiod_set_value_cansleep(zp->perst, 1);
 	zumapro_pcie_phy_safe_clk(zp->phy, true);
 	writel(0, elbi + PCIE_APP_LTSSM_ENABLE);
@@ -882,6 +985,17 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 	 * link is up.
 	 */
 	gpiod_set_value_cansleep(zp->cp_wakeup, 1);
+
+	/*
+	 * Let the CP bring its PCIe endpoint up before we start training.
+	 * Downstream blocks 5 ms right here (mif_gpio_set_value(AP2CP_WAKEUP,
+	 * 1, 5) before exynos_pcie_poweron()); we used to start PERST/training
+	 * immediately.  The boot bounce polls CP2AP_WAKEUP first so it never
+	 * raced, but a runtime relink runs straight off the CP2AP_WAKEUP IRQ --
+	 * with no settle the RC's Detect can find no receiver and the LTSSM
+	 * sticks at DETECT (0x00), the intermittent relink failure.
+	 */
+	usleep_range(5000, 6000);
 
 	/*
 	 * Downstream re-links with the full poweron sequence and its
@@ -962,6 +1076,13 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 		}
 
 		/*
+		 * dw_pcie_setup_rc() only re-inits group 0; re-arm the modem's
+		 * separated DL MSI groups 1-4 too, or DL RX dies at the first park.
+		 */
+		if (zp->dl_isr)
+			zumapro_pcie_enable_sep_msi(zp);
+
+		/*
 		 * Downstream writes GEN3_RELATED (0x890) = 0x12000 ("EQ Off")
 		 * before every PERST release; Gen3 training on this PHY runs
 		 * without equalization phases 2/3.
@@ -991,6 +1112,15 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 			 * Below-target link: PERST-retry like downstream
 			 * (up to the loop limit, then proceed with what
 			 * trained -- downstream accepts after 10 tries too).
+			 *
+			 * Speed only, NOT width: HW showed that rejecting a
+			 * Gen3 x1 relink and re-PERSTing for x2 is futile and
+			 * harmful -- the CP presents x1 five times running, then
+			 * the rapid PERST/PHY-off cycles wedge it into "no
+			 * receiver" (LTSSM 0x03) and every later relink times
+			 * out.  x1 is what the CP offers at wake; take it.  A
+			 * degraded width is a wake-sequence problem (get the CP
+			 * fully awake before training), not a retrain-hammer one.
 			 */
 			if (FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta) < 3 &&
 			    try < PCIE_LINK_TRAIN_RETRIES - 1) {
@@ -1000,6 +1130,9 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 			}
 			writel(0, elbi + PCIE_APP_XFER_PENDING);
 			zumapro_pcie_phy_keep_refclk(zp->phy, false);
+			/* Re-arm sudden-linkdown recovery for the fresh link. */
+			if (zp->linkdown_cb)
+				zumapro_pcie_arm_linkdown_irq(zp, true);
 			return 0;
 		}
 		dev_dbg(zp->pci.dev,
@@ -1038,6 +1171,247 @@ int zumapro_pcie_modem_wake(struct device *rc_dev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_wake);
+
+/*
+ * Enable ASPM L1.1/L1.2 on the modem link once the CP is ONLINE.  Deferred out
+ * of host_post_init() because at enumeration the endpoint is the CP mask ROM,
+ * which can't take L1 mid-boot; the modem driver calls this after the boot
+ * handshake completes and again after every runtime relink (pci_restore_state
+ * reverts the endpoint to its pre-L1.2 saved config).  With short idles absorbed
+ * in-band by L1.2 the CP keeps CP2AP_WAKEUP high during active traffic instead
+ * of deep-parking the link between packets, so data no longer thrashes the
+ * heavyweight PERST relink.  Mirrors downstream s51xx_pcie_l1ss_ctrl(1).
+ */
+int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp)
+		return -ENODEV;
+
+	zumapro_pcie_enable_link_l1ss(&zp->pci.pp);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_enable_l1ss);
+
+/*
+ * Arm iMSI-RX groups 1-4 (the modem's separated DL MSIs): enable message-0 of
+ * each group and unmask it.  dw_pcie_setup_rc() only touches group 0, and a
+ * relink's SOFT_PWR_RESET wipes these, so this is re-run after every retrain.
+ */
+static void zumapro_pcie_enable_sep_msi(struct zumapro_pcie *zp)
+{
+	int g;
+
+	for (g = 1; g <= ZUMAPRO_PCIE_SEP_MSI_NUM; g++) {
+		dw_pcie_writel_dbi(&zp->pci,
+				   PCIE_MSI_INTR0_ENABLE + g * MSI_REG_CTRL_BLOCK_SIZE,
+				   0x1);
+		dw_pcie_writel_dbi(&zp->pci,
+				   PCIE_MSI_INTR0_MASK + g * MSI_REG_CTRL_BLOCK_SIZE,
+				   ~0x1);
+	}
+}
+
+static irqreturn_t zumapro_pcie_sep_msi_isr(int irq, void *data)
+{
+	struct zumapro_sep_msi *v = data;
+	struct zumapro_pcie *zp = v->zp;
+
+	/* Level-triggered: clear the group's message-0 status (write-1-clear). */
+	dw_pcie_writel_dbi(&zp->pci,
+			   PCIE_MSI_INTR0_STATUS + v->group * MSI_REG_CTRL_BLOCK_SIZE,
+			   0x1);
+
+	if (zp->dl_isr)
+		zp->dl_isr(zp->dl_isr_data);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * The modem driver registers its PKTPROC DL drain here once it is ready to
+ * receive; we request the four "msi1".."msi4" GIC lines and arm the groups.
+ * Any of the four firing drains all DL queues, so the callback is queue-blind.
+ */
+int zumapro_pcie_register_dl_isr(struct device *rc_dev, void (*isr)(void *),
+				 void *data)
+{
+	static const char * const names[ZUMAPRO_PCIE_SEP_MSI_NUM] = {
+		"msi1", "msi2", "msi3", "msi4"
+	};
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	struct platform_device *pdev;
+	int i, irq, ret;
+
+	if (!zp)
+		return -ENODEV;
+
+	pdev = to_platform_device(zp->pci.dev);
+	zp->dl_isr = isr;
+	zp->dl_isr_data = data;
+
+	for (i = 0; i < ZUMAPRO_PCIE_SEP_MSI_NUM; i++) {
+		irq = platform_get_irq_byname(pdev, names[i]);
+		if (irq < 0) {
+			ret = irq;
+			goto err;
+		}
+
+		zp->sep_msi[i].zp = zp;
+		zp->sep_msi[i].group = i + 1;
+		ret = request_irq(irq, zumapro_pcie_sep_msi_isr, 0, names[i],
+				  &zp->sep_msi[i]);
+		if (ret) {
+			dev_err(rc_dev, "separated MSI %s request_irq: %d\n",
+				names[i], ret);
+			goto err;
+		}
+	}
+
+	zumapro_pcie_enable_sep_msi(zp);
+	dev_info(rc_dev, "modem PKTPROC DL: %d separated MSI vectors armed\n",
+		 ZUMAPRO_PCIE_SEP_MSI_NUM);
+	return 0;
+
+err:
+	while (i-- > 0)
+		free_irq(platform_get_irq_byname(pdev, names[i]), &zp->sep_msi[i]);
+	zp->dl_isr = NULL;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_register_dl_isr);
+
+void zumapro_pcie_unregister_dl_isr(struct device *rc_dev)
+{
+	static const char * const names[ZUMAPRO_PCIE_SEP_MSI_NUM] = {
+		"msi1", "msi2", "msi3", "msi4"
+	};
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	struct platform_device *pdev;
+	int i;
+
+	if (!zp || !zp->dl_isr)
+		return;
+
+	pdev = to_platform_device(zp->pci.dev);
+	for (i = 0; i < ZUMAPRO_PCIE_SEP_MSI_NUM; i++) {
+		dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_INTR0_MASK +
+				   (i + 1) * MSI_REG_CTRL_BLOCK_SIZE, ~0x0);
+		free_irq(platform_get_irq_byname(pdev, names[i]), &zp->sep_msi[i]);
+	}
+	zp->dl_isr = NULL;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_unregister_dl_isr);
+
+/*
+ * Enable/disable the ELBI link-down + completion-timeout interrupts.  `on`
+ * once a relink is up, off at the top of our own teardown so a graceful
+ * modem_link_down() does not fire the sudden-linkdown path.  A relink's
+ * SOFT_PWR_RESET wipes the *_EN registers, so modem_link_up() re-arms.
+ */
+static void zumapro_pcie_arm_linkdown_irq(struct zumapro_pcie *zp, bool on)
+{
+	void __iomem *elbi = zp->pci.elbi_base;
+	u32 v1, v2;
+
+	v1 = readl(elbi + PCIE_IRQ1_EN);
+	v2 = readl(elbi + PCIE_IRQ2_EN);
+	if (on) {
+		v1 |= IRQ_LINK_DOWN_ENABLE;
+		v2 |= IRQ_RADM_CPL_TIMEOUT_ENABLE;
+	} else {
+		v1 &= ~IRQ_LINK_DOWN_ENABLE;
+		v2 &= ~IRQ_RADM_CPL_TIMEOUT_ENABLE;
+	}
+	writel(v1, elbi + PCIE_IRQ1_EN);
+	writel(v2, elbi + PCIE_IRQ2_EN);
+}
+
+/*
+ * ELBI aggregated "intr" line.  Read-and-write-back clears the three IRQ latch
+ * registers (write-1-to-clear, exactly as establish_link does for IRQ0); on a
+ * sudden link-down or completion timeout forward to the modem's recovery
+ * callback, which schedules a bounded relink.  Only these two events are
+ * unmasked in the *_EN registers, so the line fires for nothing else.
+ */
+static irqreturn_t zumapro_pcie_intr_isr(int irq, void *data)
+{
+	struct zumapro_pcie *zp = data;
+	void __iomem *elbi = zp->pci.elbi_base;
+	u32 irq0, irq1, irq2;
+
+	irq0 = readl(elbi + PCIE_IRQ0);
+	writel(irq0, elbi + PCIE_IRQ0);
+	irq1 = readl(elbi + PCIE_IRQ1);
+	writel(irq1, elbi + PCIE_IRQ1);
+	irq2 = readl(elbi + PCIE_IRQ2);
+	writel(irq2, elbi + PCIE_IRQ2);
+
+	if ((irq1 & IRQ_LINK_DOWN_ASSERT) ||
+	    (irq2 & IRQ_RADM_CPL_TIMEOUT_ASSERT)) {
+		dev_info(zp->pci.dev,
+			 "modem link lost (irq1 %#x irq2 %#x), requesting relink\n",
+			 irq1, irq2);
+		if (zp->linkdown_cb)
+			zp->linkdown_cb(zp->linkdown_data);
+	}
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * The modem driver registers a sudden-linkdown recovery callback here once it
+ * is ONLINE.  Requests the dedicated ELBI "intr" GIC line and unmasks the
+ * link-down + completion-timeout events.  Callback runs in hardirq context, so
+ * it must not sleep (the modem's just marks the link down and queues work).
+ */
+int zumapro_pcie_register_linkdown_cb(struct device *rc_dev,
+				      void (*cb)(void *), void *data)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	struct platform_device *pdev;
+	int irq, ret;
+
+	if (!zp)
+		return -ENODEV;
+
+	pdev = to_platform_device(zp->pci.dev);
+	irq = platform_get_irq_byname(pdev, "intr");
+	if (irq < 0)
+		return irq;
+
+	zp->linkdown_cb = cb;
+	zp->linkdown_data = data;
+
+	ret = request_irq(irq, zumapro_pcie_intr_isr, 0, "pcie-intr", zp);
+	if (ret) {
+		dev_err(rc_dev, "link-down intr request_irq: %d\n", ret);
+		zp->linkdown_cb = NULL;
+		return ret;
+	}
+	zp->intr_irq = irq;
+	zumapro_pcie_arm_linkdown_irq(zp, true);
+	dev_info(rc_dev, "modem link-down recovery armed (intr irq %d)\n", irq);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_register_linkdown_cb);
+
+void zumapro_pcie_unregister_linkdown_cb(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp || !zp->linkdown_cb)
+		return;
+
+	zumapro_pcie_arm_linkdown_irq(zp, false);
+	if (zp->intr_irq) {
+		free_irq(zp->intr_irq, zp);
+		zp->intr_irq = 0;
+	}
+	zp->linkdown_cb = NULL;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_unregister_linkdown_cb);
 
 static int zumapro_pcie_probe(struct platform_device *pdev)
 {

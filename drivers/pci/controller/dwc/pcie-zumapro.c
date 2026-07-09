@@ -616,7 +616,9 @@ static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
 {
 	u16 rc_l1ss = dw_pcie_find_ext_capability(pci, PCI_EXT_CAP_ID_L1SS);
 	int ep_l1ss = pci_find_ext_capability(ep, PCI_EXT_CAP_ID_L1SS);
+	u8 rc_exp = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
 	u32 ep_ctl1 = 0, val;
+	u16 lnkctl;
 
 	if (!rc_l1ss || !ep_l1ss)
 		return;
@@ -628,10 +630,28 @@ static void zumapro_pcie_fixup_rc_l1ss(struct dw_pcie *pci, struct pci_dev *ep)
 	val &= ~PCI_L1SS_CTL1_L1SS_MASK;
 	val |= ep_ctl1 & PCI_L1SS_CTL1_L1SS_MASK;
 	dw_pcie_write_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4, val);
+
+	/*
+	 * L1.1/L1.2 are substates of base ASPM L1: they only trigger when BOTH
+	 * ends assert PCI_EXP_LNKCTL_ASPM_L1.  The core enables it on the
+	 * endpoint, but the root port's LnkCtl is DBI-read-only to the core, and
+	 * the modem link's SOFT_PWR_RESET wipes it on every park/relink while the
+	 * ASPM core still caches it as enabled and won't re-write -- so the root
+	 * port ends up with the L1SS bits set but base L1 off, and the link never
+	 * leaves L0 between packets (hw: RC LnkCtl ASPM disabled, ~1 W idle).  The
+	 * WLAN link never resets, so its one-time core enable stuck; the modem
+	 * needs base L1 re-asserted here on every relink.
+	 */
+	if (rc_exp) {
+		lnkctl = dw_pcie_read_dbi(pci, rc_exp + PCI_EXP_LNKCTL, 0x2);
+		lnkctl |= PCI_EXP_LNKCTL_ASPM_L1;
+		dw_pcie_write_dbi(pci, rc_exp + PCI_EXP_LNKCTL, 0x2, lnkctl);
+	}
 	dw_pcie_dbi_ro_wr_dis(pci);
 
-	dev_dbg(pci->dev, "L1SS: root-port CTL1 fixed up to %#x\n",
-		dw_pcie_read_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4));
+	dev_dbg(pci->dev, "L1SS: root-port CTL1=%#x lnkctl=%#x\n",
+		dw_pcie_read_dbi(pci, rc_l1ss + PCI_L1SS_CTL1, 0x4),
+		rc_exp ? dw_pcie_read_dbi(pci, rc_exp + PCI_EXP_LNKCTL, 0x2) : 0);
 }
 
 /*

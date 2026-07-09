@@ -165,6 +165,12 @@
  * see s5300_init_control_messages().
  */
 #define S5300_IPC_DS_DET		(1 << 14)
+/*
+ * cp2ap_united_status bit 2: the global TX flow-control gate (downstream
+ * SHM_FLOWCTL_BIT, shmem_tx_state_handler).  The CP updates the word and rings
+ * MSI vector 1: 1 = suspend all uplink, 0 = resume.
+ */
+#define S5300_CP2AP_FLOWCTL		BIT(2)
 /* ap2cp_handover_block_info = <DRAM_V1 2092> (zuma-cp-s5300-sit.dtsi). */
 #define S5300_IPC_HANDOVER		0x82c
 #define S5300_HANDOVER_SIZE		161	/* sizeof(t_handover_block_info) */
@@ -521,6 +527,7 @@ struct s5300_modem {
 	u16			ul_cp_quota;
 	u8			ul_end_bit_owner;
 	bool			ul_active;
+	bool			tx_suspended;	/* CP TX flow control (vector-1 cp2ap_status) */
 };
 
 /* --- circular-ring helpers (downstream include/circ_queue.h) ------------- */
@@ -1064,6 +1071,36 @@ static irqreturn_t s5300_cp_crash_irq(int irq, void *data)
 }
 
 /*
+ * MSI vector 1: the CP's cp2ap_status interrupt (downstream
+ * shmem_tx_state_handler).  Its one runtime payload is the global TX
+ * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
+ * it uplink while its ingress quiesces, and to resume afterwards.  Downstream
+ * reacts by stopping the data netdevs; the legacy FMT/RAW rings stay open
+ * (they are CP-paced -- the CP polls them at its leisure), so only the PKTPROC
+ * UL path is gated here.
+ */
+static irqreturn_t s5300_tx_state_irq(int irq, void *data)
+{
+	struct s5300_modem *sm = data;
+	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
+	bool suspend = status & S5300_CP2AP_FLOWCTL;
+
+	if (suspend == READ_ONCE(sm->tx_suspended))
+		return IRQ_HANDLED;
+
+	WRITE_ONCE(sm->tx_suspended, suspend);
+	if (sm->ndev) {
+		if (suspend)
+			netif_stop_queue(sm->ndev);
+		else
+			netif_wake_queue(sm->ndev);
+	}
+	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
+			     suspend ? "suspend" : "resume", status);
+	return IRQ_HANDLED;
+}
+
+/*
  * RC sudden-linkdown / completion-timeout callback (hardirq, from the ELBI
  * "intr" ISR).  The CP dropped its PCIe side without a CP2AP_WAKEUP edge -- the
  * 0x5-race wedge -- so s5300_pm_work() has no wakeup to relink on and the link
@@ -1211,7 +1248,8 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
  * once ONLINE, the RFS file channel (ch 0x29, to the RFS port) and the vendor
  * AT/router channel (ch 0x15, to the AT port), and the diagnostic monitor
  * channel (ch 0x51, to the DM port).  Boot is temporally disjoint from the
- * runtime channels, so demuxing on the header channel id is safe.
+ * runtime channels, so only BOOT-channel frames are handed to /dev/umts_boot0;
+ * unknown runtime RAW channels are logged and dropped.
  * Runs from the MSI handler; if the CP asked for a receive ack on a runtime raw
  * frame (REQ_ACK_RAW) answer with RES_ACK_RAW like the FMT path.
  */
@@ -1346,9 +1384,9 @@ static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 			} else {
 				sm->ndev->stats.rx_dropped++;
 			}
-		} else if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
-			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out,
-					flen);
+		} else if (!READ_ONCE(sm->online) && hdr[8] == S5300_BOOT_CH &&
+			   payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
+			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out, flen);
 			kfifo_in_spinlocked(&sm->rx_fifo, frame + S5300_HDR_SIZE,
 					    payload, &sm->rx_lock);
 			woke = true;
@@ -1356,8 +1394,9 @@ static void s5300_drain_rxq(struct s5300_modem *sm, u32 intval)
 			u8 first = 0;
 
 			s5300_circ_read(&first, buff, S5300_RAW_RXQ_SIZE, body, 1);
-			dev_warn(sm->dev, "rxq drop ch %#x payload %u first %#x\n",
-				 hdr[8], payload, first);
+			dev_info_ratelimited(sm->dev,
+					     "raw rxq drop unhandled ch %#x payload %u first %#x\n",
+					     hdr[8], payload, first);
 		}
 
 		out = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, total);
@@ -1502,6 +1541,11 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 			s5300_check_cp_capabilities(sm);
 			s5300_pktproc_ul_activate(sm);
 			s5300_init_ipc_queues(sm);
+			/* A rebooted CP starts un-flow-controlled. */
+			if (READ_ONCE(sm->tx_suspended)) {
+				WRITE_ONCE(sm->tx_suspended, false);
+				netif_wake_queue(sm->ndev);
+			}
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
@@ -2541,6 +2585,19 @@ static netdev_tx_t s5300_ndo_start_xmit(struct sk_buff *skb,
 	struct s5300_modem *sm = *(struct s5300_modem **)netdev_priv(ndev);
 	unsigned int len;
 
+	/*
+	 * CP-driven TX flow control (vector-1 cp2ap_status): the CP asked for
+	 * uplink silence, so hold the packet in the qdisc until it resumes.
+	 * The re-check closes the race with a resume landing between the flag
+	 * read and the queue stop.
+	 */
+	if (READ_ONCE(sm->tx_suspended)) {
+		netif_stop_queue(ndev);
+		if (READ_ONCE(sm->tx_suspended))
+			return NETDEV_TX_BUSY;
+		netif_wake_queue(ndev);
+	}
+
 	/* ul_xmit copies only the linear head; we set no SG feature, so this is a
 	 * no-op today, but guard the invariant regardless.
 	 */
@@ -2818,8 +2875,8 @@ static int s5300_probe(struct platform_device *pdev)
 	/*
 	 * Exactly 4 vectors: the mask ROM aborts the PBL download at any other
 	 * MME (8 vectors -> MME=3 regressed boot_stage to 0x1ff on hardware).
-	 * Vector 0 = IPC message/command; 1 = TX flow control; 2..3 spare for
-	 * pktproc.  Only vector 0 matters until the data path exists.
+	 * Vector 0 = IPC message/command; 1 = cp2ap_status (TX flow control);
+	 * 2..3 spare.  Both 0 and 1 get handlers below.
 	 */
 	ret = pci_alloc_irq_vectors(sm->pdev, S5300_MSI_VECTORS,
 				    S5300_MSI_VECTORS, PCI_IRQ_MSI);
@@ -2831,14 +2888,20 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "%d MSI vector(s)\n", ret);
 
 	/*
-	 * The EP-capability MSIs (this vector 0) carry control + FMT.  PKTPROC DL
-	 * arrives on the RC's separated MSI groups 1-4 instead (registered below),
-	 * so only vector 0 needs a handler here.
+	 * The EP-capability MSIs: vector 0 carries control + FMT (PKTPROC DL
+	 * arrives on the RC's separated MSI groups 1-4 instead, registered
+	 * below); vector 1 is the CP's cp2ap_status TX-flow-control interrupt.
+	 * A never-requested vector stays disabled in iMSI-RX, so the CP's
+	 * suspend request would be silently dropped at the RC.
 	 */
 	ret = request_irq(pci_irq_vector(sm->pdev, 0), s5300_irq_handler, 0,
 			  "s5300-ipc", sm);
 	if (ret)
 		goto err_vectors;
+	ret = request_irq(pci_irq_vector(sm->pdev, 1), s5300_tx_state_irq, 0,
+			  "s5300-tx-state", sm);
+	if (ret)
+		goto err_irq0;
 
 	/*
 	 * CP-driven runtime PCIe PM: the CP toggles CP2AP_WAKEUP to ask for the
@@ -3006,6 +3069,8 @@ err_cp2ap:
 err_wq:
 	destroy_workqueue(sm->pm_wq);
 err_irq:
+	free_irq(pci_irq_vector(sm->pdev, 1), sm);
+err_irq0:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
@@ -3045,6 +3110,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 * port that wwan_remove_port() is about to free.
 	 */
 	zumapro_pcie_unregister_dl_isr(sm->rc_dev);
+	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	unregister_netdev(sm->ndev);
 	wwan_remove_port(sm->dm_port);

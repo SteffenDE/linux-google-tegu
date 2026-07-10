@@ -1572,9 +1572,20 @@
 			#size-cells = <2>;
 			#interrupt-cells = <1>;
 			device_type = "pci";
+			/*
+			 * "msi1".."msi4" are the DWC iMSI-RX "separated MSI"
+			 * group 1-4 outputs (MSI data 32/64/96/128): the Exynos
+			 * modem fires one per PKTPROC DL queue in exclusive
+			 * irq_mode, each on its own GIC line so a DL reply is
+			 * delivered without waiting on the shared "msi" (group 0).
+			 */
 			interrupts = <GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 416 IRQ_TYPE_LEVEL_HIGH 0>;
-			interrupt-names = "intr", "msi";
+				     <GIC_SPI 416 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 417 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 418 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 419 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 420 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "intr", "msi", "msi1", "msi2", "msi3", "msi4";
 			interrupt-map-mask = <0 0 0 0>;
 			interrupt-map = <0 0 0 0 &gic GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH 0>;
 			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_DBI_ACLK>,

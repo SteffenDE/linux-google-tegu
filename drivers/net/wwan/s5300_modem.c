@@ -329,10 +329,10 @@
  * use_exclusive_irq=1).  The CP arms DL *unconditionally* (no capability bit),
  * so this info block MUST match what the firmware runs -- a 1-queue/shared block
  * degrades the CP's notify engine and stalls the SIT control channel (proven on
- * HW).  We still poll rear_ptr from the shared MSI-0 handler, so the exclusive
- * per-queue vectors going unhandled costs DL latency, not correctness.  num_desc
- * spans the whole per-queue buffer region (see S5300_PKTPROC_DL_NUM_DESC); the
- * CP uses what we advertise.
+ * HW).  Each queue's per-queue MSI (exclusive irq_mode) is wired to the DL drain
+ * (s5300_dl_isr); leaving vectors 1-3 unhandled stalled RX for seconds until an
+ * unrelated vector-0 IRQ polled the rings.  num_desc spans the whole per-queue
+ * buffer region (see S5300_PKTPROC_DL_NUM_DESC); the CP uses what we advertise.
  */
 #define S5300_PKTPROC_DL_NUM_Q		4
 #define S5300_PKTPROC_DL_BUFF_BY_Q	(S5300_PKTPROC_DL_BUFF_SIZE / S5300_PKTPROC_DL_NUM_Q)
@@ -560,6 +560,7 @@ struct s5300_modem {
 	struct completion	init_done;
 	struct mutex		io_lock;	/* serialises ioctl/write sequencing */
 	spinlock_t		lock;		/* orders ap2cp_msg word + doorbell */
+	spinlock_t		dl_lock;	/* serialises the DL drain across MSI vectors */
 	int			cp_status;	/* enum modem_state */
 	bool			online;
 
@@ -1678,6 +1679,19 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * PKTPROC DL drain, invoked by the RC from each of the modem's separated DL-MSI
+ * groups (exclusive irq_mode; registered via zumapro_pcie_register_dl_isr).
+ * Any group firing scans all queues, so it is queue-blind.  Runs in hard IRQ.
+ */
+static void s5300_dl_isr(void *data)
+{
+	struct s5300_modem *sm = data;
+
+	if (READ_ONCE(sm->online))
+		s5300_pktproc_dl_drain(sm);
+}
+
 static int s5300_setup_doorbell(struct s5300_modem *sm)
 {
 	struct pci_bus_region region;
@@ -2578,15 +2592,19 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5300_PKTPROC_DL_INFO_OFF;
 	u32 n = sm->dl_num_desc;
+	unsigned long flags;
 	u32 q;
 
 	if (!n || !sm->ndev)
 		return;
 
 	/*
-	 * Exclusive irq_mode: the CP fires per-queue MSIs we do not wire up, so
-	 * poll every queue's rear_ptr from the shared MSI-0 handler instead.
+	 * Exclusive irq_mode: the CP raises a per-queue MSI for each DL queue.
+	 * Every queue's vector is wired to this drain and it scans all queues,
+	 * so two vectors can land here concurrently on different CPUs -- serialise
+	 * the ring-pointer updates.
 	 */
+	spin_lock_irqsave(&sm->dl_lock, flags);
 	for (q = 0; q < S5300_PKTPROC_DL_NUM_Q; q++) {
 		void __iomem *qi = info + S5300_PKTPROC_DL_QINFO(q);
 		void __iomem *descs = sm->pktproc + S5300_PKTPROC_DL_DESC_OFF +
@@ -2636,6 +2654,7 @@ next:
 		if (space)
 			writel(sm->dl_fore[q], qi + S5300_QINFO_FORE);
 	}
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
 }
 
 /*
@@ -2869,6 +2888,7 @@ static int s5300_probe(struct platform_device *pdev)
 
 	sm->dev = dev;
 	spin_lock_init(&sm->lock);
+	spin_lock_init(&sm->dl_lock);
 	spin_lock_init(&sm->rx_lock);
 	mutex_init(&sm->io_lock);
 	mutex_init(&sm->pcie_onoff_lock);
@@ -3232,6 +3252,19 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
+	 * Arm the RC's separated DL MSIs.  Their drain delivers into ndev and
+	 * guards on sm->online, so a DL MSI that arrives before the CP is ONLINE
+	 * is a no-op -- it is safe to arm them here.
+	 */
+	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
+	if (ret) {
+		dev_err(dev, "register DL ISR: %d\n", ret);
+		unregister_netdev(sm->ndev);
+		free_netdev(sm->ndev);
+		goto err_oem;
+	}
+
+	/*
 	 * Arm sudden-linkdown recovery: relink AP-initiated when the CP yanks the
 	 * link without a CP2AP_WAKEUP edge.  Non-fatal -- the GPIO/TX-driven relink
 	 * paths still work without it -- so a failure here only loses the extra
@@ -3301,6 +3334,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 * run s5300_drain_fmt_rxq()/s5300_drain_rxq() -> wwan_port_rx() against a
 	 * port that wwan_remove_port() is about to free.
 	 */
+	zumapro_pcie_unregister_dl_isr(sm->rc_dev);
 	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	unregister_netdev(sm->ndev);

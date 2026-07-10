@@ -115,6 +115,9 @@ static const struct of_device_id zumapro_pcie_of_match[];
 #define PCIE_L2_ENTER_WAIT_US		20000
 #define PCIE_L2_ENTER_WAIT_STEP_US	10
 
+/* iMSI-RX groups 1-4 = the four modem PKTPROC DL-queue "separated" MSIs. */
+#define ZUMAPRO_PCIE_SEP_MSI_NUM	4
+
 struct zumapro_pcie {
 	struct dw_pcie		pci;
 	struct clk_bulk_data	*clks;
@@ -148,6 +151,20 @@ struct zumapro_pcie {
 	bool			msi_saved;
 
 	/*
+	 * Separated MSI (modem PKTPROC DL, exclusive irq_mode): the CP fires a
+	 * per-queue MSI on iMSI-RX groups 1-4 (data 32/64/96/128), each routed to
+	 * its own GIC line.  The modem driver registers one drain callback; each
+	 * group's handler clears its status and calls it.  Re-enabled on every
+	 * relink (PERST wipes the group ENABLE/MASK, like group 0).
+	 */
+	void			(*dl_isr)(void *data);
+	void			*dl_isr_data;
+	struct zumapro_sep_msi {
+		struct zumapro_pcie *zp;
+		int		group;		/* iMSI-RX group 1-4 */
+	}			sep_msi[ZUMAPRO_PCIE_SEP_MSI_NUM];
+
+	/*
 	 * Sudden link-down / completion-timeout recovery: the CP can yank its
 	 * PCIe side without raising CP2AP_WAKEUP (the 0x5-race wedge), leaving
 	 * the AP with no GPIO edge to relink on.  The ELBI aggregated "intr" IRQ
@@ -163,6 +180,7 @@ struct zumapro_pcie {
 };
 
 static struct zumapro_pcie *zumapro_pcie_from_dev(struct device *rc_dev);
+static void zumapro_pcie_enable_sep_msi(struct zumapro_pcie *zp);
 static void zumapro_pcie_arm_linkdown_irq(struct zumapro_pcie *zp, bool on);
 
 /*
@@ -1060,6 +1078,13 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev)
 		}
 
 		/*
+		 * dw_pcie_setup_rc() only re-inits group 0; re-arm the modem's
+		 * separated DL MSI groups 1-4 too, or DL RX dies at the first park.
+		 */
+		if (zp->dl_isr)
+			zumapro_pcie_enable_sep_msi(zp);
+
+		/*
 		 * Downstream writes GEN3_RELATED (0x890) = 0x12000 ("EQ Off")
 		 * before every PERST release; Gen3 training on this PHY runs
 		 * without equalization phases 2/3.
@@ -1170,6 +1195,116 @@ int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_enable_l1ss);
+
+/*
+ * Arm iMSI-RX groups 1-4 (the modem's separated DL MSIs): enable message-0 of
+ * each group and unmask it.  dw_pcie_setup_rc() only touches group 0, and a
+ * relink's SOFT_PWR_RESET wipes these, so this is re-run after every retrain.
+ */
+static void zumapro_pcie_enable_sep_msi(struct zumapro_pcie *zp)
+{
+	int g;
+
+	for (g = 1; g <= ZUMAPRO_PCIE_SEP_MSI_NUM; g++) {
+		dw_pcie_writel_dbi(&zp->pci,
+				   PCIE_MSI_INTR0_ENABLE + g * MSI_REG_CTRL_BLOCK_SIZE,
+				   0x1);
+		dw_pcie_writel_dbi(&zp->pci,
+				   PCIE_MSI_INTR0_MASK + g * MSI_REG_CTRL_BLOCK_SIZE,
+				   ~0x1);
+	}
+}
+
+static irqreturn_t zumapro_pcie_sep_msi_isr(int irq, void *data)
+{
+	struct zumapro_sep_msi *v = data;
+	struct zumapro_pcie *zp = v->zp;
+
+	/* Level-triggered: clear the group's message-0 status (write-1-clear). */
+	dw_pcie_writel_dbi(&zp->pci,
+			   PCIE_MSI_INTR0_STATUS + v->group * MSI_REG_CTRL_BLOCK_SIZE,
+			   0x1);
+
+	if (zp->dl_isr)
+		zp->dl_isr(zp->dl_isr_data);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * The modem driver registers its PKTPROC DL drain here once it is ready to
+ * receive; we request the four "msi1".."msi4" GIC lines and arm the groups.
+ * Any of the four firing drains all DL queues, so the callback is queue-blind.
+ */
+int zumapro_pcie_register_dl_isr(struct device *rc_dev, void (*isr)(void *),
+				 void *data)
+{
+	static const char * const names[ZUMAPRO_PCIE_SEP_MSI_NUM] = {
+		"msi1", "msi2", "msi3", "msi4"
+	};
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	struct platform_device *pdev;
+	int i, irq, ret;
+
+	if (!zp)
+		return -ENODEV;
+
+	pdev = to_platform_device(zp->pci.dev);
+	zp->dl_isr = isr;
+	zp->dl_isr_data = data;
+
+	for (i = 0; i < ZUMAPRO_PCIE_SEP_MSI_NUM; i++) {
+		irq = platform_get_irq_byname(pdev, names[i]);
+		if (irq < 0) {
+			ret = irq;
+			goto err;
+		}
+
+		zp->sep_msi[i].zp = zp;
+		zp->sep_msi[i].group = i + 1;
+		ret = request_irq(irq, zumapro_pcie_sep_msi_isr, 0, names[i],
+				  &zp->sep_msi[i]);
+		if (ret) {
+			dev_err(rc_dev, "separated MSI %s request_irq: %d\n",
+				names[i], ret);
+			goto err;
+		}
+	}
+
+	zumapro_pcie_enable_sep_msi(zp);
+	dev_info(rc_dev, "modem PKTPROC DL: %d separated MSI vectors armed\n",
+		 ZUMAPRO_PCIE_SEP_MSI_NUM);
+	return 0;
+
+err:
+	while (i-- > 0)
+		free_irq(platform_get_irq_byname(pdev, names[i]), &zp->sep_msi[i]);
+	zp->dl_isr = NULL;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_register_dl_isr);
+
+void zumapro_pcie_unregister_dl_isr(struct device *rc_dev)
+{
+	static const char * const names[ZUMAPRO_PCIE_SEP_MSI_NUM] = {
+		"msi1", "msi2", "msi3", "msi4"
+	};
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	struct platform_device *pdev;
+	int i;
+
+	if (!zp || !zp->dl_isr)
+		return;
+
+	pdev = to_platform_device(zp->pci.dev);
+	for (i = 0; i < ZUMAPRO_PCIE_SEP_MSI_NUM; i++) {
+		dw_pcie_writel_dbi(&zp->pci, PCIE_MSI_INTR0_MASK +
+				   (i + 1) * MSI_REG_CTRL_BLOCK_SIZE, ~0x0);
+		free_irq(platform_get_irq_byname(pdev, names[i]), &zp->sep_msi[i]);
+	}
+	zp->dl_isr = NULL;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_unregister_dl_isr);
 
 /*
  * Enable/disable the ELBI link-down + completion-timeout interrupts.  `on`

@@ -44,6 +44,12 @@
  * app messages, and this driver wraps them in the 12-byte EXYNOS link header,
  * moves them across the FMT ring and rings the CP's data doorbell.  The bulk
  * data path (PKTPROC rings -> netdev) is still to come.
+ *
+ * Post-ONLINE the CP runs its own PCIe runtime PM: it parks the link when idle
+ * and drives CP2AP_WAKEUP to ask for it back.  The FMT ring is AP DRAM so a
+ * send always stages its frame, but the doorbell is a PCIe write that needs the
+ * link up -- so it is gated on a wakeup handshake (s5300_pm_work(): relink on
+ * CP2AP_WAKEUP, nudge AP2CP_WAKEUP + defer the doorbell when the CP is parked).
  */
 
 #include <linux/completion.h>
@@ -55,6 +61,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -70,6 +77,7 @@
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 #include <linux/wwan.h>
 
 #define S5300_PCI_VENDOR_ID		0x144d
@@ -274,8 +282,9 @@
 
 /*
  * Non-command interrupt word: a queue-has-data / flow-control mask OR'd with
- * INT_VALID (downstream mask2int()).  Only the FMT bits are used here; RAW
- * data goes through PKTPROC once the data path lands.
+ * INT_VALID (downstream mask2int()).  FMT carries the SIT control channel and
+ * the NORM_RAW ring carries the RFS file channel post-ONLINE; bulk PS data
+ * goes through PKTPROC once the data path lands.
  */
 #define S5300_MASK_REQ_ACK_FMT		0x0020
 #define S5300_MASK_RES_ACK_FMT		0x0008
@@ -442,6 +451,16 @@ struct s5300_boot_mode {
 #define IOCTL_LOAD_CP_IMAGE		_IOW('o', 0x40, struct s5300_cp_image)
 #define IOCTL_HANDOVER_BLOCK_INFO	_IO('o', 0x57)
 
+struct s5300_modem;
+
+/*
+ * A generic cpif channel exposed as a misc chardev.  Received frames (link
+ * header already stripped by the ring drain) are queued as skbs, one delivered
+ * per read(); write() wraps one app message in the 12-byte EXYNOS link header
+ * for @channel and pushes it onto the transport ring (@raw_ring picks NORM_RAW
+ * vs FMT).  Used by oem_ipc1 (ch 0x82, FMT) and the RFS file channel (ch 0x29,
+ * NORM_RAW).
+ */
 struct s5300_chardev {
 	struct s5300_modem	*sm;
 	struct miscdevice	miscdev;
@@ -507,6 +526,22 @@ struct s5300_modem {
 	 * std_dl writer uses the same ring but is temporally disjoint (io_lock).
 	 */
 	struct mutex		raw_tx_lock;
+
+	/*
+	 * CP-driven runtime PCIe power management (post-ONLINE): the CP parks
+	 * its link when idle and drives CP2AP_WAKEUP to ask for it back.  The
+	 * relink sleeps, so it runs on an ordered workqueue off the wakeup IRQ.
+	 */
+	int			cp2ap_irq;
+	struct workqueue_struct	*pm_wq;
+	struct work_struct	pm_work;
+	struct mutex		pcie_onoff_lock; /* serialises relink up/down */
+	bool			pm_armed;	/* cp2ap_irq enabled (boot-seq serialised) */
+	bool			link_up;	/* RC link powered on (sm->lock) */
+	bool			db_reserved;	/* doorbell deferred to wake (sm->lock) */
+	bool			relink_requested; /* sudden-linkdown relink pending (sm->lock) */
+	unsigned long		last_linkdown;	/* jiffies of last linkdown relink (rate limit) */
+	unsigned long		fmt_busy_until;	/* inhibit park during an FMT transfer (jiffies) */
 
 	/* EXYNOS link-header sequence counters (reset per boot). */
 	u16			frame_seq;
@@ -656,9 +691,9 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
 
 	pci_read_config_dword(bridge, PCI_MEMORY_BASE, &val);
 	if (val != want) {
-		dev_info(sm->dev,
-			 "opening root-port memory window %#x-%#x (was %#010x)\n",
-			 base, limit, val);
+		dev_dbg(sm->dev,
+			"opening root-port memory window %#x-%#x (was %#010x)\n",
+			base, limit, val);
 		pci_write_config_dword(bridge, PCI_MEMORY_BASE, want);
 		pci_read_config_dword(bridge, PCI_MEMORY_BASE, &val);
 		if (val != want) {
@@ -671,9 +706,9 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
 	pci_read_config_dword(bridge, PCI_BASE_ADDRESS_0, &val);
 	if ((val & PCI_BASE_ADDRESS_MEM_MASK) >= base &&
 	    (val & PCI_BASE_ADDRESS_MEM_MASK) <= limit) {
-		dev_info(sm->dev,
-			 "evicting root-port BAR0 (%#010x) from the doorbell window\n",
-			 val);
+		dev_dbg(sm->dev,
+			"evicting root-port BAR0 (%#010x) from the doorbell window\n",
+			val);
 		pci_write_config_dword(bridge, PCI_BASE_ADDRESS_0, 0);
 		pci_write_config_dword(bridge, PCI_BASE_ADDRESS_1, 0);
 	}
@@ -692,9 +727,12 @@ static int s5300_open_bridge_window(struct s5300_modem *sm)
  * the EP's memory decode may not be settled yet, so an all-ones read-back gets
  * the command register and doorbell BAR repaired and the write retried
  * (downstream s51xx_pcie_send_doorbell_int() retries at 1 ms up to 100x; keep
- * it short here because the IPC path can ring from hard-IRQ context).
+ * it short here because the IPC path can ring from hard-IRQ context).  Returns
+ * true if the write took.  If config space itself reads 0xffff the link is
+ * *physically* down (the CP parked it): reprogramming BARs cannot revive that,
+ * so bail and let the caller escalate to a relink.
  */
-static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
+static bool s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 {
 	int try;
 	u16 cmd;
@@ -702,11 +740,22 @@ static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 	for (try = 0; try < 10; try++) {
 		writel(val, sm->doorbell);
 		if (readl(sm->doorbell) != 0xffffffff)
-			return;
+			return true;
 
 		pci_read_config_word(sm->pdev, PCI_COMMAND, &cmd);
-		if (cmd != 0xffff &&
-		    (cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
+		if (cmd == 0xffff) {
+			/*
+			 * Config space unreadable = the link is physically down
+			 * (the CP parked it, link_up was stale-true).  Reprogramming
+			 * BARs cannot revive that and hammering it on a dead link
+			 * can wedge the CP, so bail immediately and let the caller
+			 * escalate to a relink.
+			 */
+			dev_dbg(sm->dev, "doorbell %#x: link down, need relink\n",
+				val);
+			return false;
+		}
+		if ((cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
 		    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
 			pci_write_config_word(sm->pdev, PCI_COMMAND, cmd |
 					      PCI_COMMAND_MEMORY |
@@ -717,6 +766,7 @@ static void s5300_send_doorbell(struct s5300_modem *sm, u32 val)
 	}
 
 	dev_err(sm->dev, "doorbell %#x kept reading back all-ones\n", val);
+	return false;
 }
 
 /*
@@ -742,15 +792,358 @@ static void s5300_verify_msi_target(struct s5300_modem *sm)
 	dev_err(sm->dev, "MSI address won't hold %pap\n", &sm->msi_phys);
 }
 
-/* Downstream pcie_send_ap2cp_irq(): interrupt word, then the doorbell. */
+/*
+ * Downstream pcie_send_ap2cp_irq(): stage the interrupt word, then ring the
+ * doorbell -- but only if the link is up.  The word lives in AP DRAM the CP
+ * DMAs, so it is always safe to stage; when the CP has parked the link
+ * (link_up false, post-ONLINE runtime PM) defer the doorbell and nudge
+ * AP2CP_WAKEUP instead.  The CP answers on CP2AP_WAKEUP, s5300_pm_work()
+ * relinks and flushes the reserved doorbell.  During boot link_up stays true,
+ * so the INIT/PHONE handshake rings immediately as before.
+ */
 static void s5300_send_ipc_irq(struct s5300_modem *sm, u32 val)
 {
+	bool wake = false;
 	unsigned long flags;
 
 	spin_lock_irqsave(&sm->lock, flags);
 	writel(val, sm->ipc + S5300_IPC_AP2CP_MSG);
-	s5300_send_doorbell(sm, S5300_DB_MSG);
+	if (sm->link_up && s5300_send_doorbell(sm, S5300_DB_MSG)) {
+		sm->db_reserved = false;
+	} else {
+		/*
+		 * The CP has parked (link_up already false) or the link is
+		 * physically down despite link_up (doorbell read back all-ones,
+		 * e.g. the CP dropped the link mid-transfer without the GPIO
+		 * park handshake).  Either way clear link_up so s5300_pm_work()
+		 * relinks, keep the doorbell reserved, and nudge AP2CP_WAKEUP so
+		 * the CP answers on CP2AP_WAKEUP; the relink then flushes it.
+		 */
+		sm->link_up = false;
+		sm->db_reserved = true;
+		wake = true;
+	}
 	spin_unlock_irqrestore(&sm->lock, flags);
+
+	if (wake) {
+		/*
+		 * Nudge AP2CP_WAKEUP so a still-alive CP answers on CP2AP_WAKEUP,
+		 * AND queue s5300_pm_work() to drive the relink ourselves: if the
+		 * CP already parked its own PCIe side (the 0x5 race) it will never
+		 * raise CP2AP_WAKEUP, and waiting on it wedges forever.  pm_work
+		 * relinks AP-initiated when a doorbell is reserved.
+		 */
+		zumapro_pcie_modem_wake(sm->rc_dev);
+		queue_work(sm->pm_wq, &sm->pm_work);
+	}
+}
+
+/*
+ * Replay the endpoint config the boot bounce established (forced doorbell
+ * BAR0, open root-port memory window, MSI target) after a runtime relink --
+ * the same restore s5300_start_bootloader() runs after the boot-phase bounce.
+ * MAIN rebuilds its own inbound doorbell decode on its link-up ISR; this
+ * repairs the AP-side outbound routing the PERST cycle reset.
+ */
+static void s5300_relink_restore(struct s5300_modem *sm)
+{
+	/* Undo the park-time quiesce (D3hot + bus-master off) before replaying
+	 * the config, mirroring downstream s51xx_pcie_restore_state(). */
+	pci_set_power_state(sm->pdev, PCI_D0);
+	pci_restore_state(sm->pdev);
+	pci_set_master(sm->pdev);
+	s5300_program_doorbell_bar(sm);
+	s5300_open_bridge_window(sm);
+	s5300_verify_msi_target(sm);
+	/*
+	 * pci_restore_state() reverted the endpoint to the config saved before
+	 * boot, when L1.2 was still off; re-enable it so short idles stay in-band
+	 * instead of provoking another deep park (downstream restore_state does
+	 * the same via s51xx_pcie_l1ss_ctrl(1)).
+	 */
+	zumapro_pcie_modem_enable_l1ss(sm->rc_dev);
+
+	/*
+	 * Ack the restore to the CP, mirroring the ap2cp_pcie_link_ack downstream
+	 * rings at the end of every s5100_poweron_pcie() (DOORBELL_INT_MASK(14)).
+	 * Without it the CP re-parks the link ~2 s after each wake -- a wake-session
+	 * probation timer the ack terminates, not a traffic-idle timer -- so the
+	 * link churns even under continuous traffic and ping RTT balloons to
+	 * seconds.  We sent it only once, in the boot path, before.
+	 */
+	s5300_send_doorbell(sm, S5300_DB_LINK_ACK);
+}
+
+#define S5300_PARK_SETTLE_MS	30
+
+/*
+ * The CP idle-parks its PCIe link aggressively (CP2AP_WAKEUP low ~1 s after it
+ * goes quiet).  A oem/GEMS file fetch, though, streams ~50 back-to-back 4 KB
+ * chunks over the FMT ring, and each chunk fills the 4 KB ring -- so if the CP
+ * parks between chunks the AP must PERST-relink for every one, which crawls and
+ * thrashes the link.  Keep the link up for a short grace period after any FMT
+ * traffic (a request delivered to userspace, or a frame we send) so the whole
+ * transfer drains at L0; normal idle park resumes once it goes quiet.
+ */
+#define S5300_FMT_BUSY_MS	500
+static inline void s5300_fmt_mark_busy(struct s5300_modem *sm)
+{
+	WRITE_ONCE(sm->fmt_busy_until, jiffies + msecs_to_jiffies(S5300_FMT_BUSY_MS));
+}
+
+/*
+ * True while the CP still owes us: any legacy txq (FMT or RAW) with head != tail
+ * is an AP->CP frame the CP has not yet consumed.  Mirrors downstream
+ * check_mem_link_tx_pending() / check_legacy_tx_pending().  readl() only, so it
+ * is safe to call under sm->lock.
+ */
+static bool s5300_tx_pending(struct s5300_modem *sm)
+{
+	return readl(sm->ipc + S5300_FMT_TXQ_HEAD) !=
+			readl(sm->ipc + S5300_FMT_TXQ_TAIL) ||
+	       readl(sm->ipc + S5300_RAW_TXQ_HEAD) !=
+			readl(sm->ipc + S5300_RAW_TXQ_TAIL);
+}
+
+/*
+ * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
+ * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
+ * ap_wakeup_handler().  Runs on an ordered workqueue because the relink sleeps
+ * (PHY power cycle + PERST retrain).  CP2AP_WAKEUP high = the CP wants the link
+ * up (it woke, or answered our AP2CP_WAKEUP nudge); low = the CP has parked and
+ * the link may drop to save power.
+ */
+static void s5300_pm_work(struct work_struct *work)
+{
+	struct s5300_modem *sm = container_of(work, struct s5300_modem, pm_work);
+	bool want_up = gpiod_get_value_cansleep(sm->cp2ap_wakeup);
+	unsigned long flags;
+
+	mutex_lock(&sm->pcie_onoff_lock);
+
+	/*
+	 * Relink when the CP asks (CP2AP_WAKEUP high) OR when the AP itself has a
+	 * doorbell reserved over a down link -- the latter recovers a CP that
+	 * parked its own side and will not raise CP2AP_WAKEUP (the 0x5-race wedge);
+	 * modem_link_up() trains AP-initiated, it does not poll CP2AP_WAKEUP.
+	 */
+	if ((want_up || sm->db_reserved || sm->relink_requested) && !sm->link_up) {
+		bool ld = sm->relink_requested;
+
+		/*
+		 * Wait for the CP to be awake before training.  Downstream's
+		 * s5100_poweron_pcie() refuses to train while CP2AP_WAKEUP is low
+		 * ("condition not met") and defers the poweron to the CP2AP rising
+		 * edge: s5100_try_gpio_cp_wakeup() only asserts AP2CP, the CP acks
+		 * by raising CP2AP, and the CP2AP IRQ then drives the poweron.
+		 * Training a half-awake CP retrains the link at Gen3 x1 instead of
+		 * x2 (hw-confirmed against downstream logbuffer_pcie0, which shows
+		 * x2 every time).  For an AP-initiated wake (CP2AP still low) nudge
+		 * AP2CP and poll CP2AP up to 300 ms; fall through and train anyway
+		 * if the CP never acks, so a genuinely wedged CP still gets a
+		 * best-effort recovery attempt.
+		 */
+		if (!want_up) {
+			int ms;
+
+			zumapro_pcie_modem_wake(sm->rc_dev);
+			for (ms = 0; ms < 300 &&
+			     !gpiod_get_value_cansleep(sm->cp2ap_wakeup); ms++)
+				usleep_range(1000, 1100);
+			if (ms < 300)
+				dev_dbg(sm->dev, "CP acked wake in %d ms\n", ms);
+		}
+
+		if (zumapro_pcie_modem_link_up(sm->rc_dev) == 0) {
+			s5300_relink_restore(sm);
+			spin_lock_irqsave(&sm->lock, flags);
+			sm->link_up = true;
+			sm->relink_requested = false;
+			spin_unlock_irqrestore(&sm->lock, flags);
+			dev_dbg(sm->dev, "%s: link up\n",
+				want_up ? "CP wakeup" :
+				ld ? "AP relink (linkdown)" : "AP relink (tx pending)");
+		} else {
+			sm->relink_requested = false;
+			dev_err(sm->dev, "relink failed\n");
+		}
+	} else if (!want_up && sm->link_up) {
+		bool park;
+
+		/*
+		 * Don't park while the CP still owes us -- port of downstream
+		 * s5100_poweroff_pcie(force_off=false): settle, then abort the
+		 * teardown if the CP re-asserted CP2AP_WAKEUP, an AP->CP frame is
+		 * still un-drained (txq head != tail), or a doorbell is reserved.
+		 * Tearing down (full PERST + PHY off) on the CP2AP_WAKEUP falling
+		 * edge with a request in flight drops it -- the source of the
+		 * control-channel flakiness.  A later falling edge retries the park.
+		 *
+		 * Read the (possibly sleeping) GPIO outside sm->lock; commit
+		 * link_up=false only under the lock and only when actually parking,
+		 * so a concurrent send either rings while the link is genuinely up
+		 * or reserves once we've decided to tear down.
+		 */
+		msleep(S5300_PARK_SETTLE_MS);
+
+		if (gpiod_get_value_cansleep(sm->cp2ap_wakeup)) {
+			dev_dbg(sm->dev, "CP sleep: park deferred (CP re-asserted)\n");
+		} else {
+			spin_lock_irqsave(&sm->lock, flags);
+			park = !s5300_tx_pending(sm) && !sm->db_reserved &&
+			       time_after_eq(jiffies, READ_ONCE(sm->fmt_busy_until));
+			if (park)
+				sm->link_up = false;
+			spin_unlock_irqrestore(&sm->lock, flags);
+
+			if (park && pci_device_is_present(sm->pdev)) {
+				/*
+				 * Quiesce the endpoint before the RC tears the link
+				 * down, mirroring downstream s51xx_pcie_save_state()
+				 * ahead of exynos_pcie_poweroff(): clear bus-master, save
+				 * config, D3hot.  A silent EP drops the link to L1 and
+				 * reliably completes PME_Turn_Off -> L2_IDLE; PME'ing a
+				 * live EP leaves the link in L0/recovery and the PERST
+				 * that follows fires from a bad LTSSM state.
+				 *
+				 * Gate on the EP still being reachable: if the CP raced
+				 * ahead and dropped its PCIe side during the settle (link
+				 * already at Detect, 0x5), pci_save_state() would capture
+				 * all-1s config and pci_restore_state() on wake would
+				 * corrupt the endpoint -- the intermittent "D3hot
+				 * inaccessible ... never wakes" wedge.  When it is already
+				 * gone, skip the save; modem_link_down() tears the corpse
+				 * down and the wake restores the last-good saved state.
+				 */
+				pci_clear_master(sm->pdev);
+				pci_save_state(sm->pdev);
+				pci_set_power_state(sm->pdev, PCI_D3hot);
+			}
+
+			if (park && zumapro_pcie_modem_link_down(sm->rc_dev, true) == -EBUSY) {
+				/*
+				 * The link was in recovery (active traffic) -- the
+				 * teardown aborted rather than brick the CP.  Bring the EP
+				 * back to D0 so it stays usable, and keep the link up; the
+				 * CP drops CP2AP_WAKEUP again once idle.
+				 */
+				pci_set_power_state(sm->pdev, PCI_D0);
+				pci_restore_state(sm->pdev);
+				pci_set_master(sm->pdev);
+				spin_lock_irqsave(&sm->lock, flags);
+				sm->link_up = true;
+				spin_unlock_irqrestore(&sm->lock, flags);
+				dev_dbg(sm->dev, "CP sleep: park aborted (link busy)\n");
+			} else if (park) {
+				/*
+				 * Intentional park done: discard any linkdown relink
+				 * request that raced the pre-teardown quiesce, so the
+				 * post-park pass does not immediately un-park us.  The
+				 * RC disarmed the linkdown IRQ inside modem_link_down,
+				 * so no further callback fires until the next relink.
+				 */
+				spin_lock_irqsave(&sm->lock, flags);
+				sm->relink_requested = false;
+				spin_unlock_irqrestore(&sm->lock, flags);
+				dev_dbg(sm->dev, "CP sleep: link down\n");
+			} else {
+				dev_dbg(sm->dev, "CP sleep: park deferred (tx pending)\n");
+			}
+		}
+	}
+
+	mutex_unlock(&sm->pcie_onoff_lock);
+
+	spin_lock_irqsave(&sm->lock, flags);
+	if (sm->db_reserved && sm->link_up &&
+	    s5300_send_doorbell(sm, S5300_DB_MSG)) {
+		/* Link is up -- delivered the doorbell a tx had reserved. */
+		sm->db_reserved = false;
+		spin_unlock_irqrestore(&sm->lock, flags);
+	} else if (sm->db_reserved) {
+		/*
+		 * Either parked (link_up false) or the relink came back but the
+		 * doorbell still read all-ones (link_up stale-true, physically
+		 * down).  In the latter case clear link_up so the next wake
+		 * actually relinks instead of retrying a dead BAR.  Re-drive
+		 * AP2CP_WAKEUP so the CP answers and the next pm_work flushes the
+		 * still-reserved doorbell, rather than stranding it.
+		 */
+		sm->link_up = false;
+		spin_unlock_irqrestore(&sm->lock, flags);
+		zumapro_pcie_modem_wake(sm->rc_dev);
+	} else {
+		spin_unlock_irqrestore(&sm->lock, flags);
+	}
+}
+
+static irqreturn_t s5300_cp2ap_wakeup_irq(int irq, void *data)
+{
+	struct s5300_modem *sm = data;
+
+	queue_work(sm->pm_wq, &sm->pm_work);
+	return IRQ_HANDLED;
+}
+
+/*
+ * MSI vector 1: the CP's cp2ap_status interrupt (downstream
+ * shmem_tx_state_handler).  Its one runtime payload is the global TX
+ * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
+ * it uplink while its ingress quiesces, and to resume afterwards.  Downstream
+ * reacts by stopping the data netdevs; the legacy FMT/RAW rings stay open
+ * (they are CP-paced -- the CP polls them at its leisure), so only the PKTPROC
+ * UL path is gated here.
+ */
+static irqreturn_t s5300_tx_state_irq(int irq, void *data)
+{
+	struct s5300_modem *sm = data;
+	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
+	bool suspend = status & S5300_CP2AP_FLOWCTL;
+
+	if (suspend == READ_ONCE(sm->tx_suspended))
+		return IRQ_HANDLED;
+
+	WRITE_ONCE(sm->tx_suspended, suspend);
+	if (sm->ndev) {
+		if (suspend)
+			netif_stop_queue(sm->ndev);
+		else
+			netif_wake_queue(sm->ndev);
+	}
+	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
+			     suspend ? "suspend" : "resume", status);
+	return IRQ_HANDLED;
+}
+
+/*
+ * RC sudden-linkdown / completion-timeout callback (hardirq, from the ELBI
+ * "intr" ISR).  The CP dropped its PCIe side without a CP2AP_WAKEUP edge -- the
+ * 0x5-race wedge -- so s5300_pm_work() has no wakeup to relink on and the link
+ * stays down forever.  Flag the link down and request an AP-initiated relink.
+ * Only meaningful once ONLINE: during boot the link bounces under driver
+ * control (with the IRQ disarmed across each modem_link_down()).  Rate-limited
+ * so a CP stuck yanking the link cannot churn faster than once a second.
+ */
+static void s5300_pcie_linkdown(void *data)
+{
+	struct s5300_modem *sm = data;
+	unsigned long flags;
+
+	if (!READ_ONCE(sm->online))
+		return;
+
+	if (sm->last_linkdown &&
+	    time_before(jiffies, sm->last_linkdown + HZ))
+		return;
+	sm->last_linkdown = jiffies;
+
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->link_up = false;
+	sm->relink_requested = true;
+	spin_unlock_irqrestore(&sm->lock, flags);
+
+	zumapro_pcie_modem_wake(sm->rc_dev);
+	queue_work(sm->pm_wq, &sm->pm_work);
 }
 
 /*
@@ -772,8 +1165,9 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 	 * load-bearing: with ds_det=0 the CP never runs its deep-sleep link
 	 * handshake, so after MAIN loads on the already-up link it never takes a
 	 * link-up ISR to arm its runtime IPC and the FMT control queue is never
-	 * drained ("no data in UL buffer").  With ds_det=1 the CP arms its
-	 * runtime IPC and the SIT control channel round-trips.  HW-validated.
+	 * drained ("no data in UL buffer").  With ds_det=1 the CP cycles
+	 * CP2AP_WAKEUP; each wake relink (s5300_pm_work) re-arms MAIN's IPC and the
+	 * SIT control channel round-trips.  HW-validated.
 	 */
 	writel(S5300_IPC_DS_DET, sm->ipc + S5300_IPC_AP2CP_STATUS);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_STATUS);
@@ -1087,6 +1481,9 @@ static void s5300_drain_fmt_rxq(struct s5300_modem *sm)
 			if (payload)
 				s5300_chardev_rx(&sm->oem, buff,
 						 S5300_FMT_RXQ_SIZE, out, payload);
+			/* The CP opened an oem transaction and expects a (multi-frame)
+			 * reply; keep the link up so it drains at L0. */
+			s5300_fmt_mark_busy(sm);
 		} else if (hdr[8] != S5300_FMT_CH) {
 			u8 first = 0;
 
@@ -1135,45 +1532,15 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm);
 static void s5300_pktproc_ul_setup(struct s5300_modem *sm);
 static void s5300_pktproc_ul_activate(struct s5300_modem *sm);
 
-/*
- * MSI vector 1: the CP's cp2ap_status interrupt (downstream
- * shmem_tx_state_handler).  Its one runtime payload is the global TX
- * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
- * it uplink while its ingress quiesces, and to resume afterwards.  Downstream
- * reacts by stopping the data netdevs; the legacy FMT/RAW rings stay open
- * (they are CP-paced -- the CP polls them at its leisure), so only the PKTPROC
- * UL path is gated here.
- */
-static irqreturn_t s5300_tx_state_irq(int irq, void *data)
-{
-	struct s5300_modem *sm = data;
-	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
-	bool suspend = status & S5300_CP2AP_FLOWCTL;
-
-	if (suspend == READ_ONCE(sm->tx_suspended))
-		return IRQ_HANDLED;
-
-	WRITE_ONCE(sm->tx_suspended, suspend);
-	if (sm->ndev) {
-		if (suspend)
-			netif_stop_queue(sm->ndev);
-		else
-			netif_wake_queue(sm->ndev);
-	}
-	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
-			     suspend ? "suspend" : "resume", status);
-	return IRQ_HANDLED;
-}
-
 static irqreturn_t s5300_irq_handler(int irq, void *data)
 {
 	struct s5300_modem *sm = data;
 	u32 val, cmd;
 
-	/* std_dl acks (and any CP->AP data) ride the NORM_RAW rxq. */
-	s5300_drain_rxq(sm);
-
 	val = readl(sm->ipc + S5300_IPC_CP2AP_MSG);
+
+	/* std_dl boot acks and the RFS file channel ride the NORM_RAW rxq. */
+	s5300_drain_rxq(sm);
 
 	/* Once ONLINE the SIT control channel delivers on the FMT rxq, and the
 	 * CP DMAs PS data into the PKTPROC DL ring (drained to the netdev).
@@ -1217,6 +1584,15 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
+			/*
+			 * The link is up post-boot; hand it to CP-driven runtime
+			 * PM.  Enable once -- pm_armed guards a re-entrant or
+			 * post-crash PHONE_START from stacking enable_irq depth.
+			 */
+			if (!sm->pm_armed) {
+				enable_irq(sm->cp2ap_irq);
+				sm->pm_armed = true;
+			}
 		}
 		/* Re-entrant PHONE_START just gets the INIT_END again. */
 		s5300_send_ipc_irq(sm, S5300_CMD(S5300_CMD_INIT_END));
@@ -1227,6 +1603,12 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 		dev_err(sm->dev, "CP crash notification %#x (err_report %#x)\n",
 			cmd, readl(sm->msi + S5300_MSI_ERR_REPORT));
 		sm->cp_status = S5300_STATE_OFFLINE;
+		/*
+		 * Runtime PM stays armed (cp2ap_irq enabled, online true) until the
+		 * mandatory IOCTL_POWER_ON re-boot quiesces it, so a spurious
+		 * CP2AP_WAKEUP edge from the dead CP can thrash a relink until then.
+		 * Bounded and self-correcting; tighten when crash recovery lands.
+		 */
 		break;
 	default:
 		dev_warn(sm->dev, "unknown CP command %#x\n", cmd);
@@ -1328,6 +1710,22 @@ static int s5300_power_on(struct s5300_modem *sm)
 	kfifo_reset(&sm->rx_fifo);
 	spin_unlock_irqrestore(&sm->rx_lock, flags);
 
+	/*
+	 * Re-arm boot-time link state: the boot handshake rings the doorbell
+	 * directly (link_up true), and CP-driven runtime PM re-enables only at
+	 * PHONE_START.  On a re-boot (post-crash) tear down the previous cycle's
+	 * runtime PM first so the cp2ap_irq enable depth stays balanced.
+	 */
+	if (sm->pm_armed) {
+		disable_irq(sm->cp2ap_irq);
+		cancel_work_sync(&sm->pm_work);
+		sm->pm_armed = false;
+	}
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->link_up = true;
+	sm->db_reserved = false;
+	spin_unlock_irqrestore(&sm->lock, flags);
+
 	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
 	s5300_init_control_messages(sm);
 
@@ -1421,7 +1819,7 @@ static int s5300_start_bootloader(struct s5300_modem *sm)
 	 * the download (downstream start_normal_boot()); CP2AP_WAKEUP signals
 	 * it is ready to re-link.
 	 */
-	ret = zumapro_pcie_modem_link_down(sm->rc_dev);
+	ret = zumapro_pcie_modem_link_down(sm->rc_dev, false);
 	if (ret)
 		return ret;
 	ret = s5300_poll_cp_wakeup(sm);
@@ -1470,6 +1868,20 @@ static int s5300_complete_boot(struct s5300_modem *sm)
 			readl(sm->msi + S5300_MSI_ERR_REPORT));
 		return -ETIMEDOUT;
 	}
+
+	/*
+	 * The link is up and the CP is ONLINE: enable L1.2 so the CP idles the
+	 * link in-band between packets instead of deep-parking it (dropping
+	 * CP2AP_WAKEUP), which would thrash the heavyweight PERST relink under
+	 * active traffic.  Mirrors downstream complete_normal_boot().  Hold
+	 * pcie_onoff_lock so the config walk can't race a park/relink from
+	 * s5300_pm_work(); if a park slipped in first, s5300_relink_restore()
+	 * re-enables it on the way back up.
+	 */
+	mutex_lock(&sm->pcie_onoff_lock);
+	if (sm->link_up)
+		zumapro_pcie_modem_enable_l1ss(sm->rc_dev);
+	mutex_unlock(&sm->pcie_onoff_lock);
 
 	dev_info(sm->dev, "CP is ONLINE\n");
 	return 0;
@@ -1649,8 +2061,9 @@ static const struct file_operations s5300_fops = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
-/* --- SIT control port (runtime FMT queue) -------------------------------- */
+/* --- FMT ring TX (SIT control port + oem chardev, post-ONLINE) ----------- */
 
+/* Free space (bytes) in the FMT txq; 0 if the CP left the pointers corrupt. */
 static u32 s5300_fmt_txq_space(struct s5300_modem *sm)
 {
 	u32 in = readl(sm->ipc + S5300_FMT_TXQ_HEAD);
@@ -1662,11 +2075,12 @@ static u32 s5300_fmt_txq_space(struct s5300_modem *sm)
 }
 
 /*
- * Wrap one app message (SIT ch 0xf5 or oem ch 0x82) in the 12-byte EXYNOS link
- * header (single frame, 8-byte padded), copy it onto the FMT txq and ring the
- * CP's FMT data doorbell.  The two post-ONLINE writers and the shared
- * fmt_frame_seq are serialised by fmt_tx_lock; each caller owns its staging
- * buffer and per-channel ch_seq.
+ * Wrap one app message in the 12-byte EXYNOS link header (single frame, 8-byte
+ * padded, channel @ch), copy it onto the FMT txq and ring the CP's FMT data
+ * doorbell.  Both post-ONLINE FMT writers -- the SIT control port (0xF5) and the
+ * oem/GEMS chardev (0x82) -- funnel through here, so the txq head RMW and the
+ * shared fmt_frame_seq are serialised by fmt_tx_lock; each caller owns its
+ * @staging buffer and @ch_seq.
  */
 static int s5300_fmt_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 			     u8 *ch_seq, u32 max, const u8 *data, u32 len)
@@ -1739,6 +2153,8 @@ static int s5300_fmt_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 	       sm->ipc + S5300_FMT_TXQ_HEAD);
 
 	s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_SEND_FMT));
+	/* Keep the link up while a multi-frame FMT transfer is in flight. */
+	s5300_fmt_mark_busy(sm);
 	ret = 0;
 out_unlock:
 	mutex_unlock(&sm->fmt_tx_lock);
@@ -1775,6 +2191,8 @@ static const struct wwan_port_ops s5300_ctrl_ops = {
 	.stop	= s5300_ctrl_stop,
 	.tx	= s5300_ctrl_tx,
 };
+
+/* --- generic channel chardev (oem_ipc1 today; RFS/DM later) -------------- */
 
 static int s5300_chardev_open(struct inode *inode, struct file *file)
 {
@@ -1907,7 +2325,7 @@ static const struct file_operations s5300_chardev_fops = {
 	.poll		= s5300_chardev_poll,
 };
 
-/* --- shared NORM_RAW ring TX (RFS + AT, post-ONLINE) --------------------- */
+/* --- shared NORM_RAW ring TX (RFS + AT + DM, post-ONLINE) ---------------- */
 
 /*
  * Wrap one frame in the 12-byte EXYNOS link header (single frame, @ch), copy it
@@ -2103,7 +2521,8 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 	if (!n || !sm->ndev)
 		return;
 
-	/* Exclusive irq_mode: the CP fires per-queue MSIs we do not wire up, so
+	/*
+	 * Exclusive irq_mode: the CP fires per-queue MSIs we do not wire up, so
 	 * poll every queue's rear_ptr from the shared MSI-0 handler instead.
 	 */
 	for (q = 0; q < S5300_PKTPROC_DL_NUM_Q; q++) {
@@ -2390,8 +2809,10 @@ static int s5300_probe(struct platform_device *pdev)
 	spin_lock_init(&sm->lock);
 	spin_lock_init(&sm->rx_lock);
 	mutex_init(&sm->io_lock);
-	mutex_init(&sm->fmt_tx_lock);
+	mutex_init(&sm->pcie_onoff_lock);
 	mutex_init(&sm->raw_tx_lock);
+	mutex_init(&sm->fmt_tx_lock);
+	INIT_WORK(&sm->pm_work, s5300_pm_work);
 	init_completion(&sm->init_done);
 	init_waitqueue_head(&sm->read_wq);
 	init_waitqueue_head(&sm->fmt_tx_wq);
@@ -2407,6 +2828,7 @@ static int s5300_probe(struct platform_device *pdev)
 	skb_queue_head_init(&sm->rfs.rxq);
 	init_waitqueue_head(&sm->rfs.read_wq);
 	sm->cp_status = S5300_STATE_OFFLINE;
+	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
 
 	sm->tx_buf = devm_kmalloc(dev, S5300_TX_BUF_SIZE, GFP_KERNEL);
@@ -2508,10 +2930,13 @@ static int s5300_probe(struct platform_device *pdev)
 	 * Downstream keeps every form of link PM off for the whole CP boot; the
 	 * core enabled ASPM L1 at enumeration, so take it back out before
 	 * poking config space (the mask ROM's config emulation has been seen
-	 * returning garbled completions to rapid access bursts).
+	 * returning garbled completions to rapid access bursts).  Clear it via
+	 * the ASPM default mask (enable "no states") rather than
+	 * pci_disable_link_state(), whose veto pci_enable_link_state() cannot
+	 * lift -- zumapro_pcie_modem_enable_l1ss() turns L1.2 back on through the
+	 * core once the CP is ONLINE.
 	 */
-	pci_disable_link_state(sm->pdev, PCIE_LINK_STATE_L0S |
-			       PCIE_LINK_STATE_L1 | PCIE_LINK_STATE_CLKPM);
+	pci_enable_link_state(sm->pdev, 0);
 
 	/* Before MSI allocation: the EP capability must carry the carveout. */
 	ret = zumapro_pcie_set_msi_target(sm->rc_dev, sm->msi_phys);
@@ -2570,8 +2995,8 @@ static int s5300_probe(struct platform_device *pdev)
 	/*
 	 * Exactly 4 vectors: the mask ROM aborts the PBL download at any other
 	 * MME (8 vectors -> MME=3 regressed boot_stage to 0x1ff on hardware).
-	 * Vector 0 = IPC message/command; 1 = TX flow control; 2..3 spare for
-	 * pktproc.  Only vector 0 matters until the data path exists.
+	 * Vector 0 = IPC message/command; 1 = cp2ap_status (TX flow control);
+	 * 2..3 spare.  Both 0 and 1 get handlers below.
 	 */
 	ret = pci_alloc_irq_vectors(sm->pdev, S5300_MSI_VECTORS,
 				    S5300_MSI_VECTORS, PCI_IRQ_MSI);
@@ -2582,21 +3007,45 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 	dev_info(dev, "%d MSI vector(s)\n", ret);
 
+	/*
+	 * The EP-capability MSIs: vector 0 carries control + FMT (PKTPROC DL
+	 * arrives on the RC's separated MSI groups 1-4 instead, registered
+	 * below); vector 1 is the CP's cp2ap_status TX-flow-control interrupt.
+	 * A never-requested vector stays disabled in iMSI-RX, so the CP's
+	 * suspend request would be silently dropped at the RC.
+	 */
 	ret = request_irq(pci_irq_vector(sm->pdev, 0), s5300_irq_handler, 0,
 			  "s5300-ipc", sm);
 	if (ret)
 		goto err_vectors;
-
-	/*
-	 * Vector 0 carries the CP's IPC message/command + FMT + PKTPROC DL
-	 * notifications; vector 1 is the cp2ap_status TX-flow-control interrupt
-	 * (2..3 spare).  A never-requested vector stays disabled in iMSI-RX, so
-	 * the CP's suspend request would be silently dropped at the RC.
-	 */
 	ret = request_irq(pci_irq_vector(sm->pdev, 1), s5300_tx_state_irq, 0,
 			  "s5300-tx-state", sm);
 	if (ret)
 		goto err_irq0;
+
+	/*
+	 * CP-driven runtime PCIe PM: the CP toggles CP2AP_WAKEUP to ask for the
+	 * link back (or announce it is parking).  Requested disabled -- the boot
+	 * path still polls this GPIO for the mid-boot re-link -- and enabled once
+	 * the CP reaches ONLINE (PHONE_START).  Ordered wq: relinks must not race.
+	 */
+	sm->pm_wq = alloc_ordered_workqueue("s5300-pm", 0);
+	if (!sm->pm_wq) {
+		ret = -ENOMEM;
+		goto err_irq;
+	}
+	sm->cp2ap_irq = gpiod_to_irq(sm->cp2ap_wakeup);
+	if (sm->cp2ap_irq < 0) {
+		ret = dev_err_probe(dev, sm->cp2ap_irq, "CP2AP_WAKEUP to irq\n");
+		goto err_wq;
+	}
+	ret = request_irq(sm->cp2ap_irq, s5300_cp2ap_wakeup_irq,
+			  IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+			  IRQF_NO_AUTOEN, "s5300-cp2ap-wakeup", sm);
+	if (ret) {
+		dev_err(dev, "CP2AP_WAKEUP request_irq: %d\n", ret);
+		goto err_wq;
+	}
 
 	sm->miscdev.minor = MISC_DYNAMIC_MINOR;
 	sm->miscdev.name = "umts_boot0";
@@ -2605,7 +3054,7 @@ static int s5300_probe(struct platform_device *pdev)
 	ret = misc_register(&sm->miscdev);
 	if (ret) {
 		dev_err(dev, "misc_register: %d\n", ret);
-		goto err_irq;
+		goto err_cp2ap;
 	}
 
 	/*
@@ -2685,6 +3134,16 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_oem;
 	}
 
+	/*
+	 * Arm sudden-linkdown recovery: relink AP-initiated when the CP yanks the
+	 * link without a CP2AP_WAKEUP edge.  Non-fatal -- the GPIO/TX-driven relink
+	 * paths still work without it -- so a failure here only loses the extra
+	 * safety net.
+	 */
+	ret = zumapro_pcie_register_linkdown_cb(sm->rc_dev, s5300_pcie_linkdown, sm);
+	if (ret)
+		dev_warn(dev, "link-down recovery unavailable: %d\n", ret);
+
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
@@ -2698,6 +3157,10 @@ err_ctrl_port:
 	wwan_remove_port(sm->ctrl_port);
 err_misc:
 	misc_deregister(&sm->miscdev);
+err_cp2ap:
+	free_irq(sm->cp2ap_irq, sm);
+err_wq:
+	destroy_workqueue(sm->pm_wq);
 err_irq:
 	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 err_irq0:
@@ -2720,16 +3183,31 @@ static void s5300_remove(struct platform_device *pdev)
 	struct s5300_modem *sm = platform_get_drvdata(pdev);
 
 	/*
+	 * Quiesce runtime PM first.  Both wakeup sources queue pm_work, so stop
+	 * them before the workqueue is cancelled/destroyed: free_irq(cp2ap) and
+	 * unregister_linkdown_cb() (which disarms the link-down IRQ and frees the
+	 * ELBI "intr" line) each synchronise their in-flight handler, so no relink
+	 * can be queued afterwards.  cancel_work_sync() then flushes the last
+	 * relink before the endpoint state it touches goes away.
+	 */
+	free_irq(sm->cp2ap_irq, sm);
+	zumapro_pcie_unregister_linkdown_cb(sm->rc_dev);
+	cancel_work_sync(&sm->pm_work);
+	destroy_workqueue(sm->pm_wq);
+
+	/*
 	 * Free the IRQ first: it synchronises in-flight handlers, so no MSI can
-	 * run s5300_drain_fmt_rxq() -> wwan_port_rx() against a port that
-	 * wwan_remove_port() is about to free.
+	 * run s5300_drain_fmt_rxq()/s5300_drain_rxq() -> wwan_port_rx() against a
+	 * port that wwan_remove_port() is about to free.
 	 */
 	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	unregister_netdev(sm->ndev);
 	misc_deregister(&sm->oem.miscdev);
+	skb_queue_purge(&sm->oem.rxq);
 	wwan_remove_port(sm->at_port);
 	misc_deregister(&sm->rfs.miscdev);
+	skb_queue_purge(&sm->rfs.rxq);
 	wwan_remove_port(sm->ctrl_port);
 	misc_deregister(&sm->miscdev);
 	pci_free_irq_vectors(sm->pdev);

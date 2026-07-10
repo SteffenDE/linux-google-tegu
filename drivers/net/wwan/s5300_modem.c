@@ -205,6 +205,14 @@
 #define S5300_FMT_MAX			SZ_2K
 
 /*
+ * rmnet PDP data channels: EXYNOS_CH_EX_ID_PDP_0 (181) through +29 (210) =
+ * rmnet0..29.  The CP places small DL packets (e.g. DNS replies) on the legacy
+ * NORM_RAW ring on these channels instead of PKTPROC; both feed the data netdev.
+ */
+#define S5300_PDP_CH_MIN		0xb5	/* EXYNOS_CH_EX_ID_PDP_0 = 181 (rmnet0) */
+#define S5300_PDP_CH_MAX		0xd2	/* +29 = 210 (rmnet29) */
+
+/*
  * EXYNOS link header (downstream include/exynos_ipc.h struct
  * exynos_link_header).  12 bytes, single-frame config, boot channel 0xF1.
  */
@@ -790,7 +798,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 	while (in != out) {
 		u8 frame[S5300_HDR_SIZE + 64];
 		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
-		u32 flen, total, payload;
+		u32 flen, total, payload, body;
 		u8 hdr[S5300_HDR_SIZE];
 
 		if (rest < S5300_HDR_SIZE)
@@ -815,16 +823,58 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			break;
 		}
 		payload = flen - S5300_HDR_SIZE;
+		body = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, S5300_HDR_SIZE);
 
-		if (payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
-			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out,
-					flen);
+		if (READ_ONCE(sm->online) && sm->ndev && payload &&
+		    hdr[8] >= S5300_PDP_CH_MIN && hdr[8] <= S5300_PDP_CH_MAX) {
+			/*
+			 * Raw-IP DL data the CP places on the legacy NORM_RAW ring
+			 * instead of PKTPROC for small packets (DNS replies); cpif's
+			 * rx_multi_pdp does the same on these PDP channels.  Feed the
+			 * data netdev like s5300_pktproc_dl_drain().  Like every
+			 * other channel we send the CP NOTHING on RX: downstream
+			 * acks nothing either, and s5300_send_ipc_irq() overwrites the
+			 * shared ap2cp_msg word, so a spurious ack would clobber a
+			 * pending SEND_* notification and desync the CP.
+			 */
+			struct sk_buff *skb = netdev_alloc_skb(sm->ndev, payload);
+			u8 ver = 0;
+
+			if (skb) {
+				s5300_circ_read(skb_put(skb, payload), buff,
+						S5300_RAW_RXQ_SIZE, body, payload);
+				ver = skb->data[0] >> 4;
+			}
+			if (skb && (ver == 4 || ver == 6)) {
+				skb->protocol = htons(ver == 6 ? ETH_P_IPV6
+							       : ETH_P_IP);
+				skb->dev = sm->ndev;
+				skb_reset_mac_header(skb);
+				skb_reset_network_header(skb);
+				sm->ndev->stats.rx_packets++;
+				sm->ndev->stats.rx_bytes += payload;
+				netif_rx(skb);
+				dev_info_once(sm->dev, "raw-ring PDP data (ch %#x) -> %s\n",
+					      hdr[8], netdev_name(sm->ndev));
+			} else if (skb) {
+				dev_kfree_skb_any(skb);
+				sm->ndev->stats.rx_length_errors++;
+			} else {
+				sm->ndev->stats.rx_dropped++;
+			}
+		} else if (!READ_ONCE(sm->online) && hdr[8] == S5300_BOOT_CH &&
+			   payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
+			s5300_circ_read(frame, buff, S5300_RAW_RXQ_SIZE, out, flen);
 			kfifo_in_spinlocked(&sm->rx_fifo, frame + S5300_HDR_SIZE,
 					    payload, &sm->rx_lock);
 			woke = true;
 		} else if (payload) {
-			dev_warn(sm->dev, "rxq oversized frame payload %u\n",
-				 payload);
+			u8 first = 0;
+
+			s5300_circ_read(&first, buff, S5300_RAW_RXQ_SIZE, body, 1);
+			dev_info_ratelimited(sm->dev,
+					     "raw rxq drop unhandled ch %#x payload %u first %#x\n",
+					     hdr[8], payload, first);
 		}
 
 		out = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, total);

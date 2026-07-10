@@ -252,16 +252,6 @@
 #define S5300_AT_MAX			SZ_2K
 
 /*
- * Diagnostic monitor channel (EXYNOS_CH_ID_CPLOG, downstream io-device
- * umts_dm0) transported on the NORM_RAW ring post-ONLINE.  DMD treats it as a
- * framed byte stream and reads up to 0xffff bytes at a time; userspace owns the
- * DM framing and logging policy.  The EXYNOS link header length is u16 and
- * includes the 12-byte transport header, so cap the payload below that.
- */
-#define S5300_DM_CH			0x51	/* EXYNOS_CH_ID_CPLOG (umts_dm0) */
-#define S5300_DM_MAX			(0xffff - S5300_HDR_SIZE)
-
-/*
  * rmnet PDP data channels: EXYNOS_CH_EX_ID_PDP_0 (181) through +29 (210) =
  * rmnet0..29.  The CP places small DL packets (e.g. DNS replies) on the legacy
  * NORM_RAW ring on these channels instead of PKTPROC; both feed the data netdev.
@@ -511,14 +501,9 @@ struct s5300_modem {
 	u8			at_ch_seq;
 	u8			*at_tx_buf;	/* header + one AT frame + pad */
 
-	/* Diagnostic monitor channel on the NORM_RAW ring (post-ONLINE). */
-	struct wwan_port	*dm_port;
-	u8			dm_ch_seq;
-	u8			*dm_tx_buf;	/* header + one DM frame + pad */
-
 	/*
 	 * Serialises the post-ONLINE writers of the shared NORM_RAW txq:
-	 * the RFS, AT, and DM ports have independent WWAN ops_locks, so their head
+	 * the RFS and AT ports have independent WWAN ops_locks, so their head
 	 * RMW and the frame_seq counter would otherwise race.  The boot std_dl
 	 * writer uses the same ring but is temporally disjoint (io_lock).
 	 */
@@ -1293,7 +1278,6 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 	sm->fmt_ch_seq = 0;
 	sm->rfs_ch_seq = 0;
 	sm->at_ch_seq = 0;
-	sm->dm_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
 	writel(0, sm->ipc + S5300_IPC_ACCESS);
@@ -1395,20 +1379,6 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 				wwan_port_rx(sm->at_port, skb);
 			} else if (payload) {
 				dev_warn(sm->dev, "at rxq drop payload %u\n",
-					 payload);
-			}
-		} else if (hdr[8] == S5300_DM_CH) {
-			struct sk_buff *skb = NULL;
-
-			if (payload && payload <= S5300_DM_MAX && sm->dm_port)
-				skb = alloc_skb(payload, GFP_ATOMIC);
-			if (skb) {
-				s5300_circ_read(skb_put(skb, payload), buff,
-						S5300_RAW_RXQ_SIZE, body,
-						payload);
-				wwan_port_rx(sm->dm_port, skb);
-			} else if (payload) {
-				dev_warn(sm->dev, "dm rxq drop payload %u\n",
 					 payload);
 			}
 		} else if (READ_ONCE(sm->online) && sm->ndev && payload &&
@@ -2541,38 +2511,6 @@ static const struct wwan_port_ops s5300_at_ops = {
 	.tx	= s5300_at_port_tx,
 };
 
-/* --- diagnostic monitor port (runtime NORM_RAW ring) --------------------- */
-
-static int s5300_dm_start(struct wwan_port *port)
-{
-	return 0;
-}
-
-static void s5300_dm_stop(struct wwan_port *port)
-{
-}
-
-static int s5300_dm_port_tx(struct wwan_port *port, struct sk_buff *skb)
-{
-	struct s5300_modem *sm = wwan_port_get_drvdata(port);
-	int ret;
-
-	ret = s5300_raw_ring_tx(sm, sm->dm_tx_buf, S5300_DM_CH,
-				&sm->dm_ch_seq, S5300_DM_MAX,
-				skb->data, skb->len);
-	if (ret)
-		return ret;
-
-	consume_skb(skb);
-	return 0;
-}
-
-static const struct wwan_port_ops s5300_dm_ops = {
-	.start	= s5300_dm_start,
-	.stop	= s5300_dm_stop,
-	.tx	= s5300_dm_port_tx,
-};
-
 /* --- probe / remove ------------------------------------------------------ */
 
 /* --- PKTPROC data path (DL/RX; UL is a later stage) ---------------------- */
@@ -2986,10 +2924,6 @@ static int s5300_probe(struct platform_device *pdev)
 				     GFP_KERNEL);
 	if (!sm->at_tx_buf)
 		return -ENOMEM;
-	sm->dm_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_DM_MAX + 8,
-				     GFP_KERNEL);
-	if (!sm->dm_tx_buf)
-		return -ENOMEM;
 	sm->oem.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_OEM_MAX + 8,
 				      GFP_KERNEL);
 	if (!sm->oem.tx_buf)
@@ -3270,19 +3204,6 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * The diagnostic monitor channel (ch 0x51 on the NORM_RAW ring):
-	 * downstream exposes it as /dev/umts_dm0 and DMD treats it as a framed
-	 * byte stream.  Created up front like the other runtime channels.
-	 */
-	sm->dm_port = wwan_create_port(dev, WWAN_PORT_DM, &s5300_dm_ops,
-				       NULL, sm);
-	if (IS_ERR(sm->dm_port)) {
-		ret = PTR_ERR(sm->dm_port);
-		dev_err(dev, "wwan_create_port(dm): %d\n", ret);
-		goto err_at_port;
-	}
-
-	/*
 	 * The oem/GEMS channel (ch 0x82 on the FMT ring), exposed as /dev/umts_oem1
 	 * for the userspace daemon that answers the CP's UE-capability-config file
 	 * requests.  Created up front; only carries traffic once ONLINE.
@@ -3294,7 +3215,7 @@ static int s5300_probe(struct platform_device *pdev)
 	ret = misc_register(&sm->oem.miscdev);
 	if (ret) {
 		dev_err(dev, "misc_register(oem): %d\n", ret);
-		goto err_dm_port;
+		goto err_at_port;
 	}
 
 	/*
@@ -3327,7 +3248,7 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_err(dev, "register DL ISR: %d\n", ret);
 		unregister_netdev(sm->ndev);
 		free_netdev(sm->ndev);
-		goto err_dm_port;
+		goto err_at_port;
 	}
 
 	/*
@@ -3345,8 +3266,6 @@ static int s5300_probe(struct platform_device *pdev)
 
 err_oem:
 	misc_deregister(&sm->oem.miscdev);
-err_dm_port:
-	wwan_remove_port(sm->dm_port);
 err_at_port:
 	wwan_remove_port(sm->at_port);
 err_rfs_port:
@@ -3408,7 +3327,6 @@ static void s5300_remove(struct platform_device *pdev)
 	unregister_netdev(sm->ndev);
 	misc_deregister(&sm->oem.miscdev);
 	skb_queue_purge(&sm->oem.rxq);
-	wwan_remove_port(sm->dm_port);
 	wwan_remove_port(sm->at_port);
 	wwan_remove_port(sm->rfs_port);
 	wwan_remove_port(sm->ctrl_port);

@@ -22,7 +22,6 @@
  * @WWAN_PORT_NMEA: embedded GNSS receiver with NMEA output
  * @WWAN_PORT_SIT: Samsung modem SIT control channel
  * @WWAN_PORT_RFS: Samsung modem Remote File System channel
- * @WWAN_PORT_DM: Samsung modem diagnostic monitor channel
  *
  * @WWAN_PORT_MAX: Highest supported port types
  * @WWAN_PORT_UNKNOWN: Special value to indicate an unknown port type
@@ -41,7 +40,6 @@ enum wwan_port_type {
 	WWAN_PORT_NMEA,
 	WWAN_PORT_SIT,
 	WWAN_PORT_RFS,
-	WWAN_PORT_DM,
 
 	/* Add new port types above this line */
 

@@ -478,6 +478,8 @@ struct s5300_modem {
 	struct device		*rc_dev;
 	struct pci_dev		*pdev;
 	struct gpio_desc	*cp2ap_wakeup;
+	struct gpio_desc	*cp2ap_active;	/* CP_ACTIVE: firmware heartbeat (low=crash), optional */
+	struct gpio_desc	*cp2ap_ps_hold;	/* PS_HOLD: CP power-rail hold (low=powered off), optional */
 
 	phys_addr_t		ipc_phys;
 	resource_size_t		ipc_size;
@@ -533,6 +535,7 @@ struct s5300_modem {
 	 * relink sleeps, so it runs on an ordered workqueue off the wakeup IRQ.
 	 */
 	int			cp2ap_irq;
+	int			cp2ap_active_irq; /* CP_ACTIVE falling edge = CP crash (0 if unwired) */
 	struct workqueue_struct	*pm_wq;
 	struct work_struct	pm_work;
 	struct mutex		pcie_onoff_lock; /* serialises relink up/down */
@@ -906,6 +909,24 @@ static bool s5300_tx_pending(struct s5300_modem *sm)
 }
 
 /*
+ * Snapshot the CP handshake inputs to classify a link wedge.  CP2AP_WAKEUP =
+ * the CP wants the link (its parked-idle vs active state); CP_ACTIVE = firmware
+ * heartbeat (low => crash); PS_HOLD = CP power-rail hold (low => the CP powered
+ * its own rail off).  The optional inputs read -1 when the DT did not wire them.
+ * gpa5 is memory-mapped (non-sleeping), so this is safe from the linkdown
+ * hardirq as well as process context.
+ */
+static void s5300_log_cp_alive(struct s5300_modem *sm, const char *ctx)
+{
+	int c2aw = gpiod_get_value(sm->cp2ap_wakeup);
+	int cp_act = sm->cp2ap_active ? gpiod_get_value(sm->cp2ap_active) : -1;
+	int ps_hold = sm->cp2ap_ps_hold ? gpiod_get_value(sm->cp2ap_ps_hold) : -1;
+
+	dev_info(sm->dev, "%s: CP gpio c2aw:%d cp_act:%d ps_hold:%d\n",
+		 ctx, c2aw, cp_act, ps_hold);
+}
+
+/*
  * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
  * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
  * ap_wakeup_handler().  Runs on an ordered workqueue because the relink sleeps
@@ -931,6 +952,13 @@ static void s5300_pm_work(struct work_struct *work)
 		bool ld = sm->relink_requested;
 
 		/*
+		 * cp_act here (before any PERST/PHY touch) distinguishes a CP that
+		 * crashed on its own -- relink is then only a symptom -- from one we
+		 * crash during the retrain.  cp_act:0 at entry => already dead.
+		 */
+		s5300_log_cp_alive(sm, "relink entry");
+
+		/*
 		 * Wait for the CP to be awake before training.  Downstream's
 		 * s5100_poweron_pcie() refuses to train while CP2AP_WAKEUP is low
 		 * ("condition not met") and defers the poweron to the CP2AP rising
@@ -952,6 +980,9 @@ static void s5300_pm_work(struct work_struct *work)
 				usleep_range(1000, 1100);
 			if (ms < 300)
 				dev_dbg(sm->dev, "CP acked wake in %d ms\n", ms);
+			else
+				s5300_log_cp_alive(sm,
+					"CP wake unacked in 300 ms, training anyway");
 		}
 
 		if (zumapro_pcie_modem_link_up(sm->rc_dev) == 0) {
@@ -1086,6 +1117,31 @@ static irqreturn_t s5300_cp2ap_wakeup_irq(int irq, void *data)
 }
 
 /*
+ * CP_ACTIVE falling edge: the CP firmware dropped its liveness heartbeat, i.e.
+ * it crashed (rail may still be up -- ps_hold distinguishes).  Mirrors
+ * downstream cp_active_handler.  Diagnostic only for now: timestamp the crash
+ * so a silent mid-traffic wedge ("pings stop, no dmesg") stops being invisible.
+ * Armed only while ONLINE (edge-triggered, fires once as cp_act goes low).
+ */
+static irqreturn_t s5300_cp_crash_irq(int irq, void *data)
+{
+	struct s5300_modem *sm = data;
+
+	if (!READ_ONCE(sm->online))
+		return IRQ_HANDLED;
+	/*
+	 * Debounce the PHONE_START->ONLINE settle: cp_act glitches low for <1 ms
+	 * as the CP arms its side, firing this falling edge while the CP is
+	 * actually fine (hw: "CP CRASH ... cp_act:1" right before "CP is ONLINE").
+	 * A real fault holds cp_act low, so re-read and only report if it is.
+	 */
+	if (gpiod_get_value(sm->cp2ap_active))
+		return IRQ_HANDLED;
+	s5300_log_cp_alive(sm, "CP CRASH (cp_act fell)");
+	return IRQ_HANDLED;
+}
+
+/*
  * MSI vector 1: the CP's cp2ap_status interrupt (downstream
  * shmem_tx_state_handler).  Its one runtime payload is the global TX
  * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
@@ -1136,6 +1192,8 @@ static void s5300_pcie_linkdown(void *data)
 	    time_before(jiffies, sm->last_linkdown + HZ))
 		return;
 	sm->last_linkdown = jiffies;
+
+	s5300_log_cp_alive(sm, "sudden linkdown");
 
 	spin_lock_irqsave(&sm->lock, flags);
 	sm->link_up = false;
@@ -1591,6 +1649,8 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 			 */
 			if (!sm->pm_armed) {
 				enable_irq(sm->cp2ap_irq);
+				if (sm->cp2ap_active_irq > 0)
+					enable_irq(sm->cp2ap_active_irq);
 				sm->pm_armed = true;
 			}
 		}
@@ -1718,6 +1778,8 @@ static int s5300_power_on(struct s5300_modem *sm)
 	 */
 	if (sm->pm_armed) {
 		disable_irq(sm->cp2ap_irq);
+		if (sm->cp2ap_active_irq > 0)
+			disable_irq(sm->cp2ap_active_irq);
 		cancel_work_sync(&sm->pm_work);
 		sm->pm_armed = false;
 	}
@@ -2885,6 +2947,24 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_rc;
 	}
 
+	/*
+	 * Optional CP-aliveness inputs, read only to classify a runtime link
+	 * wedge (crashed vs powered-off vs alive-but-not-waking).  Absent DT =>
+	 * NULL; only a real error (e.g. -EPROBE_DEFER) aborts probe.
+	 */
+	sm->cp2ap_active = devm_gpiod_get_optional(dev, "cp2ap-active", GPIOD_IN);
+	if (IS_ERR(sm->cp2ap_active)) {
+		ret = dev_err_probe(dev, PTR_ERR(sm->cp2ap_active),
+				    "failed to get CP2AP_CP_ACTIVE\n");
+		goto err_rc;
+	}
+	sm->cp2ap_ps_hold = devm_gpiod_get_optional(dev, "cp2ap-ps-hold", GPIOD_IN);
+	if (IS_ERR(sm->cp2ap_ps_hold)) {
+		ret = dev_err_probe(dev, PTR_ERR(sm->cp2ap_ps_hold),
+				    "failed to get CP2AP_PS_HOLD\n");
+		goto err_rc;
+	}
+
 	ret = s5300_map_region(sm, "ipc", &sm->ipc_phys, &sm->ipc_size,
 			       &sm->ipc);
 	if (ret) {
@@ -3047,6 +3127,23 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_wq;
 	}
 
+	/*
+	 * Optional CP-crash detector: CP_ACTIVE falling edge.  Armed with the
+	 * runtime-PM IRQ at PHONE_START.  Non-fatal -- purely diagnostic.
+	 */
+	if (sm->cp2ap_active) {
+		sm->cp2ap_active_irq = gpiod_to_irq(sm->cp2ap_active);
+		if (sm->cp2ap_active_irq > 0 &&
+		    request_irq(sm->cp2ap_active_irq, s5300_cp_crash_irq,
+				IRQF_TRIGGER_FALLING | IRQF_NO_AUTOEN,
+				"s5300-cp-crash", sm)) {
+			dev_warn(dev, "CP_ACTIVE request_irq failed; crash detect off\n");
+			sm->cp2ap_active_irq = 0;
+		} else if (sm->cp2ap_active_irq < 0) {
+			sm->cp2ap_active_irq = 0;
+		}
+	}
+
 	sm->miscdev.minor = MISC_DYNAMIC_MINOR;
 	sm->miscdev.name = "umts_boot0";
 	sm->miscdev.fops = &s5300_fops;
@@ -3158,6 +3255,8 @@ err_ctrl_port:
 err_misc:
 	misc_deregister(&sm->miscdev);
 err_cp2ap:
+	if (sm->cp2ap_active_irq > 0)
+		free_irq(sm->cp2ap_active_irq, sm);
 	free_irq(sm->cp2ap_irq, sm);
 err_wq:
 	destroy_workqueue(sm->pm_wq);
@@ -3190,6 +3289,8 @@ static void s5300_remove(struct platform_device *pdev)
 	 * can be queued afterwards.  cancel_work_sync() then flushes the last
 	 * relink before the endpoint state it touches goes away.
 	 */
+	if (sm->cp2ap_active_irq > 0)
+		free_irq(sm->cp2ap_active_irq, sm);
 	free_irq(sm->cp2ap_irq, sm);
 	zumapro_pcie_unregister_linkdown_cb(sm->rc_dev);
 	cancel_work_sync(&sm->pm_work);

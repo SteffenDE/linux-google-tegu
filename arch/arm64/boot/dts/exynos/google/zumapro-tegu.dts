@@ -951,6 +951,16 @@
 		google,pcie = <&pcie0>;
 		samsung,doorbell-addr = <0x14e60000>;
 		cp2ap-wakeup-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;
+		/*
+		 * Optional CP-aliveness inputs, read only to classify a runtime
+		 * link wedge: CP_ACTIVE (gpa5-2) is the CP firmware heartbeat
+		 * (low = crash), PS_HOLD (gpa5-0) is the CP power-rail hold
+		 * (low = the CP powered its own rail off).  gpa5-{0,2} from the
+		 * downstream cpif node (gpio_cp2ap_cp_ps_hold,
+		 * gpio_cp2ap_phone_active).
+		 */
+		cp2ap-active-gpios = <&gpa5 2 GPIO_ACTIVE_HIGH>;
+		cp2ap-ps-hold-gpios = <&gpa5 0 GPIO_ACTIVE_HIGH>;
 	};
 };
 

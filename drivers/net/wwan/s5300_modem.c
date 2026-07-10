@@ -142,6 +142,12 @@
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
 #define S5300_IPC_CP2AP_STATUS		0x80c
+/*
+ * ap2cp_united_status ds_det field (downstream sbi_ds_det_pos=14, mask 0x3;
+ * get_ds_detect() returns 1 on this device).  Load-bearing for runtime IPC --
+ * see s5300_init_control_messages().
+ */
+#define S5300_IPC_DS_DET		(1 << 14)
 /* ap2cp_handover_block_info = <DRAM_V1 2092> (zuma-cp-s5300-sit.dtsi). */
 #define S5300_IPC_HANDOVER		0x82c
 #define S5300_HANDOVER_SIZE		161	/* sizeof(t_handover_block_info) */
@@ -527,7 +533,16 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 	writel(S5300_IPC_CAP_BASE, sm->ipc + S5300_IPC_CAP_OFS_PTR);
 	writel(0, sm->ipc + S5300_IPC_AP2CP_MSG);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_MSG);
-	writel(0, sm->ipc + S5300_IPC_AP2CP_STATUS);
+	/*
+	 * ap2cp_united_status ds_det field (bits 14-15) = 1 (downstream
+	 * get_ds_detect(); the live working device reads 0x4000 here).  This is
+	 * load-bearing: with ds_det=0 the CP never runs its deep-sleep link
+	 * handshake, so after MAIN loads on the already-up link it never takes a
+	 * link-up ISR to arm its runtime IPC and the FMT control queue is never
+	 * drained ("no data in UL buffer").  With ds_det=1 the CP arms its
+	 * runtime IPC and the SIT control channel round-trips.  HW-validated.
+	 */
+	writel(S5300_IPC_DS_DET, sm->ipc + S5300_IPC_AP2CP_STATUS);
 	writel(0, sm->ipc + S5300_IPC_CP2AP_STATUS);
 	for (i = 0; i < S5300_IPC_CAP_WORDS; i++)
 		writel(0, sm->ipc + S5300_IPC_CAP_BASE + 4 * i);

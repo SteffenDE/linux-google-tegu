@@ -3239,7 +3239,7 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_err(dev, "register DL ISR: %d\n", ret);
 		unregister_netdev(sm->ndev);
 		free_netdev(sm->ndev);
-		goto err_at_port;
+		goto err_oem;
 	}
 
 	/*

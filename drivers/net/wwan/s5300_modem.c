@@ -157,6 +157,12 @@
  * see s5300_init_control_messages().
  */
 #define S5300_IPC_DS_DET		(1 << 14)
+/*
+ * cp2ap_united_status bit 2: the global TX flow-control gate (downstream
+ * SHM_FLOWCTL_BIT, shmem_tx_state_handler).  The CP updates the word and rings
+ * MSI vector 1: 1 = suspend all uplink, 0 = resume.
+ */
+#define S5300_CP2AP_FLOWCTL		BIT(2)
 /* ap2cp_handover_block_info = <DRAM_V1 2092> (zuma-cp-s5300-sit.dtsi). */
 #define S5300_IPC_HANDOVER		0x82c
 #define S5300_HANDOVER_SIZE		161	/* sizeof(t_handover_block_info) */
@@ -448,6 +454,7 @@ struct s5300_modem {
 	u16			ul_cp_quota;
 	u8			ul_end_bit_owner;
 	bool			ul_active;
+	bool			tx_suspended;	/* CP TX flow control (vector-1 cp2ap_status) */
 };
 
 /* --- circular-ring helpers (downstream include/circ_queue.h) ------------- */
@@ -917,6 +924,36 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm);
 static void s5300_pktproc_ul_setup(struct s5300_modem *sm);
 static void s5300_pktproc_ul_activate(struct s5300_modem *sm);
 
+/*
+ * MSI vector 1: the CP's cp2ap_status interrupt (downstream
+ * shmem_tx_state_handler).  Its one runtime payload is the global TX
+ * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
+ * it uplink while its ingress quiesces, and to resume afterwards.  Downstream
+ * reacts by stopping the data netdevs; the legacy FMT/RAW rings stay open
+ * (they are CP-paced -- the CP polls them at its leisure), so only the PKTPROC
+ * UL path is gated here.
+ */
+static irqreturn_t s5300_tx_state_irq(int irq, void *data)
+{
+	struct s5300_modem *sm = data;
+	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
+	bool suspend = status & S5300_CP2AP_FLOWCTL;
+
+	if (suspend == READ_ONCE(sm->tx_suspended))
+		return IRQ_HANDLED;
+
+	WRITE_ONCE(sm->tx_suspended, suspend);
+	if (sm->ndev) {
+		if (suspend)
+			netif_stop_queue(sm->ndev);
+		else
+			netif_wake_queue(sm->ndev);
+	}
+	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
+			     suspend ? "suspend" : "resume", status);
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t s5300_irq_handler(int irq, void *data)
 {
 	struct s5300_modem *sm = data;
@@ -959,6 +996,11 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 			s5300_check_cp_capabilities(sm);
 			s5300_pktproc_ul_activate(sm);
 			s5300_init_ipc_queues(sm);
+			/* A rebooted CP starts un-flow-controlled. */
+			if (READ_ONCE(sm->tx_suspended)) {
+				WRITE_ONCE(sm->tx_suspended, false);
+				netif_wake_queue(sm->ndev);
+			}
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
@@ -1758,6 +1800,19 @@ static netdev_tx_t s5300_ndo_start_xmit(struct sk_buff *skb,
 	struct s5300_modem *sm = *(struct s5300_modem **)netdev_priv(ndev);
 	unsigned int len;
 
+	/*
+	 * CP-driven TX flow control (vector-1 cp2ap_status): the CP asked for
+	 * uplink silence, so hold the packet in the qdisc until it resumes.
+	 * The re-check closes the race with a resume landing between the flag
+	 * read and the queue stop.
+	 */
+	if (READ_ONCE(sm->tx_suspended)) {
+		netif_stop_queue(ndev);
+		if (READ_ONCE(sm->tx_suspended))
+			return NETDEV_TX_BUSY;
+		netif_wake_queue(ndev);
+	}
+
 	/* ul_xmit copies only the linear head; we set no SG feature, so this is a
 	 * no-op today, but guard the invariant regardless.
 	 */
@@ -2020,6 +2075,17 @@ static int s5300_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_vectors;
 
+	/*
+	 * Vector 0 carries the CP's IPC message/command + FMT + PKTPROC DL
+	 * notifications; vector 1 is the cp2ap_status TX-flow-control interrupt
+	 * (2..3 spare).  A never-requested vector stays disabled in iMSI-RX, so
+	 * the CP's suspend request would be silently dropped at the RC.
+	 */
+	ret = request_irq(pci_irq_vector(sm->pdev, 1), s5300_tx_state_irq, 0,
+			  "s5300-tx-state", sm);
+	if (ret)
+		goto err_irq0;
+
 	sm->miscdev.minor = MISC_DYNAMIC_MINOR;
 	sm->miscdev.name = "umts_boot0";
 	sm->miscdev.fops = &s5300_fops;
@@ -2071,6 +2137,8 @@ err_ctrl_port:
 err_misc:
 	misc_deregister(&sm->miscdev);
 err_irq:
+	free_irq(pci_irq_vector(sm->pdev, 1), sm);
+err_irq0:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
@@ -2094,6 +2162,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 * run s5300_drain_fmt_rxq() -> wwan_port_rx() against a port that
 	 * wwan_remove_port() is about to free.
 	 */
+	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	unregister_netdev(sm->ndev);
 	wwan_remove_port(sm->ctrl_port);

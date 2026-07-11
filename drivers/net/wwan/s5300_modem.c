@@ -2343,11 +2343,16 @@ static long s5300_dev_ioctl(struct file *file, unsigned int cmd,
 	case IOCTL_CP_RESET:
 		/*
 		 * GPIO CP reset primitive (cbd's POWER_RESET), the userspace
-		 * recovery path's first step.  arg != 0 asserts the dump GPIO so
-		 * that a following PBL load+start boots the ROM's minidump agent,
-		 * which decodes the crash record into srinfo (read back via
-		 * IOCTL_GET_SRINFO); arg == 0 is a plain reset that leaves
-		 * the CP ready for the image download that re-boots it.
+		 * recovery path's first step.  arg 0 is the plain warm wreset
+		 * that leaves the CP ready for the image download that re-boots
+		 * it (downstream's crash-recovery reset); arg 1 asserts the dump
+		 * GPIO so that a following PBL load+start boots the ROM's
+		 * minidump agent, which decodes the crash record into srinfo
+		 * (read back via IOCTL_GET_SRINFO); arg 2 is the full power
+		 * cycle -- downstream's only reset for a CP that is NOT crashed
+		 * (a warm wreset of a running CP leaves the endpoint half-alive,
+		 * boot stuck at boot_stage 0), and the recovery bottom when a
+		 * warm-reset re-boot already failed.
 		 *
 		 * Quiesce the crashed cycle's runtime PM first: its wakeup/crash
 		 * IRQs and a pm_work in flight must not drive link transitions
@@ -2355,8 +2360,12 @@ static long s5300_dev_ioctl(struct file *file, unsigned int cmd,
 		 * (downstream start_dump_boot(): "do not handle cp2ap_wakeup irq
 		 * during dump process").
 		 */
+		if (arg > 2) {
+			ret = -EINVAL;
+			break;
+		}
 		s5300_quiesce_pm(sm);
-		ret = zumapro_pcie_cp_reset(sm->rc_dev, !!arg);
+		ret = zumapro_pcie_cp_reset(sm->rc_dev, arg == 1, arg == 2);
 		break;
 	case IOCTL_LOAD_CP_IMAGE:
 		ret = s5300_load_cp_image(sm, uarg);

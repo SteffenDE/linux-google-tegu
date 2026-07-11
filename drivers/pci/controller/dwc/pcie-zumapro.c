@@ -202,12 +202,14 @@ static void zumapro_pcie_arm_linkdown_irq(struct zumapro_pcie *zp, bool on);
  * does NOT wipe the resident MAIN image (downstream warm-boots with only the
  * 92 KB PBL every time, which proves MAIN survives).
  */
-static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp, bool dump)
+static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp, bool dump,
+				     bool cold)
 {
 	bool leaving_dump = false;
 
 	dev_info(zp->pci.dev, "%s the CP (modem) endpoint\n",
-		 dump ? "dump-resetting" : "powering on");
+		 dump ? "dump-resetting" : cold ? "cold power cycling" :
+		 "powering on");
 
 	gpiod_direction_output(zp->cp_pda_active, 1);
 	/*
@@ -236,10 +238,18 @@ static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp, bool dump)
 	 * cp_pwr is a soft control: the modem PMIC self-refreshes CP DRAM
 	 * across it.  Sequence and delays mirror gpio_power_offon_cp()
 	 * (non-WRESET_WA).
+	 *
+	 * @cold forces the same full cycle: downstream only ever warm-resets a
+	 * CRASHED CP (power_reset_dump_cp); every deliberate (re)boot of a
+	 * running one (power_reset_cp, power_on_cp) is this full cycle.  A warm
+	 * wreset of a running CP leaves the endpoint half-alive (hw: the link
+	 * retrains to L0 by itself but the ROM drops MSI config writes, so the
+	 * boot handshake sticks at boot_stage 0 indefinitely).
 	 */
-	if (leaving_dump) {
+	if (cold || leaving_dump) {
 		dev_info(zp->pci.dev,
-			 "TEGU_CP_TRACE gpio full power cycle (leaving dump mode)\n");
+			 "TEGU_CP_TRACE gpio full power cycle (%s)\n",
+			 leaving_dump ? "leaving dump mode" : "cold reset");
 		gpiod_direction_output(zp->cp_nreset, 0);
 		gpiod_direction_output(zp->cp_wrst, 0);
 		gpiod_direction_output(zp->cp_pwr, 0);
@@ -535,7 +545,7 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 
 	/* Power the modem endpoint before the link comes up (stub). */
 	if (zp->cp_pwr)
-		zumapro_pcie_cp_power_on(zp, false);
+		zumapro_pcie_cp_power_on(zp, false, false);
 
 	/* Release the PHY from PMU isolation. */
 	ret = phy_init(zp->phy);
@@ -831,17 +841,23 @@ EXPORT_SYMBOL_GPL(zumapro_pcie_reserve_msi_base);
  * crash-reason paths: re-run the GPIO warm-reset that probe issues at cold
  * power-on.  @dump raises DUMP_NOTI so the CP ROM comes up in dump mode and
  * decodes its crash record into the srinfo region (the modem driver then reads
- * the reason); without it the CP re-boots normally.  When and in which mode to
- * reset -- and the image download that follows -- is the userspace daemon's job.
+ * the reason); without it the CP re-boots normally.  @cold runs the full
+ * power-off/on cycle instead of the warm wreset -- downstream's only reset for
+ * a CP that is not crashed (power_reset_cp/power_on_cp), and the recovery
+ * bottom when a warm reset left the endpoint half-alive.  When and in which
+ * mode to reset -- and the image download that follows -- is the userspace
+ * daemon's job.
  */
-int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump)
+int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump, bool cold)
 {
 	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
 
 	if (!zp || !zp->cp_pwr)
 		return -ENODEV;
+	if (dump && cold)
+		return -EINVAL;
 
-	zumapro_pcie_cp_power_on(zp, dump);
+	zumapro_pcie_cp_power_on(zp, dump, cold);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_cp_reset);

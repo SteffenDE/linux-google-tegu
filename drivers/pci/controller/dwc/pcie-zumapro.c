@@ -202,22 +202,64 @@ static void zumapro_pcie_arm_linkdown_irq(struct zumapro_pcie *zp, bool on);
  * does NOT wipe the resident MAIN image (downstream warm-boots with only the
  * 92 KB PBL every time, which proves MAIN survives).
  */
-static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp)
+static void zumapro_pcie_cp_power_on(struct zumapro_pcie *zp, bool dump)
 {
-	dev_info(zp->pci.dev, "powering on the CP (modem) endpoint\n");
+	bool leaving_dump = false;
+
+	dev_info(zp->pci.dev, "%s the CP (modem) endpoint\n",
+		 dump ? "dump-resetting" : "powering on");
 
 	gpiod_direction_output(zp->cp_pda_active, 1);
 	/*
-	 * Downstream power_on_cp() drives DUMP_NOTI low before the rails; a
-	 * floating line risks CP MAIN booting into dump mode.  Optional so
-	 * old DTBs keep working.
+	 * DUMP_NOTI low for a normal boot (downstream power_on_cp; a floating
+	 * line risks CP MAIN booting into dump mode); high when @dump so the ROM
+	 * comes up in dump mode and decodes its crash record into srinfo.  Optional
+	 * so old DTBs keep working.
 	 */
-	if (zp->cp_dump_noti)
-		gpiod_direction_output(zp->cp_dump_noti, 0);
+	if (zp->cp_dump_noti) {
+		leaving_dump = !dump &&
+			       gpiod_get_value_cansleep(zp->cp_dump_noti);
+		gpiod_direction_output(zp->cp_dump_noti, dump ? 1 : 0);
+	}
 
 	gpiod_direction_output(zp->cp_wakeup, 1);
 	msleep(10);
 	gpiod_set_value_cansleep(zp->cp_wakeup, 0);
+
+	/*
+	 * Leaving dump mode the warm pulse below is not enough: MAIN then
+	 * boots (full download, CRC ok, launch ok) but never raises INIT_START
+	 * (hw, and the earlier dump=1->dump=0 experiment broke the same way).
+	 * Stock recovers out of dump with the FULL power cycle -- cbd's
+	 * recovery POWER_ON runs power_on_cp() -> gpio_power_offon_cp(), which
+	 * drops cp_pwr/cp_nreset (the warm wreset is only used to enter dump).
+	 * cp_pwr is a soft control: the modem PMIC self-refreshes CP DRAM
+	 * across it.  Sequence and delays mirror gpio_power_offon_cp()
+	 * (non-WRESET_WA).
+	 */
+	if (leaving_dump) {
+		dev_info(zp->pci.dev,
+			 "TEGU_CP_TRACE gpio full power cycle (leaving dump mode)\n");
+		gpiod_direction_output(zp->cp_nreset, 0);
+		gpiod_direction_output(zp->cp_wrst, 0);
+		gpiod_direction_output(zp->cp_pwr, 0);
+		msleep(30);
+		gpiod_direction_output(zp->cp_pm_wrst, 0);
+		msleep(50);
+		gpiod_set_value_cansleep(zp->cp_pm_wrst, 1);
+		msleep(10);
+		gpiod_set_value_cansleep(zp->cp_pwr, 1);
+		msleep(10);
+		gpiod_set_value_cansleep(zp->cp_nreset, 1);
+		msleep(10);
+		gpiod_set_value_cansleep(zp->cp_wrst, 1);
+
+		/* ROM settle before link training */
+		msleep(200);
+		gpiod_set_value_cansleep(zp->cp_wakeup, 1);
+		msleep(5);
+		return;
+	}
 	/*
 	 * WARM reset (downstream gpio_power_wreset_cp, confirmed on the live
 	 * device): hold cp_pwr/cp_nreset HIGH and pulse ONLY pm_wrst + cp_wrst.
@@ -493,7 +535,7 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 
 	/* Power the modem endpoint before the link comes up (stub). */
 	if (zp->cp_pwr)
-		zumapro_pcie_cp_power_on(zp);
+		zumapro_pcie_cp_power_on(zp, false);
 
 	/* Release the PHY from PMU isolation. */
 	ret = phy_init(zp->phy);
@@ -785,6 +827,26 @@ int zumapro_pcie_reserve_msi_base(struct device *rc_dev, unsigned int count)
 EXPORT_SYMBOL_GPL(zumapro_pcie_reserve_msi_base);
 
 /*
+ * CP reset primitive (cbd's POWER_RESET) for the modem driver's recovery and
+ * crash-reason paths: re-run the GPIO warm-reset that probe issues at cold
+ * power-on.  @dump raises DUMP_NOTI so the CP ROM comes up in dump mode and
+ * decodes its crash record into the srinfo region (the modem driver then reads
+ * the reason); without it the CP re-boots normally.  When and in which mode to
+ * reset -- and the image download that follows -- is the userspace daemon's job.
+ */
+int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+
+	if (!zp || !zp->cp_pwr)
+		return -ENODEV;
+
+	zumapro_pcie_cp_power_on(zp, dump);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_cp_reset);
+
+/*
  * Link bounce for the modem boot handshake: after the first-stage download
  * the CP bootloader expects the link to drop and retrain (downstream
  * start_normal_boot() runs poweroff/poweron between the boot_stage poll and
@@ -969,6 +1031,29 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev, bool guarded)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_down);
+
+/*
+ * Link-state query for the modem boot path: true when the LTSSM reports a
+ * settled link (L0..L1 idle), so the boot kick can tell a probe-trained
+ * mask-ROM link (reuse) from a dead one after a CP reset (train first --
+ * endpoint accesses while the link is down or mid-train stall the
+ * interconnect, hw-observed).  Deliberately stricter than the dw link_up op:
+ * a crash with the link up leaves the LTSSM churning in Recovery
+ * (RCVRY_LOCK..) against the vanished endpoint, which link_up counts as up
+ * (hw: the dump-boot skipped its train and kicked a dead window).
+ */
+bool zumapro_pcie_modem_link_active(struct device *rc_dev)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	u32 state;
+
+	if (!zp)
+		return false;
+	state = readl(zp->pci.elbi_base + PCIE_ELBI_RDLH_LINKUP) &
+		LTSSM_STATE_MASK;
+	return state >= LTSSM_STATE_L0 && state <= LTSSM_STATE_L1_IDLE;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_link_active);
 
 int zumapro_pcie_modem_link_up(struct device *rc_dev)
 {

@@ -555,6 +555,8 @@ struct s5300_modem {
 	bool			relink_requested; /* sudden-linkdown relink pending (sm->lock) */
 	unsigned long		last_linkdown;	/* jiffies of last linkdown relink (rate limit) */
 	unsigned long		fmt_busy_until;	/* inhibit park during an FMT transfer (jiffies) */
+	struct delayed_work	park_work;	/* deferred-park re-check (queues pm_work) */
+	unsigned int		park_retries;	/* deferred-park retries this idle cycle (pm_work only) */
 
 	/* EXYNOS link-header sequence counters (reset per boot). */
 	u16			frame_seq;
@@ -889,6 +891,13 @@ static void s5300_relink_restore(struct s5300_modem *sm)
 }
 
 #define S5300_PARK_SETTLE_MS	30
+/*
+ * Deferred-park retries per idle cycle.  Each retry re-checks after a real
+ * wait (the FMT grace remainder, or a drain-after-nudge delay), so a small
+ * budget suffices before giving up (leaving the link up).
+ */
+#define S5300_PARK_RETRIES	5
+#define S5300_PARK_DRAIN_MS	100	/* CP wake + ring drain after a nudge */
 
 /*
  * The CP idle-parks its PCIe link aggressively (CP2AP_WAKEUP low ~1 s after it
@@ -996,6 +1005,15 @@ out:
 	return ret;
 }
 
+/* Deferred-park re-check timer: re-run the link reconcile (s5300_pm_work). */
+static void s5300_park_work(struct work_struct *work)
+{
+	struct s5300_modem *sm = container_of(to_delayed_work(work),
+					      struct s5300_modem, park_work);
+
+	queue_work(sm->pm_wq, &sm->pm_work);
+}
+
 /*
  * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
  * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
@@ -1071,6 +1089,8 @@ static void s5300_pm_work(struct work_struct *work)
 			sm->link_up = true;
 			sm->relink_requested = false;
 			spin_unlock_irqrestore(&sm->lock, flags);
+			/* Fresh wake session: new deferred-park retry budget. */
+			sm->park_retries = 0;
 			dev_dbg(sm->dev, "%s: link up\n",
 				want_up ? "CP wakeup" :
 				ld ? "AP relink (linkdown)" : "AP relink (tx pending)");
@@ -1099,9 +1119,14 @@ static void s5300_pm_work(struct work_struct *work)
 
 		if (gpiod_get_value_cansleep(sm->cp2ap_wakeup)) {
 			dev_dbg(sm->dev, "CP sleep: park deferred (CP re-asserted)\n");
+			sm->park_retries = 0;
 		} else {
+			bool txp, dbr;
+
 			spin_lock_irqsave(&sm->lock, flags);
-			park = !s5300_tx_pending(sm) && !sm->db_reserved &&
+			txp = s5300_tx_pending(sm);
+			dbr = sm->db_reserved;
+			park = !txp && !dbr &&
 			       time_after_eq(jiffies, READ_ONCE(sm->fmt_busy_until));
 			if (park)
 				sm->link_up = false;
@@ -1144,6 +1169,7 @@ static void s5300_pm_work(struct work_struct *work)
 				spin_lock_irqsave(&sm->lock, flags);
 				sm->link_up = true;
 				spin_unlock_irqrestore(&sm->lock, flags);
+				sm->park_retries = 0;
 				dev_dbg(sm->dev, "CP sleep: park aborted (link busy)\n");
 			} else if (park) {
 				/*
@@ -1156,9 +1182,52 @@ static void s5300_pm_work(struct work_struct *work)
 				spin_lock_irqsave(&sm->lock, flags);
 				sm->relink_requested = false;
 				spin_unlock_irqrestore(&sm->lock, flags);
+				sm->park_retries = 0;
 				dev_dbg(sm->dev, "CP sleep: link down\n");
+			} else if (sm->park_retries++ < S5300_PARK_RETRIES) {
+				unsigned long delay;
+
+				/*
+				 * Deferred: an un-drained AP->CP frame, a reserved
+				 * doorbell or the FMT grace window is holding the link
+				 * -- but the CP has already dropped CP2AP_WAKEUP, so no
+				 * further edge comes to retry the park and the link
+				 * would stay pinned at L0 forever (hw: an idle-time CP
+				 * wake session delivering one indication armed the FMT
+				 * grace, the park deferred, and nothing ever re-checked).
+				 * Schedule a re-check for when the blocker should be
+				 * gone: the grace window's own expiry, or a short drain
+				 * delay after nudging the CP awake (only a wake drains a
+				 * ring; the nudge's c2aw edges usually re-drive pm_work
+				 * before the fallback fires).
+				 */
+				if (txp || dbr) {
+					zumapro_pcie_modem_wake(sm->rc_dev);
+					delay = msecs_to_jiffies(S5300_PARK_DRAIN_MS);
+				} else {
+					delay = READ_ONCE(sm->fmt_busy_until) - jiffies;
+					if ((long)delay <= 0)
+						delay = 1;
+				}
+				dev_dbg(sm->dev,
+					"CP sleep: park deferred (%s), re-check in %ums (retry %u)\n",
+					txp ? "tx pending" :
+					dbr ? "doorbell reserved" : "fmt grace",
+					jiffies_to_msecs(delay), sm->park_retries);
+				queue_delayed_work(sm->pm_wq, &sm->park_work, delay);
 			} else {
-				dev_dbg(sm->dev, "CP sleep: park deferred (tx pending)\n");
+				/*
+				 * Retries exhausted: the CP is not draining its rings
+				 * despite the nudges.  Leave the link up (the CP can
+				 * still ask to park again) and log the queue state --
+				 * this is an anomaly worth seeing.
+				 */
+				dev_info(sm->dev,
+					 "CP sleep: park stuck, CP not draining (fmt %u/%u raw %u/%u)\n",
+					 readl(sm->ipc + S5300_FMT_TXQ_HEAD),
+					 readl(sm->ipc + S5300_FMT_TXQ_TAIL),
+					 readl(sm->ipc + S5300_RAW_TXQ_HEAD),
+					 readl(sm->ipc + S5300_RAW_TXQ_TAIL));
 			}
 		}
 	}
@@ -1878,6 +1947,12 @@ static void s5300_quiesce_pm(struct s5300_modem *sm)
 	disable_irq(sm->cp2ap_irq);
 	if (sm->cp2ap_active_irq > 0)
 		disable_irq(sm->cp2ap_active_irq);
+	/*
+	 * A pm_work draining below can re-arm the park re-check, but its
+	 * queued pm_work then bails on the cleared online -- no further link
+	 * ops -- so one sync cancel of each suffices.
+	 */
+	cancel_delayed_work_sync(&sm->park_work);
 	cancel_work_sync(&sm->pm_work);
 	sm->pm_armed = false;
 }
@@ -3069,6 +3144,7 @@ static int s5300_probe(struct platform_device *pdev)
 	mutex_init(&sm->raw_tx_lock);
 	mutex_init(&sm->fmt_tx_lock);
 	INIT_WORK(&sm->pm_work, s5300_pm_work);
+	INIT_DELAYED_WORK(&sm->park_work, s5300_park_work);
 	init_completion(&sm->init_done);
 	init_waitqueue_head(&sm->read_wq);
 	init_waitqueue_head(&sm->fmt_tx_wq);
@@ -3500,7 +3576,14 @@ static void s5300_remove(struct platform_device *pdev)
 		free_irq(sm->cp2ap_active_irq, sm);
 	free_irq(sm->cp2ap_irq, sm);
 	zumapro_pcie_unregister_linkdown_cb(sm->rc_dev);
+	/*
+	 * pm_work and the park re-check queue each other: cancel the timer,
+	 * flush pm_work (which may re-arm the timer once more), cancel again.
+	 * destroy_workqueue() drains anything that still slipped through.
+	 */
+	cancel_delayed_work_sync(&sm->park_work);
 	cancel_work_sync(&sm->pm_work);
+	cancel_delayed_work_sync(&sm->park_work);
 	destroy_workqueue(sm->pm_wq);
 
 	/*

@@ -104,9 +104,23 @@ static const struct drm_ioctl_desc exynos_ioctls[] = {
 
 DEFINE_DRM_GEM_FOPS(exynos_drm_driver_fops);
 
+/*
+ * The render node exists solely for the driver-private G2D and IPP
+ * submission ioctls.  Without those engines built in it would advertise
+ * rendering capability the device does not have, and generic userspace
+ * (Mesa kmsro via wlroots) builds its GPU stack on the display device's
+ * render node instead of the real GPU's.
+ */
+#if IS_ENABLED(CONFIG_DRM_EXYNOS_G2D) || IS_ENABLED(CONFIG_DRM_EXYNOS_IPP)
+#define EXYNOS_DRM_RENDER_FEATURES	DRIVER_RENDER
+#else
+#define EXYNOS_DRM_RENDER_FEATURES	0
+#endif
+
 static const struct drm_driver exynos_drm_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM
-				  | DRIVER_ATOMIC | DRIVER_RENDER,
+				  | DRIVER_ATOMIC
+				  | EXYNOS_DRM_RENDER_FEATURES,
 	.open			= exynos_drm_open,
 	.postclose		= exynos_drm_postclose,
 	.dumb_create		= exynos_drm_gem_dumb_create,

@@ -23,7 +23,7 @@ int zumapro_pcie_modem_link_up(struct device *rc_dev);
 bool zumapro_pcie_modem_link_active(struct device *rc_dev);
 int zumapro_pcie_modem_wake(struct device *rc_dev);
 int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev);
-int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump);
+int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump, bool cold);
 int zumapro_pcie_register_dl_isr(struct device *rc_dev, void (*isr)(void *),
 				 void *data);
 void zumapro_pcie_unregister_dl_isr(struct device *rc_dev);
@@ -62,7 +62,8 @@ static inline int zumapro_pcie_modem_enable_l1ss(struct device *rc_dev)
 {
 	return -ENODEV;
 }
-static inline int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump)
+static inline int zumapro_pcie_cp_reset(struct device *rc_dev, bool dump,
+					bool cold)
 {
 	return -ENODEV;
 }

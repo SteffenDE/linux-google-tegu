@@ -176,6 +176,7 @@
 #define S5300_HANDOVER_SIZE		161	/* sizeof(t_handover_block_info) */
 
 #define S5300_IPC_SRINFO_OFFSET		0x400000
+#define S5300_IPC_SRINFO_SIZE		0x300000
 #define S5300_IPC_MAGIC_ONLINE		0xaa	/* SHM_IPC_MAGIC (running) */
 #define S5300_IPC_MAGIC_BOOT		0xbdbd	/* SHM_BOOT_MAGIC (download) */
 
@@ -445,11 +446,20 @@ struct s5300_boot_mode {
 };
 
 #define IOCTL_POWER_ON			_IO('o', 0x19)
+#define IOCTL_CP_RESET			_IO('o', 0x21)	/* arg != 0 => dump mode */
 #define IOCTL_START_CP_BOOTLOADER	_IOW('o', 0x22, struct s5300_boot_mode)
 #define IOCTL_COMPLETE_NORMAL_BOOTUP	_IO('o', 0x23)
 #define IOCTL_GET_CP_STATUS		_IO('o', 0x27)
 #define IOCTL_LOAD_CP_IMAGE		_IOW('o', 0x40, struct s5300_cp_image)
+#define IOCTL_GET_SRINFO		_IOWR('o', 0x45, struct s5300_srinfo)
 #define IOCTL_HANDOVER_BLOCK_INFO	_IO('o', 0x57)
+
+/* IOCTL_GET_SRINFO transfer descriptor; len returns the bytes copied. */
+struct s5300_srinfo {
+	__u64	buf;
+	__u32	len;
+	__u32	reserved;
+};
 
 struct s5300_modem;
 
@@ -928,6 +938,65 @@ static void s5300_log_cp_alive(struct s5300_modem *sm, const char *ctx)
 }
 
 /*
+ * Log a fingerprint of the CP's crash record.  At crash time srinfo
+ * (IPC+0x400000, AP DRAM already mapped) holds the still-ENCODED assert record
+ * -- high-entropy, no magic -- so the head is only useful to tell crashes
+ * apart in dmesg.  Decoding is userspace policy: the daemon dump-boots the CP
+ * (the ROM's minidump agent rewrites the record as ASCII SRINFO/JSON) and
+ * reads it back via IOCTL_GET_SRINFO to log + persist the crash cause.
+ */
+static void s5300_log_cp_crash_record(struct s5300_modem *sm)
+{
+	u8 head[16];
+
+	memcpy_fromio(head, sm->ipc + S5300_IPC_SRINFO_OFFSET, sizeof(head));
+	dev_info(sm->dev, "CP crash record head %16ph (daemon decodes the reason)\n",
+		 head);
+}
+
+/*
+ * Copy the raw srinfo region out to userspace (downstream IOCTL_GET_SRINFO,
+ * which cbd calls after the dump-boot).  The kernel stays a dumb byte pipe:
+ * the daemon parses the SRINFO/JSON record (8-byte magic + 12-byte header
+ * whose last word is the JSON length), logs the crash cause and persists the
+ * full record -- crash cause, call stack, blackbox, dumppc.
+ */
+static int s5300_get_srinfo(struct s5300_modem *sm, void __user *arg)
+{
+	struct s5300_srinfo req;
+	void __user *ubuf;
+	void *bounce;
+	u32 off = 0, n;
+	int ret = 0;
+
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	n = min_t(u32, req.len, S5300_IPC_SRINFO_SIZE);
+	ubuf = u64_to_user_ptr(req.buf);
+
+	bounce = kmalloc(SZ_16K, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+	while (off < n) {
+		u32 chunk = min_t(u32, n - off, SZ_16K);
+
+		memcpy_fromio(bounce, sm->ipc + S5300_IPC_SRINFO_OFFSET + off,
+			      chunk);
+		if (copy_to_user(ubuf + off, bounce, chunk)) {
+			ret = -EFAULT;
+			goto out;
+		}
+		off += chunk;
+	}
+	req.len = n;
+	if (copy_to_user(arg, &req, sizeof(req)))
+		ret = -EFAULT;
+out:
+	kfree(bounce);
+	return ret;
+}
+
+/*
  * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
  * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
  * ap_wakeup_handler().  Runs on an ordered workqueue because the relink sleeps
@@ -940,6 +1009,16 @@ static void s5300_pm_work(struct work_struct *work)
 	struct s5300_modem *sm = container_of(work, struct s5300_modem, pm_work);
 	bool want_up = gpiod_get_value_cansleep(sm->cp2ap_wakeup);
 	unsigned long flags;
+
+	/*
+	 * A dead CP has no link to manage.  Once a crash clears online, the
+	 * recovery path (CP reset + dump-boot/re-boot) owns the link, and a
+	 * relink from here races its transitions -- hw: a pm_work retrain
+	 * 0.5 ms before the boot bounce's link-down wedged the SoC (DBI
+	 * access on a link mid-transition).  PHONE_START re-arms runtime PM.
+	 */
+	if (!READ_ONCE(sm->online))
+		return;
 
 	mutex_lock(&sm->pcie_onoff_lock);
 
@@ -1139,6 +1218,16 @@ static irqreturn_t s5300_cp_crash_irq(int irq, void *data)
 	if (gpiod_get_value(sm->cp2ap_active))
 		return IRQ_HANDLED;
 	s5300_log_cp_alive(sm, "CP CRASH (cp_act fell)");
+	s5300_log_cp_crash_record(sm);
+	/*
+	 * Mark the CP offline so userspace (exynos-modem) sees the crash via
+	 * IOCTL_GET_CP_STATUS.  A link-down crash never delivers the CRASH_EXIT
+	 * mailbox, so this GPIO edge is the only crash signal for that class.
+	 * Clearing online also stops runtime PM (s5300_pm_work bails) from
+	 * relinking against the dead CP while recovery owns the link.
+	 */
+	WRITE_ONCE(sm->online, false);
+	sm->cp_status = S5300_STATE_OFFLINE;
 	return IRQ_HANDLED;
 }
 
@@ -1663,13 +1752,15 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	case S5300_CMD_CRASH_EXIT:
 		dev_err(sm->dev, "CP crash notification %#x (err_report %#x)\n",
 			cmd, readl(sm->msi + S5300_MSI_ERR_REPORT));
-		sm->cp_status = S5300_STATE_OFFLINE;
+		s5300_log_cp_crash_record(sm);
 		/*
-		 * Runtime PM stays armed (cp2ap_irq enabled, online true) until the
-		 * mandatory IOCTL_POWER_ON re-boot quiesces it, so a spurious
-		 * CP2AP_WAKEUP edge from the dead CP can thrash a relink until then.
-		 * Bounded and self-correcting; tighten when crash recovery lands.
+		 * Clearing online stops runtime PM from thrashing relinks against
+		 * the dead CP (s5300_pm_work bails): the recovery path owns the
+		 * link from here.  The IRQs stay armed until IOCTL_CP_RESET or
+		 * IOCTL_POWER_ON quiesces them; their queued work no-ops.
 		 */
+		WRITE_ONCE(sm->online, false);
+		sm->cp_status = S5300_STATE_OFFLINE;
 		break;
 	default:
 		dev_warn(sm->dev, "unknown CP command %#x\n", cmd);
@@ -1773,6 +1864,24 @@ static int s5300_poll_cp_wakeup(struct s5300_modem *sm)
 
 /* --- boot ioctls --------------------------------------------------------- */
 
+/*
+ * Tear down the previous cycle's CP-driven runtime PM: disable the wakeup and
+ * crash IRQs and drain a pm_work in flight, so nothing races the boot/recovery
+ * path's link transitions (hw: a pm_work relink racing the boot bounce stalls
+ * the interconnect on a DBI access -- silent SoC wedge).  CP-driven runtime PM
+ * re-enables only at PHONE_START; pm_armed keeps the enable depth balanced.
+ */
+static void s5300_quiesce_pm(struct s5300_modem *sm)
+{
+	if (!sm->pm_armed)
+		return;
+	disable_irq(sm->cp2ap_irq);
+	if (sm->cp2ap_active_irq > 0)
+		disable_irq(sm->cp2ap_active_irq);
+	cancel_work_sync(&sm->pm_work);
+	sm->pm_armed = false;
+}
+
 static int s5300_power_on(struct s5300_modem *sm)
 {
 	unsigned long flags;
@@ -1786,17 +1895,10 @@ static int s5300_power_on(struct s5300_modem *sm)
 
 	/*
 	 * Re-arm boot-time link state: the boot handshake rings the doorbell
-	 * directly (link_up true), and CP-driven runtime PM re-enables only at
-	 * PHONE_START.  On a re-boot (post-crash) tear down the previous cycle's
-	 * runtime PM first so the cp2ap_irq enable depth stays balanced.
+	 * directly (link_up true), and on a re-boot (post-crash) the previous
+	 * cycle's runtime PM must not race the boot path.
 	 */
-	if (sm->pm_armed) {
-		disable_irq(sm->cp2ap_irq);
-		if (sm->cp2ap_active_irq > 0)
-			disable_irq(sm->cp2ap_active_irq);
-		cancel_work_sync(&sm->pm_work);
-		sm->pm_armed = false;
-	}
+	s5300_quiesce_pm(sm);
 	spin_lock_irqsave(&sm->lock, flags);
 	sm->link_up = true;
 	sm->db_reserved = false;
@@ -1858,12 +1960,36 @@ out:
 static int s5300_start_bootloader(struct s5300_modem *sm)
 {
 	struct pci_dev *pdev = sm->pdev;
+	unsigned long flags;
+	u16 vid;
 	int ret;
 
 	if (!sm->pbl_size)
 		return dev_err_probe(sm->dev, -EINVAL, "no PBL staged\n");
 
 	sm->cp_status = S5300_STATE_BOOTING;
+
+	/*
+	 * Arm boot-time link state: the boot handshake rings the doorbell
+	 * directly.  The normal boot gets this from IOCTL_POWER_ON, but the
+	 * dump-boot (reset(dump) + LOAD + START, no POWER_ON so the crash
+	 * record is not disturbed) reaches START with the crashed cycle's
+	 * link_up=false still latched -- doorbells would then be deferred to
+	 * the (quiesced) pm_work and the kick never delivered.
+	 */
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->link_up = true;
+	sm->db_reserved = false;
+	spin_unlock_irqrestore(&sm->lock, flags);
+
+	/*
+	 * Clear the stale boot_stage before the kick.  The MSI region is AP
+	 * DRAM, so the crashed cycle's DONE survives the CP reset and the poll
+	 * below would short-circuit before the ROM fetched anything.  POWER_ON
+	 * also clears it, but the dump-boot skips POWER_ON (downstream runs
+	 * clear_boot_stage() at every reset entry instead).
+	 */
+	writel(0, sm->msi + S5300_MSI_BOOT_STAGE);
 
 	/* Arm the download ring (magic 0xBDBD) before the first-stage kick. */
 	s5300_init_boot_ring(sm);
@@ -1874,6 +2000,33 @@ static int s5300_start_bootloader(struct s5300_modem *sm)
 	writel(upper_32_bits(sm->ipc_phys + S5300_BOOT_IMG_OFFSET),
 	       sm->msi + S5300_MSI_IMG_ADDR_HI);
 	writel(sm->pbl_size, sm->msi + S5300_MSI_IMG_SIZE);
+
+	/*
+	 * Ensure the physical link is up before the endpoint accesses below.
+	 * After IOCTL_CP_RESET the link is down (the GPIO sequence only raises
+	 * AP2CP_WAKEUP; training is separate), and the doorbell MEM write
+	 * would hit the RP window while the fresh ROM churns the LTSSM --
+	 * hw-observed to stall the interconnect (silent SoC wedge; a stably
+	 * dead window merely reads all-ones).  Downstream trains here too:
+	 * start_normal_boot() and start_dump_boot() both run register_pcie()
+	 * before set_cp_rom_boot_img().  At cold boot the probe has already
+	 * trained to the mask ROM and this is skipped; a fresh train comes up
+	 * with virgin endpoint config, so replay the outbound routing.
+	 * The config VID probe backs up the LTSSM query: an all-ones read
+	 * means the endpoint is unreachable no matter what the LTSSM claims
+	 * (config reads on a dead link are safe, hw-proven).
+	 */
+	pci_read_config_word(pdev, PCI_VENDOR_ID, &vid);
+	if (!zumapro_pcie_modem_link_active(sm->rc_dev) || vid == 0xffff) {
+		ret = zumapro_pcie_modem_link_up(sm->rc_dev);
+		if (ret) {
+			dev_err(sm->dev, "pre-kick link train failed: %d\n",
+				ret);
+			return ret;
+		}
+		s5300_program_doorbell_bar(sm);
+		s5300_open_bridge_window(sm);
+	}
 
 	/* The ROM reads these on the doorbell; make sure the writes stuck. */
 	s5300_verify_msi_target(sm);
@@ -2112,11 +2265,32 @@ static long s5300_dev_ioctl(struct file *file, unsigned int cmd,
 	case IOCTL_POWER_ON:
 		ret = s5300_power_on(sm);
 		break;
+	case IOCTL_CP_RESET:
+		/*
+		 * GPIO CP reset primitive (cbd's POWER_RESET), the userspace
+		 * recovery path's first step.  arg != 0 asserts the dump GPIO so
+		 * that a following PBL load+start boots the ROM's minidump agent,
+		 * which decodes the crash record into srinfo (read back via
+		 * IOCTL_GET_SRINFO); arg == 0 is a plain reset that leaves
+		 * the CP ready for the image download that re-boots it.
+		 *
+		 * Quiesce the crashed cycle's runtime PM first: its wakeup/crash
+		 * IRQs and a pm_work in flight must not drive link transitions
+		 * concurrently with the reset and the boot that follows
+		 * (downstream start_dump_boot(): "do not handle cp2ap_wakeup irq
+		 * during dump process").
+		 */
+		s5300_quiesce_pm(sm);
+		ret = zumapro_pcie_cp_reset(sm->rc_dev, !!arg);
+		break;
 	case IOCTL_LOAD_CP_IMAGE:
 		ret = s5300_load_cp_image(sm, uarg);
 		break;
 	case IOCTL_START_CP_BOOTLOADER:
 		ret = s5300_start_bootloader(sm);
+		break;
+	case IOCTL_GET_SRINFO:
+		ret = s5300_get_srinfo(sm, uarg);
 		break;
 	default:
 		ret = -ENOTTY;

@@ -1053,8 +1053,14 @@ static void s5300_pm_work(struct work_struct *work)
 		 * cp_act here (before any PERST/PHY touch) distinguishes a CP that
 		 * crashed on its own -- relink is then only a symptom -- from one we
 		 * crash during the retrain.  cp_act:0 at entry => already dead.
+		 * Debug level: an idle CP wakes the link for every downlink
+		 * delivery (paging-paced, seconds apart), which would otherwise
+		 * dominate dmesg.
 		 */
-		s5300_log_cp_alive(sm, "relink entry");
+		dev_dbg(sm->dev, "relink entry: CP gpio c2aw:%d cp_act:%d ps_hold:%d\n",
+			gpiod_get_value(sm->cp2ap_wakeup),
+			sm->cp2ap_active ? gpiod_get_value(sm->cp2ap_active) : -1,
+			sm->cp2ap_ps_hold ? gpiod_get_value(sm->cp2ap_ps_hold) : -1);
 
 		/*
 		 * Wait for the CP to be awake before training.  Downstream's

@@ -227,6 +227,9 @@
 #define S5300_OEM_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
 #define S5300_OEM_MAX			(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
 #define S5300_OEM_RXQ_MAX		64	/* bound the un-drained rx backlog */
+#define S5300_OEM_MULTI_IDS		64
+/* The fragment countdown is one byte: at most 256 2036-byte payloads. */
+#define S5300_OEM_MSG_MAX		(256 * (S5300_FMT_MAX - S5300_HDR_SIZE))
 /* FMT chardev backpressure: a full-ring send re-nudges the CP every poll tick
  * and blocks (per frame) up to the timeout before giving up. */
 #define S5300_FMT_TX_POLL_MS		20
@@ -267,6 +270,10 @@
 #define S5300_HDR_SIZE			12
 #define S5300_HDR_SYNC			0xabcd	/* EXYNOS_START_MASK */
 #define S5300_HDR_CFG_SINGLE		0xc000	/* EXYNOS_SINGLE_MASK << 8 */
+#define S5300_HDR_CFG_MULTI_START	BIT(15)
+#define S5300_HDR_CFG_MULTI_LAST		BIT(14)
+#define S5300_HDR_CFG_MULTI_ID_MASK	GENMASK(13, 8)
+#define S5300_HDR_CFG_MULTI_ID_SHIFT	8
 #define S5300_BOOT_CH			0xf1	/* EXYNOS_CH_ID_BOOT */
 
 /* Interrupt-word encoding (downstream link_device_memory.h). */
@@ -490,7 +497,10 @@ struct s5300_chardev {
 	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
 	u32			tx_max;		/* max app payload per frame */
 	u8			*tx_buf;	/* header + one frame + pad */
-	struct sk_buff_head	rxq;		/* one skb per received frame */
+	struct sk_buff_head	rxq;		/* one skb per received app message */
+	struct sk_buff_head	rx_frag[S5300_OEM_MULTI_IDS];
+	u32			rx_frag_len[S5300_OEM_MULTI_IDS];
+	bool			rx_frag_drop[S5300_OEM_MULTI_IDS];
 	wait_queue_head_t	read_wq;
 };
 
@@ -1472,6 +1482,11 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 		sm->sit[i].frame_seq = 0;
 	}
 	sm->oem.frame_seq = 0;
+	for (i = 0; i < S5300_OEM_MULTI_IDS; i++) {
+		skb_queue_purge(&sm->oem.rx_frag[i]);
+		sm->oem.rx_frag_len[i] = 0;
+		sm->oem.rx_frag_drop[i] = false;
+	}
 	sm->rfs.ch_seq = 0;
 	sm->at_ch_seq = 0;
 
@@ -1491,7 +1506,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 
 /* Defined below; called from the RX drain and the chardev write path here. */
 static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
-			     u32 ringsize, u32 out, u32 payload);
+			     u32 ringsize, u32 out, u32 payload, u16 cfg);
 static int s5300_raw_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 			     u8 *ch_seq, u32 max, const u8 *data, u32 len);
 
@@ -1555,7 +1570,8 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			 * (the chardev enqueues + wakes a reader). */
 			if (payload && payload <= S5300_RFS_MAX)
 				s5300_chardev_rx(&sm->rfs, buff,
-						 S5300_RAW_RXQ_SIZE, out, payload);
+						 S5300_RAW_RXQ_SIZE, out, payload,
+						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
 			struct sk_buff *skb = NULL;
 
@@ -1633,31 +1649,122 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 }
 
 /*
- * Copy one channel frame's payload out of a ring into an skb and queue it for
- * the chardev's reader (runs in the drain, hard IRQ: GFP_ATOMIC).  @buff/@out
- * point at the frame's link header; the payload starts one header in.  The
- * backlog is bounded so a daemon that never opens the node cannot exhaust
- * memory -- excess frames are dropped (a draining daemon never hits this).
+ * Copy one channel frame's payload out of a ring and queue a complete app
+ * message for the chardev's reader (runs in the drain, hard IRQ: GFP_ATOMIC).
+ * EXYNOS FMT splits messages larger than 2036 bytes across frames; @cfg carries
+ * a six-bit packet ID and marks the final fragment.  Downstream's
+ * gather_multi_frame_sit() validates nothing: it accumulates fragments per
+ * packet ID until one carries the LAST bit, then delivers the concatenation.
+ * Mirror that tolerance -- the countdown byte and START bit are not checked, a
+ * CP-aborted message simply pollutes the next same-ID delivery, and message
+ * integrity is the reader's protocol layer's job (GEMS decodes and re-requests).
+ * Only resource bounds (assembly size, delivered backlog) drop frames here.
  */
 static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
-			     u32 ringsize, u32 out, u32 payload)
+			     u32 ringsize, u32 out, u32 payload, u16 cfg)
 {
-	struct sk_buff *skb;
+	struct sk_buff_head *frags;
+	struct sk_buff *skb, *frag, *first = NULL, *tail = NULL;
+	bool last;
+	u32 id, total;
 
-	if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
-		dev_warn_ratelimited(cd->sm->dev, "%s rxq full, dropping %u\n",
-				     cd->miscdev.name, payload);
+	if ((cfg & S5300_HDR_CFG_SINGLE) == S5300_HDR_CFG_SINGLE) {
+		if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+			dev_warn_ratelimited(cd->sm->dev,
+					     "%s rxq full, dropping %u\n",
+					     cd->miscdev.name, payload);
+			return;
+		}
+		skb = alloc_skb(payload, GFP_ATOMIC);
+		if (!skb) {
+			dev_warn_ratelimited(cd->sm->dev,
+					     "%s alloc_skb(%u) failed, dropping\n",
+					     cd->miscdev.name, payload);
+			return;
+		}
+		s5300_circ_read(skb_put(skb, payload), buff, ringsize,
+				s5300_circ_new(ringsize, out, S5300_HDR_SIZE),
+				payload);
+		skb_queue_tail(&cd->rxq, skb);
+		wake_up_interruptible(&cd->read_wq);
 		return;
 	}
+
+	id = (cfg & S5300_HDR_CFG_MULTI_ID_MASK) >>
+		S5300_HDR_CFG_MULTI_ID_SHIFT;
+	last = cfg & S5300_HDR_CFG_MULTI_LAST;
+	frags = &cd->rx_frag[id];
+
+	if (cd->rx_frag_drop[id]) {
+		if (last)
+			cd->rx_frag_drop[id] = false;
+		return;
+	}
+
 	skb = alloc_skb(payload, GFP_ATOMIC);
 	if (!skb) {
 		dev_warn_ratelimited(cd->sm->dev,
-				     "%s alloc_skb(%u) failed, dropping\n",
-				     cd->miscdev.name, payload);
+				     "%s alloc_skb(%u) failed, dropping packet %u\n",
+				     cd->miscdev.name, payload, id);
+		skb_queue_purge(frags);
+		cd->rx_frag_len[id] = 0;
+		cd->rx_frag_drop[id] = !last;
 		return;
 	}
 	s5300_circ_read(skb_put(skb, payload), buff, ringsize,
 			s5300_circ_new(ringsize, out, S5300_HDR_SIZE), payload);
+
+	if (check_add_overflow(cd->rx_frag_len[id], payload, &total) ||
+	    total > S5300_OEM_MSG_MAX) {
+		dev_warn_ratelimited(cd->sm->dev,
+				     "%s multi-frame message too large, dropping\n",
+				     cd->miscdev.name);
+		kfree_skb(skb);
+		skb_queue_purge(frags);
+		cd->rx_frag_len[id] = 0;
+		cd->rx_frag_drop[id] = !last;
+		return;
+	}
+	skb_queue_tail(frags, skb);
+	cd->rx_frag_len[id] = total;
+
+	if (!last)
+		return;
+
+	if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+		dev_warn_ratelimited(cd->sm->dev,
+				     "%s rxq full, dropping packet %u\n",
+				     cd->miscdev.name, id);
+		skb_queue_purge(frags);
+		cd->rx_frag_len[id] = 0;
+		return;
+	}
+
+	/* Keep the payload in its existing fragment skbs.  A zero-length head
+	 * avoids a high-order GFP_ATOMIC allocation and the read path copies the
+	 * fragment list to userspace later in process context. */
+	skb = alloc_skb(0, GFP_ATOMIC);
+	if (!skb) {
+		dev_warn_ratelimited(cd->sm->dev,
+				     "%s failed to allocate message head, dropping packet %u\n",
+				     cd->miscdev.name, id);
+		skb_queue_purge(frags);
+		cd->rx_frag_len[id] = 0;
+		return;
+	}
+	while ((frag = skb_dequeue(frags))) {
+		frag->next = NULL;
+		if (tail)
+			tail->next = frag;
+		else
+			first = frag;
+		tail = frag;
+		skb->len += frag->len;
+		skb->data_len += frag->len;
+		skb->truesize += frag->truesize;
+	}
+	skb_shinfo(skb)->frag_list = first;
+	cd->rx_frag_len[id] = 0;
 	skb_queue_tail(&cd->rxq, skb);
 	wake_up_interruptible(&cd->read_wq);
 }
@@ -1715,7 +1822,8 @@ static void s5300_drain_fmt_rxq(struct s5300_modem *sm)
 		if (hdr[8] == S5300_OEM_CH) {
 			if (payload)
 				s5300_chardev_rx(&sm->oem, buff,
-						 S5300_FMT_RXQ_SIZE, out, payload);
+						 S5300_FMT_RXQ_SIZE, out, payload,
+						 hdr[4] | (hdr[5] << 8));
 			/* The CP opened an oem transaction and expects a (multi-frame)
 			 * reply; keep the link up so it drains at L0. */
 			s5300_fmt_mark_busy(sm);
@@ -2569,13 +2677,13 @@ static int s5300_chardev_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* One read() returns exactly one received frame's payload (datagram-like). */
+/* One read() returns exactly one received application message (datagram-like). */
 static ssize_t s5300_chardev_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
 	struct s5300_chardev *cd = file->private_data;
-	struct sk_buff *skb;
-	size_t n;
+	struct sk_buff *skb, *frag;
+	size_t copied, headlen, n;
 
 	skb = skb_dequeue(&cd->rxq);
 	if (!skb) {
@@ -2586,14 +2694,30 @@ static ssize_t s5300_chardev_read(struct file *file, char __user *buf,
 			return -ERESTARTSYS;
 	}
 
-	n = min(count, (size_t)skb->len);
-	if (copy_to_user(buf, skb->data, n)) {
-		/* Keep the message for a retry rather than losing it. */
+	if (count < skb->len) {
 		skb_queue_head(&cd->rxq, skb);
-		return -EFAULT;
+		return -EMSGSIZE;
 	}
+	n = skb->len;
+	copied = 0;
+	headlen = skb_headlen(skb);
+	if (headlen && copy_to_user(buf, skb->data, headlen))
+		goto copy_error;
+	copied += headlen;
+	skb_walk_frags(skb, frag) {
+		if (copy_to_user(buf + copied, frag->data, frag->len))
+			goto copy_error;
+		copied += frag->len;
+	}
+	if (WARN_ON_ONCE(copied != n))
+		goto copy_error;
 	kfree_skb(skb);
 	return n;
+
+copy_error:
+	/* Keep the message for a retry rather than losing it. */
+	skb_queue_head(&cd->rxq, skb);
+	return -EFAULT;
 }
 
 /*
@@ -3194,6 +3318,8 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->oem.channel = S5300_OEM_CH;
 	sm->oem.tx_max = S5300_OEM_MAX;
 	skb_queue_head_init(&sm->oem.rxq);
+	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+		skb_queue_head_init(&sm->oem.rx_frag[i]);
 	init_waitqueue_head(&sm->oem.read_wq);
 	sm->rfs.sm = sm;
 	sm->rfs.channel = S5300_RFS_CH;
@@ -3649,6 +3775,8 @@ static void s5300_remove(struct platform_device *pdev)
 	unregister_netdev(sm->ndev);
 	misc_deregister(&sm->oem.miscdev);
 	skb_queue_purge(&sm->oem.rxq);
+	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+		skb_queue_purge(&sm->oem.rx_frag[i]);
 	wwan_remove_port(sm->at_port);
 	misc_deregister(&sm->rfs.miscdev);
 	skb_queue_purge(&sm->rfs.rxq);

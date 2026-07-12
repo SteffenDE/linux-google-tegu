@@ -212,6 +212,7 @@
 
 /* Largest SIT app message the corpus shows is the 983-byte setup-data-call. */
 #define S5300_FMT_MAX			SZ_2K
+#define S5300_FMT_FRAME_PAYLOAD		(S5300_FMT_MAX - S5300_HDR_SIZE)
 
 /*
  * OEM/GEMS channel (downstream io-device oem_ipc, an IPC_FMT multi-channel iod
@@ -220,16 +221,21 @@
  * only the channel byte differs.  The CP streams UE-capability-config file
  * requests here; left unanswered its internal LTE-RRC message queue overflows
  * and the modem asserts (PAL_QUEUE_FULL).  A userspace daemon answers it via
- * /dev/umts_oem1.  Config chunks are ~4 KB, so a frame fills most of one 4 KB
- * FMT ring slot: cap the payload so header+payload+pad still fits the ring
- * (leaving the circ one-slot gap).
+ * /dev/umts_oem1.  CP->AP application messages may exceed the 2036-byte EXYNOS
+ * frame payload, so the chardev reassembles RX fragments.  AP->CP writes go out
+ * as ONE oversized single frame whenever they fit the ring: that is the shape
+ * this CP firmware is hardware-validated to consume (the ~4KB uecapconfig block
+ * replies), whereas fragmenting the same replies into spec-style multi-frames
+ * broke the boot uecap exchange and with it LTE attach.  Only messages too
+ * large for the ring fall back to the downstream packet-ID/countdown format,
+ * whose AP->CP acceptance is unproven (TRACE NEEDED: stock GEMS write sizes).
  */
 #define S5300_OEM_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
 #define S5300_OEM_MAX			(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
 #define S5300_OEM_RXQ_MAX		64	/* bound the un-drained rx backlog */
 #define S5300_OEM_MULTI_IDS		64
 /* The fragment countdown is one byte: at most 256 2036-byte payloads. */
-#define S5300_OEM_MSG_MAX		(256 * (S5300_FMT_MAX - S5300_HDR_SIZE))
+#define S5300_OEM_MSG_MAX		(256 * S5300_FMT_FRAME_PAYLOAD)
 /* FMT chardev backpressure: a full-ring send re-nudges the CP every poll tick
  * and blocks (per frame) up to the timeout before giving up. */
 #define S5300_FMT_TX_POLL_MS		20
@@ -493,14 +499,16 @@ struct s5300_chardev {
 	struct miscdevice	miscdev;
 	u8			channel;	/* EXYNOS channel id */
 	u8			ch_seq;		/* per-channel link-header seq */
+	u8			tx_packet_id;	/* six-bit EXYNOS multi-frame ID */
 	u16			frame_seq;	/* per-channel link-header frame seq */
 	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
-	u32			tx_max;		/* max app payload per frame */
-	u8			*tx_buf;	/* header + one frame + pad */
+	u32			tx_max;		/* max app message per write */
+	u8			*tx_buf;	/* header + one transport frame + pad */
 	struct sk_buff_head	rxq;		/* one skb per received app message */
 	struct sk_buff_head	rx_frag[S5300_OEM_MULTI_IDS];
 	u32			rx_frag_len[S5300_OEM_MULTI_IDS];
 	bool			rx_frag_drop[S5300_OEM_MULTI_IDS];
+	struct mutex		tx_msg_lock;	/* serialise one app message's fragments */
 	wait_queue_head_t	read_wq;
 };
 
@@ -1482,6 +1490,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 		sm->sit[i].frame_seq = 0;
 	}
 	sm->oem.frame_seq = 0;
+	sm->oem.tx_packet_id = 0;
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++) {
 		skb_queue_purge(&sm->oem.rx_frag[i]);
 		sm->oem.rx_frag_len[i] = 0;
@@ -2540,16 +2549,16 @@ static u32 s5300_fmt_txq_space(struct s5300_modem *sm)
 }
 
 /*
- * Wrap one app message in the 12-byte EXYNOS link header (single frame, 8-byte
- * padded, channel @ch), copy it onto the FMT txq and ring the CP's FMT data
- * doorbell.  All post-ONLINE FMT writers -- the two SIT control ports
- * (0xF5/0xF6) and the oem/GEMS chardev (0x82) -- funnel through here, so the
- * txq head RMW is serialised by fmt_tx_lock; each logical channel owns its
- * @frame_seq and @ch_seq.  The staging buffer is also protected by
- * fmt_tx_lock.
+ * Wrap one app-message fragment in the 12-byte EXYNOS link header (8-byte
+ * padded, channel @ch and fragment config @cfg), copy it onto the FMT txq and
+ * ring the CP's FMT data doorbell.  All post-ONLINE FMT writers -- the two
+ * SIT control ports (0xF5/0xF6) and the oem/GEMS chardev (0x82) -- funnel
+ * through here, so the txq head RMW is serialised by fmt_tx_lock; each
+ * logical channel owns its @frame_seq and @ch_seq.  The staging buffer is
+ * also protected by fmt_tx_lock.
  */
 static int s5300_fmt_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
-			     u16 *frame_seq, u8 *ch_seq, u32 max,
+			     u16 *frame_seq, u8 *ch_seq, u16 cfg, u32 max,
 			     const u8 *data, u32 len)
 {
 	void __iomem *txq = sm->ipc + S5300_FMT_TXQ_OFFSET;
@@ -2568,23 +2577,6 @@ static int s5300_fmt_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 	pad = total - flen;
 
 	mutex_lock(&sm->fmt_tx_lock);
-
-	seq = ++*frame_seq;
-	frame[0] = S5300_HDR_SYNC & 0xff;
-	frame[1] = S5300_HDR_SYNC >> 8;
-	frame[2] = seq & 0xff;
-	frame[3] = seq >> 8;
-	frame[4] = S5300_HDR_CFG_SINGLE & 0xff;
-	frame[5] = S5300_HDR_CFG_SINGLE >> 8;
-	frame[6] = flen & 0xff;
-	frame[7] = flen >> 8;
-	frame[8] = ch;
-	frame[9] = ++*ch_seq;
-	frame[10] = 0;
-	frame[11] = 0;
-	memcpy(frame + S5300_HDR_SIZE, data, len);
-	if (pad)
-		memset(frame + flen, 0, pad);
 
 	in = readl(sm->ipc + S5300_FMT_TXQ_HEAD);
 	out = readl(sm->ipc + S5300_FMT_TXQ_TAIL);
@@ -2612,6 +2604,23 @@ static int s5300_fmt_ring_tx(struct s5300_modem *sm, u8 *staging, u8 ch,
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+
+	seq = ++*frame_seq;
+	frame[0] = S5300_HDR_SYNC & 0xff;
+	frame[1] = S5300_HDR_SYNC >> 8;
+	frame[2] = seq & 0xff;
+	frame[3] = seq >> 8;
+	frame[4] = cfg & 0xff;
+	frame[5] = cfg >> 8;
+	frame[6] = flen & 0xff;
+	frame[7] = flen >> 8;
+	frame[8] = ch;
+	frame[9] = ++*ch_seq;
+	frame[10] = 0;
+	frame[11] = 0;
+	memcpy(frame + S5300_HDR_SIZE, data, len);
+	if (pad)
+		memset(frame + flen, 0, pad);
 
 	s5300_circ_write(txq, frame, S5300_FMT_TXQ_SIZE, in, total);
 	/* Order the payload store ahead of the head advance the CP reads. */
@@ -2651,7 +2660,8 @@ static int s5300_ctrl_tx(struct wwan_port *port, struct sk_buff *skb)
 
 	/* Linear: the port is created with caps=NULL, so frag_len is SIZE_MAX. */
 	ret = s5300_fmt_ring_tx(sm, sm->fmt_tx_buf, sit->channel,
-				&sit->frame_seq, &sit->ch_seq, S5300_FMT_MAX,
+				&sit->frame_seq, &sit->ch_seq,
+				S5300_HDR_CFG_SINGLE, S5300_FMT_FRAME_PAYLOAD,
 				skb->data, skb->len);
 	if (ret)
 		return ret;
@@ -2720,10 +2730,55 @@ copy_error:
 	return -EFAULT;
 }
 
+static int s5300_fmt_chardev_frame_tx(struct file *file, const u8 *data,
+				      u32 len, u16 cfg, bool interruptible)
+{
+	struct s5300_chardev *cd = file->private_data;
+	struct s5300_modem *sm = cd->sm;
+	unsigned long deadline;
+	u32 needed;
+	int ret;
+
+	needed = round_up(S5300_HDR_SIZE + len, 8);
+	deadline = jiffies + msecs_to_jiffies(S5300_FMT_TX_TIMEOUT_MS);
+	for (;;) {
+		ret = s5300_fmt_ring_tx(sm, cd->tx_buf, cd->channel,
+					&cd->frame_seq, &cd->ch_seq, cfg,
+					S5300_OEM_MAX, data, len);
+		if (ret != -EBUSY)
+			return ret;
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+
+		/* The CP advances the FMT tail without an MSI.  Poll briefly and
+		 * re-ring SEND_FMT on every retry so a lost notification cannot
+		 * strand the frame already occupying the one-slot ring. */
+		if (interruptible) {
+			ret = wait_event_interruptible_timeout(sm->fmt_tx_wq,
+					s5300_fmt_txq_space(sm) >= needed,
+					msecs_to_jiffies(S5300_FMT_TX_POLL_MS));
+			if (ret < 0)
+				return ret;
+		} else {
+			wait_event_timeout(sm->fmt_tx_wq,
+					s5300_fmt_txq_space(sm) >= needed,
+					msecs_to_jiffies(S5300_FMT_TX_POLL_MS));
+		}
+	}
+}
+
 /*
- * One write() is one app message.  It fills at most one FMT ring slot, so on a
- * full ring (-EBUSY) block until the CP drains it (fmt_tx_wq, woken from the IRQ
- * handler) rather than dropping the frame; O_NONBLOCK maps that to -EAGAIN.
+ * One write() is one app message.  NORM_RAW messages are one link frame; FMT
+ * OEM messages go out as one oversized single frame while they fit the ring
+ * (see the S5300_OEM_MAX comment) and fall back to downstream-compatible
+ * 2036-byte fragments beyond that.  Ring backpressure blocks until the CP
+ * drains each frame.  For multi-frame messages, a signal after the first
+ * fragment cannot safely abort the syscall: userspace retry would resend from
+ * fragment zero while the CP keeps the abandoned partial assembly.  Keep only
+ * the pre-first-fragment wait interruptible, and reject nonblocking
+ * multi-frame writes up front.
  */
 static ssize_t s5300_chardev_write(struct file *file, const char __user *buf,
 				   size_t count, loff_t *ppos)
@@ -2731,8 +2786,9 @@ static ssize_t s5300_chardev_write(struct file *file, const char __user *buf,
 	struct s5300_chardev *cd = file->private_data;
 	struct s5300_modem *sm = cd->sm;
 	unsigned long deadline;
-	u32 needed;
+	u32 fragment_count, fragment, len, packet_id, remaining, sent;
 	u8 *kbuf;
+	u16 cfg;
 	int ret;
 
 	if (count == 0)
@@ -2740,23 +2796,59 @@ static ssize_t s5300_chardev_write(struct file *file, const char __user *buf,
 	if (count > cd->tx_max)
 		return -EMSGSIZE;
 
-	kbuf = kmalloc(count, GFP_KERNEL);
+	if (!cd->raw_ring) {
+		/* Prefer one oversized single frame: the CP demonstrably parses
+		 * those (hw-validated uecap replies), while its acceptance of
+		 * AP->CP multi-frame is unproven. */
+		fragment_count = count <= S5300_OEM_MAX ? 1 :
+				 DIV_ROUND_UP(count, S5300_FMT_FRAME_PAYLOAD);
+		if (fragment_count > 1 && (file->f_flags & O_NONBLOCK))
+			return -EINVAL;
+	}
+
+	kbuf = kvmalloc(count, GFP_KERNEL);
 	if (!kbuf)
 		return -ENOMEM;
 	if (copy_from_user(kbuf, buf, count)) {
-		kfree(kbuf);
+		kvfree(kbuf);
 		return -EFAULT;
 	}
 
-	needed = round_up(S5300_HDR_SIZE + count, 8);
+	if (!cd->raw_ring) {
+		if (mutex_lock_interruptible(&cd->tx_msg_lock)) {
+			kvfree(kbuf);
+			return -ERESTARTSYS;
+		}
+		packet_id = (++cd->tx_packet_id) & 0x3f;
+		for (fragment = 0, sent = 0; fragment < fragment_count;
+		     fragment++, sent += len) {
+			len = fragment_count == 1 ? count :
+			      min_t(u32, count - sent, S5300_FMT_FRAME_PAYLOAD);
+			remaining = fragment_count - fragment - 1;
+			if (fragment_count == 1)
+				cfg = S5300_HDR_CFG_SINGLE;
+			else if (remaining)
+				cfg = S5300_HDR_CFG_MULTI_START |
+					(packet_id << S5300_HDR_CFG_MULTI_ID_SHIFT) |
+					remaining;
+			else
+				cfg = S5300_HDR_CFG_MULTI_LAST |
+					(packet_id << S5300_HDR_CFG_MULTI_ID_SHIFT);
+
+			ret = s5300_fmt_chardev_frame_tx(file, kbuf + sent,
+						       len, cfg, fragment == 0);
+			if (ret)
+				break;
+		}
+		mutex_unlock(&cd->tx_msg_lock);
+		kvfree(kbuf);
+		return ret < 0 ? ret : (ssize_t)count;
+	}
+
 	deadline = jiffies + msecs_to_jiffies(S5300_FMT_TX_TIMEOUT_MS);
 	for (;;) {
-		ret = cd->raw_ring
-			? s5300_raw_ring_tx(sm, cd->tx_buf, cd->channel,
-					    &cd->ch_seq, cd->tx_max, kbuf, count)
-			: s5300_fmt_ring_tx(sm, cd->tx_buf, cd->channel,
-					    &cd->frame_seq, &cd->ch_seq,
-					    cd->tx_max, kbuf, count);
+		ret = s5300_raw_ring_tx(sm, cd->tx_buf, cd->channel,
+					&cd->ch_seq, cd->tx_max, kbuf, count);
 		if (ret != -EBUSY)
 			break;
 		if (file->f_flags & O_NONBLOCK) {
@@ -2767,33 +2859,15 @@ static ssize_t s5300_chardev_write(struct file *file, const char __user *buf,
 			ret = -ETIMEDOUT;
 			break;
 		}
-		if (cd->raw_ring) {
-			/*
-			 * NORM_RAW is request/response ping-pong (RFS): the CP
-			 * drains our frame before the next write, so the ring
-			 * effectively never fills.  There is no raw TX wq to wake
-			 * on, so just re-check after a short sleep.
-			 */
-			if (msleep_interruptible(S5300_FMT_TX_POLL_MS)) {
-				ret = -ERESTARTSYS;
-				break;
-			}
-		} else {
-			/*
-			 * The CP frees FMT ring space by draining our frame,
-			 * which does not MSI us, so re-check on a short tick.
-			 * Each retry re-rings SEND_FMT (in s5300_fmt_ring_tx),
-			 * so a blocked writer keeps nudging the CP.
-			 */
-			ret = wait_event_interruptible_timeout(sm->fmt_tx_wq,
-					s5300_fmt_txq_space(sm) >= needed,
-					msecs_to_jiffies(S5300_FMT_TX_POLL_MS));
-			if (ret < 0)
-				break;		/* interrupted */
+		/* NORM_RAW is request/response ping-pong (RFS): there is no
+		 * RAW TX wait queue, so re-check after a short sleep. */
+		if (msleep_interruptible(S5300_FMT_TX_POLL_MS)) {
+			ret = -ERESTARTSYS;
+			break;
 		}
 	}
 
-	kfree(kbuf);
+	kvfree(kbuf);
 	return ret < 0 ? ret : (ssize_t)count;
 }
 
@@ -3316,16 +3390,18 @@ static int s5300_probe(struct platform_device *pdev)
 	init_waitqueue_head(&sm->fmt_tx_wq);
 	sm->oem.sm = sm;
 	sm->oem.channel = S5300_OEM_CH;
-	sm->oem.tx_max = S5300_OEM_MAX;
+	sm->oem.tx_max = S5300_OEM_MSG_MAX;
 	skb_queue_head_init(&sm->oem.rxq);
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
 		skb_queue_head_init(&sm->oem.rx_frag[i]);
+	mutex_init(&sm->oem.tx_msg_lock);
 	init_waitqueue_head(&sm->oem.read_wq);
 	sm->rfs.sm = sm;
 	sm->rfs.channel = S5300_RFS_CH;
 	sm->rfs.tx_max = S5300_RFS_MAX;
 	sm->rfs.raw_ring = true;
 	skb_queue_head_init(&sm->rfs.rxq);
+	mutex_init(&sm->rfs.tx_msg_lock);
 	init_waitqueue_head(&sm->rfs.read_wq);
 	sm->cp_status = S5300_STATE_OFFLINE;
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
@@ -3346,7 +3422,8 @@ static int s5300_probe(struct platform_device *pdev)
 				     GFP_KERNEL);
 	if (!sm->at_tx_buf)
 		return -ENOMEM;
-	sm->oem.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_OEM_MAX + 8,
+	sm->oem.tx_buf = devm_kmalloc(dev,
+				      S5300_HDR_SIZE + S5300_OEM_MAX + 8,
 				      GFP_KERNEL);
 	if (!sm->oem.tx_buf)
 		return -ENOMEM;

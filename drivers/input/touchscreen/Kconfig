@@ -1324,6 +1324,24 @@ config TOUCHSCREEN_SYNA_TCM
 	  To compile this driver as a module, choose M here: the
 	  module will be called syna_tcm.
 
+config TOUCHSCREEN_TBN
+	tristate "Touch Bus Negotiator (AoC channel)"
+	depends on AOC_TBN_DRIVER
+	help
+	  Say Y here to enable the Touch Bus Negotiator (TBN), which hands
+	  ownership of the touch SPI bus to the Always-on Compute (AoC)
+	  coprocessor while the display is off so AoC can watch for a
+	  low-power touch-wake (LPTW) gesture, and reclaims it on resume.
+
+	  Only the AoC-channel arbitration mode (tbn,mode = 2) used by the
+	  Pixel 9a (tegu) is implemented.  A touch driver opts in via the
+	  register_tbn() / tbn_request_bus() / tbn_release_bus() API.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called touch_bus_negotiator.
+
 config TOUCHSCREEN_TPS6507X
 	tristate "TPS6507x based touchscreens"
 	depends on I2C

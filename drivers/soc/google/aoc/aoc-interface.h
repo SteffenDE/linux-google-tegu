@@ -9,13 +9,11 @@
  * published by the Free Software Foundation.
  */
 
-#if IS_ENABLED(CONFIG_SOC_ZUMA)
-  #include "aoc-interface-zuma.h"
-#elif IS_ENABLED(CONFIG_SOC_GS201)
-  #include "aoc-interface-gs201.h"
-#elif IS_ENABLED(CONFIG_SOC_GS101)
-  #include "aoc-interface-gs101.h"
-#else
-  #error "Unsupported platform!"
-#endif
+/*
+ * tegu is zumapro (zuma family).  The tree has no per-SoC CONFIG_SOC_*
+ * symbol (drivers match via DT compatible), and this driver is only built
+ * for zumapro, so select the zuma interface table directly rather than
+ * gating on CONFIG_SOC_ZUMA.
+ */
+#include "aoc-interface-zuma.h"
 

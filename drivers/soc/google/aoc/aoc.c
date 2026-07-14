@@ -2846,15 +2846,23 @@ static int __init aoc_init(void)
 		goto err_aoc_driver;
 	}
 
-	if (platform_device_register(&sscd_dev) != 0) {
-		pr_err("failed to register AoC coredump device\n");
-		goto err_aoc_coredump;
-	}
+	/*
+	 * The AoC coredump platform_device (sscd_dev, name "aoc") is
+	 * intentionally not registered: sscoredump is stubbed for bring-up, so it
+	 * would only be name-matched and probed by this very driver (it has no
+	 * of_node, so that probe fails with -EINVAL -- the "missing pcu-base"
+	 * noise).  aoc.c's coredump path already self-skips on a NULL sscd_report.
+	 * Original registration + cleanup kept below, commented out.
+	 */
+	// if (platform_device_register(&sscd_dev) != 0) {
+	// 	pr_err("failed to register AoC coredump device\n");
+	// 	goto err_aoc_coredump;
+	// }
 
 	return 0;
 
-err_aoc_coredump:
-	platform_driver_unregister(&aoc_driver);
+// err_aoc_coredump:
+// 	platform_driver_unregister(&aoc_driver);
 err_aoc_driver:
 	bus_unregister(&aoc_bus_type);
 err_aoc_bus:

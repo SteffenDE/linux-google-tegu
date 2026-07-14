@@ -2,6 +2,7 @@
 
 config GSA
 	tristate "GSA driver"
+	depends on TRUSTY
 	default n
 
 config GSA_PKVM

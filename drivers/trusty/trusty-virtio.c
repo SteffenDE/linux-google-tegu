@@ -704,18 +704,17 @@ err_share_memory:
 	return ret;
 }
 
-static dma_addr_t trusty_virtio_dma_map_page(struct device *dev,
-					     struct page *page,
-					     unsigned long offset, size_t size,
+static dma_addr_t trusty_virtio_dma_map_phys(struct device *dev,
+					     phys_addr_t phys, size_t size,
 					     enum dma_data_direction dir,
 					     unsigned long attrs)
 {
-	struct tipc_msg_buf *buf = page_to_virt(page) + offset;
+	struct tipc_msg_buf *buf = phys_to_virt(phys);
 
 	return buf->buf_id;
 }
 
-static void trusty_virtio_dma_unmap_page(struct device *dev,
+static void trusty_virtio_dma_unmap_phys(struct device *dev,
 					 dma_addr_t dma_handle,
 					 size_t size,
 					 enum dma_data_direction dir,
@@ -725,8 +724,8 @@ static void trusty_virtio_dma_unmap_page(struct device *dev,
 }
 
 static const struct dma_map_ops trusty_virtio_dma_map_ops = {
-	.map_page = trusty_virtio_dma_map_page,
-	.unmap_page = trusty_virtio_dma_unmap_page,
+	.map_phys = trusty_virtio_dma_map_phys,
+	.unmap_phys = trusty_virtio_dma_unmap_phys,
 };
 
 static int trusty_virtio_probe(struct platform_device *pdev)

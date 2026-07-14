@@ -13,6 +13,7 @@
 #define _TOUCH_BUS_NEGOTIATOR_H
 
 #include <linux/completion.h>
+#include <linux/errno.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -99,6 +100,14 @@ struct tbn_context {
 	void *lptw_event_cbdata;
 };
 
+/*
+ * A touch driver may be built regardless of whether the negotiator is
+ * reachable from it (TBN off, or =m while the touch driver is =y).  Provide
+ * no-op stubs so the consumer always builds and links; with the stubs
+ * register_tbn() yields mask 0 and tbn_ready() is false, so the consumer keeps
+ * its plain AP-owns-the-bus suspend path.
+ */
+#if IS_REACHABLE(CONFIG_TOUCHSCREEN_TBN)
 bool tbn_ready(void);
 int register_tbn(u32 *output);
 void unregister_tbn(u32 *output);
@@ -108,5 +117,38 @@ void register_tbn_lptw_callback(void (*callback)(struct TbnLptwEvent *lptw,
 int tbn_request_bus_with_result(u32 dev_mask, bool *lptw_triggered);
 int tbn_request_bus(u32 dev_mask);
 int tbn_release_bus(u32 dev_mask);
+#else
+static inline bool tbn_ready(void)
+{
+	return false;
+}
+static inline int register_tbn(u32 *output)
+{
+	*output = 0;
+	return 0;
+}
+static inline void unregister_tbn(u32 *output)
+{
+	*output = 0;
+}
+static inline void
+register_tbn_lptw_callback(void (*callback)(struct TbnLptwEvent *lptw,
+					    void *user_data),
+			   void *cbdata)
+{
+}
+static inline int tbn_request_bus_with_result(u32 dev_mask, bool *lptw_triggered)
+{
+	return -ENODEV;
+}
+static inline int tbn_request_bus(u32 dev_mask)
+{
+	return -ENODEV;
+}
+static inline int tbn_release_bus(u32 dev_mask)
+{
+	return -ENODEV;
+}
+#endif /* IS_REACHABLE(CONFIG_TOUCHSCREEN_TBN) */
 
 #endif /* _TOUCH_BUS_NEGOTIATOR_H */

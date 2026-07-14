@@ -292,6 +292,18 @@ int tbn_release_bus(u32 dev_mask)
 }
 EXPORT_SYMBOL_GPL(tbn_release_bus);
 
+/*
+ * True only when a consumer can safely hand the bus to AoC: the negotiator
+ * has probed and the AoC TBN service is live.  Consumers gate their
+ * suspend-time release on this so a missing/crashed AoC falls back to the
+ * AP-owns-the-bus path instead of stalling on 500 ms handshake timeouts.
+ */
+bool tbn_ready(void)
+{
+	return tbn_context != NULL && aoc_tbn_service_ready();
+}
+EXPORT_SYMBOL_GPL(tbn_ready);
+
 int register_tbn(u32 *output)
 {
 	u32 i;

@@ -99,6 +99,7 @@ struct tbn_context {
 	void *lptw_event_cbdata;
 };
 
+bool tbn_ready(void);
 int register_tbn(u32 *output);
 void unregister_tbn(u32 *output);
 void register_tbn_lptw_callback(void (*callback)(struct TbnLptwEvent *lptw,

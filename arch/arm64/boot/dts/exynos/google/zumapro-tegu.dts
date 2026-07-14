@@ -812,6 +812,15 @@
 
 		vdd-supply = <&s2mpg14_ldo25>;
 		avdd-supply = <&s2mpg14_ldo4>;
+
+		/*
+		 * Opt in to the Touch Bus Negotiator: while the display is off
+		 * the driver puts the IC into low-power gesture mode and hands
+		 * the SPI bus to AoC (see the /tbn node), so AoC can watch for a
+		 * tap and wake the AP over its mailbox.  Without this the driver
+		 * uses the plain deep-sleep path and owns the bus throughout.
+		 */
+		goog,tbn-enabled;
 	};
 };
 
@@ -942,6 +951,19 @@
  * downstream cpif node (research/dumped.dts:20516, 20632).
  */
 / {
+	/*
+	 * Touch Bus Negotiator.  tbn,mode = 2 (TBN_MODE_AOC_CHANNEL): the
+	 * AP <-> AoC bus handshake runs as messages over the com.google.tbn
+	 * AoC service, not over GPIOs.  Matches research/dumped.dts, which
+	 * carries a bare /tbn node with tbn,mode = 2 and no GPIOs.
+	 * tbn,max_devices defaults to 1 (single touch consumer).
+	 */
+	tbn {
+		compatible = "touch_bus_negotiator";
+		tbn,mode = <2>;
+		tbn,max_devices = <1>;
+	};
+
 	modem {
 		compatible = "samsung,s5300-modem";
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,

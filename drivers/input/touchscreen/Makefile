@@ -88,6 +88,9 @@ obj-$(CONFIG_TOUCHSCREEN_SUN4I)		+= sun4i-ts.o
 obj-$(CONFIG_TOUCHSCREEN_SUR40)		+= sur40.o
 obj-$(CONFIG_TOUCHSCREEN_SURFACE3_SPI)	+= surface3_spi.o
 obj-$(CONFIG_TOUCHSCREEN_SYNA_TCM)	+= syna_tcm.o
+obj-$(CONFIG_TOUCHSCREEN_TBN)		+= touch_bus_negotiator.o
+# The TBN client uses the AoC TBN service helpers exported from the AoC core.
+CFLAGS_touch_bus_negotiator.o		:= -I$(srctree)/drivers/soc/google/aoc
 obj-$(CONFIG_TOUCHSCREEN_TI_AM335X_TSC)	+= ti_am335x_tsc.o
 obj-$(CONFIG_TOUCHSCREEN_TOUCHIT213)	+= touchit213.o
 obj-$(CONFIG_TOUCHSCREEN_TOUCHRIGHT)	+= touchright.o

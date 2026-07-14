@@ -212,7 +212,8 @@
 		iommus = <&sysmmu_aoc>;
 		samsung,iommu-group = <&iommu_group_aoc>;
 		memory-region = <&aoc_reserved>;
-		gsa-enabled = "true";
+		/* gsa-enabled = "true"; -- read as a bool; a string value warns */
+		gsa-enabled;
 		gsa-device = <&gsa>;
 		mbox-channels = <48>;
 		mbox-names = "aoc2ap";

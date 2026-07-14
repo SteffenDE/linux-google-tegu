@@ -192,6 +192,17 @@
 	};
 
 	/*
+	 * SoC chip-id block.  Source: downstream chipid@10000000 in
+	 * research/dumped.dts:14927 (reg verbatim).  No in-tree driver binds this
+	 * compatible; the AoC chip-id reader (aoc_chipid.c) maps it to forward the
+	 * SoC product-id/type/revision to AoC firmware via fw_data.
+	 */
+	chipid@10000000 {
+		compatible = "google,zuma-chipid";
+		reg = <0x0 0x10000000 0xd000>;
+	};
+
+	/*
 	 * Always-On Compute coprocessor.  Source: downstream aoc@17000000 in
 	 * research/dumped.dts:13234.  reg regions (blk_aoc, aoc_req, aoc_s2mpu,
 	 * ssmt_aoc), the watchdog interrupt, the 48-channel mailbox fan-out and

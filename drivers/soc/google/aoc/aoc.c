@@ -14,6 +14,7 @@
 #include "aoc.h"
 
 #include <linux/atomic.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-map-ops.h>
 #include <linux/firmware.h>
 #include <linux/fs.h>
@@ -36,6 +37,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
+#include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
@@ -83,7 +85,6 @@ static void sscd_release(struct device *dev);
 static struct sscd_info sscd_info;
 static struct sscd_platform_data sscd_pdata;
 static struct platform_device sscd_dev = { .name = "aoc",
-					   .driver_override = SSCD_NAME,
 					   .id = -1,
 					   .dev = {
 						   .platform_data = &sscd_pdata,
@@ -126,7 +127,7 @@ const static struct dev_pm_ops aoc_core_pm_ops = {
 	.resume = aoc_core_resume,
 };
 
-static int aoc_bus_match(struct device *dev, struct device_driver *drv);
+static int aoc_bus_match(struct device *dev, const struct device_driver *drv);
 static int aoc_bus_probe(struct device *dev);
 static void aoc_bus_remove(struct device *dev);
 
@@ -1076,7 +1077,7 @@ static struct attribute *aoc_attrs[] = {
 ATTRIBUTE_GROUPS(aoc);
 
 static int aoc_platform_probe(struct platform_device *dev);
-static int aoc_platform_remove(struct platform_device *dev);
+static void aoc_platform_remove(struct platform_device *dev);
 static void aoc_platform_shutdown(struct platform_device *dev);
 
 static const struct of_device_id aoc_match[] = {
@@ -1099,7 +1100,7 @@ static struct platform_driver aoc_driver = {
 		},
 };
 
-static int aoc_bus_match(struct device *dev, struct device_driver *drv)
+static int aoc_bus_match(struct device *dev, const struct device_driver *drv)
 {
 	struct aoc_driver *driver = AOC_DRIVER(drv);
 
@@ -1122,7 +1123,8 @@ static int aoc_bus_match(struct device *dev, struct device_driver *drv)
 
 	/* Drivers with a name only match services with that name */
 	if (driver_matches_by_name &&
-	    !driver_matches_service_by_name(drv, (char *)device_name)) {
+	    !driver_matches_service_by_name((struct device_driver *)drv,
+					    (char *)device_name)) {
 		return 0;
 	}
 
@@ -1241,6 +1243,13 @@ static struct aoc_service_dev *create_service_device(struct aoc_prvdata *prvdata
 	return dev;
 }
 
+/*
+ * The per-device IOMMU fault-handler API (iommu_register_device_fault_handler
+ * and struct iommu_fault.event) was removed upstream in favour of the iopf
+ * path. We are not adopting iopf during bring-up, so fault reporting is
+ * stubbed out; the handler body is kept under #if 0 for future reference.
+ */
+#if 0
 static int aoc_iommu_fault_handler(struct iommu_fault *fault, void *token)
 {
 	struct device *dev = token;
@@ -1254,14 +1263,11 @@ static int aoc_iommu_fault_handler(struct iommu_fault *fault, void *token)
 	/* Tell the IOMMU driver that the fault is non-fatal. */
 	return -EAGAIN;
 }
+#endif
 
 static void aoc_configure_iommu_fault_handler(struct aoc_prvdata *p)
 {
-	struct device *dev = p->dev;
-	int rc = iommu_register_device_fault_handler(dev, aoc_iommu_fault_handler, dev);
-
-	if (rc)
-		dev_err(dev, "iommu_register_device_fault_handler failed: rc = %d\n", rc);
+	/* Stubbed for bring-up: per-device fault-handler API removed in 7.1. */
 }
 
 static void aoc_configure_iommu(struct aoc_prvdata *p, const struct firmware *fw)
@@ -1300,7 +1306,7 @@ static void aoc_configure_iommu(struct aoc_prvdata *p, const struct firmware *fw
 		rc = iommu_map(domain, IOMMU_VADDR(iommu[i].value),
 						IOMMU_PADDR(iommu[i].value),
 						IOMMU_SIZE(iommu[i].value),
-						IOMMU_READ | IOMMU_WRITE);
+						IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 		if (rc < 0) {
 			dev_err(
 				dev,
@@ -1721,7 +1727,7 @@ void trigger_aoc_ssr(bool ap_triggered_reset, char *reset_reason) {
 		} else {
 			configure_crash_interrupts(prvdata, false);
 			if (ap_triggered_reset) {
-				strlcpy(prvdata->ap_reset_reason, reset_reason,
+				strscpy(prvdata->ap_reset_reason, reset_reason,
 					AP_RESET_REASON_LENGTH);
 				prvdata->ap_triggered_reset = true;
 			}
@@ -2153,7 +2159,7 @@ static const struct file_operations aoc_fops = {
 	.owner = THIS_MODULE,
 };
 
-static char *aoc_devnode(struct device *dev, umode_t *mode)
+static char *aoc_devnode(const struct device *dev, umode_t *mode)
 {
 	if (!mode || !dev)
 		return NULL;
@@ -2184,7 +2190,7 @@ static int init_chardev(struct aoc_prvdata *prvdata)
 
 	aoc_major = MAJOR(prvdata->aoc_devt);
 
-	prvdata->_class = class_create(THIS_MODULE, AOC_CHARDEV_NAME);
+	prvdata->_class = class_create(AOC_CHARDEV_NAME);
 	if (!prvdata->_class) {
 		pr_err("failed to create aoc_class\n");
 		rc = -ENXIO;
@@ -2324,7 +2330,7 @@ exit:
 	return 0;
 }
 
-static void aoc_pheap_map(struct samsung_dma_buffer *buffer, void *ctx, bool should_map)
+static void aoc_pheap_map(struct ion_physical_heap_buffer *buffer, void *ctx, bool should_map)
 {
 	struct device *dev = ctx;
 	struct aoc_prvdata *prvdata = dev_get_drvdata(dev);
@@ -2350,12 +2356,12 @@ static void aoc_pheap_map(struct samsung_dma_buffer *buffer, void *ctx, bool sho
 	mutex_unlock(&aoc_service_lock);
 }
 
-static void aoc_pheap_alloc_cb(struct samsung_dma_buffer *buffer, void *ctx)
+static void aoc_pheap_alloc_cb(struct ion_physical_heap_buffer *buffer, void *ctx)
 {
 	aoc_pheap_map(buffer, ctx, true);
 }
 
-static void aoc_pheap_free_cb(struct samsung_dma_buffer *buffer, void *ctx)
+static void aoc_pheap_free_cb(struct ion_physical_heap_buffer *buffer, void *ctx)
 {
 	aoc_pheap_map(buffer, ctx, false);
 }
@@ -2442,7 +2448,7 @@ long aoc_unlocked_ioctl_handle_ion_fd(unsigned int cmd, unsigned long arg)
 {
 	struct aoc_ion_handle handle;
 	struct dma_buf *dmabuf;
-	struct samsung_dma_buffer *dma_heap_buf;
+	struct ion_physical_heap_buffer *dma_heap_buf;
 
 	struct ion_physical_heap *phys_heap;
 	phys_addr_t base;
@@ -2467,8 +2473,8 @@ long aoc_unlocked_ioctl_handle_ion_fd(unsigned int cmd, unsigned long arg)
 	 * is created and maintained by AoC.
 	 */
 	base = 0;
-	if (dma_heap_buf->heap->priv) {
-		phys_heap = dma_heap_buf->heap->priv;
+	if (dma_heap_buf->heap) {
+		phys_heap = dma_heap_buf->heap;
 		base = phys_heap->base;
 	}
 
@@ -2791,7 +2797,7 @@ err_platform_not_null:
 	return rc;
 }
 
-static int aoc_platform_remove(struct platform_device *pdev)
+static void aoc_platform_remove(struct platform_device *pdev)
 {
 	struct aoc_prvdata *prvdata;
 	int i;
@@ -2811,8 +2817,6 @@ static int aoc_platform_remove(struct platform_device *pdev)
 	deinit_chardev(prvdata);
 	platform_set_drvdata(pdev, NULL);
 	aoc_platform_device = NULL;
-
-	return 0;
 }
 
 static void sscd_release(struct device *dev)
@@ -2870,4 +2874,4 @@ module_init(aoc_init);
 module_exit(aoc_exit);
 
 MODULE_LICENSE("GPL v2");
-MODULE_IMPORT_NS(DMA_BUF);
+MODULE_IMPORT_NS("DMA_BUF");

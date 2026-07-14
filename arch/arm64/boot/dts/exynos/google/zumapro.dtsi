@@ -134,6 +134,21 @@
 	};
 
 	/*
+	 * Google Security Authenticator (GSA) client.  Hardware mailbox at
+	 * 0x16490000 for firmware-image authentication, plus a Trusty tipc
+	 * channel (hwmgr) for coprocessor start.  The s2mpu phandle and the
+	 * log-region / gsa_gsc child are omitted -- pKVM, GSC and the GSA log
+	 * are disabled for this minimal bring-up.  Needed to authenticate and
+	 * start AoC (research/aoc.md).  IRQ from research/dumped.dts
+	 * (gsa-ns interrupts = <0 0x177 4>).
+	 */
+	gsa: gsa@16490000 {
+		compatible = "google,gs101-gsa-v1";
+		reg = <0x0 0x16490000 0x1000>;
+		interrupts = <GIC_SPI 375 IRQ_TYPE_LEVEL_HIGH 0>;
+	};
+
+	/*
 	 * ACPM TMU zones.  The ACPM firmware only *measures* on a bare boot (its
 	 * throttling governor is configured by the downstream kernel, not the
 	 * bootloader), so the CPU-cluster zones own throttling in Linux via

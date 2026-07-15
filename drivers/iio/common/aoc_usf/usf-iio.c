@@ -16,11 +16,27 @@
 
 #define pr_fmt(fmt) "usf-iio: " fmt
 
+#include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
+
+#include <soc/google/aoc_channel.h>
+
+#include "usf-proto.h"
+
+#define USF_WAKE_SERVICE	"com.google.usf"
+#define USF_NONWAKE_SERVICE	"com.google.usf.non_wake_up"
+
+#define USF_CTL_TIMEOUT_MS	5000	/* per request/response round-trip */
+#define USF_RETRY_MS		1000	/* bootstrap retry cadence */
+#define USF_MAX_RETRIES		15	/* ~15 s before giving up */
+#define USF_RESP_MAX		1024	/* one AOCC MTU */
 
 static bool autopoll;
 module_param(autopoll, bool, 0644);
@@ -29,19 +45,232 @@ MODULE_PARM_DESC(autopoll,
 
 struct usf_iio {
 	struct device *dev;
-	struct work_struct enum_work;
+	struct delayed_work enum_work;
+	unsigned int retries;
 	bool enumerated;
+
+	/* AOCC transport: control + wake samples on @wake, the rest on @nonwake */
+	struct aocc_channel *wake;
+	struct aocc_channel *nonwake;
+
+	/* Control request/response, serialised by @ctl_lock. */
+	struct mutex ctl_lock;
+	struct usf_fbb fbb;		/* request builder scratch (~1.5 KB) */
+	u32 txn;			/* monotonic transaction id */
+
+	/* Response slot, filled by the rx callback, protected by @resp_lock. */
+	spinlock_t resp_lock;
+	struct completion resp_done;
+	u32 resp_txn;			/* awaited txn, or U32_MAX for none */
+	u32 resp_ready;			/* txn whose payload is in resp[], else U32_MAX */
+	u32 resp_len;
+	u8 resp[USF_RESP_MAX];
+
+	/* Discovered USF server handles (resolved at runtime; never hardcoded). */
+	u32 sensor_mgr;
+	u32 sample_chan;
 };
+
+/*
+ * AOCC rx callback. Runs in the per-service demux kthread; must not sleep.
+ * Responses (type 2) matching the awaited txn wake the control path; async
+ * samples (type 9) are handled by the data path (follow-up commit).
+ */
+static void usf_iio_channel_rx(void *ctx, const void *payload, size_t len)
+{
+	struct usf_iio *usf = ctx;
+	const u8 *pay;
+	u32 type, plen, rtxn;
+	unsigned long flags;
+	bool matched = false;
+
+	if (!usf_parse_outer(payload, len, &type, &pay, &plen) || !pay)
+		return;
+	if (type != USF_T_RESPONSE)
+		return;			/* samples (type 9) handled later */
+
+	rtxn = usf_resp_txn(pay, plen);
+
+	spin_lock_irqsave(&usf->resp_lock, flags);
+	if (usf->resp_txn != U32_MAX && rtxn == usf->resp_txn) {
+		usf->resp_len = min_t(u32, plen, USF_RESP_MAX);
+		memcpy(usf->resp, pay, usf->resp_len);
+		usf->resp_ready = rtxn;	/* mark which txn's payload resp[] holds */
+		usf->resp_txn = U32_MAX;
+		matched = true;
+	}
+	spin_unlock_irqrestore(&usf->resp_lock, flags);
+
+	if (matched)
+		complete(&usf->resp_done);
+}
+
+/*
+ * Send one request on the wake channel and wait for its response. Caller holds
+ * ctl_lock (which also owns @fbb, so @req must stay valid across the write).
+ * On success @resp/@resp_len point at usf->resp (valid until the next call).
+ */
+static int usf_ctl(struct usf_iio *usf, u32 txn, const u8 *req, size_t reqlen,
+		   const u8 **resp, u32 *resp_len)
+{
+	unsigned long flags;
+	long left;
+	int ret;
+
+	reinit_completion(&usf->resp_done);
+	spin_lock_irqsave(&usf->resp_lock, flags);
+	usf->resp_txn = txn;
+	usf->resp_ready = U32_MAX;	/* discard any stale payload */
+	spin_unlock_irqrestore(&usf->resp_lock, flags);
+
+	ret = aocc_kernel_write(usf->wake, req, reqlen);
+	if (ret < 0)
+		goto clear;
+
+	left = wait_for_completion_timeout(&usf->resp_done,
+					   msecs_to_jiffies(USF_CTL_TIMEOUT_MS));
+
+	/*
+	 * Trust resp[] only if it actually holds this txn's payload. The
+	 * completion token alone is not enough: a stalled rx could complete()
+	 * for a prior txn after that call already timed out, leaking a wakeup
+	 * into this one. resp_ready closes that window deterministically.
+	 */
+	spin_lock_irqsave(&usf->resp_lock, flags);
+	usf->resp_txn = U32_MAX;
+	if (usf->resp_ready == txn) {
+		*resp = usf->resp;
+		*resp_len = usf->resp_len;
+		ret = 0;
+	} else {
+		ret = left ? -EIO : -ETIMEDOUT;
+	}
+	spin_unlock_irqrestore(&usf->resp_lock, flags);
+	return ret;
+
+clear:
+	spin_lock_irqsave(&usf->resp_lock, flags);
+	usf->resp_txn = U32_MAX;
+	spin_unlock_irqrestore(&usf->resp_lock, flags);
+	return ret;
+}
+
+/* GetServer(uuid) -> server handle (0 = not found / error). */
+static u32 usf_get_server(struct usf_iio *usf, const u8 uuid[16],
+			  const char *label)
+{
+	const u8 *req, *resp, *body;
+	size_t reqlen;
+	u32 rlen, blen, txn, handle = 0;
+	int ret;
+
+	mutex_lock(&usf->ctl_lock);
+	txn = usf->txn++;
+	ret = usf_build_get_server(&usf->fbb, txn, uuid, &req, &reqlen);
+	if (!ret)
+		ret = usf_ctl(usf, txn, req, reqlen, &resp, &rlen);
+	if (!ret) {
+		body = usf_resp_body(resp, rlen, &blen);
+		if (body)
+			handle = usf_fb_u32(body, blen, 0, 0);
+	}
+	mutex_unlock(&usf->ctl_lock);
+
+	if (ret)
+		dev_warn(usf->dev, "GetServer(%s) failed: %d\n", label, ret);
+	else
+		dev_info(usf->dev, "GetServer(%s) -> handle %u%s\n", label,
+			 handle, handle ? "" : " (NOT FOUND)");
+	return handle;
+}
+
+static int usf_open_channels(struct usf_iio *usf)
+{
+	int ret;
+
+	usf->wake = aocc_kernel_open_channel(USF_WAKE_SERVICE,
+					     usf_iio_channel_rx, usf);
+	if (IS_ERR(usf->wake)) {
+		ret = PTR_ERR(usf->wake);
+		usf->wake = NULL;
+		return ret;
+	}
+
+	usf->nonwake = aocc_kernel_open_channel(USF_NONWAKE_SERVICE,
+						usf_iio_channel_rx, usf);
+	if (IS_ERR(usf->nonwake)) {
+		ret = PTR_ERR(usf->nonwake);
+		usf->nonwake = NULL;
+		aocc_kernel_close_channel(usf->wake);
+		usf->wake = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
+static void usf_close_channels(struct usf_iio *usf)
+{
+	if (usf->nonwake) {
+		aocc_kernel_close_channel(usf->nonwake);
+		usf->nonwake = NULL;
+	}
+	if (usf->wake) {
+		aocc_kernel_close_channel(usf->wake);
+		usf->wake = NULL;
+	}
+}
+
+/* Reschedule the bootstrap if we have retries left; otherwise give up. */
+static bool usf_retry(struct usf_iio *usf, const char *why)
+{
+	if (usf->retries++ < USF_MAX_RETRIES) {
+		dev_dbg(usf->dev, "%s; retry %u/%u\n", why, usf->retries,
+			USF_MAX_RETRIES);
+		schedule_delayed_work(&usf->enum_work,
+				      msecs_to_jiffies(USF_RETRY_MS));
+		return true;
+	}
+	dev_warn(usf->dev, "giving up after %u retries: %s\n", usf->retries, why);
+	return false;
+}
 
 static void usf_iio_enumerate_work(struct work_struct *work)
 {
-	struct usf_iio *usf = container_of(work, struct usf_iio, enum_work);
+	struct usf_iio *usf = container_of(to_delayed_work(work),
+					   struct usf_iio, enum_work);
+	u32 h_reg, h_sensor, h_sample;
+	int ret;
 
 	if (usf->enumerated)
 		return;
 
-	/* Bootstrap + enumeration + IIO registration land here (follow-ups). */
-	dev_info(usf->dev, "enumerate trigger (stub)\n");
+	ret = usf_open_channels(usf);
+	if (ret) {
+		/* AoC / AOCC not up yet: transient, keep retrying. */
+		usf_retry(usf, "AOCC channels not ready");
+		return;
+	}
+
+	h_reg = usf_get_server(usf, usf_uuid_registry, "Registry");
+	h_sensor = usf_get_server(usf, usf_uuid_sensor_mgr, "SensorMgr");
+	h_sample = usf_get_server(usf, usf_uuid_sample_channel, "SampleChannel");
+
+	if (!h_sensor || !h_sample) {
+		/* Servers dormant: the registry is not loaded yet. */
+		usf_close_channels(usf);
+		usf_retry(usf, "USF servers not responding (registry loaded?)");
+		return;
+	}
+
+	usf->sensor_mgr = h_sensor;
+	usf->sample_chan = h_sample;
+	usf->enumerated = true;
+	dev_info(usf->dev,
+		 "USF bootstrap OK (registry=%u sensor_mgr=%u sample_chan=%u)\n",
+		 h_reg, h_sensor, h_sample);
+
+	/* Sensor enumeration + IIO registration land here (follow-up commit). */
 }
 
 static ssize_t enumerate_store(struct device *dev,
@@ -55,8 +284,10 @@ static ssize_t enumerate_store(struct device *dev,
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
-	if (val)
-		schedule_work(&usf->enum_work);
+	if (val && !usf->enumerated) {
+		usf->retries = 0;
+		schedule_delayed_work(&usf->enum_work, 0);
+	}
 	return count;
 }
 static DEVICE_ATTR_WO(enumerate);
@@ -76,11 +307,17 @@ static int usf_iio_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	usf->dev = &pdev->dev;
-	INIT_WORK(&usf->enum_work, usf_iio_enumerate_work);
+	usf->txn = 1;
+	usf->resp_txn = U32_MAX;
+	usf->resp_ready = U32_MAX;
+	mutex_init(&usf->ctl_lock);
+	spin_lock_init(&usf->resp_lock);
+	init_completion(&usf->resp_done);
+	INIT_DELAYED_WORK(&usf->enum_work, usf_iio_enumerate_work);
 	platform_set_drvdata(pdev, usf);
 
 	if (autopoll)
-		schedule_work(&usf->enum_work);
+		schedule_delayed_work(&usf->enum_work, 0);
 
 	return 0;
 }
@@ -89,7 +326,8 @@ static void usf_iio_remove(struct platform_device *pdev)
 {
 	struct usf_iio *usf = platform_get_drvdata(pdev);
 
-	cancel_work_sync(&usf->enum_work);
+	cancel_delayed_work_sync(&usf->enum_work);
+	usf_close_channels(usf);
 }
 
 static struct platform_driver usf_iio_driver = {

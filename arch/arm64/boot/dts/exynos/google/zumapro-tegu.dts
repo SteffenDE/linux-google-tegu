@@ -660,6 +660,23 @@
 	pmic-sub {
 		compatible = "samsung,s2mpg15-pmic";
 
+		/*
+		 * The two sensor rails the AoC powers.  Enable-only (bit 7 of
+		 * LxS_CTRL); the bootloader leaves the voltage selectors at the
+		 * downstream values so no voltage constraint is claimed -- see
+		 * s2mps11.c s2mpg15_regulators.  Consumed by the aoc node's
+		 * sensor_power_list below.
+		 */
+		regulators {
+			s2mpg15_ldo5: ldo5s {
+				regulator-name = "L5S_PROX";
+			};
+
+			s2mpg15_ldo7: ldo7s {
+				regulator-name = "L7S_SENSORS";
+			};
+		};
+
 		meter {
 			compatible = "samsung,s2mpg15-meter";
 			#address-cells = <1>;
@@ -729,6 +746,20 @@
 			};
 		};
 	};
+};
+
+/*
+ * Give the AoC its sensor rails.  The AoC driver enables sensor_power_list
+ * at init (reset_sensor_power); without them the AoC sensor stack has no
+ * power and enumerates only fused/software sensors -- the physical
+ * LSM6DSV/MMC5616/SPL07003/TMD3733 chips never probe.  sensor_1v8 =
+ * L7S_SENSORS (LDO7S, 1.8 V), sensor_3v3 = L5S_PROX (LDO5S, 3.3 V); matches
+ * downstream aoc@17000000 in research/dumped.dts.
+ */
+&aoc {
+	sensor_1v8-supply = <&s2mpg15_ldo7>;
+	sensor_3v3-supply = <&s2mpg15_ldo5>;
+	sensor_power_list = "sensor_1v8", "sensor_3v3";
 };
 
 /*

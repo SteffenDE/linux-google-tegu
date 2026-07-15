@@ -41,7 +41,11 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
+#include <linux/math64.h>
+#include <linux/timekeeping.h>
+#include <clocksource/arm_arch_timer.h>
 #include <soc/google/acpm_ipc_ctrl.h>
+#include <soc/google/aoc_clock.h>
 #include <soc/google/debug-snapshot.h>
 #include <soc/google/exynos-cpupm.h>
 #include <soc/google/exynos-pmu-if.h>
@@ -841,6 +845,47 @@ static inline u64 sys_tick_to_aoc_tick(u64 sys_tick)
 
 	return (sys_tick - clock_offset()) / prvdata->aoc_clock_divider;
 }
+
+/* An AoC timestamp older/newer than this is treated as untrustworthy. */
+#define AOC_TS_SANITY_NS	(10 * NSEC_PER_SEC)
+
+u64 aoc_ts_to_boottime_ns(u64 aoc_ts)
+{
+	u64 now_cnt, now_boot, aoc_now_ns, delta_ns;
+	u32 rate;
+
+	if (!aoc_fw_ready())
+		return 0;
+	rate = arch_timer_get_rate();
+	if (!rate)
+		return 0;
+
+	now_cnt = arch_timer_read_counter();
+	now_boot = ktime_get_boottime_ns();
+
+	/*
+	 * aoc_ts is in nanoseconds of the AoC clock domain, which is the
+	 * architected counter (offset by the firmware's system_clock_offset)
+	 * scaled to ns. Express "now" in the same domain and difference the two;
+	 * CLOCK_BOOTTIME advances with that counter, so the ns delta is exact.
+	 */
+	aoc_now_ns = mul_u64_u64_div_u64(now_cnt - clock_offset(), NSEC_PER_SEC,
+					 rate);
+
+	if (aoc_ts <= aoc_now_ns) {
+		delta_ns = aoc_now_ns - aoc_ts;
+		if (delta_ns > AOC_TS_SANITY_NS || delta_ns > now_boot)
+			return 0;
+		return now_boot - delta_ns;
+	}
+
+	/* Stamped slightly ahead of our read (the two clock reads race). */
+	delta_ns = aoc_ts - aoc_now_ns;
+	if (delta_ns > AOC_TS_SANITY_NS)
+		return 0;
+	return now_boot + delta_ns;
+}
+EXPORT_SYMBOL_GPL(aoc_ts_to_boottime_ns);
 
 static ssize_t aoc_clock_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)

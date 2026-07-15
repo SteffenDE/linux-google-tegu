@@ -27,6 +27,7 @@
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
@@ -35,6 +36,7 @@
 #include <linux/iio/kfifo_buf.h>
 
 #include <soc/google/aoc_channel.h>
+#include <soc/google/aoc_clock.h>
 
 #include "usf-proto.h"
 
@@ -99,6 +101,7 @@ struct usf_iio {
 	struct usf_sensor *sensors[USF_MAX_DEV];
 	int nsensors;
 	spinlock_t sample_lock;	/* fences sample push/lookup vs buffer teardown */
+	bool ts_logged;		/* one-shot log of the first timestamp mapping */
 };
 
 /* Per-IIO-device state (in iio_priv). */
@@ -286,6 +289,30 @@ static s32 usf_f32_to_micro(u32 bits)
 	return neg ? -(s32)num : (s32)num;
 }
 
+/*
+ * Map a sample's AoC timestamp to CLOCK_BOOTTIME. The AoC stamps samples in ns
+ * off the architected counter it shares with the AP, so aoc_ts_to_boottime_ns()
+ * recovers the exact boottime; on the rare miss (firmware not ready, or a stamp
+ * too far from now to trust) fall back to the current boottime. The first
+ * mapping is logged once so the mapping can be checked on HW (a healthy sample
+ * is a few ms old).
+ */
+static s64 usf_sample_boottime(struct usf_iio *usf, u64 aoc_ts)
+{
+	u64 boot = aoc_ts_to_boottime_ns(aoc_ts);
+
+	if (!usf->ts_logged) {
+		u64 now = ktime_get_boottime_ns();
+
+		usf->ts_logged = true;
+		dev_info(usf->dev,
+			 "timestamp map: aoc_ts=%llu -> boottime=%llu (now=%llu, age=%lld ns)%s\n",
+			 aoc_ts, boot, now, (s64)(now - boot),
+			 boot ? "" : " [untrusted, substituting now]");
+	}
+	return (s64)(boot ? boot : ktime_get_boottime_ns());
+}
+
 /* Parse a type-9 compact sample batch and push each record to the IIO buffer. */
 static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 {
@@ -343,9 +370,8 @@ static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 		off = 16 + (size_t)i * stride;
 		if (off + stride > plen)
 			break;
-		/* 60-bit AoC-ns for now; mapping to CLOCK_BOOTTIME via TimeSync is a follow-up. */
 		tsp = get_unaligned_le64(pay + off);
-		ts = (s64)(tsp & USF_SAMPLE_TS_MASK);
+		ts = usf_sample_boottime(usf, tsp & USF_SAMPLE_TS_MASK);
 
 		memset(&scan, 0, sizeof(scan));
 		for (d = 0; d < (u32)n; d++)

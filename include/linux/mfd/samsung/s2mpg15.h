@@ -23,7 +23,17 @@ enum s2mpg15_common_reg {
 /* PMIC registers (type 0x100) */
 enum s2mpg15_pmic_reg {
 	S2MPG15_PMIC_INT1 = 0x00,
+	/* LxS_CTRL: bit 7 is the rail enable, bits 5:0 the voltage selector. */
+	S2MPG15_PMIC_L5S_CTRL = 0x33,	/* L5S_PROX,    sensor 3.3 V */
+	S2MPG15_PMIC_L7S_CTRL = 0x35,	/* L7S_SENSORS, sensor 1.8 V */
 	S2MPG15_PMIC_BB_USONIC = 0xea,
+};
+
+/* Regulator ids -- only the sensor rails the AoC currently powers. */
+enum s2mpg15_regulators {
+	S2MPG15_LDO5,
+	S2MPG15_LDO7,
+	S2MPG15_REGULATOR_MAX,
 };
 
 #endif /* __LINUX_MFD_S2MPG15_H */

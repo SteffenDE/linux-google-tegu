@@ -113,16 +113,30 @@ struct usf_sensor {
 	u32 sampling_id;	/* live stream id (0 = not streaming) */
 	s64 period_ns;
 	u8 ndata;		/* data channels (1 scalar, 3 vector) */
+
+	/*
+	 * Scale: samples quantise to raw = round(value / resolution), so raw is
+	 * a native-unit LSB count and IIO SCALE carries the resolution (folded
+	 * with the Android->IIO unit factor). res_q = resolution << USF_SCALE_Q;
+	 * 0 means the firmware gave no resolution -> micro-unit fallback.
+	 */
+	u64 res_q;
+	u64 scale_nano;		/* IIO_CHAN_INFO_SCALE in nano units */
 };
+
+/* Fixed-point fraction bits for the resolution divisor (res_q). */
+#define USF_SCALE_Q	30
+#define USF_NANO	1000000000ULL
 
 /* Forced scan masks (all data channels; timestamp is tracked separately). */
 static const unsigned long usf_scan_masks_3axis[] = { GENMASK(2, 0), 0 };
 static const unsigned long usf_scan_masks_scalar[] = { BIT(0), 0 };
 
 /*
- * Sample axes arrive as f32 in Android sensor units; the data path quantises
- * each to micro-units (value * 1e6) as an s32 raw, so SCALE is a fixed 1e-6.
- * Unit-correct per-type scaling (mag Gauss, pressure kPa, ...) comes later.
+ * Sample axes arrive as f32 in Android sensor units. The data path quantises
+ * each to raw = round(value / resolution) as an s32, and IIO SCALE = resolution
+ * (times the Android->IIO unit factor), so the value is recovered as raw*SCALE
+ * without the fixed-1e-6 saturation that clipped high-range sensors (ALS, mag).
  */
 #define USF_AXIS(_type, _mod, _idx) {				\
 	.type = _type,						\
@@ -186,48 +200,42 @@ static const struct usf_type_map {
 	int num_channels;
 	int ndata;		/* data channels (1 scalar, 3 vector) */
 	const unsigned long *scan_masks;
+	/*
+	 * Android-native -> IIO unit factor, times 1e9: SCALE(nano) =
+	 * resolution * unit_nano. 1e9 = 1:1 (accel m/s^2, gyro rad/s, light
+	 * lux, prox count); mag uT -> Gauss is /100; pressure hPa -> kPa is /10.
+	 */
+	u64 unit_nano;
 } usf_type_maps[] = {
 	{ "Accelerometer", "usf_accel", usf_accel_channels,
-	  ARRAY_SIZE(usf_accel_channels), 3, usf_scan_masks_3axis },
+	  ARRAY_SIZE(usf_accel_channels), 3, usf_scan_masks_3axis, 1000000000ULL },
 	{ "Gyroscope", "usf_gyro", usf_gyro_channels,
-	  ARRAY_SIZE(usf_gyro_channels), 3, usf_scan_masks_3axis },
+	  ARRAY_SIZE(usf_gyro_channels), 3, usf_scan_masks_3axis, 1000000000ULL },
 	{ "Magnetometer", "usf_magn", usf_magn_channels,
-	  ARRAY_SIZE(usf_magn_channels), 3, usf_scan_masks_3axis },
+	  ARRAY_SIZE(usf_magn_channels), 3, usf_scan_masks_3axis, 10000000ULL },
 	{ "Ambient Light", "usf_als", usf_light_channels,
-	  ARRAY_SIZE(usf_light_channels), 1, usf_scan_masks_scalar },
+	  ARRAY_SIZE(usf_light_channels), 1, usf_scan_masks_scalar, 1000000000ULL },
 	/* "Proximity" alone also matches gesture/voice/AAD sensors; be specific */
 	{ "TMD3733 Proximity", "usf_prox", usf_prox_channels,
-	  ARRAY_SIZE(usf_prox_channels), 1, usf_scan_masks_scalar },
+	  ARRAY_SIZE(usf_prox_channels), 1, usf_scan_masks_scalar, 1000000000ULL },
 	{ "Barometer", "usf_baro", usf_pressure_channels,
-	  ARRAY_SIZE(usf_pressure_channels), 1, usf_scan_masks_scalar },
+	  ARRAY_SIZE(usf_pressure_channels), 1, usf_scan_masks_scalar, 100000000ULL },
 };
 
 static int usf_read_raw(struct iio_dev *indio_dev,
 			struct iio_chan_spec const *chan,
 			int *val, int *val2, long mask)
 {
-	if (mask != IIO_CHAN_INFO_SCALE)
-		return -EINVAL;
+	struct usf_sensor *s = iio_priv(indio_dev);
 
-	/*
-	 * Raw is the Android-unit value * 1e6 (usf_f32_to_micro). Fold the
-	 * Android->IIO unit conversion into the scale (usf-iio-bridge.md S3.2).
-	 * accel (m/s^2), gyro (rad/s), light (lux) already match IIO. The
-	 * mag/pressure factors assume uT / hPa -- validate against a datasheet.
-	 */
-	switch (chan->type) {
-	case IIO_MAGN:		/* uT -> Gauss (/100): 1e-6/100 = 1e-8 */
-		*val = 0;
-		*val2 = 10;
-		return IIO_VAL_INT_PLUS_NANO;
-	case IIO_PRESSURE:	/* hPa -> kPa (/10): 1e-6/10 = 1e-7 */
-		*val = 0;
-		*val2 = 100;
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		/* SCALE = resolution * unit factor, discovered per sensor. */
+		*val = s->scale_nano / USF_NANO;
+		*val2 = s->scale_nano % USF_NANO;
 		return IIO_VAL_INT_PLUS_NANO;
 	default:
-		*val = 0;
-		*val2 = 1;		/* 1e-6 */
-		return IIO_VAL_INT_PLUS_MICRO;
+		return -EINVAL;
 	}
 }
 
@@ -253,40 +261,63 @@ static bool usf_name_has(const char *name, const char *sub)
 }
 
 /*
- * IEEE-754 binary32 -> round(value * 1e6) as s32, using only integer math
- * (the kernel must not touch the FPU). Out-of-range / non-finite inputs clamp.
+ * IEEE-754 binary32 -> round(|value| * mul * 2^q) as a u64 magnitude, integer
+ * math only (the kernel must not touch the FPU). @neg (if given) gets the sign.
+ * Saturates to U64_MAX on overflow / non-finite so callers can clamp.
  */
-static s32 usf_f32_to_micro(u32 bits)
+static u64 usf_f32_scaled(u32 bits, u64 mul, unsigned int q, bool *neg)
 {
 	u32 mant = bits & 0x7fffff;
 	int exp = (bits >> 23) & 0xff;
-	bool neg = bits & 0x80000000u;
 	u64 num;
 	int e;
 
+	if (neg)
+		*neg = bits & 0x80000000u;
 	if (exp == 0)
 		return 0;			/* zero / subnormal ~= 0 */
 	if (exp == 0xff)
-		return neg ? S32_MIN : S32_MAX;	/* inf / NaN */
+		return U64_MAX;			/* inf / NaN */
 
 	num = ((u64)1 << 23) | mant;		/* value = num * 2^(exp-127-23) */
-	e = exp - 127 - 23;
-	num *= 1000000ULL;			/* micro-units, still scaled by 2^e */
-	if (e >= 0) {
-		if (e >= 24 || num > (u64)S32_MAX >> e)
-			return neg ? S32_MIN : S32_MAX;
-		num <<= e;
-	} else {
-		int sh = -e;
-
-		if (sh >= 64)
-			num = 0;
-		else
-			num = (num + (1ULL << (sh - 1))) >> sh; /* round-nearest */
+	if (mul > 1) {
+		if (num > U64_MAX / mul)
+			return U64_MAX;
+		num *= mul;
 	}
-	if (num > S32_MAX)
+	e = exp - 127 - 23 + (int)q;		/* fold the 2^q into the exponent */
+	if (e >= 0) {
+		if (e >= 64 || num > (U64_MAX >> e))
+			return U64_MAX;
+		return num << e;
+	}
+	e = -e;
+	if (e >= 64)
+		return 0;
+	return (num + (1ULL << (e - 1))) >> e;	/* round-nearest */
+}
+
+static s32 usf_clamp_s32(u64 mag, bool neg)
+{
+	if (mag > S32_MAX)
 		return neg ? S32_MIN : S32_MAX;
-	return neg ? -(s32)num : (s32)num;
+	return neg ? -(s32)mag : (s32)mag;
+}
+
+/* Quantise one sample axis to a raw scan value for its device's scale. */
+static s32 usf_scale_sample(const struct usf_sensor *s, u32 val_bits)
+{
+	bool neg;
+	u64 val_q;
+
+	if (!s->res_q)		/* no resolution reported: micro-unit fallback */
+		return usf_clamp_s32(usf_f32_scaled(val_bits, 1000000, 0, &neg),
+				     neg);
+
+	val_q = usf_f32_scaled(val_bits, 1, USF_SCALE_Q, &neg);
+	if (val_q == U64_MAX)
+		return neg ? S32_MIN : S32_MAX;
+	return usf_clamp_s32((val_q + s->res_q / 2) / s->res_q, neg);
 }
 
 /*
@@ -375,7 +406,7 @@ static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 
 		memset(&scan, 0, sizeof(scan));
 		for (d = 0; d < (u32)n; d++)
-			scan.chan[d] = usf_f32_to_micro(
+			scan.chan[d] = usf_scale_sample(match,
 				get_unaligned_le32(pay + off + 8 + d * 4));
 
 		iio_push_to_buffers_with_ts(indio, &scan, sizeof(scan), ts);
@@ -621,15 +652,19 @@ static int usf_sensor_list(struct usf_iio *usf, u32 *handles, int max)
 	return 0;
 }
 
-/* GetSensorInfo(handle) -> name into @out. Returns 0 or -errno. */
-static int usf_sensor_name(struct usf_iio *usf, u32 handle, char *out,
-			   size_t outsz)
+/*
+ * GetSensorInfo(handle) -> name into @out, and the id9 resolution (f32 bits, 0
+ * if absent) into @res_bits. Returns 0 or -errno.
+ */
+static int usf_sensor_info(struct usf_iio *usf, u32 handle, char *out,
+			   size_t outsz, u32 *res_bits)
 {
 	const u8 *req, *resp, *body;
 	size_t reqlen;
 	u32 rlen, blen, txn;
 	int ret;
 
+	*res_bits = 0;
 	mutex_lock(&usf->ctl_lock);
 	txn = usf->txn++;
 	ret = usf_build_no_body(&usf->fbb, USF_MSG_GET_SENSOR_INFO, txn, handle,
@@ -641,15 +676,39 @@ static int usf_sensor_name(struct usf_iio *usf, u32 handle, char *out,
 		if (!body || usf_fb_string(body, blen, 0, out, outsz) < 0) {
 			out[0] = '\0';
 			ret = -ENODATA;
+		} else {
+			*res_bits = usf_fb_u32(body, blen, 9, 0);
 		}
 	}
 	mutex_unlock(&usf->ctl_lock);
 	return ret;
 }
 
+/*
+ * Derive the IIO scale from the sensor's reported resolution (id9). raw =
+ * round(value / resolution) [res_q = resolution << USF_SCALE_Q] and SCALE =
+ * resolution * unit factor. If the firmware gives no usable resolution, fall
+ * back to fixed micro-units (SCALE = 1e-6 * unit factor), matching the original
+ * behaviour for that sensor.
+ */
+static void usf_set_scale(struct usf_sensor *s, const struct usf_type_map *map,
+			  u32 res_bits)
+{
+	u64 res_q = usf_f32_scaled(res_bits, 1, USF_SCALE_Q, NULL);
+	u64 scale = usf_f32_scaled(res_bits, map->unit_nano, 0, NULL);
+
+	if (res_q && res_q != U64_MAX && scale && scale != U64_MAX) {
+		s->res_q = res_q;
+		s->scale_nano = scale;
+	} else {
+		s->res_q = 0;			/* micro-unit fallback */
+		s->scale_nano = map->unit_nano / 1000000;
+	}
+}
+
 static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 			       const char *name,
-			       const struct usf_type_map *map)
+			       const struct usf_type_map *map, u32 res_bits)
 {
 	struct iio_dev *indio;
 	struct usf_sensor *s;
@@ -666,6 +725,7 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 	s->indio = indio;
 	s->handle = handle;
 	s->ndata = map->ndata;
+	usf_set_scale(s, map, res_bits);
 
 	indio->name = map->iio_name;
 	indio->info = &usf_iio_info;
@@ -683,8 +743,10 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 		return ret;
 
 	usf->sensors[usf->nsensors++] = s;
-	dev_info(usf->dev, "registered %s for USF '%s' (handle 0x%x)\n",
-		 map->iio_name, name, handle);
+	dev_info(usf->dev,
+		 "registered %s for USF '%s' (handle 0x%x) scale=%llu.%09llu%s\n",
+		 map->iio_name, name, handle, s->scale_nano / USF_NANO,
+		 s->scale_nano % USF_NANO, s->res_q ? "" : " (micro fallback)");
 	return 0;
 }
 
@@ -698,6 +760,7 @@ static void usf_enumerate(struct usf_iio *usf)
 	char name[USF_NAME_MAX];
 	bool filtered = sensor && sensor[0];
 	int count, i, m;
+	u32 res_bits;
 
 	count = usf_sensor_list(usf, handles, USF_LIST_MAX);
 	if (count <= 0) {
@@ -707,7 +770,7 @@ static void usf_enumerate(struct usf_iio *usf)
 	dev_info(usf->dev, "enumerated %d USF sensors\n", count);
 
 	for (i = 0; i < count; i++) {
-		if (usf_sensor_name(usf, handles[i], name, sizeof(name)))
+		if (usf_sensor_info(usf, handles[i], name, sizeof(name), &res_bits))
 			continue;
 		dev_info(usf->dev, "  handle 0x%02x : %s\n", handles[i], name);
 
@@ -716,7 +779,7 @@ static void usf_enumerate(struct usf_iio *usf)
 		for (m = 0; m < (int)ARRAY_SIZE(usf_type_maps); m++) {
 			if (usf_name_has(name, usf_type_maps[m].match)) {
 				usf_register_sensor(usf, handles[i], name,
-						    &usf_type_maps[m]);
+						    &usf_type_maps[m], res_bits);
 				break;
 			}
 		}

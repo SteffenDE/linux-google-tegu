@@ -66,7 +66,8 @@ MODULE_PARM_DESC(sensor,
 
 static int rate = 50;
 module_param(rate, int, 0644);
-MODULE_PARM_DESC(rate, "requested sampling rate in Hz (AoC caps per sensor)");
+MODULE_PARM_DESC(rate,
+		 "initial sampling rate in Hz; per-device sampling_frequency overrides it (AoC caps per sensor)");
 
 struct usf_sensor;
 
@@ -112,6 +113,7 @@ struct usf_sensor {
 	u32 client_id;		/* AP-chosen opaque id echoed in samples */
 	u32 sampling_id;	/* live stream id (0 = not streaming) */
 	s64 period_ns;
+	int samp_freq;		/* requested rate in Hz (sampling_frequency) */
 	u8 ndata;		/* data channels (1 scalar, 3 vector) */
 
 	/*
@@ -143,6 +145,7 @@ static const unsigned long usf_scan_masks_scalar[] = { BIT(0), 0 };
 	.modified = 1,						\
 	.channel2 = IIO_MOD_##_mod,				\
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
+	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
 	.scan_index = _idx,					\
 	.scan_type = {						\
 		.sign = 's',					\
@@ -170,6 +173,7 @@ static const struct iio_chan_spec usf_magn_channels[] = {
 #define USF_SCALAR_CHANNEL(_type) {				\
 	.type = _type,						\
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
+	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
 	.scan_index = 0,					\
 	.scan_type = {						\
 		.sign = 's',					\
@@ -234,13 +238,74 @@ static int usf_read_raw(struct iio_dev *indio_dev,
 		*val = s->scale_nano / USF_NANO;
 		*val2 = s->scale_nano % USF_NANO;
 		return IIO_VAL_INT_PLUS_NANO;
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		*val = s->samp_freq;
+		return IIO_VAL_INT;
 	default:
 		return -EINVAL;
 	}
 }
 
+/*
+ * Set the sampling rate. The AoC picks the nearest supported ODR, so the value
+ * read back is what was requested, not necessarily what streams. A live stream
+ * is retuned in place (ReconfigSampling keeps the sampling_id); otherwise the
+ * rate takes effect at the next buffer enable.
+ */
+static int usf_write_raw(struct iio_dev *indio_dev,
+			 struct iio_chan_spec const *chan,
+			 int val, int val2, long mask)
+{
+	struct usf_sensor *s = iio_priv(indio_dev);
+	struct usf_iio *usf = s->usf;
+	const u8 *req;
+	size_t reqlen;
+	s64 period_ns;
+	u32 txn, sid;
+	int ret;
+
+	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
+		return -EINVAL;
+	if (val <= 0 || val > 1000000)		/* keep period_ns >= 1000 ns */
+		return -EINVAL;
+
+	s->samp_freq = val;
+	period_ns = 1000000000LL / val;
+
+	/*
+	 * Read sampling_id *inside* ctl_lock, and hold ctl_lock across the retune
+	 * send. usf_stop_sampling() (buffer disable) clears sampling_id before it
+	 * takes ctl_lock to send its enable=0, so if we observe a live sid here a
+	 * concurrent stop cannot have disabled yet and its disable is serialised
+	 * after our enable. Otherwise we would risk leaving the AoC streaming a
+	 * sampling_id that nothing stops again.
+	 */
+	ret = 0;
+	mutex_lock(&usf->ctl_lock);
+	spin_lock(&usf->sample_lock);
+	sid = s->sampling_id;
+	spin_unlock(&usf->sample_lock);
+	if (sid) {
+		txn = usf->txn++;
+		ret = usf_build_reconfig(&usf->fbb, txn, s->handle, sid,
+					 period_ns, 0, true, &req, &reqlen);
+		if (!ret)
+			ret = aocc_kernel_write(usf->wake, req, reqlen);
+		if (ret >= 0)
+			s->period_ns = period_ns;
+	}
+	mutex_unlock(&usf->ctl_lock);
+
+	if (ret < 0) {
+		dev_warn(usf->dev, "ReconfigSampling(rate) failed: %d\n", ret);
+		return ret;
+	}
+	return 0;
+}
+
 static const struct iio_info usf_iio_info = {
 	.read_raw = usf_read_raw,
+	.write_raw = usf_write_raw,
 };
 
 /* Case-insensitive substring test. */
@@ -541,7 +606,7 @@ static int usf_start_sampling(struct usf_sensor *s)
 	s64 period_ns;
 	int ret;
 
-	period_ns = 1000000000LL / (rate > 0 ? rate : 50);
+	period_ns = 1000000000LL / (s->samp_freq > 0 ? s->samp_freq : 50);
 	s->client_id = 0xC0DE0000u | s->handle;
 	s->period_ns = period_ns;
 
@@ -725,6 +790,7 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 	s->indio = indio;
 	s->handle = handle;
 	s->ndata = map->ndata;
+	s->samp_freq = rate > 0 ? rate : 50;
 	usf_set_scale(s, map, res_bits);
 
 	indio->name = map->iio_name;

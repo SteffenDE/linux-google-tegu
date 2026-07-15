@@ -581,10 +581,11 @@ static int sec_pmic_acpm_probe(struct platform_device *pdev)
 
 	/*
 	 * The PMIC interrupt is carried by the s2mpg10/11/14 nodes (and used
-	 * by the s2mpg10/11 regulator/RTC IRQ chips), but the meter-only
-	 * s2mpg15 sub PMIC has no interrupt consumer -- sec_irq_init() ignores
-	 * it, and its combiner interrupt has no mainline parent -- so allow it
-	 * to be absent there.
+	 * by the s2mpg10/11 regulator/RTC IRQ chips), but the s2mpg15 sub PMIC
+	 * has no interrupt consumer -- its enable-only sensor regulators and
+	 * read-only meter need no IRQ, sec_irq_init() ignores it, and its
+	 * combiner interrupt has no mainline parent -- so allow it to be absent
+	 * there.
 	 */
 	irq = platform_get_irq_optional(pdev, 0);
 	if (irq < 0) {

@@ -20,6 +20,7 @@
 #include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mpg11.h>
 #include <linux/mfd/samsung/s2mpg14.h>
+#include <linux/mfd/samsung/s2mpg15.h>
 #include <linux/mfd/samsung/s2mps11.h>
 #include <linux/mfd/samsung/s2mps13.h>
 #include <linux/mfd/samsung/s2mps14.h>
@@ -1298,6 +1299,40 @@ static const struct regulator_desc s2mpg14_regulators[] = {
 	regulator_desc_s2mpg14_ldo(25),
 };
 
+/*
+ * S2MPG15 (zumapro sub PMIC): enable-only descriptors for the two sensor
+ * rails the AoC powers -- LDO7S (L7S_SENSORS, 1.8 V) and LDO5S (L5S_PROX,
+ * 3.3 V).  Same rationale as the S2MPG14 rails above: bootloader leaves the
+ * voltage selectors correct, so only the enable bit is wired.  The AoC
+ * driver enables them via its sensor_power_list; without them the AoC
+ * sensor stack has no power and enumerates no physical sensors.
+ */
+static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
+	.is_enabled		= regulator_is_enabled_regmap,
+	.enable			= regulator_enable_regmap,
+	.disable		= regulator_disable_regmap,
+};
+
+/* LxS_CTRL bit 7 is the plain on/off enable. */
+#define regulator_desc_s2mpg15_ldo(_num)				\
+	[S2MPG15_LDO##_num] = {						\
+		.name		= "ldo" #_num "s",			\
+		.of_match	= of_match_ptr("ldo" #_num "s"),	\
+		.regulators_node = of_match_ptr("regulators"),		\
+		.id		= S2MPG15_LDO##_num,			\
+		.ops		= &s2mpg15_reg_enable_only_ops,		\
+		.type		= REGULATOR_VOLTAGE,			\
+		.owner		= THIS_MODULE,				\
+		.enable_reg	= S2MPG15_PMIC_L##_num##S_CTRL,		\
+		.enable_mask	= BIT(7),				\
+		.enable_time	= 130,					\
+	}
+
+static const struct regulator_desc s2mpg15_regulators[] = {
+	regulator_desc_s2mpg15_ldo(5),
+	regulator_desc_s2mpg15_ldo(7),
+};
+
 static const struct regulator_ops s2mps11_ldo_ops = {
 	.list_voltage		= regulator_list_voltage_linear,
 	.map_voltage		= regulator_map_voltage_linear,
@@ -2233,6 +2268,11 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 		regulators = s2mpg14_regulators;
 		BUILD_BUG_ON(ARRAY_SIZE(s2mpg14_regulators) > S2MPS_REGULATOR_MAX);
 		break;
+	case S2MPG15:
+		rdev_num = ARRAY_SIZE(s2mpg15_regulators);
+		regulators = s2mpg15_regulators;
+		BUILD_BUG_ON(ARRAY_SIZE(s2mpg15_regulators) > S2MPS_REGULATOR_MAX);
+		break;
 	case S2MPS11X:
 		rdev_num = ARRAY_SIZE(s2mps11_regulators);
 		regulators = s2mps11_regulators;
@@ -2315,6 +2355,7 @@ static const struct platform_device_id s2mps11_pmic_id[] = {
 	{ .name = "s2mpg10-regulator", .driver_data = S2MPG10 },
 	{ .name = "s2mpg11-regulator", .driver_data = S2MPG11 },
 	{ .name = "s2mpg14-regulator", .driver_data = S2MPG14 },
+	{ .name = "s2mpg15-regulator", .driver_data = S2MPG15 },
 	{ .name = "s2mps11-regulator", .driver_data = S2MPS11X },
 	{ .name = "s2mps13-regulator", .driver_data = S2MPS13X },
 	{ .name = "s2mps14-regulator", .driver_data = S2MPS14X },

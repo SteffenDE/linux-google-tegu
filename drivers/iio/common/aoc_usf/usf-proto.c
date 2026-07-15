@@ -346,6 +346,25 @@ int usf_build_reconfig(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 			     b->scratch_body, blen, out, out_len);
 }
 
+int usf_build_stop_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
+			    u32 sampling_id, const u8 **out, size_t *out_len)
+{
+	const u8 *body;
+	size_t blen;
+	u32 bt;
+
+	fbb_init(b);
+	fbb_start_table(b);
+	fbb_add_i32(b, 0, sampling_id);		/* fid0 sampling_id */
+	bt = fbb_end_table(b);
+	fbb_finish(b, bt, &body, &blen);
+	if (b->overflow || blen > USF_FBB_CAP)
+		return -EOVERFLOW;
+	memcpy(b->scratch_body, body, blen);
+	return build_request(b, USF_MSG_STOP_SAMPLING, txn, sensor_handle,
+			     b->scratch_body, blen, out, out_len);
+}
+
 /* ------------------------------------------------------------------ *
  * FlatBuffer reader (schemaless, field-id based)                      *
  * ------------------------------------------------------------------ */

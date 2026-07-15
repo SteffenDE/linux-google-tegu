@@ -8,6 +8,7 @@
 #
 
 # When adding new entries keep the list in alphabetical order
+obj-y += aoc_usf/
 obj-y += cros_ec_sensors/
 obj-y += hid-sensors/
 obj-y += inv_sensors/

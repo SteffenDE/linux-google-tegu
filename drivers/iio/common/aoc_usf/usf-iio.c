@@ -30,7 +30,9 @@
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
+#include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/kfifo_buf.h>
 
 #include <soc/google/aoc_channel.h>
 
@@ -58,6 +60,10 @@ static char *sensor = "gyro";
 module_param(sensor, charp, 0644);
 MODULE_PARM_DESC(sensor,
 		 "USF sensor name substring to expose for P2a bring-up (e.g. gyro, accel)");
+
+static int rate = 50;
+module_param(rate, int, 0644);
+MODULE_PARM_DESC(rate, "sampling rate in Hz for the exposed sensor");
 
 struct usf_iio {
 	struct device *dev;
@@ -88,13 +94,20 @@ struct usf_iio {
 
 	/* The single IIO device registered for P2a (extended to many later). */
 	struct iio_dev *sensor_indio;
+	spinlock_t sample_lock;	/* fences sample push vs buffer teardown */
 };
 
 /* Per-IIO-device state (in iio_priv). */
 struct usf_sensor {
 	struct usf_iio *usf;
 	u32 handle;		/* USF sensor handle (dst for Create/Reconfig) */
+	u32 client_id;		/* AP-chosen opaque id echoed in samples */
+	u32 sampling_id;	/* live stream id (0 = not streaming); RCU-ish */
+	s64 period_ns;
 };
+
+/* Forced all-axes scan mask: the 3 data channels (timestamp is separate). */
+static const unsigned long usf_scan_masks[] = { GENMASK(2, 0), 0 };
 
 /*
  * Sample axes arrive as f32 in Android sensor units; the data path quantises
@@ -181,9 +194,103 @@ static bool usf_name_has(const char *name, const char *sub)
 }
 
 /*
+ * IEEE-754 binary32 -> round(value * 1e6) as s32, using only integer math
+ * (the kernel must not touch the FPU). Out-of-range / non-finite inputs clamp.
+ */
+static s32 usf_f32_to_micro(u32 bits)
+{
+	u32 mant = bits & 0x7fffff;
+	int exp = (bits >> 23) & 0xff;
+	bool neg = bits & 0x80000000u;
+	u64 num;
+	int e;
+
+	if (exp == 0)
+		return 0;			/* zero / subnormal ~= 0 */
+	if (exp == 0xff)
+		return neg ? S32_MIN : S32_MAX;	/* inf / NaN */
+
+	num = ((u64)1 << 23) | mant;		/* value = num * 2^(exp-127-23) */
+	e = exp - 127 - 23;
+	num *= 1000000ULL;			/* micro-units, still scaled by 2^e */
+	if (e >= 0) {
+		if (e >= 24 || num > (u64)S32_MAX >> e)
+			return neg ? S32_MIN : S32_MAX;
+		num <<= e;
+	} else {
+		int sh = -e;
+
+		if (sh >= 64)
+			num = 0;
+		else
+			num = (num + (1ULL << (sh - 1))) >> sh; /* round-nearest */
+	}
+	if (num > S32_MAX)
+		return neg ? S32_MIN : S32_MAX;
+	return neg ? -(s32)num : (s32)num;
+}
+
+/* Parse a type-9 compact sample batch and push each record to the IIO buffer. */
+static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
+{
+	struct iio_dev *indio = usf->sensor_indio;
+	struct usf_sensor *s;
+	struct usf_sample_hdr hdr;
+	u32 scount, dcount, n, i, d;
+	size_t stride, off;
+	struct {
+		s32 chan[3];
+		aligned_s64 timestamp;
+	} scan;
+
+	if (!indio || plen < sizeof(hdr))
+		return;
+	s = iio_priv(indio);
+	memcpy(&hdr, pay, sizeof(hdr));
+
+	scount = usf_sample_count(&hdr);
+	dcount = usf_sample_dcount(&hdr);
+	stride = 8 + (size_t)dcount * 4;
+	n = min(dcount, 3u);
+
+	/*
+	 * Hold sample_lock across the sampling_id check and the pushes:
+	 * usf_stop_sampling() clears sampling_id under the same lock on buffer
+	 * disable, so once it returns no push can be in flight to race the IIO
+	 * buffer teardown. iio_push_to_buffers is non-sleeping (kfifo), so this
+	 * is safe under a spinlock.
+	 */
+	spin_lock(&usf->sample_lock);
+	if (!s->sampling_id || hdr.sampling_id != s->sampling_id) {
+		spin_unlock(&usf->sample_lock);
+		return;			/* not streaming, or not our stream */
+	}
+
+	for (i = 0; i < scount; i++) {
+		u64 tsp;
+		s64 ts;
+
+		off = 16 + (size_t)i * stride;
+		if (off + stride > plen)
+			break;
+		/* 60-bit AoC-ns for now; TimeSync -> CLOCK_BOOTTIME is P2c. */
+		tsp = get_unaligned_le64(pay + off);
+		ts = (s64)(tsp & USF_SAMPLE_TS_MASK);
+
+		memset(&scan, 0, sizeof(scan));
+		for (d = 0; d < n; d++)
+			scan.chan[d] = usf_f32_to_micro(
+				get_unaligned_le32(pay + off + 8 + d * 4));
+
+		iio_push_to_buffers_with_ts(indio, &scan, sizeof(scan), ts);
+	}
+	spin_unlock(&usf->sample_lock);
+}
+
+/*
  * AOCC rx callback. Runs in the per-service demux kthread; must not sleep.
  * Responses (type 2) matching the awaited txn wake the control path; async
- * samples (type 9) are handled by the data path (follow-up commit).
+ * samples (type 9) are demuxed to the IIO buffer by sampling_id.
  */
 static void usf_iio_channel_rx(void *ctx, const void *payload, size_t len)
 {
@@ -195,8 +302,12 @@ static void usf_iio_channel_rx(void *ctx, const void *payload, size_t len)
 
 	if (!usf_parse_outer(payload, len, &type, &pay, &plen) || !pay)
 		return;
+	if (type == USF_T_SAMPLE) {
+		usf_handle_sample(usf, pay, plen);
+		return;
+	}
 	if (type != USF_T_RESPONSE)
-		return;			/* samples (type 9) handled later */
+		return;
 
 	rtxn = usf_resp_txn(pay, plen);
 
@@ -293,6 +404,90 @@ static u32 usf_get_server(struct usf_iio *usf, const u8 uuid[16],
 	return handle;
 }
 
+/* CreateSampling: start the AoC stream for this sensor. */
+static int usf_start_sampling(struct usf_sensor *s)
+{
+	struct usf_iio *usf = s->usf;
+	const u8 *req, *resp, *body;
+	size_t reqlen;
+	u32 rlen, blen, txn, sid = 0;
+	s64 period_ns;
+	int ret;
+
+	period_ns = 1000000000LL / (rate > 0 ? rate : 50);
+	s->client_id = 0xC0DE0000u | s->handle;
+	s->period_ns = period_ns;
+
+	mutex_lock(&usf->ctl_lock);
+	txn = usf->txn++;
+	ret = usf_build_create_sampling(&usf->fbb, txn, s->handle, period_ns,
+					s->client_id, &req, &reqlen);
+	if (!ret)
+		ret = usf_ctl(usf, txn, req, reqlen, &resp, &rlen);
+	if (!ret) {
+		body = usf_resp_body(resp, rlen, &blen);
+		if (body)
+			sid = usf_fb_u32(body, blen, 0, 0);
+	}
+	mutex_unlock(&usf->ctl_lock);
+
+	if (ret) {
+		dev_err(usf->dev, "CreateSampling failed: %d\n", ret);
+		return ret;
+	}
+
+	spin_lock(&usf->sample_lock);
+	s->sampling_id = sid;
+	spin_unlock(&usf->sample_lock);
+	dev_info(usf->dev, "%s streaming: sampling_id=%u period=%lld ns\n",
+		 s->usf->sensor_indio->name, sid, period_ns);
+	return 0;
+}
+
+/* ReconfigSampling(enable=0): stop the stream (best effort, fire-and-forget). */
+static int usf_stop_sampling(struct usf_sensor *s)
+{
+	struct usf_iio *usf = s->usf;
+	const u8 *req;
+	size_t reqlen;
+	u32 txn, sid;
+	int ret;
+
+	spin_lock(&usf->sample_lock);
+	sid = s->sampling_id;
+	s->sampling_id = 0;		/* stop accepting samples immediately */
+	spin_unlock(&usf->sample_lock);
+	if (!sid)
+		return 0;
+
+	mutex_lock(&usf->ctl_lock);
+	txn = usf->txn++;
+	ret = usf_build_reconfig(&usf->fbb, txn, s->handle, sid, s->period_ns,
+				 0, false, &req, &reqlen);
+	if (!ret)
+		ret = aocc_kernel_write(usf->wake, req, reqlen);
+	mutex_unlock(&usf->ctl_lock);
+
+	if (ret < 0)
+		dev_warn(usf->dev, "ReconfigSampling(stop) failed: %d\n", ret);
+	return 0;
+}
+
+static int usf_buffer_postenable(struct iio_dev *indio_dev)
+{
+	return usf_start_sampling(iio_priv(indio_dev));
+}
+
+static int usf_buffer_predisable(struct iio_dev *indio_dev)
+{
+	return usf_stop_sampling(iio_priv(indio_dev));
+}
+
+static const struct iio_buffer_setup_ops usf_buffer_ops = {
+	.postenable = usf_buffer_postenable,
+	.predisable = usf_buffer_predisable,
+};
+
 /* GetSensorList with settle-retry -> handles[]. Returns count or -errno. */
 static int usf_sensor_list(struct usf_iio *usf, u32 *handles, int max)
 {
@@ -376,6 +571,11 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 	indio->modes = INDIO_DIRECT_MODE;
 	indio->channels = map->channels;
 	indio->num_channels = map->num_channels;
+	indio->available_scan_masks = usf_scan_masks;
+
+	ret = devm_iio_kfifo_buffer_setup(usf->dev, indio, &usf_buffer_ops);
+	if (ret)
+		return ret;
 
 	ret = devm_iio_device_register(usf->dev, indio);
 	if (ret)
@@ -549,6 +749,7 @@ static int usf_iio_probe(struct platform_device *pdev)
 	usf->resp_ready = U32_MAX;
 	mutex_init(&usf->ctl_lock);
 	spin_lock_init(&usf->resp_lock);
+	spin_lock_init(&usf->sample_lock);
 	init_completion(&usf->resp_done);
 	INIT_DELAYED_WORK(&usf->enum_work, usf_iio_enumerate_work);
 	platform_set_drvdata(pdev, usf);

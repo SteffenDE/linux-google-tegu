@@ -20,6 +20,8 @@
 #include <linux/workqueue.h>
 #include <uapi/linux/sched/types.h>
 
+#include <soc/google/aoc_channel.h>
+
 #include "aoc.h"
 #include "uapi/aoc_channel_dev.h"
 
@@ -142,6 +144,23 @@ struct file_prvdata {
 /* TODO(b/141396548): Move these to drv_data. */
 static LIST_HEAD(s_open_files);
 
+/*
+ * In-kernel channel clients (aocc_kernel_open_channel()). These share the same
+ * demux and channel-index space as the userspace file clients above, but
+ * deliver demultiplexed messages through a callback instead of a char-dev read
+ * queue. See <soc/google/aoc_channel.h>.
+ */
+struct aocc_channel {
+	struct aoc_service_dev *service;
+	int channel_index;
+	void (*rx)(void *ctx, const void *payload, size_t len);
+	void *ctx;
+	struct list_head list;
+};
+
+static LIST_HEAD(s_kernel_channels);
+static DEFINE_MUTEX(s_kernel_channels_lock);
+
 /* Shared memory transport doorbell globals. */
 /* TODO (b/184637825): Use mailbox device for AoC shared memory transport. */
 static struct aoc_service_dev *sh_mem_doorbell_service_dev;
@@ -257,11 +276,38 @@ static int aocc_demux_kthread(void *data)
 		}
 
 		if (!handler_found) {
-			pr_warn_ratelimited("Could not find handler for channel %d",
-					    channel);
-			/* Notifies AOC the channel is closed. */
-			aocc_send_cmd_msg(service, AOCC_CMD_CLOSE_CHANNEL, channel);
+			struct aocc_channel *kchan;
+
+			/*
+			 * Not a userspace file: try the in-kernel clients. Match
+			 * by channel index only, not by service: the index space
+			 * is global, and the AoC delivers a stream on whichever
+			 * service (wake / non_wake_up) matches the sensor's
+			 * wakeup class, tagged with the channel that created it.
+			 * A non-wake sensor sampled from the wake channel thus
+			 * arrives on the non_wake_up service with the wake
+			 * channel's index -- exactly like the userspace file path
+			 * above, which also matches by index alone.
+			 */
+			mutex_lock(&s_kernel_channels_lock);
+			list_for_each_entry(kchan, &s_kernel_channels, list) {
+				if (channel == kchan->channel_index) {
+					handler_found = 1;
+					kchan->rx(kchan->ctx, node->msg.payload,
+						  node->msg_size - sizeof(uint32_t));
+					break;
+				}
+			}
+			mutex_unlock(&s_kernel_channels_lock);
 			kfree(node);
+
+			if (!handler_found) {
+				pr_warn_ratelimited("Could not find handler for channel %d",
+						    channel);
+				/* Notifies AOC the channel is closed. */
+				aocc_send_cmd_msg(service, AOCC_CMD_CLOSE_CHANNEL,
+						  channel);
+			}
 			continue;
 		}
 	}
@@ -313,6 +359,131 @@ static int aocc_send_cmd_msg(aoc_service *service_id, enum aoc_cmd_code code,
 	mutex_unlock(&aocc_write_lock);
 	return ret;
 }
+
+/* In-kernel channel client API (see <soc/google/aoc_channel.h>) */
+
+struct aocc_channel *
+aocc_kernel_open_channel(const char *service_name,
+			 void (*rx)(void *ctx, const void *payload, size_t len),
+			 void *ctx)
+{
+	struct aocc_device_entry *entry;
+	struct aoc_service_dev *service = NULL;
+	struct aocc_channel *chan;
+	int rc;
+
+	if (!service_name || !rx)
+		return ERR_PTR(-EINVAL);
+
+	/* Resolve the (already probed) service device by name. */
+	mutex_lock(&aocc_devices_lock);
+	list_for_each_entry(entry, &aocc_devices_list, list) {
+		if (strcmp(dev_name(&entry->service->dev), service_name) == 0) {
+			service = entry->service;
+			get_device(&service->dev);
+			break;
+		}
+	}
+	mutex_unlock(&aocc_devices_lock);
+
+	if (!service)
+		return ERR_PTR(-ENODEV);
+
+	if (atomic_read(&channel_index_counter) >= AOCC_MAX_CHANNEL_INDEX) {
+		pr_err("Too many channels have been opened.");
+		put_device(&service->dev);
+		return ERR_PTR(-EMFILE);
+	}
+
+	chan = kzalloc(sizeof(*chan), GFP_KERNEL);
+	if (!chan) {
+		put_device(&service->dev);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	chan->service = service;
+	chan->rx = rx;
+	chan->ctx = ctx;
+	chan->channel_index = atomic_inc_return(&channel_index_counter);
+
+	/* Publish before opening so an immediate reply can be routed. */
+	mutex_lock(&s_kernel_channels_lock);
+	list_add(&chan->list, &s_kernel_channels);
+	mutex_unlock(&s_kernel_channels_lock);
+
+	rc = aocc_send_cmd_msg(service, AOCC_CMD_OPEN_CHANNEL,
+			       chan->channel_index);
+	if (rc < 0) {
+		pr_err("send AOCC_CMD_OPEN_CHANNEL fail %d", rc);
+		mutex_lock(&s_kernel_channels_lock);
+		list_del(&chan->list);
+		mutex_unlock(&s_kernel_channels_lock);
+		put_device(&service->dev);
+		kfree(chan);
+		return ERR_PTR(rc);
+	}
+
+	dev_info(&service->dev, "New in-kernel client with channel ID %d",
+		 chan->channel_index);
+	return chan;
+}
+EXPORT_SYMBOL_GPL(aocc_kernel_open_channel);
+
+int aocc_kernel_write(struct aocc_channel *chan, const void *payload, size_t len)
+{
+	char *buffer;
+	int retval;
+
+	if (IS_ERR_OR_NULL(chan))
+		return -EINVAL;
+	if (chan->service->dead)
+		return -ESHUTDOWN;
+	if (len == 0 || len > AOCC_MAX_MSG_SIZE - sizeof(int))
+		return -EMSGSIZE;
+
+	buffer = kmalloc(len + sizeof(int), GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+
+	/* Prepend the channel index, matching aocc_write(). */
+	((int *)buffer)[0] = chan->channel_index;
+	memcpy(buffer + sizeof(int), payload, len);
+
+	mutex_lock(&aocc_write_lock);
+	retval = aoc_service_write(chan->service, buffer, len + sizeof(int), true);
+	mutex_unlock(&aocc_write_lock);
+
+	if (retval < 0 && retval != -EAGAIN)
+		pr_err("Write failed for channel %d with code %d\n",
+		       chan->channel_index, retval);
+
+	kfree(buffer);
+	return retval;
+}
+EXPORT_SYMBOL_GPL(aocc_kernel_write);
+
+void aocc_kernel_close_channel(struct aocc_channel *chan)
+{
+	if (IS_ERR_OR_NULL(chan))
+		return;
+
+	/*
+	 * Serialise against the demux dispatch, which holds this lock across
+	 * the rx callback: once list_del() returns, no further callback for
+	 * this channel can be in flight, so the free below is safe.
+	 */
+	mutex_lock(&s_kernel_channels_lock);
+	list_del(&chan->list);
+	mutex_unlock(&s_kernel_channels_lock);
+
+	if (!chan->service->dead)
+		aocc_send_cmd_msg(chan->service, AOCC_CMD_CLOSE_CHANNEL,
+				  chan->channel_index);
+
+	put_device(&chan->service->dev);
+	kfree(chan);
+}
+EXPORT_SYMBOL_GPL(aocc_kernel_close_channel);
 
 /* File methods */
 static int aocc_open(struct inode *inode, struct file *file);

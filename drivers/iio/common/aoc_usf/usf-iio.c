@@ -50,20 +50,23 @@
 #define USF_NAME_MAX		64
 #define USF_SETTLE_TRIES	25	/* GetSensorList settle: 25 * 200 ms = 5 s */
 #define USF_SETTLE_MS		200
+#define USF_MAX_DEV		12	/* max IIO devices registered */
 
 static bool autopoll;
 module_param(autopoll, bool, 0644);
 MODULE_PARM_DESC(autopoll,
 		 "enumerate sensors at probe instead of waiting for the sysfs poke");
 
-static char *sensor = "gyro";
+static char *sensor = "";
 module_param(sensor, charp, 0644);
 MODULE_PARM_DESC(sensor,
-		 "USF sensor name substring to expose for P2a bring-up (e.g. gyro, accel)");
+		 "if set, only expose USF sensors whose name contains this substring (default: all supported)");
 
 static int rate = 50;
 module_param(rate, int, 0644);
-MODULE_PARM_DESC(rate, "sampling rate in Hz for the exposed sensor");
+MODULE_PARM_DESC(rate, "requested sampling rate in Hz (AoC caps per sensor)");
+
+struct usf_sensor;
 
 struct usf_iio {
 	struct device *dev;
@@ -92,22 +95,26 @@ struct usf_iio {
 	u32 sensor_mgr;
 	u32 sample_chan;
 
-	/* The single IIO device registered for P2a (extended to many later). */
-	struct iio_dev *sensor_indio;
-	spinlock_t sample_lock;	/* fences sample push vs buffer teardown */
+	/* Registered IIO devices, one per exposed sensor. */
+	struct usf_sensor *sensors[USF_MAX_DEV];
+	int nsensors;
+	spinlock_t sample_lock;	/* fences sample push/lookup vs buffer teardown */
 };
 
 /* Per-IIO-device state (in iio_priv). */
 struct usf_sensor {
 	struct usf_iio *usf;
+	struct iio_dev *indio;	/* owning IIO device */
 	u32 handle;		/* USF sensor handle (dst for Create/Reconfig) */
 	u32 client_id;		/* AP-chosen opaque id echoed in samples */
-	u32 sampling_id;	/* live stream id (0 = not streaming); RCU-ish */
+	u32 sampling_id;	/* live stream id (0 = not streaming) */
 	s64 period_ns;
+	u8 ndata;		/* data channels (1 scalar, 3 vector) */
 };
 
-/* Forced all-axes scan mask: the 3 data channels (timestamp is separate). */
-static const unsigned long usf_scan_masks[] = { GENMASK(2, 0), 0 };
+/* Forced scan masks (all data channels; timestamp is tracked separately). */
+static const unsigned long usf_scan_masks_3axis[] = { GENMASK(2, 0), 0 };
+static const unsigned long usf_scan_masks_scalar[] = { BIT(0), 0 };
 
 /*
  * Sample axes arrive as f32 in Android sensor units; the data path quantises
@@ -143,32 +150,81 @@ static const struct iio_chan_spec usf_magn_channels[] = {
 	USF_3AXIS_CHANNELS(IIO_MAGN),
 };
 
+#define USF_SCALAR_CHANNEL(_type) {				\
+	.type = _type,						\
+	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
+	.scan_index = 0,					\
+	.scan_type = {						\
+		.sign = 's',					\
+		.realbits = 32,					\
+		.storagebits = 32,				\
+		.endianness = IIO_LE,				\
+	},							\
+}
+#define USF_SCALAR_CHANNELS(_type)		\
+	USF_SCALAR_CHANNEL(_type),		\
+	IIO_CHAN_SOFT_TIMESTAMP(1)
+
+static const struct iio_chan_spec usf_light_channels[] = {
+	USF_SCALAR_CHANNELS(IIO_LIGHT),
+};
+static const struct iio_chan_spec usf_prox_channels[] = {
+	USF_SCALAR_CHANNELS(IIO_PROXIMITY),
+};
+static const struct iio_chan_spec usf_pressure_channels[] = {
+	USF_SCALAR_CHANNELS(IIO_PRESSURE),
+};
+
 /* Map a USF sensor name (substring) to an IIO device type + channels. */
 static const struct usf_type_map {
-	const char *match;
+	const char *match;	/* case-insensitive substring of the USF name */
 	const char *iio_name;
 	const struct iio_chan_spec *channels;
 	int num_channels;
+	int ndata;		/* data channels (1 scalar, 3 vector) */
+	const unsigned long *scan_masks;
 } usf_type_maps[] = {
 	{ "Accelerometer", "usf_accel", usf_accel_channels,
-	  ARRAY_SIZE(usf_accel_channels) },
+	  ARRAY_SIZE(usf_accel_channels), 3, usf_scan_masks_3axis },
 	{ "Gyroscope", "usf_gyro", usf_gyro_channels,
-	  ARRAY_SIZE(usf_gyro_channels) },
+	  ARRAY_SIZE(usf_gyro_channels), 3, usf_scan_masks_3axis },
 	{ "Magnetometer", "usf_magn", usf_magn_channels,
-	  ARRAY_SIZE(usf_magn_channels) },
+	  ARRAY_SIZE(usf_magn_channels), 3, usf_scan_masks_3axis },
+	{ "Ambient Light", "usf_als", usf_light_channels,
+	  ARRAY_SIZE(usf_light_channels), 1, usf_scan_masks_scalar },
+	/* "Proximity" alone also matches gesture/voice/AAD sensors; be specific */
+	{ "TMD3733 Proximity", "usf_prox", usf_prox_channels,
+	  ARRAY_SIZE(usf_prox_channels), 1, usf_scan_masks_scalar },
+	{ "Barometer", "usf_baro", usf_pressure_channels,
+	  ARRAY_SIZE(usf_pressure_channels), 1, usf_scan_masks_scalar },
 };
 
 static int usf_read_raw(struct iio_dev *indio_dev,
 			struct iio_chan_spec const *chan,
 			int *val, int *val2, long mask)
 {
-	switch (mask) {
-	case IIO_CHAN_INFO_SCALE:
-		*val = 0;
-		*val2 = 1;		/* 1e-6: raw is (value * 1e6) */
-		return IIO_VAL_INT_PLUS_MICRO;
-	default:
+	if (mask != IIO_CHAN_INFO_SCALE)
 		return -EINVAL;
+
+	/*
+	 * Raw is the Android-unit value * 1e6 (usf_f32_to_micro). Fold the
+	 * Android->IIO unit conversion into the scale (usf-iio-bridge.md S3.2).
+	 * accel (m/s^2), gyro (rad/s), light (lux) already match IIO. The
+	 * mag/pressure factors assume uT / hPa -- validate against a datasheet.
+	 */
+	switch (chan->type) {
+	case IIO_MAGN:		/* uT -> Gauss (/100): 1e-6/100 = 1e-8 */
+		*val = 0;
+		*val2 = 10;
+		return IIO_VAL_INT_PLUS_NANO;
+	case IIO_PRESSURE:	/* hPa -> kPa (/10): 1e-6/10 = 1e-7 */
+		*val = 0;
+		*val2 = 100;
+		return IIO_VAL_INT_PLUS_NANO;
+	default:
+		*val = 0;
+		*val2 = 1;		/* 1e-6 */
+		return IIO_VAL_INT_PLUS_MICRO;
 	}
 }
 
@@ -233,38 +289,52 @@ static s32 usf_f32_to_micro(u32 bits)
 /* Parse a type-9 compact sample batch and push each record to the IIO buffer. */
 static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 {
-	struct iio_dev *indio = usf->sensor_indio;
-	struct usf_sensor *s;
+	struct usf_sensor *match = NULL;
+	struct iio_dev *indio;
 	struct usf_sample_hdr hdr;
-	u32 scount, dcount, n, i, d;
+	u32 scount, dcount, sid, i, d;
 	size_t stride, off;
+	int k, n;
+	/*
+	 * The device scan is n data s32 at offsets 0.. then an 8-aligned s64
+	 * timestamp. One 3-axis-sized buffer serves both scalar and vector
+	 * devices: iio_push writes the timestamp using the device's scan_bytes,
+	 * so for a scalar device it lands at offset 8 (over the unused axes).
+	 */
 	struct {
 		s32 chan[3];
 		aligned_s64 timestamp;
 	} scan;
 
-	if (!indio || plen < sizeof(hdr))
+	if (plen < sizeof(hdr))
 		return;
-	s = iio_priv(indio);
 	memcpy(&hdr, pay, sizeof(hdr));
-
+	sid = hdr.sampling_id;
 	scount = usf_sample_count(&hdr);
 	dcount = usf_sample_dcount(&hdr);
 	stride = 8 + (size_t)dcount * 4;
-	n = min(dcount, 3u);
 
 	/*
-	 * Hold sample_lock across the sampling_id check and the pushes:
+	 * Hold sample_lock across the sampling_id lookup and the pushes:
 	 * usf_stop_sampling() clears sampling_id under the same lock on buffer
 	 * disable, so once it returns no push can be in flight to race the IIO
 	 * buffer teardown. iio_push_to_buffers is non-sleeping (kfifo), so this
 	 * is safe under a spinlock.
 	 */
 	spin_lock(&usf->sample_lock);
-	if (!s->sampling_id || hdr.sampling_id != s->sampling_id) {
-		spin_unlock(&usf->sample_lock);
-		return;			/* not streaming, or not our stream */
+	for (k = 0; k < usf->nsensors; k++) {
+		if (usf->sensors[k]->sampling_id &&
+		    usf->sensors[k]->sampling_id == sid) {
+			match = usf->sensors[k];
+			break;
+		}
 	}
+	if (!match) {
+		spin_unlock(&usf->sample_lock);
+		return;			/* not one of our active streams */
+	}
+	indio = match->indio;
+	n = min_t(int, match->ndata, dcount);
 
 	for (i = 0; i < scount; i++) {
 		u64 tsp;
@@ -273,12 +343,12 @@ static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 		off = 16 + (size_t)i * stride;
 		if (off + stride > plen)
 			break;
-		/* 60-bit AoC-ns for now; TimeSync -> CLOCK_BOOTTIME is P2c. */
+		/* 60-bit AoC-ns for now; mapping to CLOCK_BOOTTIME via TimeSync is a follow-up. */
 		tsp = get_unaligned_le64(pay + off);
 		ts = (s64)(tsp & USF_SAMPLE_TS_MASK);
 
 		memset(&scan, 0, sizeof(scan));
-		for (d = 0; d < n; d++)
+		for (d = 0; d < (u32)n; d++)
 			scan.chan[d] = usf_f32_to_micro(
 				get_unaligned_le32(pay + off + 8 + d * 4));
 
@@ -440,7 +510,7 @@ static int usf_start_sampling(struct usf_sensor *s)
 	s->sampling_id = sid;
 	spin_unlock(&usf->sample_lock);
 	dev_info(usf->dev, "%s streaming: sampling_id=%u period=%lld ns\n",
-		 s->usf->sensor_indio->name, sid, period_ns);
+		 s->indio->name, sid, period_ns);
 	return 0;
 }
 
@@ -569,19 +639,24 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 	struct usf_sensor *s;
 	int ret;
 
+	if (usf->nsensors >= USF_MAX_DEV)
+		return -ENOSPC;
+
 	indio = devm_iio_device_alloc(usf->dev, sizeof(*s));
 	if (!indio)
 		return -ENOMEM;
 	s = iio_priv(indio);
 	s->usf = usf;
+	s->indio = indio;
 	s->handle = handle;
+	s->ndata = map->ndata;
 
 	indio->name = map->iio_name;
 	indio->info = &usf_iio_info;
 	indio->modes = INDIO_DIRECT_MODE;
 	indio->channels = map->channels;
 	indio->num_channels = map->num_channels;
-	indio->available_scan_masks = usf_scan_masks;
+	indio->available_scan_masks = map->scan_masks;
 
 	ret = devm_iio_kfifo_buffer_setup(usf->dev, indio, &usf_buffer_ops);
 	if (ret)
@@ -591,17 +666,21 @@ static int usf_register_sensor(struct usf_iio *usf, u32 handle,
 	if (ret)
 		return ret;
 
-	usf->sensor_indio = indio;
+	usf->sensors[usf->nsensors++] = s;
 	dev_info(usf->dev, "registered %s for USF '%s' (handle 0x%x)\n",
 		 map->iio_name, name, handle);
 	return 0;
 }
 
-/* Enumerate the AoC sensors and register the one selected by the sensor param. */
+/*
+ * Enumerate the AoC sensors and register an IIO device for each supported one
+ * (optionally filtered by the sensor= module param).
+ */
 static void usf_enumerate(struct usf_iio *usf)
 {
 	u32 handles[USF_LIST_MAX];
 	char name[USF_NAME_MAX];
+	bool filtered = sensor && sensor[0];
 	int count, i, m;
 
 	count = usf_sensor_list(usf, handles, USF_LIST_MAX);
@@ -616,8 +695,8 @@ static void usf_enumerate(struct usf_iio *usf)
 			continue;
 		dev_info(usf->dev, "  handle 0x%02x : %s\n", handles[i], name);
 
-		if (usf->sensor_indio || !usf_name_has(name, sensor))
-			continue;	/* P2a: register the first chosen match */
+		if (filtered && !usf_name_has(name, sensor))
+			continue;
 		for (m = 0; m < (int)ARRAY_SIZE(usf_type_maps); m++) {
 			if (usf_name_has(name, usf_type_maps[m].match)) {
 				usf_register_sensor(usf, handles[i], name,
@@ -626,9 +705,9 @@ static void usf_enumerate(struct usf_iio *usf)
 			}
 		}
 	}
-	if (!usf->sensor_indio)
-		dev_warn(usf->dev, "no registerable sensor matching '%s'\n",
-			 sensor);
+	if (!usf->nsensors)
+		dev_warn(usf->dev, "no registerable sensors%s%s\n",
+			 filtered ? " matching " : "", filtered ? sensor : "");
 }
 
 static int usf_open_channels(struct usf_iio *usf)

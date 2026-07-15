@@ -28,6 +28,7 @@ enum usf_msg_id {
 	USF_MSG_GET_SENSOR_INFO = 4,
 	USF_MSG_GET_SENSOR_LIST = 5,
 	USF_MSG_CREATE_SAMPLING = 8,
+	USF_MSG_STOP_SAMPLING   = 9,
 	USF_MSG_RECONFIG        = 10,
 	USF_MSG_REGISTRY_GET    = 21,
 };
@@ -77,6 +78,8 @@ int usf_build_create_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 int usf_build_reconfig(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 		       u32 sampling_id, s64 period_ns, s64 max_latency_ns,
 		       bool enable, const u8 **out, size_t *out_len);
+int usf_build_stop_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
+			    u32 sampling_id, const u8 **out, size_t *out_len);
 
 /* Envelope/response readers (schemaless, field-id based). */
 

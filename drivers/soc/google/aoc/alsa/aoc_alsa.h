@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/wait.h>
 #include <linux/usb.h>
+#include <linux/uio.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -33,8 +34,15 @@
 
 #include "../aoc-interface.h"
 #include "google-aoc-enum.h"
-#include "usbaudio.h"
-#include "audiometrics.h"
+
+/*
+ * Downstream includes the ALSA USB-audio driver's private header
+ * (sound/usb/usbaudio.h, via -I, for struct snd_usb_audio used by the
+ * USB-offload glue) and the vendor audiometrics module's audiometrics.h.
+ * Neither user is built in this tree; the offload declarations below only
+ * need the type name.
+ */
+struct snd_usb_audio;
 
 #define AOC_SND_CARD "aoc-snd-card"
 #define ALSA_AOC_CMD "alsa-aoc"
@@ -530,9 +538,9 @@ int aoc_set_usb_mem_config(struct aoc_chip *achip);
 
 int aoc_multichannel_processor_switch_set(struct aoc_chip *achip, int value);
 
-int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, void *src,
+int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, struct iov_iter *src,
 		    uint32_t count);
-int aoc_audio_read(struct aoc_alsa_stream *alsa_stream, void *dest,
+int aoc_audio_read(struct aoc_alsa_stream *alsa_stream, struct iov_iter *dest,
 		   uint32_t count);
 int aoc_audio_volume_set(struct aoc_chip *chip, uint32_t volume,
 			 int src, int dst);

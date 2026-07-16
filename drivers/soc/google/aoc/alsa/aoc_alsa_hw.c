@@ -9,7 +9,14 @@
  * published by the Free Software Foundation.
  */
 
+/*
+ * The voice-call notifier comes from the downstream Samsung modem stack;
+ * the call sites below are already CONFIG_EXYNOS_MODEM_IF-guarded and our
+ * modem port does not provide it.
+ */
+#if IS_ENABLED(CONFIG_EXYNOS_MODEM_IF)
 #include <soc/google/modem_notifier.h>
+#endif
 
 #include "aoc_alsa.h"
 #include "aoc_alsa_drv.h"
@@ -776,7 +783,8 @@ int aoc_sidetone_eq_set(struct aoc_chip *chip, int biquad_idx, long *val)
 	cmd.stage_num = biquad_idx;
 	for (i = 0; i < n_params; i++) {
 		tmp = (uint32_t)val[i];
-		cmd.coeffs[i] = *(float *)(&tmp);
+		/* Raw IEEE754 bit pattern; memcpy avoids FP codegen. */
+		memcpy(&cmd.coeffs[i], &tmp, sizeof(tmp));
 	}
 	err = aoc_audio_control(CMD_OUTPUT_CHANNEL, (uint8_t *)&cmd, sizeof(cmd), (uint8_t *)&cmd,
 				chip);
@@ -2611,10 +2619,11 @@ int aoc_compr_offload_playback_rate_set(struct aoc_chip *chip, long *val)
 
 	AocCmdHdrSet(&(cmd.parent), CMD_AUDIO_OUTPUT_DECODER_CFG_SPEED_ID, sizeof(cmd));
 
+	/* Raw IEEE754 bit patterns; memcpy avoids FP codegen. */
 	tmp = (uint32_t)val[0];
-	cmd.speed = *(float *)(&tmp);
+	memcpy(&cmd.speed, &tmp, sizeof(tmp));
 	tmp = (uint32_t)val[1];
-	cmd.pitch = *(float *)(&tmp);
+	memcpy(&cmd.pitch, &tmp, sizeof(tmp));
 	cmd.stretch_mode = (int32_t)val[2];
 	cmd.fallback_mode = (int32_t)val[3];
 
@@ -3039,7 +3048,7 @@ int aoc_audio_voip_stop(struct aoc_alsa_stream *alsa_stream)
 /* TODO: this function is modified to deal with the issue where ALSA appl_ptr
  * and the reader pointer in AoC ringer buffer are out-of-sync due to overflow
  */
-int aoc_audio_read(struct aoc_alsa_stream *alsa_stream, void *dest,
+int aoc_audio_read(struct aoc_alsa_stream *alsa_stream, struct iov_iter *dest,
 		   uint32_t count)
 {
 	int err = 0;
@@ -3074,9 +3083,8 @@ int aoc_audio_read(struct aoc_alsa_stream *alsa_stream, void *dest,
 	if (!aoc_online_state(dev))
 		memset(tmp, 0, count);
 
-	err = copy_to_user(dest, tmp, count);
-	if (err != 0) {
-		pr_err("ERR: %d bytes not copied to user space\n", err);
+	if (copy_to_iter(tmp, count, dest) != count) {
+		pr_err("ERR: bytes not copied to user space\n");
 		err = -EFAULT;
 	}
 
@@ -3084,7 +3092,7 @@ out:
 	return err < 0 ? err : 0;
 }
 
-int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, void *src,
+int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, struct iov_iter *src,
 		    uint32_t count)
 {
 	int err = 0;
@@ -3116,9 +3124,8 @@ int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, void *src,
 		if (alsa_stream->cstream)
 			pr_debug("compr offload, count: %d, blocksize: %d\n", count, block_size);
 
-		err = copy_from_user(tmp, src, block_size);
-		if (err != 0) {
-			pr_err("ERR: %d bytes not read from user space\n", err);
+		if (copy_from_iter(tmp, block_size, src) != block_size) {
+			pr_err("ERR: bytes not read from user space\n");
 			err = -EFAULT;
 			goto out;
 		}
@@ -3130,7 +3137,6 @@ int aoc_audio_write(struct aoc_alsa_stream *alsa_stream, void *src,
 		}
 
 		count -= block_size;
-		src += block_size;
 	}
 
 out:

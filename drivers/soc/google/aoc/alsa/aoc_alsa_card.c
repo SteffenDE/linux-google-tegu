@@ -1469,9 +1469,10 @@ static int aoc_of_parse_hac_amp(struct device_node *node,
 {
 	pdata->g_chip.hac_amp_en_gpio = devm_gpiod_get_optional(card->dev,
 			"hac_amp_en", GPIOD_OUT_LOW);
-	if (!IS_ERR(pdata->g_chip.hac_amp_en_gpio)) {
+	if (IS_ERR(pdata->g_chip.hac_amp_en_gpio))
+		return PTR_ERR(pdata->g_chip.hac_amp_en_gpio);
+	if (pdata->g_chip.hac_amp_en_gpio)
 		pr_info("platform has hac amp\n");
-	}
 	return 0;
 }
 

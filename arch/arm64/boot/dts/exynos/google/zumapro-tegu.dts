@@ -957,6 +957,168 @@
 };
 
 /*
+ * AoC sound card.  The AoC firmware is the audio DSP/router: frontends are
+ * AoC ring-buffer services (audio_playbackN), the backend is the AoC TDM0
+ * interface feeding the two TAS2572 dies.  Structure and IDs follow the
+ * dumped downstream card (research/dumped.dts sound-aoc node); the id
+ * property is the AoC entrypoint/backend ID consumed by google-aoc-path.
+ *
+ * The dai_link order is load-bearing: PCM device numbers follow link
+ * order, and the driver's device-number -> stream-type/entrypoint tables
+ * assume the downstream numbering (device 0 = EP1 = the mmap stream,
+ * device 1 = EP2 = stock primary, device 5 = EP6 = deep buffer).  Only
+ * the six playback frontends are wired for now; capture/haptics/voice
+ * links come with their sub-driver bring-up and must keep this order.
+ */
+/ {
+	aoc_pcm: aoc-pcm {
+		compatible = "google-aoc-snd-pcm";
+	};
+
+	aoc_path: aoc-path {
+		compatible = "google-aoc-path";
+		#sound-dai-cells = <1>;
+	};
+
+	sound-aoc {
+		compatible = "google-aoc-snd-card";
+		aoc-card-name = "google,aoc-snd-card";
+
+		dai_link {
+			fe_ep1_rx {
+				dai-name = "audio_playback0";
+				stream-name = "EP1 playback";
+				id = <0x00>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x00>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep2_rx {
+				dai-name = "audio_playback1";
+				stream-name = "EP2 playback";
+				id = <0x01>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x01>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep3_rx {
+				dai-name = "audio_playback2";
+				stream-name = "EP3 playback";
+				id = <0x02>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x02>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep4_rx {
+				dai-name = "audio_playback3";
+				stream-name = "EP4 playback";
+				id = <0x03>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x03>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep5_rx {
+				dai-name = "audio_playback4";
+				stream-name = "EP5 playback";
+				id = <0x04>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x04>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep6_rx {
+				dai-name = "audio_playback5";
+				stream-name = "EP6 playback";
+				id = <0x05>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x05>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			be_tdm0_rx {
+				dai-name = "TDM_0_RX Playback";
+				stream-name = "TDM_0_RX Playback";
+				id = <0x80000006>;
+				playback;
+				no-pcm;
+				useops;
+				usefixup;
+
+				cpu {
+					sound-dai = <&aoc_path 0x80000006>;
+				};
+
+				daifmt {
+					dai-format = "dsp_a";
+				};
+
+				codec {
+					sound-dai = <&speaker_amp_l>, <&speaker_amp_r>;
+				};
+			};
+		};
+	};
+};
+
+/*
  * PCIe GEN3A_1 root complex for the on-board Broadcom BCM4383 WiFi.
  *
  * Pin wiring is from research/dumped.dts:4714-4750: PERST# on gph3-0

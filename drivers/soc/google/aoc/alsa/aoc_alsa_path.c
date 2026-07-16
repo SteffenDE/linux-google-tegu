@@ -12,7 +12,6 @@
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
 #include <sound/soc.h>
@@ -182,7 +181,12 @@ static struct snd_soc_dai_driver aoc_dai_drv[] = {
 			.channels_min = 1,
 			.channels_max = 2,
 		},
-		.compress_new = aoc_compress_new,
+		/*
+		 * Downstream sets .compress_new = aoc_compress_new here for
+		 * the EP7 compress-offload frontend; compress support is not
+		 * built in this tree (and mainline moved the hook into
+		 * snd_soc_dai_ops).  Restore it with the compress port.
+		 */
 		.name = "EP7 PB",
 		.id = IDX_EP7_RX,
 	},
@@ -910,15 +914,6 @@ static struct snd_soc_dai_driver aoc_dai_drv[] = {
 
 };
 
-static int aoc_compress_new(struct snd_soc_pcm_runtime *rtd, int num)
-{
-	int ret = snd_soc_new_compress(rtd, num);
-	if (ret >= 0) {
-		rtd->pcm->nonatomic = true;
-	}
-	return ret;
-}
-
 static int be_startup(struct snd_pcm_substream *stream, struct snd_soc_dai *dai)
 {
 	pr_debug("%s: dai %s id 0x%x", __func__, dai->name, dai->id);
@@ -1224,7 +1219,7 @@ static int aoc_path_put(uint32_t ep_id, uint32_t hw_id,
 			struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_dapm_widget *widget =
-		snd_soc_dapm_kcontrol_widget(kcontrol);
+		snd_soc_dapm_kcontrol_to_widget(kcontrol);
 	struct snd_soc_component *component =
 		snd_soc_dapm_to_component(widget->dapm);
 	struct aoc_chip *chip =
@@ -2398,7 +2393,7 @@ static int aoc_of_xlate_dai_name(struct snd_soc_component *component,
 
 static int aoc_cmp_probe(struct snd_soc_component *comp)
 {
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(comp);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(comp);
 	int ret;
 
 	ret = snd_soc_dapm_new_controls(dapm, aoc_widget,

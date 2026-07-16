@@ -221,6 +221,16 @@
 /* USB32DRD link Q-channel gate. */
 #define CLK_GOUT_HSI0_USB32DRD_LINK		10
 
+/*
+ * CMU_HSI0 USI4 clocks (speaker amp I2C, hsi2c_19).  Same chain shape as
+ * USI2: PERI USER mux -> USI4 mux -> USI4 div -> ipclk gate, pclk on the
+ * NOC user mux.
+ */
+#define CLK_MOUT_HSI0_USI4			11
+#define CLK_DOUT_HSI0_USI4			12
+#define CLK_GOUT_HSI0_USI4_USI_CLK		13
+#define CLK_GOUT_HSI0_USI4_USI_PCLK		14
+
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1
 #define CLK_MOUT_DPUB_NOC_USER			2

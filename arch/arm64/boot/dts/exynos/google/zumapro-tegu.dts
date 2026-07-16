@@ -965,10 +965,14 @@
  *
  * The dai_link order is load-bearing: PCM device numbers follow link
  * order, and the driver's device-number -> stream-type/entrypoint tables
- * assume the downstream numbering (device 0 = EP1 = the mmap stream,
- * device 1 = EP2 = stock primary, device 5 = EP6 = deep buffer).  Only
- * the six playback frontends are wired for now; capture/haptics/voice
- * links come with their sub-driver bring-up and must keep this order.
+ * (aoc_audio_stream_type[], aoc_alsa_hw.c) assume the downstream numbering
+ * (device 0 = EP1 = the mmap stream, device 1 = EP2 = stock primary,
+ * device 5 = EP6 = deep buffer, device 8 = the first capture frontend).
+ * Capture therefore has to sit at device 8, so the compress (device 6) and
+ * haptics (device 7) frontends occupy their slots first even though their
+ * backends (compress sub-driver / cs40l26) are not brought up yet; opening
+ * those two PCMs fails cleanly until then.  The backends come last.  Extend
+ * this list, never reorder it.
  */
 / {
 	aoc_pcm: aoc-pcm {
@@ -1093,6 +1097,68 @@
 				};
 			};
 
+			/*
+			 * Device 6/7 slot-holders: they claim the compress and
+			 * haptics device numbers so the capture frontend lands
+			 * on device 8.  Their backends are not wired yet, so the
+			 * PCMs exist but fail to start until compress/cs40l26
+			 * bring-up.
+			 */
+			fe_ep7_rx {
+				dai-name = "audio_playback6";
+				stream-name = "EP7 playback";
+				id = <0x06>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x06>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep8_rx {
+				dai-name = "audio_haptics";
+				stream-name = "EP8 playback";
+				id = <0x07>;
+				dynamic;
+				playback;
+
+				cpu {
+					sound-dai = <&aoc_path 0x07>;
+				};
+
+				platform {
+					rx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			/* Device 8: first capture frontend (audio-record). */
+			fe_ep1_tx {
+				dai-name = "audio_capture0";
+				stream-name = "EP1 capture";
+				id = <0x40000000>;
+				dynamic;
+				capture;
+
+				cpu {
+					sound-dai = <&aoc_path 0x40000000>;
+				};
+
+				platform {
+					tx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
 			be_tdm0_rx {
 				dai-name = "TDM_0_RX Playback";
 				stream-name = "TDM_0_RX Playback";
@@ -1112,6 +1178,27 @@
 
 				codec {
 					sound-dai = <&speaker_amp_l>, <&speaker_amp_r>;
+				};
+			};
+
+			/*
+			 * Capture backend.  The built-in mics are DMICs owned by
+			 * the AoC, so there is no AP-side codec: the link takes
+			 * the dummy codec and the AoC sources the samples.  The
+			 * capture frontend routes here via the "INTERNAL_MIC_TX"
+			 * mixer switch on the EP1_TX path.
+			 */
+			be_internal_mic_tx {
+				dai-name = "INTERNAL_MIC_TX Capture";
+				stream-name = "INTERNAL_MIC_TX Capture";
+				id = <0xc000000a>;
+				capture;
+				no-pcm;
+				useops;
+				usefixup;
+
+				cpu {
+					sound-dai = <&aoc_path 0xc000000a>;
 				};
 			};
 		};

@@ -37,8 +37,6 @@ struct be_path_cache port_array[PORT_MAX] = {
 static const struct snd_soc_dai_ops be_dai_ops;
 static struct mutex path_mutex;
 
-static int aoc_compress_new(struct snd_soc_pcm_runtime *rtd, int num);
-
 static const uint32_t rx_ep_list[] = {
 	IDX_EP2_RX,           /* low-latency-playback */
 	IDX_EP3_RX,           /* haptic-audio */

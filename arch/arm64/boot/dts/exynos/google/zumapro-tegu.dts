@@ -791,6 +791,13 @@
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
+
+	/* Left speaker amp reset (downstream tas2572_1_rst). */
+	spk_amp_l_rst: spk-amp-l-rst-pins {
+		samsung,pins = "gpp6-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
 };
 
 /*
@@ -818,6 +825,24 @@
 		samsung,pins = "gpa6-2";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	/* Right speaker amp IRQ, XEINT_16 (downstream tas2572_2_irq). */
+	spk_amp_r_irq: spk-amp-r-irq-pins {
+		samsung,pins = "gpa7-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+/* Left speaker amp IRQ, XEINT_5 (downstream tas2572_1_irq). */
+&pinctrl_far_alive {
+	spk_amp_l_irq: spk-amp-l-irq-pins {
+		samsung,pins = "gpa5-5";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
 };
@@ -888,6 +913,48 @@
 	};
 };
 
+&usi4_hsi0 {
+	status = "okay";
+};
+
+/*
+ * Speaker amplifiers: two TI TAS2572 dies, one per speaker.  Downstream
+ * models them as a single ti,tas25xx node fronting both I2C addresses
+ * (research/dumped.dts:6833, zumapro-tegu-audio-common-tas2572.dtsi); the
+ * mainline tas2781 driver supports the TAS2572 in register mode with no
+ * DSP firmware, but takes one reset/IRQ line per node, so each die gets
+ * its own node.  Reset and IRQ GPIOs are from the dumped ti,reset-gpio(2)/
+ * ti,irq-gpio(2) properties.  The amps are wired to the AoC TDM0 backend;
+ * they only make sound once the AoC sound card exists, but they probe and
+ * expose regmap/controls standalone.
+ */
+&hsi2c_19 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	speaker_amp_l: amplifier@48 {
+		compatible = "ti,tas2572";
+		reg = <0x48>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&gpp6 3 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&gpa5 5 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spk_amp_l_irq &spk_amp_l_rst>;
+		sound-name-prefix = "L";
+	};
+
+	speaker_amp_r: amplifier@49 {
+		compatible = "ti,tas2572";
+		reg = <0x49>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&gph2 1 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&gpa7 2 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spk_amp_r_irq &spk_amp_r_rst>;
+		sound-name-prefix = "R";
+	};
+};
+
 /*
  * PCIe GEN3A_1 root complex for the on-board Broadcom BCM4383 WiFi.
  *
@@ -945,6 +1012,13 @@
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	/* Right speaker amp reset (downstream tas2572_2_rst). */
+	spk_amp_r_rst: spk-amp-r-rst-pins {
+		samsung,pins = "gph2-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 	};
 };
 

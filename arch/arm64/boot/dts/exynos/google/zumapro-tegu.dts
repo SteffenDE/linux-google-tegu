@@ -770,8 +770,9 @@
  * 1.8 V, L25M_TSP_DVDD) and m_ldo4 (avdd, 3.3 V, L4M_TS_AVDD).
  *
  * The SPI bus pins keep their bootloader mux: downstream ships an empty
- * pinctrl-0 on this bus, and pinctrl_hsi0 stays disabled here so nothing
- * disturbs them (same adoption approach as the display pipeline).
+ * pinctrl-0 on this bus, so nothing disturbs them (same adoption approach
+ * as the display pipeline).  pinctrl_hsi0 is enabled further down for the
+ * modem PCIe and speaker-amp pins, but no node touches the SPI bus mux.
  *
  * HW boot 2026-06-12 confirmed the rails are off after ABL (probe ran,
  * SPI transferred, IDENTIFY read all-zero), so they are wired to the

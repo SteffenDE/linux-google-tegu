@@ -2045,6 +2045,41 @@
 		};
 
 		/*
+		 * USI4_HSI0 in I2C mode: the speaker amplifiers (hsi2c_19 on
+		 * Tegu).  Address/IRQ/sysreg offset from downstream
+		 * zumapro-usi.dtsi and research/dumped.dts (hsi2c@111F0000,
+		 * GIC SPI 0x19a, usi-offset 0x1024).  Like the working spi_20
+		 * (USI2_HSI0), no bus pinctrl: the dumped node carries none and
+		 * the bootloader leaves the pins muxed.
+		 */
+		usi4_hsi0: usi@111f00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x111f00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_PCLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_CLK>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_hsi0 0x1024>;
+			samsung,mode = <USI_MODE_I2C>;
+			status = "disabled";
+
+			hsi2c_19: i2c@111f0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x111f0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_CLK>,
+					 <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 410 IRQ_TYPE_LEVEL_HIGH 0>;
+				status = "disabled";
+			};
+		};
+
+		/*
 		 * Source: pinctrl controller addresses/IRQs are from:
 		 *  - peric0: research/dumped.dts:3393-3397
 		 *  - peric1: research/dumped.dts:4139-4143

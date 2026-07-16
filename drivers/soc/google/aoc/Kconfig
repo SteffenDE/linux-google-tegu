@@ -41,3 +41,11 @@ config AOC_TBN_DRIVER
 	default Y if AOC_DRIVER
 	help
 		Say yes here to add TBN service for the AoC
+
+config AOC_ALSA
+	tristate "WhiteChapel AoC ALSA support"
+	depends on AOC_DRIVER && SND_SOC
+	help
+		Say yes here to build the ASoC drivers for the AoC audio DSP:
+		the google-aoc-path CPU DAI component, the AoC PCM platform
+		driver, and the google-aoc-snd-card machine driver.

@@ -82,36 +82,20 @@ static bool drv_registered = false;
 static bool aoc_audio_online = false;
 static wait_queue_head_t aoc_audio_state_wait_head;
 
-static void compressed_offload_isr(struct aoc_service_dev *dev)
-{
-	aoc_compr_offload_isr(dev);
-}
-
 static void pcm_isr(struct aoc_service_dev *dev)
 {
 	aoc_pcm_isr(dev);
 }
 
-static void voip_isr(struct aoc_service_dev *dev)
-{
-	aoc_voip_isr(dev);
-}
-
-static void incall_hifi_isr(struct aoc_service_dev *dev)
-{
-	aoc_incall_hifi_isr(dev);
-}
-
+/*
+ * Downstream also wires per-service ISRs for the incall/hifi (mbox 5/21),
+ * voip (22) and compress-offload services; those sub-drivers are not built
+ * in this tree, so their services fall back to the hrtimer poll path.
+ */
 static void audio_set_isr(struct aoc_service_dev *dev)
 {
 	if (dev->mbox_index == PCM_CHANNEL) {
 		dev->handler = pcm_isr;
-		pr_notice("%s supports interrupt-driven\n", dev_name(&dev->dev));
-	} else if (dev->mbox_index == INCALL_CHANNEL || dev->mbox_index == HIFI_CHANNEL) {
-		dev->handler = incall_hifi_isr;
-		pr_notice("%s supports interrupt-driven\n", dev_name(&dev->dev));
-	} else if (dev->mbox_index == VOIP_CHANNEL) {
-		dev->handler = voip_isr;
 		pr_notice("%s supports interrupt-driven\n", dev_name(&dev->dev));
 	}
 }
@@ -300,51 +284,14 @@ static int snd_aoc_alsa_probe(void)
 		goto out;
 	}
 
-	err = aoc_voice_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc voice\n");
-		goto out;
-	}
-
-	err = aoc_compr_init();
-	if (err) {
-		pr_err("ERR:%d failed to init aoc compress offload\n", err);
-		goto out;
-	}
-
+	/*
+	 * Downstream also inits voice, compress, nohost, incall, voip, usb
+	 * and dp platform drivers here; those sub-drivers are not built in
+	 * this tree yet (speaker/mic PCM only).
+	 */
 	err = aoc_path_init();
 	if (err) {
 		pr_err("ERR: fail to init aoc path\n");
-		goto out;
-	}
-
-	err = aoc_nohost_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc nohost driver\n");
-		goto out;
-	}
-
-	err = aoc_incall_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc incall driver\n");
-		goto out;
-	}
-
-	err = aoc_voip_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc voip driver\n");
-		goto out;
-	}
-
-	err = aoc_usb_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc usb driver\n");
-		goto out;
-	}
-
-	err = aoc_dp_init();
-	if (err) {
-		pr_err("ERR: fail to init aoc dp driver\n");
 		goto out;
 	}
 
@@ -356,13 +303,7 @@ out:
 
 static int snd_aoc_alsa_remove(void)
 {
-	aoc_dp_exit();
-	aoc_voip_exit();
-	aoc_incall_exit();
-	aoc_nohost_exit();
 	aoc_path_exit();
-	aoc_compr_exit();
-	aoc_voice_exit();
 	aoc_pcm_exit();
 
 	return 0;
@@ -416,8 +357,11 @@ static int aoc_alsa_probe(struct aoc_service_dev *adev)
 		dev_notice(dev, "alsa-aoc communication is ready!\n");
 	}
 
-	if (strcmp(dev_name(dev), AOC_COMPR_OFFLOAD_SERVICE) == 0)
-		adev->handler = compressed_offload_isr;
+	/*
+	 * Downstream wires compressed_offload_isr for the compress-offload
+	 * service (audio_playback6) here; the compress sub-driver is not
+	 * built in this tree.
+	 */
 
 	return 0;
 }

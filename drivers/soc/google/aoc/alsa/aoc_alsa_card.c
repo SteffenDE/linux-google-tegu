@@ -350,7 +350,7 @@ static int hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 		hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
 	struct snd_interval *channels =
 		hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
-	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct aoc_chip *chip =
 		(struct aoc_chip *)snd_soc_card_get_drvdata(rtd->card);
 	struct snd_card_pdata *pdata =
@@ -505,7 +505,7 @@ static int i2s_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_dai *codec_dai;
-	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 
 	u32 rate, bclk, channel;
 	int i, bit_width, ret;
@@ -554,7 +554,7 @@ static int tdm_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_hw_params *param)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_soc_dai *codec_dai;
 	struct snd_soc_dai_link *dai_link = rtd->dai_link;
 	u32 rate, bclk, channel, tdmslot;
@@ -1108,7 +1108,7 @@ static int of_parse_dai_cpu(struct device *dev,
 	dai->num_cpus = 1;
 	component->of_node = of_node;
 
-	ret = snd_soc_of_get_dai_name(of_cpu_root, &component->dai_name);
+	ret = snd_soc_of_get_dai_name(of_cpu_root, &component->dai_name, 0);
 	if (ret) {
 		if (ret == -EPROBE_DEFER) {
 			pr_info("%s: wait cpu_dai for %s", __func__, dai->name);
@@ -1192,9 +1192,15 @@ static int of_parse_one_dai(struct device_node *node, struct device *dev,
 			dai->trigger[1] = SND_SOC_DPCM_TRIGGER_POST;
 			break;
 		case 2:
-			dai->trigger[0] = SND_SOC_DPCM_TRIGGER_BESPOKE;
-			dai->trigger[1] = SND_SOC_DPCM_TRIGGER_BESPOKE;
-			break;
+			/*
+			 * Downstream maps 2 to SND_SOC_DPCM_TRIGGER_BESPOKE,
+			 * which mainline removed.  No tegu dai_link uses it;
+			 * reject it loudly rather than guess an ordering.
+			 */
+			pr_err("%s: trigger mode 2 (BESPOKE) not supported for %s",
+			       __func__, dai->name);
+			ret = -EINVAL;
+			goto exit;
 		default:
 			dai->trigger[0] = SND_SOC_DPCM_TRIGGER_PRE;
 			dai->trigger[1] = SND_SOC_DPCM_TRIGGER_PRE;
@@ -1236,8 +1242,18 @@ static int of_parse_one_dai(struct device_node *node, struct device *dev,
 			dai->name);
 	}
 
-	dai->dpcm_playback = of_property_read_bool(node, "playback");
-	dai->dpcm_capture = of_property_read_bool(node, "capture");
+	/*
+	 * Mainline dropped dpcm_playback/dpcm_capture (direction comes from
+	 * the DAI capabilities); single-direction links are expressed via
+	 * playback_only/capture_only instead.
+	 */
+	{
+		bool playback = of_property_read_bool(node, "playback");
+		bool capture = of_property_read_bool(node, "capture");
+
+		dai->playback_only = playback && !capture;
+		dai->capture_only = capture && !playback;
+	}
 	dai->no_pcm = of_property_read_bool(node, "no-pcm");
 	dai->dynamic = of_property_read_bool(node, "dynamic");
 	dai->ignore_pmdown_time =
@@ -1771,7 +1787,7 @@ static void init_backend_control(struct snd_soc_pcm_runtime *rtd, u32 id)
 	    !be_res_map[idx].controls)
 		return;
 
-	cpu_dai = asoc_rtd_to_cpu(rtd, 0);
+	cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	snd_soc_add_dai_controls(cpu_dai,
 		 be_res_map[idx].controls, be_res_map[idx].num_controls);
 }
@@ -1970,7 +1986,7 @@ err:
 	return ret;
 }
 
-static int aoc_snd_card_remove(struct platform_device *pdev)
+static void aoc_snd_card_remove(struct platform_device *pdev)
 {
 	struct snd_soc_card *card = platform_get_drvdata(pdev);
 
@@ -1978,8 +1994,6 @@ static int aoc_snd_card_remove(struct platform_device *pdev)
 		snd_soc_unregister_card(card);
 		snd_soc_card_set_drvdata(card, NULL);
 	}
-
-	return 0;
 }
 
 static const struct of_device_id aoc_snd_of_match[] = {

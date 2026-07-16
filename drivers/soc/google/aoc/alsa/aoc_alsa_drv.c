@@ -30,7 +30,15 @@ struct aoc_service_resource {
 	void *prvdata;
 };
 
-/* TODO: audio_haptics should be added, capture1-3 needs to be determined */
+/*
+ * aoc_audio_online only flips true once EVERY service named here has
+ * probed, so each entry is a hard boot-time dependency on the firmware
+ * service directory.  Downstream lists ~34 services (plus SoC-#if'd
+ * extras); this tree only builds the PCM/path/control sub-drivers, so
+ * list exactly the services that code can address — all verified present
+ * on tegu firmware 15231849 (research/audio.md, on-device capture).
+ * Grow the list together with the voip/incall/compress/etc. bring-up.
+ */
 static const char *const audio_service_names[] = {
 	"audio_output_control",
 	"audio_input_control",
@@ -47,29 +55,6 @@ static const char *const audio_service_names[] = {
 	"audio_capture2",
 	"audio_capture3",
 	"ultrasonic_capture",
-	"audio_voip_rx",
-	"audio_voip_tx",
-	"audio_incall_pb_0",
-	"audio_incall_pb_1",
-	"audio_incall_pb_2",
-	"audio_incall_cap_0",
-	"audio_incall_cap_1",
-	"audio_incall_cap_2",
-	"decoder_eof",
-	"audio_raw",
-	"audio_hifiin",
-	"audio_hifiout",
-	"audio_android_aec",
-	"audio_ultrasonic",
-	"audio_immersive",
-	"audio_capture_inject",
-#if IS_ENABLED(CONFIG_SOC_GS201) || IS_ENABLED(CONFIG_SOC_ZUMA)
-	"audio_hotword_tap",
-#endif
-#if IS_ENABLED(CONFIG_SOC_ZUMA)
-	"audio_displayport",
-	"audio_incall_cap_3",
-#endif
 	NULL,
 };
 

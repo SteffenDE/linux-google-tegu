@@ -40,6 +40,15 @@ __poll_t aoc_audio_state_poll(struct file *f, poll_table *wait,
 
 bool aoc_audio_current_state(void);
 
+/*
+ * Speaker-protection interlock. The speaker backend refuses to start until
+ * userspace has loaded the AoC excursion/thermal limiter and armed this flag;
+ * it is cleared whenever the AoC goes down so protection must be re-armed
+ * before playback can resume. Paired with the AoC online state above.
+ */
+bool aoc_speaker_protection_is_armed(void);
+void aoc_speaker_protection_set_armed(bool armed);
+
 struct aoc_state_client_t *alloc_audio_state_client(void);
 void free_audio_state_client(struct aoc_state_client_t *client);
 void audio_free_isr(struct aoc_service_dev *dev);

@@ -389,6 +389,19 @@ static int i2s_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_dai_link *dai_link = rtd->dai_link;
 
+	/*
+	 * Speaker-protection interlock. The TAS speaker amps hang off TDM_0_RX and
+	 * rely on the AoC excursion/thermal limiter, which mainline must load from
+	 * userspace. Until it has been loaded and this backend armed, refuse to
+	 * start it so no audio can reach the speakers unprotected.
+	 */
+	if (dai_link->id == TDM_0_RX && !aoc_speaker_protection_is_armed()) {
+		dev_warn(rtd->card->dev,
+			 "%s: speaker protection not armed, blocking %s\n",
+			 __func__, dai_link->name);
+		return -EPERM;
+	}
+
 	pr_debug("%s: %s dai_fmt = 0x%x\n", __func__,
 			dai_link->name, dai_link->dai_fmt);
 

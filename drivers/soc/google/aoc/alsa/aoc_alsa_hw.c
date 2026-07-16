@@ -289,15 +289,19 @@ static int aoc_audio_control(const char *cmd_channel, const uint8_t *cmd,
 
 	if (err < 1) {
 		uint16_t cmd_id = ((struct CMD_HDR *)cmd)->id;
-		char reset_reason[40];
 
-		scnprintf(reset_reason, sizeof(reset_reason), "ALSA command timeout %#06x",
-			cmd_id);
+		/*
+		 * Downstream calls aoc_trigger_watchdog() here, restarting
+		 * the whole AoC on any 500 ms command timeout.  The AoC also
+		 * carries the (working) sensor stack in this tree, so an
+		 * audio bring-up mistake must not take it down; fail the
+		 * command instead.  Revisit once the audio command set is
+		 * hardware-proven.
+		 */
 		pr_err(ALSA_AOC_CMD " ERR:timeout - cmd [%s] id %#06x\n",
 		       CMD_CHANNEL(dev), cmd_id);
 		print_hex_dump(KERN_ERR, ALSA_AOC_CMD " :mem ",
 			       DUMP_PREFIX_OFFSET, 16, 1, cmd, cmd_size, false);
-		aoc_trigger_watchdog(reset_reason);
 	} else if (err == 4) {
 		pr_err(ALSA_AOC_CMD " ERR:%#x - cmd [%s] id %#06x\n",
 		       *(uint32_t *)buffer, CMD_CHANNEL(dev),

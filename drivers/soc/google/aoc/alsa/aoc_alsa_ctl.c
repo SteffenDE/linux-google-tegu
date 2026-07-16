@@ -10,6 +10,7 @@
  */
 
 #include "aoc_alsa.h"
+#include "aoc_alsa_drv.h"
 
 /* Volume maximum and minimum */
 #define CTRL_VOL_MIN 0
@@ -2485,7 +2486,41 @@ static const char *ft_aec_ref_source_texts[NUM_AEC_REF_SOURCE] = { "Default", "S
 								   "BT" };
 static SOC_ENUM_SINGLE_DECL(ft_aec_ref_source_enum, 1, 0, ft_aec_ref_source_texts);
 
+/*
+ * Speaker-protection interlock. Userspace loads the AoC excursion/thermal
+ * limiter (blob + per-unit calibration) and then sets this to 1; the speaker
+ * backend refuses to start until it is armed (see i2s_startup). It is cleared
+ * automatically when the AoC goes down, so protection must be re-armed.
+ */
+static int aoc_spk_protection_armed_get(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = aoc_speaker_protection_is_armed();
+	return 0;
+}
+
+static int aoc_spk_protection_armed_put(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	bool armed = !!ucontrol->value.integer.value[0];
+
+	if (armed == aoc_speaker_protection_is_armed())
+		return 0;
+
+	aoc_speaker_protection_set_armed(armed);
+	return 1;
+}
+
 static struct snd_kcontrol_new snd_aoc_ctl[] = {
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Speaker Protection Armed",
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = snd_ctl_boolean_mono_info,
+		.get = aoc_spk_protection_armed_get,
+		.put = aoc_spk_protection_armed_put,
+		.count = 1,
+	},
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.name = "PCM Playback Volume",

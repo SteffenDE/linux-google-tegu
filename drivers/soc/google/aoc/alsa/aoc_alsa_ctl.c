@@ -920,81 +920,6 @@ static int audio_mmap_offload_ctl_set(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static int audio_offload_position_ctl_get(struct snd_kcontrol *kcontrol,
-					  struct snd_ctl_elem_value *ucontrol)
-{
-	struct aoc_chip *chip = snd_kcontrol_chip(kcontrol);
-	uint64_t current_position = 0;
-	int err = 0;
-
-	if (mutex_lock_interruptible(&chip->audio_mutex))
-		return -EINTR;
-
-	if (chip->compr_offload_stream != NULL) {
-		err = aoc_compr_get_position(chip->compr_offload_stream, &current_position);
-		if (err == 0)
-			memcpy(ucontrol->value.bytes.data, &current_position, sizeof(uint64_t));
-	}
-
-	mutex_unlock(&chip->audio_mutex);
-
-	return err;
-}
-
-static int audio_offload_position_ctl_set(struct snd_kcontrol *kcontrol,
-					       struct snd_ctl_elem_value *ucontrol)
-{
-	struct aoc_chip *chip = snd_kcontrol_chip(kcontrol);
-	int err = 0;
-
-	if (mutex_lock_interruptible(&chip->audio_mutex))
-		return -EINTR;
-
-	if (chip->compr_offload_stream != NULL)
-		err = aoc_compr_offload_reset_io_sample_base(chip->compr_offload_stream);
-
-	mutex_unlock(&chip->audio_mutex);
-	return err;
-}
-
-static int audio_offload_decoder_position_ctl_get(struct snd_kcontrol *kcontrol,
-					  struct snd_ctl_elem_value *ucontrol)
-{
-	struct aoc_chip *chip = snd_kcontrol_chip(kcontrol);
-	uint64_t current_decoder_position = 0;
-	int err = 0;
-
-	if (mutex_lock_interruptible(&chip->audio_mutex))
-		return -EINTR;
-
-	if (chip->compr_offload_stream != NULL) {
-		err = aoc_compr_get_decoder_position(
-			chip->compr_offload_stream, &current_decoder_position);
-		if (err == 0)
-			memcpy(ucontrol->value.bytes.data, &current_decoder_position, sizeof(uint64_t));
-	}
-
-	mutex_unlock(&chip->audio_mutex);
-
-	return err;
-}
-
-static int audio_offload_decoder_position_ctl_set(struct snd_kcontrol *kcontrol,
-					       struct snd_ctl_elem_value *ucontrol)
-{
-	struct aoc_chip *chip = snd_kcontrol_chip(kcontrol);
-	int err = 0;
-
-	if (mutex_lock_interruptible(&chip->audio_mutex))
-		return -EINTR;
-
-	if (chip->compr_offload_stream != NULL)
-		err = aoc_compr_offload_reset_decorder_base(chip->compr_offload_stream);
-
-	mutex_unlock(&chip->audio_mutex);
-	return err;
-}
-
 static int sidetone_enable_ctl_set(struct snd_kcontrol *kcontrol,
 				   struct snd_ctl_elem_value *ucontrol)
 {
@@ -2040,7 +1965,11 @@ static int usb_cfg_v2_ctl_set(struct snd_kcontrol *kcontrol, struct snd_ctl_elem
 		chip->usb_direction = val;
 		break;
 	case USB_MEM_CFG:
-		aoc_set_usb_mem_config(chip);
+		/*
+		 * Downstream calls aoc_set_usb_mem_config() (USB-offload
+		 * sub-driver, not built in this tree).
+		 */
+		err = -EOPNOTSUPP;
 		break;
 	default:
 		err = -EINVAL;
@@ -2916,29 +2845,11 @@ static struct snd_kcontrol_new snd_aoc_ctl[] = {
 
 	SOC_SINGLE_EXT("2.1 Enable", SND_SOC_NOPM, 0, 1, 0, two_one_enable_get, two_one_enable_set),
 
-	{
-		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-		.name = "Offload Position",
-		.index = 0,
-		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
-		.private_value = OFFLOAD_POSITION,
-		.info = snd_aoc_ctl_info,
-		.get = audio_offload_position_ctl_get,
-		.put = audio_offload_position_ctl_set,
-		.count = 1,
-	},
-
-	{
-		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-		.name = "Offload Decoder Position",
-		.index = 0,
-		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
-		.private_value = OFFLOAD_POSITION,
-		.info = snd_aoc_ctl_info,
-		.get = audio_offload_decoder_position_ctl_get,
-		.put = audio_offload_decoder_position_ctl_set,
-		.count = 1,
-	},
+	/*
+	 * Downstream adds "Offload Position" / "Offload Decoder Position"
+	 * controls here; they call into the compress sub-driver, which is
+	 * not built in this tree.
+	 */
 
 	SOC_SINGLE_EXT("Voice PCM Stream Wait Time in MSec", SND_SOC_NOPM, 0, 10000, 0,
 		voice_pcm_wait_time_get, voice_pcm_wait_time_set),
@@ -3041,7 +2952,11 @@ int snd_aoc_new_ctl(struct aoc_chip *chip)
 			return err;
 	}
 
-	pdm_callback_register(snd_aoc_pdm_state, NUM_OF_BUILTIN_MIC, chip);
+	/*
+	 * Downstream registers snd_aoc_pdm_state with the vendor audiometrics
+	 * module here (pdm_callback_register) so Android health stats can query
+	 * mic state; audiometrics is not built in this tree.
+	 */
 
 	return 0;
 }

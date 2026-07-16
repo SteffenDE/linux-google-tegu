@@ -65,6 +65,7 @@ static spinlock_t service_lock;
 static int8_t n_services = 0;
 static bool drv_registered = false;
 static bool aoc_audio_online = false;
+static bool speaker_protection_armed = false;
 static wait_queue_head_t aoc_audio_state_wait_head;
 
 static void pcm_isr(struct aoc_service_dev *dev)
@@ -236,6 +237,18 @@ bool aoc_audio_current_state(void)
 }
 EXPORT_SYMBOL_GPL(aoc_audio_current_state);
 
+bool aoc_speaker_protection_is_armed(void)
+{
+	return speaker_protection_armed;
+}
+EXPORT_SYMBOL_GPL(aoc_speaker_protection_is_armed);
+
+void aoc_speaker_protection_set_armed(bool armed)
+{
+	speaker_protection_armed = armed;
+}
+EXPORT_SYMBOL_GPL(aoc_speaker_protection_set_armed);
+
 struct aoc_state_client_t *alloc_audio_state_client(void)
 {
 	struct aoc_state_client_t *client;
@@ -373,6 +386,9 @@ static int aoc_alsa_remove(struct aoc_service_dev *adev)
 	if (aoc_audio_online) {
 		aoc_audio_online = false;
 		wake_up(&aoc_audio_state_wait_head);
+		/* AoC went down: any loaded speaker-protection state is gone, so
+		 * force userspace to re-arm before playback can resume. */
+		speaker_protection_armed = false;
 	}
 
 	if (service_lists[i].event_callback)

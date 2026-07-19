@@ -16,6 +16,7 @@
 #include <linux/kthread.h>
 #include <linux/io.h>
 #include <linux/random.h>
+#include <linux/pm_runtime.h>
 #include <linux/unaligned.h>
 
 #include <soc.h>
@@ -359,6 +360,20 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 #define BRCMF_PCIE_DS_EXIT_TIMEOUT		msecs_to_jiffies(5000)
 
+/* Idle time before runtime PM drops the device to D3 (matches bcmdhd). */
+#define BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS	1000
+
+/*
+ * Runtime PM is experimental: it only deep-sleeps (D3, link down) once the
+ * firmware has naturally reached in-band DEV_SLEEP, but resume-on-receive
+ * while associated is not yet hardware-validated.  Keep it off by default so
+ * it is inert unless explicitly enabled for testing.
+ */
+static bool brcmf_pcie_runtime_pm;
+module_param_named(pcie_runtime_pm, brcmf_pcie_runtime_pm, bool, 0644);
+MODULE_PARM_DESC(pcie_runtime_pm,
+		 "Enable PCIe runtime PM (D3 autosuspend when idle); experimental, default off");
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -453,6 +468,7 @@ struct brcmf_pciedev_info {
 	atomic_t ds_active_count;
 	bool ds_exit_completed;
 	bool skip_ds_ack;
+	bool runtime_pm_enabled;
 	bool irq_allocated;
 	bool irq_ready;
 	bool have_msi;
@@ -566,6 +582,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 			     struct brcmf_fw_request *fwreq);
 static struct brcmf_fw_request *
 brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo);
 static void
 brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *devinfo, bool active);
 static void brcmf_pcie_debugfs_create(struct device *dev);
@@ -3263,6 +3281,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	brcmf_pcie_runtime_pm_enable(devinfo);
 
 	return;
 
@@ -3635,6 +3654,7 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 		return;
 
 	devinfo = bus->bus_priv.pcie->devinfo;
+	brcmf_pcie_runtime_pm_disable(devinfo);
 	brcmf_pcie_bus_console_read(devinfo, false);
 	brcmf_pcie_fwcon_timer(devinfo, false);
 
@@ -3673,10 +3693,46 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 }
 
 
+/*
+ * Hand the device over to runtime PM once it is set up.  The PCI core already
+ * enables runtime PM for the device but keeps it forbidden (control=on) and
+ * holds one usage reference across probe; drop both here so the autosuspend
+ * timer can fire.  Deliberately no pm_runtime_enable() call -- doing so would
+ * unbalance the core's own enable.  Defined outside CONFIG_PM (pm_runtime_*
+ * stub out) because the call sites in setup/remove are unconditional.
+ */
+static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+
+	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
+		return;
+
+	pm_runtime_set_autosuspend_delay(dev,
+					 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(dev);
+	devinfo->runtime_pm_enabled = true;
+
+	pm_runtime_allow(dev);			/* balances pci_pm_init forbid */
+	pm_runtime_put_autosuspend(dev);	/* balances probe usage ref */
+}
+
+static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+
+	if (!devinfo->runtime_pm_enabled)
+		return;
+
+	pm_runtime_get_sync(dev);		/* restore probe ref, resume */
+	pm_runtime_forbid(dev);			/* control=on again */
+	pm_runtime_dont_use_autosuspend(dev);
+	devinfo->runtime_pm_enabled = false;
+}
+
 #ifdef CONFIG_PM
 
-
-static int brcmf_pcie_pm_enter_D3(struct device *dev)
+static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
@@ -3686,8 +3742,26 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
+	if (devinfo->state == BRCMFMAC_PCIE_STATE_DOWN)
+		return 0;
+
+	/*
+	 * Runtime suspend is fail-closed: only deep-sleep once the firmware has
+	 * itself gone idle into in-band DEV_SLEEP.  If it has not, refuse with
+	 * -EBUSY so the PM core retries later, instead of forcing the D3
+	 * handshake from an active state (which times out and can trap the fw).
+	 */
+	if (runtime && brcmf_pcie_inband_ds(devinfo) &&
+	    brcmf_pcie_get_inband_ds_state(devinfo) != BRCMF_PCIE_DS_DEV_SLEEP)
+		return -EBUSY;
+
 	brcmf_pcie_fwcon_timer(devinfo, false);
-	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	/*
+	 * System suspend tears the data path down; runtime suspend keeps it up
+	 * so a subsequent ring access resumes the device transparently.
+	 */
+	if (!runtime)
+		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	/*
 	 * With in-band DS the device may have micro-slept; wake it, release
@@ -3707,8 +3781,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 			   BRCMF_PCIE_MBDATA_TIMEOUT);
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
-		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		if (!runtime)
+			brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_pcie_set_skip_ds_ack(devinfo, false);
+		brcmf_pcie_fwcon_timer(devinfo, true);
 		return -EIO;
 	}
 
@@ -3718,7 +3794,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 }
 
 
-static int brcmf_pcie_pm_leave_D3(struct device *dev)
+static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
@@ -3755,6 +3831,18 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+
+	/*
+	 * System resume can tear the device down and re-probe here.  Runtime
+	 * resume must not: it runs inside this device's own PM callback, and
+	 * brcmf_pcie_remove() -> brcmf_pcie_runtime_pm_disable() ->
+	 * pm_runtime_get_sync() would wait for this in-flight resume to finish,
+	 * deadlocking on itself.  Fail the runtime resume instead and leave
+	 * recovery to a later system resume or reset.
+	 */
+	if (runtime)
+		return -EIO;
+
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;
@@ -3768,11 +3856,33 @@ cleanup:
 }
 
 
+static int brcmf_pcie_pm_suspend(struct device *dev)
+{
+	return brcmf_pcie_pm_enter_D3(dev, false);
+}
+
+static int brcmf_pcie_pm_resume(struct device *dev)
+{
+	return brcmf_pcie_pm_leave_D3(dev, false);
+}
+
+static int brcmf_pcie_pm_runtime_suspend(struct device *dev)
+{
+	return brcmf_pcie_pm_enter_D3(dev, true);
+}
+
+static int brcmf_pcie_pm_runtime_resume(struct device *dev)
+{
+	return brcmf_pcie_pm_leave_D3(dev, true);
+}
+
 static const struct dev_pm_ops brcmf_pciedrvr_pm = {
-	.suspend = brcmf_pcie_pm_enter_D3,
-	.resume = brcmf_pcie_pm_leave_D3,
-	.freeze = brcmf_pcie_pm_enter_D3,
-	.restore = brcmf_pcie_pm_leave_D3,
+	.suspend = brcmf_pcie_pm_suspend,
+	.resume = brcmf_pcie_pm_resume,
+	.freeze = brcmf_pcie_pm_suspend,
+	.restore = brcmf_pcie_pm_resume,
+	SET_RUNTIME_PM_OPS(brcmf_pcie_pm_runtime_suspend,
+			   brcmf_pcie_pm_runtime_resume, NULL)
 };
 
 

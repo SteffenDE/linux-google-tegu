@@ -72,6 +72,7 @@
 #include <linux/pcie-zumapro.h>
 #include <linux/platform_device.h>
 #include <linux/poll.h>
+#include <linux/rcupdate.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -534,6 +535,14 @@ struct s5300_modem {
 	/* Runtime SIT control channels on the legacy FMT queue (post-ONLINE). */
 	struct s5300_sit_port	sit[S5300_SIT_PORT_COUNT];
 	u8			*fmt_tx_buf;	/* header + one SIT app msg + pad */
+
+	/*
+	 * The userspace-facing ports (SIT + AT WWAN ports, data netdev) exist
+	 * only while the CP is ONLINE: ports_work converges them onto
+	 * sm->online so userspace never probes a port that cannot answer.
+	 */
+	struct work_struct	ports_work;
+	bool			ports_up;	/* ports registered (ports_work only) */
 
 	/*
 	 * OEM/GEMS channel (ch 0x82) on the FMT ring, exposed as /dev/umts_oem1.
@@ -1330,6 +1339,7 @@ static irqreturn_t s5300_cp_crash_irq(int irq, void *data)
 	 */
 	WRITE_ONCE(sm->online, false);
 	sm->cp_status = S5300_STATE_OFFLINE;
+	schedule_work(&sm->ports_work);
 	return IRQ_HANDLED;
 }
 
@@ -1347,16 +1357,19 @@ static irqreturn_t s5300_tx_state_irq(int irq, void *data)
 	struct s5300_modem *sm = data;
 	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
 	bool suspend = status & S5300_CP2AP_FLOWCTL;
+	struct net_device *ndev;
 
 	if (suspend == READ_ONCE(sm->tx_suspended))
 		return IRQ_HANDLED;
 
 	WRITE_ONCE(sm->tx_suspended, suspend);
-	if (sm->ndev) {
+	/* Snapshot: ports_work clears sm->ndev before unregistering it. */
+	ndev = READ_ONCE(sm->ndev);
+	if (ndev) {
 		if (suspend)
-			netif_stop_queue(sm->ndev);
+			netif_stop_queue(ndev);
 		else
-			netif_wake_queue(sm->ndev);
+			netif_wake_queue(ndev);
 	}
 	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
 			     suspend ? "suspend" : "resume", status);
@@ -1545,6 +1558,8 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 	}
 
 	while (in != out) {
+		/* Snapshot per frame: ports_work clears it before unregister. */
+		struct net_device *ndev = READ_ONCE(sm->ndev);
 		u8 frame[S5300_HDR_SIZE + 64];
 		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
 		u32 flen, total, payload, body;
@@ -1582,21 +1597,23 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 						 S5300_RAW_RXQ_SIZE, out, payload,
 						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
+			/* Snapshot: ports_work clears it before removal. */
+			struct wwan_port *at_port = READ_ONCE(sm->at_port);
 			struct sk_buff *skb = NULL;
 
 			/* Single-frame raw text; bound a corrupt CP length. */
-			if (payload && payload <= S5300_AT_MAX && sm->at_port)
+			if (payload && payload <= S5300_AT_MAX && at_port)
 				skb = alloc_skb(payload, GFP_ATOMIC);
 			if (skb) {
 				s5300_circ_read(skb_put(skb, payload), buff,
 						S5300_RAW_RXQ_SIZE, body,
 						payload);
-				wwan_port_rx(sm->at_port, skb);
+				wwan_port_rx(at_port, skb);
 			} else if (payload) {
 				dev_warn(sm->dev, "at rxq drop payload %u\n",
 					 payload);
 			}
-		} else if (READ_ONCE(sm->online) && sm->ndev && payload &&
+		} else if (READ_ONCE(sm->online) && ndev && payload &&
 			   hdr[8] >= S5300_PDP_CH_MIN && hdr[8] <= S5300_PDP_CH_MAX) {
 			/*
 			 * Raw-IP DL data the CP places on the legacy NORM_RAW ring
@@ -1608,7 +1625,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			 * shared ap2cp_msg word, so a spurious ack would clobber a
 			 * pending SEND_* notification and desync the CP.
 			 */
-			struct sk_buff *skb = netdev_alloc_skb(sm->ndev, payload);
+			struct sk_buff *skb = netdev_alloc_skb(ndev, payload);
 			u8 ver = 0;
 
 			if (skb) {
@@ -1619,19 +1636,19 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			if (skb && (ver == 4 || ver == 6)) {
 				skb->protocol = htons(ver == 6 ? ETH_P_IPV6
 							       : ETH_P_IP);
-				skb->dev = sm->ndev;
+				skb->dev = ndev;
 				skb_reset_mac_header(skb);
 				skb_reset_network_header(skb);
-				sm->ndev->stats.rx_packets++;
-				sm->ndev->stats.rx_bytes += payload;
+				ndev->stats.rx_packets++;
+				ndev->stats.rx_bytes += payload;
 				netif_rx(skb);
 				dev_info_once(sm->dev, "raw-ring PDP data (ch %#x) -> %s\n",
-					      hdr[8], netdev_name(sm->ndev));
+					      hdr[8], netdev_name(ndev));
 			} else if (skb) {
 				dev_kfree_skb_any(skb);
-				sm->ndev->stats.rx_length_errors++;
+				ndev->stats.rx_length_errors++;
 			} else {
-				sm->ndev->stats.rx_dropped++;
+				ndev->stats.rx_dropped++;
 			}
 		} else if (!READ_ONCE(sm->online) && hdr[8] == S5300_BOOT_CH &&
 			   payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
@@ -1851,20 +1868,24 @@ static void s5300_drain_fmt_rxq(struct s5300_modem *sm)
 		} else if (payload &&
 			   READ_ONCE(sm->sit[hdr[8] - S5300_SIT_CH_BASE].started)) {
 			struct s5300_sit_port *sit;
+			struct wwan_port *port;
 
 			sit = &sm->sit[hdr[8] - S5300_SIT_CH_BASE];
-			skb = alloc_skb(payload, GFP_ATOMIC);
+			/* Snapshot: ports_work clears it before removal. */
+			port = READ_ONCE(sit->port);
+			skb = port ? alloc_skb(payload, GFP_ATOMIC) : NULL;
 			if (!skb) {
 				dev_warn(sm->dev,
-					 "fmt rxq alloc_skb(%u) failed, dropping\n",
-					 payload);
+					 "fmt rxq drop ch %#x payload %u (%s)\n",
+					 hdr[8], payload,
+					 port ? "alloc_skb failed" : "port down");
 			} else {
 				s5300_circ_read(skb_put(skb, payload), buff,
 						S5300_FMT_RXQ_SIZE,
 						s5300_circ_new(S5300_FMT_RXQ_SIZE,
 							       out, S5300_HDR_SIZE),
 						payload);
-				wwan_port_rx(sit->port, skb);
+				wwan_port_rx(port, skb);
 			}
 		}
 
@@ -1930,17 +1951,29 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	case S5300_CMD_PHONE_START:
 		dev_info(sm->dev, "CP PHONE_START\n");
 		if (!READ_ONCE(sm->online)) {
+			struct net_device *ndev;
+
 			s5300_check_cp_capabilities(sm);
 			s5300_pktproc_ul_activate(sm);
 			s5300_init_ipc_queues(sm);
-			/* A rebooted CP starts un-flow-controlled. */
-			if (READ_ONCE(sm->tx_suspended)) {
-				WRITE_ONCE(sm->tx_suspended, false);
-				netif_wake_queue(sm->ndev);
-			}
+			/*
+			 * A rebooted CP starts un-flow-controlled.  Normally
+			 * ports_work removed the netdev with the dead CP and a
+			 * fresh one comes up with an awake queue; but if the
+			 * work sat queued across the whole down-up cycle, the
+			 * transitions cancel out and the surviving netdev may
+			 * still hold a pre-crash flow-control stop -- wake it.
+			 */
+			WRITE_ONCE(sm->tx_suspended, false);
+			ndev = READ_ONCE(sm->ndev);
+			if (ndev)
+				netif_wake_queue(ndev);
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
+			/* Registration sleeps, so the ports come up in work
+			 * context. */
+			schedule_work(&sm->ports_work);
 			/*
 			 * The link is up post-boot; hand it to CP-driven runtime
 			 * PM.  Enable once -- pm_armed guards a re-entrant or
@@ -1967,9 +2000,12 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 		 * the dead CP (s5300_pm_work bails): the recovery path owns the
 		 * link from here.  The IRQs stay armed until IOCTL_CP_RESET or
 		 * IOCTL_POWER_ON quiesces them; their queued work no-ops.
+		 * Taking the ports down tells userspace the modem is gone;
+		 * they return once the recovered CP is ONLINE again.
 		 */
 		WRITE_ONCE(sm->online, false);
 		sm->cp_status = S5300_STATE_OFFLINE;
+		schedule_work(&sm->ports_work);
 		break;
 	default:
 		dev_warn(sm->dev, "unknown CP command %#x\n", cmd);
@@ -2104,6 +2140,7 @@ static int s5300_power_on(struct s5300_modem *sm)
 	reinit_completion(&sm->init_done);
 	WRITE_ONCE(sm->online, false);
 	sm->cp_status = S5300_STATE_OFFLINE;
+	schedule_work(&sm->ports_work);
 	spin_lock_irqsave(&sm->rx_lock, flags);
 	kfifo_reset(&sm->rx_fifo);
 	spin_unlock_irqrestore(&sm->rx_lock, flags);
@@ -2505,6 +2542,15 @@ static long s5300_dev_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		s5300_quiesce_pm(sm);
+		/*
+		 * The full power cycle (arg 2) is the one reset that can hit a
+		 * still-ONLINE CP; mark it offline so the userspace-facing
+		 * ports come down for a clean re-probe after the re-boot.  The
+		 * crash paths already cleared online before userspace got here.
+		 */
+		WRITE_ONCE(sm->online, false);
+		sm->cp_status = S5300_STATE_OFFLINE;
+		schedule_work(&sm->ports_work);
 		ret = zumapro_pcie_cp_reset(sm->rc_dev, arg == 1, arg == 2);
 		break;
 	case IOCTL_LOAD_CP_IMAGE:
@@ -3080,11 +3126,13 @@ static void s5300_pktproc_dl_init(struct s5300_modem *sm)
 static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5300_PKTPROC_DL_INFO_OFF;
+	/* Snapshot: ports_work clears sm->ndev before unregistering it. */
+	struct net_device *ndev = READ_ONCE(sm->ndev);
 	u32 n = sm->dl_num_desc;
 	unsigned long flags;
 	u32 q;
 
-	if (!n || !sm->ndev)
+	if (!n || !ndev)
 		return;
 
 	/*
@@ -3110,23 +3158,23 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 			struct sk_buff *skb;
 
 			if (len == 0 || len > S5300_PKTPROC_MAX_PKT) {
-				sm->ndev->stats.rx_length_errors++;
+				ndev->stats.rx_length_errors++;
 				goto next;
 			}
-			skb = netdev_alloc_skb(sm->ndev, len);
+			skb = netdev_alloc_skb(ndev, len);
 			if (!skb) {
-				sm->ndev->stats.rx_dropped++;
+				ndev->stats.rx_dropped++;
 				goto next;
 			}
 			memcpy_fromio(skb_put(skb, len),
 				      buff + done * S5300_PKTPROC_MAX_PKT, len);
 			skb->protocol = htons((skb->data[0] >> 4) == 6 ?
 					      ETH_P_IPV6 : ETH_P_IP);
-			skb->dev = sm->ndev;
+			skb->dev = ndev;
 			skb_reset_mac_header(skb);
 			skb_reset_network_header(skb);
-			sm->ndev->stats.rx_packets++;
-			sm->ndev->stats.rx_bytes += len;
+			ndev->stats.rx_packets++;
+			ndev->stats.rx_bytes += len;
 			netif_rx(skb);
 next:
 			done = (done + 1 == n) ? 0 : done + 1;
@@ -3328,6 +3376,141 @@ static void s5300_netdev_setup(struct net_device *ndev)
 	ndev->needs_free_netdev = true;
 }
 
+static void s5300_unregister_modem_ports(struct s5300_modem *sm);
+
+/*
+ * The userspace-facing ports -- the two logical SIT control stacks, the
+ * vendor AT channel and the raw-IP data netdev -- exist only while the CP is
+ * ONLINE, the way other PCIe WWAN drivers (t7xx, iosm) expose ports only once
+ * their firmware is up.  A port that exists but cannot answer is worse than
+ * no port: modem stacks probe ports as they appear, and on a cold boot the
+ * multi-second CP firmware download races that probing -- a probe that times
+ * out gets the device blacklisted as unusable with no later re-probe.  Port
+ * add/remove is the readiness signal userspace already understands, and it
+ * makes CP crash recovery symmetric: the ports go away with the dead CP and
+ * return once the recovered CP is back up.  All four are registered together
+ * so they enumerate as one modem device (a lone early data netdev would be
+ * probed -- and dismissed -- without its control ports).
+ *
+ * The boot/RFS/OEM chardevs are NOT managed here: the boot daemon needs them
+ * before ONLINE to boot the CP in the first place.
+ */
+static int s5300_register_modem_ports(struct s5300_modem *sm)
+{
+	struct net_device *ndev;
+	struct wwan_port *port;
+	int i, ret;
+
+	/* Channel order so WWAN names 0xf5 wwan0sit0 and 0xf6 wwan0sit1. */
+	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
+		port = wwan_create_port(sm->dev, WWAN_PORT_SIT,
+					&s5300_ctrl_ops, NULL, &sm->sit[i]);
+		if (IS_ERR(port)) {
+			ret = PTR_ERR(port);
+			dev_err(sm->dev, "wwan_create_port(sit%d): %d\n", i,
+				ret);
+			goto err;
+		}
+		/*
+		 * The FMT ring drain (hard IRQ) snapshots this pointer with
+		 * READ_ONCE and dereferences it: release-publish so the port's
+		 * init is ordered before the pointer store.
+		 */
+		smp_store_release(&sm->sit[i].port, port);
+	}
+
+	port = wwan_create_port(sm->dev, WWAN_PORT_AT, &s5300_at_ops, NULL, sm);
+	if (IS_ERR(port)) {
+		ret = PTR_ERR(port);
+		dev_err(sm->dev, "wwan_create_port(at): %d\n", ret);
+		goto err;
+	}
+	smp_store_release(&sm->at_port, port);
+
+	ndev = alloc_netdev(sizeof(struct s5300_modem *), "rmnet%d",
+			    NET_NAME_ENUM, s5300_netdev_setup);
+	if (!ndev) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	*(struct s5300_modem **)netdev_priv(ndev) = sm;
+	SET_NETDEV_DEV(ndev, sm->dev);
+	ret = register_netdev(ndev);
+	if (ret) {
+		dev_err(sm->dev, "register_netdev: %d\n", ret);
+		free_netdev(ndev);
+		goto err;
+	}
+	smp_store_release(&sm->ndev, ndev);
+	return 0;
+
+err:
+	s5300_unregister_modem_ports(sm);
+	return ret;
+}
+
+static void s5300_unregister_modem_ports(struct s5300_modem *sm)
+{
+	struct wwan_port *sit_port[S5300_SIT_PORT_COUNT];
+	struct wwan_port *at_port;
+	struct net_device *ndev;
+	int i;
+
+	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
+		sit_port[i] = sm->sit[i].port;
+		WRITE_ONCE(sm->sit[i].port, NULL);
+	}
+	at_port = sm->at_port;
+	WRITE_ONCE(sm->at_port, NULL);
+	ndev = sm->ndev;
+	WRITE_ONCE(sm->ndev, NULL);
+
+	/*
+	 * The ring drains and the flow-control handler run in hard IRQ and
+	 * snapshot the pointers cleared above.  The two IPC vectors are
+	 * synchronised directly; the RC-owned PKTPROC DL MSIs cannot be from
+	 * here, so wait out a grace period -- synchronize_rcu() spans hardirq
+	 * handlers -- before destroying what a handler may still hold.
+	 */
+	synchronize_irq(pci_irq_vector(sm->pdev, 0));
+	synchronize_irq(pci_irq_vector(sm->pdev, 1));
+	synchronize_rcu();
+
+	if (ndev)
+		unregister_netdev(ndev);	/* needs_free_netdev frees it */
+	if (at_port)
+		wwan_remove_port(at_port);
+	for (i = S5300_SIT_PORT_COUNT; i-- > 0;)
+		if (sit_port[i])
+			wwan_remove_port(sit_port[i]);
+}
+
+/*
+ * Converge port state onto sm->online.  ONLINE flips in hard IRQ while
+ * (un)registration sleeps, so re-check after every pass; the work item is
+ * single-instance (non-reentrant), so ports_up needs no lock.
+ */
+static void s5300_ports_work(struct work_struct *work)
+{
+	struct s5300_modem *sm = container_of(work, struct s5300_modem,
+					      ports_work);
+
+	for (;;) {
+		bool online = READ_ONCE(sm->online);
+
+		if (online == sm->ports_up)
+			return;
+		if (online) {
+			if (s5300_register_modem_ports(sm))
+				return;	/* logged; the next CP cycle retries */
+			sm->ports_up = true;
+		} else {
+			s5300_unregister_modem_ports(sm);
+			sm->ports_up = false;
+		}
+	}
+}
+
 static int s5300_map_region(struct s5300_modem *sm, const char *name,
 			    phys_addr_t *phys, resource_size_t *size,
 			    void __iomem **map)
@@ -3384,10 +3567,15 @@ static int s5300_probe(struct platform_device *pdev)
 	mutex_init(&sm->raw_tx_lock);
 	mutex_init(&sm->fmt_tx_lock);
 	INIT_WORK(&sm->pm_work, s5300_pm_work);
+	INIT_WORK(&sm->ports_work, s5300_ports_work);
 	INIT_DELAYED_WORK(&sm->park_work, s5300_park_work);
 	init_completion(&sm->init_done);
 	init_waitqueue_head(&sm->read_wq);
 	init_waitqueue_head(&sm->fmt_tx_wq);
+	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
+		sm->sit[i].sm = sm;
+		sm->sit[i].channel = S5300_SIT_CH_BASE + i;
+	}
 	sm->oem.sm = sm;
 	sm->oem.channel = S5300_OEM_CH;
 	sm->oem.tx_max = S5300_OEM_MSG_MAX;
@@ -3670,26 +3858,11 @@ static int s5300_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Two persistent logical SIT/RIL stacks share the FMT transport.  Create
-	 * them in channel order so WWAN names 0xf5 as wwan0sit0 and 0xf6 as
-	 * wwan0sit1.  They exist regardless of whether a second SIM is mapped.
-	 * Writes remain rejected until the CP reaches ONLINE.
-	 */
-	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
-		sm->sit[i].sm = sm;
-		sm->sit[i].channel = S5300_SIT_CH_BASE + i;
-		sm->sit[i].port = wwan_create_port(dev, WWAN_PORT_SIT,
-						   &s5300_ctrl_ops, NULL,
-						   &sm->sit[i]);
-		if (IS_ERR(sm->sit[i].port)) {
-			ret = PTR_ERR(sm->sit[i].port);
-			sm->sit[i].port = NULL;
-			dev_err(dev, "wwan_create_port(sit%d): %d\n", i, ret);
-			goto err_sit_ports;
-		}
-	}
-
-	/*
+	 * The SIT/AT WWAN ports and the data netdev are NOT created here:
+	 * s5300_ports_work() registers them when the CP reaches ONLINE and
+	 * removes them when it leaves (crash/reset), so userspace only ever
+	 * sees ports that can carry traffic.
+	 *
 	 * The RFS file channel (ch 0x29 on the NORM_RAW ring), exposed as
 	 * /dev/umts_rfs0 for the userspace server that answers the CP's NV and
 	 * carrier-config file requests.  Created up front; only carries traffic
@@ -3702,20 +3875,7 @@ static int s5300_probe(struct platform_device *pdev)
 	ret = misc_register(&sm->rfs.miscdev);
 	if (ret) {
 		dev_err(dev, "misc_register(rfs): %d\n", ret);
-		goto err_sit_ports;
-	}
-
-	/*
-	 * The vendor AT/router port (ch 0x15 on the NORM_RAW ring): a raw
-	 * diagnostic AT byte-stream.  Created up front like the others; only
-	 * carries traffic once ONLINE.
-	 */
-	sm->at_port = wwan_create_port(dev, WWAN_PORT_AT, &s5300_at_ops,
-				       NULL, sm);
-	if (IS_ERR(sm->at_port)) {
-		ret = PTR_ERR(sm->at_port);
-		dev_err(dev, "wwan_create_port(at): %d\n", ret);
-		goto err_rfs;
+		goto err_boot0;
 	}
 
 	/*
@@ -3730,39 +3890,18 @@ static int s5300_probe(struct platform_device *pdev)
 	ret = misc_register(&sm->oem.miscdev);
 	if (ret) {
 		dev_err(dev, "misc_register(oem): %d\n", ret);
-		goto err_at_port;
+		goto err_rfs;
 	}
 
 	/*
-	 * The raw-IP PS-data netdev.  Created up front; the DL ring is armed at
-	 * INIT_START and drained once ONLINE.  Userspace assigns the address the
-	 * CP returns from SETUP_DATA_CALL and brings it up.
-	 */
-	sm->ndev = alloc_netdev(sizeof(struct s5300_modem *), "rmnet%d",
-				NET_NAME_ENUM, s5300_netdev_setup);
-	if (!sm->ndev) {
-		ret = -ENOMEM;
-		goto err_oem;
-	}
-	*(struct s5300_modem **)netdev_priv(sm->ndev) = sm;
-	SET_NETDEV_DEV(sm->ndev, dev);
-	ret = register_netdev(sm->ndev);
-	if (ret) {
-		dev_err(dev, "register_netdev: %d\n", ret);
-		free_netdev(sm->ndev);
-		goto err_oem;
-	}
-
-	/*
-	 * Arm the RC's separated DL MSIs.  Their drain delivers into ndev and
-	 * guards on sm->online, so a DL MSI that arrives before the CP is ONLINE
-	 * is a no-op -- it is safe to arm them here.
+	 * Arm the RC's separated DL MSIs.  Their drain delivers into the data
+	 * netdev and guards on sm->online and the netdev pointer, so a DL MSI
+	 * that arrives before the CP is ONLINE (netdev not yet registered) is
+	 * a no-op -- it is safe to arm them here.
 	 */
 	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
 	if (ret) {
 		dev_err(dev, "register DL ISR: %d\n", ret);
-		unregister_netdev(sm->ndev);
-		free_netdev(sm->ndev);
 		goto err_oem;
 	}
 
@@ -3781,15 +3920,9 @@ static int s5300_probe(struct platform_device *pdev)
 
 err_oem:
 	misc_deregister(&sm->oem.miscdev);
-err_at_port:
-	wwan_remove_port(sm->at_port);
 err_rfs:
 	misc_deregister(&sm->rfs.miscdev);
-err_sit_ports:
-	while (i > 0) {
-		i--;
-		wwan_remove_port(sm->sit[i].port);
-	}
+err_boot0:
 	misc_deregister(&sm->miscdev);
 err_cp2ap:
 	if (sm->cp2ap_active_irq > 0)
@@ -3801,6 +3934,14 @@ err_irq:
 	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 err_irq0:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	/*
+	 * Every ports_work queuer (the IPC vectors, the crash GPIO, the boot0
+	 * ioctls) is gone; converge any CP boot that raced the failed probe
+	 * away.  A never-queued work makes both of these no-ops.
+	 */
+	cancel_work_sync(&sm->ports_work);
+	if (sm->ports_up)
+		s5300_unregister_modem_ports(sm);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
 err_disable:
@@ -3842,24 +3983,31 @@ static void s5300_remove(struct platform_device *pdev)
 	destroy_workqueue(sm->pm_wq);
 
 	/*
-	 * Free the IRQ first: it synchronises in-flight handlers, so no MSI can
-	 * run s5300_drain_fmt_rxq()/s5300_drain_rxq() -> wwan_port_rx() against a
-	 * port that wwan_remove_port() is about to free.
+	 * Free the IRQs first: that synchronises in-flight handlers and stops
+	 * every ports_work queuer, so the cancel below is final and the port
+	 * teardown cannot race a ring drain delivering into a dying port.
 	 */
 	zumapro_pcie_unregister_dl_isr(sm->rc_dev);
 	free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
-	unregister_netdev(sm->ndev);
+	/*
+	 * The boot0 ioctls (POWER_ON/CP_RESET) queue ports_work: deregister
+	 * that chardev before the final cancel so a new open cannot re-queue
+	 * the work after it.  An ioctl already in flight can still slip a
+	 * schedule_work() past the cancel -- the misc layer has no revoke, so
+	 * any ioctl racing unbind already races the whole teardown; this only
+	 * narrows that pre-existing window.
+	 */
+	misc_deregister(&sm->miscdev);
+	cancel_work_sync(&sm->ports_work);
+	if (sm->ports_up)
+		s5300_unregister_modem_ports(sm);
 	misc_deregister(&sm->oem.miscdev);
 	skb_queue_purge(&sm->oem.rxq);
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
 		skb_queue_purge(&sm->oem.rx_frag[i]);
-	wwan_remove_port(sm->at_port);
 	misc_deregister(&sm->rfs.miscdev);
 	skb_queue_purge(&sm->rfs.rxq);
-	for (i = S5300_SIT_PORT_COUNT; i-- > 0;)
-		wwan_remove_port(sm->sit[i].port);
-	misc_deregister(&sm->miscdev);
 	pci_free_irq_vectors(sm->pdev);
 	pci_disable_device(sm->pdev);
 	pci_dev_put(sm->pdev);

@@ -1533,11 +1533,29 @@ static int __brcmf_pcie_pm_enter_active(struct brcmf_bus *bus, bool block)
 	if (!brcmf_pcie_inband_ds(devinfo))
 		return 0;
 
+	/*
+	 * Keep the device runtime-resumed for the duration of this ring access.
+	 * The blocking (process-context) callers can wait for a full D3 exit;
+	 * the IRQ-thread rx-repost path cannot sleep, but it only ever runs
+	 * while the device is already active, so a non-resuming ref is enough.
+	 */
+	if (devinfo->runtime_pm_enabled) {
+		if (block) {
+			err = pm_runtime_resume_and_get(&devinfo->pdev->dev);
+			if (err < 0)
+				return err;
+		} else {
+			pm_runtime_get_noresume(&devinfo->pdev->dev);
+		}
+	}
+
 	atomic_inc(&devinfo->ds_active_count);
 
 	err = brcmf_pcie_inband_device_wake(devinfo, true, block);
 	if (err) {
 		atomic_dec(&devinfo->ds_active_count);
+		if (devinfo->runtime_pm_enabled)
+			pm_runtime_put_autosuspend(&devinfo->pdev->dev);
 		return err;
 	}
 
@@ -1573,6 +1591,15 @@ void brcmf_pcie_pm_leave_active(struct brcmf_bus *bus)
 	atomic_dec(&devinfo->ds_active_count);
 	brcmf_pcie_inband_device_wake(devinfo, false, false);
 	brcmf_pcie_ack_pending_ds(devinfo);
+
+	/*
+	 * Drop the ref taken in enter_active and arm the autosuspend timer
+	 * (pm_runtime_put_autosuspend() marks last-busy itself).  Once the last
+	 * ring access leaves and the firmware acks DEV_SLEEP, .runtime_suspend
+	 * can take the device to D3.
+	 */
+	if (devinfo->runtime_pm_enabled)
+		pm_runtime_put_autosuspend(&devinfo->pdev->dev);
 }
 
 bool brcmf_pcie_pm_attach_hold(struct brcmf_bus *bus)

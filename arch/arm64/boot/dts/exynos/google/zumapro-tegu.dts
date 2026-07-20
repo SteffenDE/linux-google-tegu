@@ -846,6 +846,13 @@
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
+
+	wlan_host_wake: wlan-host-wake-pins {
+		samsung,pins = "gpa5-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
 };
 
 &usi2_hsi0 {
@@ -1369,6 +1376,16 @@
 		wifi@0,0 {
 			compatible = "pci14e4,4449", "brcm,bcm4329-fmac";
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+			/*
+			 * OOB host-wake: the BCM4383 pulses gpa5-3 when it has
+			 * traffic for the host while the PCIe link is in a deep
+			 * runtime-PM state that cannot deliver an in-band MSI.
+			 */
+			interrupts-extended = <&gpa5 3 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "host-wake";
+			pinctrl-names = "default";
+			pinctrl-0 = <&wlan_host_wake>;
 		};
 	};
 };

@@ -16,7 +16,9 @@
 #include <linux/kthread.h>
 #include <linux/io.h>
 #include <linux/random.h>
+#include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/unaligned.h>
 
 #include <soc.h>
@@ -469,6 +471,7 @@ struct brcmf_pciedev_info {
 	bool ds_exit_completed;
 	bool skip_ds_ack;
 	bool runtime_pm_enabled;
+	int host_wake_irq;
 	bool irq_allocated;
 	bool irq_ready;
 	bool have_msi;
@@ -3731,9 +3734,26 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;
+	int irq;
 
 	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
 		return;
+
+	/*
+	 * Optional OOB host-wake: an inbound frame cannot raise an in-band MSI
+	 * while the link is in D3, so the chip pulses a sideband line instead.
+	 * As a dedicated wake IRQ the PM core arms it on runtime suspend and
+	 * resumes the device when it fires -- no handler here.  This does not
+	 * touch system-suspend wake (that stays gated on device_may_wakeup),
+	 * leaving the existing WoWL policy unchanged.
+	 */
+	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
+	if (irq > 0) {
+		if (dev_pm_set_dedicated_wake_irq(dev, irq))
+			dev_warn(dev, "failed to set up host-wake IRQ %d\n", irq);
+		else
+			devinfo->host_wake_irq = irq;
+	}
 
 	pm_runtime_set_autosuspend_delay(dev,
 					 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
@@ -3754,6 +3774,12 @@ static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
 	pm_runtime_get_sync(dev);		/* restore probe ref, resume */
 	pm_runtime_forbid(dev);			/* control=on again */
 	pm_runtime_dont_use_autosuspend(dev);
+
+	if (devinfo->host_wake_irq) {
+		dev_pm_clear_wake_irq(dev);
+		devinfo->host_wake_irq = 0;
+	}
+
 	devinfo->runtime_pm_enabled = false;
 }
 

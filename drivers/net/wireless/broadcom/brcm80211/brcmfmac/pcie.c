@@ -376,6 +376,16 @@ module_param_named(pcie_runtime_pm, brcmf_pcie_runtime_pm, bool, 0644);
 MODULE_PARM_DESC(pcie_runtime_pm,
 		 "Enable PCIe runtime PM (D3 autosuspend when idle); experimental, default off");
 
+/*
+ * Opt-in the fw_console sysfs node.  It reads firmware memory over BAR1, so it
+ * is off unless requested at load time (brcmfmac.fw_console=1).  Evaluated when
+ * the device is set up, so it must be set before the interface comes up.
+ */
+static bool brcmf_pcie_fw_console;
+module_param_named(fw_console, brcmf_pcie_fw_console, bool, 0444);
+MODULE_PARM_DESC(fw_console,
+		 "Expose the fw_console sysfs node to dump the firmware log; default off");
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -1714,6 +1724,38 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		}
 	}
 }
+
+/*
+ * Reading fw_console flushes the firmware console ring to the kernel log.
+ * Unlike the CONFIG_BRCMDBG console_interval debugfs poll, this always exists
+ * and prints unconditionally (the error path), so a wedged or trapped firmware
+ * can be dumped from a production build.  It reads over BAR1 without resuming
+ * the device -- a trapped firmware keeps the PCIe link up, which is exactly
+ * when this helps; a device that is genuinely suspended has nothing to dump and
+ * is skipped so the console loop never spins on a dead (0xffffffff) link.
+ */
+static ssize_t fw_console_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo;
+
+	if (!bus || !bus->bus_priv.pcie)
+		return -ENODEV;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	if (!devinfo)
+		return -ENODEV;
+
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
+		return sysfs_emit(buf, "device not active\n");
+
+	if (!devinfo->shared.console.base_addr)
+		brcmf_pcie_bus_console_init(devinfo);
+	brcmf_pcie_bus_console_read(devinfo, true);
+
+	return sysfs_emit(buf, "firmware console flushed to kernel log\n");
+}
+static DEVICE_ATTR_RO(fw_console);
 
 
 static void brcmf_pcie_intr_disable(struct brcmf_pciedev_info *devinfo)
@@ -3330,6 +3372,10 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_fwcon_timer(devinfo, true);
 	brcmf_pcie_runtime_pm_enable(devinfo);
 
+	if (brcmf_pcie_fw_console &&
+	    device_create_file(dev, &dev_attr_fw_console))
+		brcmf_err(bus, "failed to create fw_console sysfs node\n");
+
 	return;
 
 fail:
@@ -3701,6 +3747,8 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 		return;
 
 	devinfo = bus->bus_priv.pcie->devinfo;
+	if (brcmf_pcie_fw_console)
+		device_remove_file(&pdev->dev, &dev_attr_fw_console);
 	brcmf_pcie_runtime_pm_disable(devinfo);
 	brcmf_pcie_bus_console_read(devinfo, false);
 	brcmf_pcie_fwcon_timer(devinfo, false);

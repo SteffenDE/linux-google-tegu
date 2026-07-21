@@ -431,6 +431,15 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 
 	/* Enable tx beamforming, errors can be ignored (not supported) */
 	(void)brcmf_fil_iovar_int_set(ifp, "txbf", 1);
+
+	/*
+	 * Allow the firmware to assert its out-of-band host-wake GPIO so an
+	 * inbound frame can wake the host while the PCIe link is in a low-power
+	 * (in-band deep-sleep / D3) state.  Without this the firmware reaches
+	 * host-sleep but never drives the wake line.  Best-effort: not all
+	 * firmware exposes the iovar.
+	 */
+	(void)brcmf_fil_iovar_int_set(ifp, "bus:host_access", 1);
 done:
 	return err;
 }

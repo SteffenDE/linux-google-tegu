@@ -505,6 +505,7 @@ u16 chandef_to_chanspec(struct brcmu_d11inf *d11inf,
 			struct cfg80211_chan_def *ch);
 bool brcmf_get_vif_state_any(struct brcmf_cfg80211_info *cfg,
 			     unsigned long state);
+bool brcmf_cfg80211_request_in_progress(struct brcmf_pub *drvr);
 void brcmf_cfg80211_arm_vif_event(struct brcmf_cfg80211_info *cfg,
 				  struct brcmf_cfg80211_vif *vif);
 bool brcmf_cfg80211_vif_event_armed(struct brcmf_cfg80211_info *cfg);

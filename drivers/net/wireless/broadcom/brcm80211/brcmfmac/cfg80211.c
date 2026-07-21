@@ -8125,6 +8125,29 @@ bool brcmf_get_vif_state_any(struct brcmf_cfg80211_info *cfg,
 	return false;
 }
 
+bool brcmf_cfg80211_request_in_progress(struct brcmf_pub *drvr)
+{
+	struct brcmf_cfg80211_info *cfg = drvr->config;
+
+	if (!cfg)
+		return false;
+
+	/*
+	 * A scan or a join is a multi-step asynchronous firmware operation.
+	 * The bus-level device-sleep power state can momentarily read
+	 * DEV_SLEEP between the escan/join submission and its completion event
+	 * while the request is still logically in flight, so the bus cannot
+	 * tell from that state alone whether it is safe to enter D3.  Report
+	 * the request as in progress so the bus keeps the device out of deep
+	 * sleep for the whole operation.
+	 */
+	if (test_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status) ||
+	    test_bit(BRCMF_SCAN_STATUS_ABORT, &cfg->scan_status))
+		return true;
+
+	return brcmf_get_vif_state_any(cfg, BRCMF_VIF_STATUS_CONNECTING);
+}
+
 static inline bool vif_event_equals(struct brcmf_cfg80211_vif_event *event,
 				    u8 action)
 {

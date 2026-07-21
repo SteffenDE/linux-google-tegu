@@ -45,6 +45,7 @@
 #include "chip.h"
 #include "core.h"
 #include "common.h"
+#include "cfg80211.h"
 
 
 enum brcmf_pcie_state {
@@ -3873,10 +3874,20 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 	 * itself gone idle into in-band DEV_SLEEP.  If it has not, refuse with
 	 * -EBUSY so the PM core retries later, instead of forcing the D3
 	 * handshake from an active state (which times out and can trap the fw).
+	 *
+	 * The DEV_SLEEP power state is not sufficient on its own: it can read
+	 * DEV_SLEEP mid-scan (between the escan submission and its completion
+	 * event) while a cfg80211 request is still logically in flight.
+	 * Sending H2D_HOST_D3_INFORM then drives the in-band DS engine with an
+	 * event that is illegal for its state and the firmware halts.  Also
+	 * refuse while a scan or join is outstanding.
 	 */
-	if (runtime && brcmf_pcie_inband_ds(devinfo) &&
-	    brcmf_pcie_get_inband_ds_state(devinfo) != BRCMF_PCIE_DS_DEV_SLEEP)
-		return -EBUSY;
+	if (runtime && brcmf_pcie_inband_ds(devinfo)) {
+		if (brcmf_pcie_get_inband_ds_state(devinfo) != BRCMF_PCIE_DS_DEV_SLEEP)
+			return -EBUSY;
+		if (brcmf_cfg80211_request_in_progress(bus->drvr))
+			return -EBUSY;
+	}
 
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	/*

@@ -1178,10 +1178,11 @@ static void brcmf_pcie_ack_pending_ds(struct brcmf_pciedev_info *devinfo)
 	enum brcmf_pcie_inband_ds_state old_state;
 	enum brcmf_pcie_inband_ds_state new_state;
 	bool send_ds_ack = false;
+	bool ack_failed = false;
 	unsigned long flags;
 	bool skip_ds_ack;
 	int active_count;
-	int err;
+	int err = 0;
 
 	spin_lock_irqsave(&devinfo->ds_lock, flags);
 	old_state = devinfo->ds_state;
@@ -1190,32 +1191,48 @@ static void brcmf_pcie_ack_pending_ds(struct brcmf_pciedev_info *devinfo)
 	if (!skip_ds_ack &&
 	    old_state == BRCMF_PCIE_DS_DEV_SLEEP_PEND &&
 	    active_count == 0) {
-		devinfo->ds_state = BRCMF_PCIE_DS_DEV_SLEEP;
-		send_ds_ack = true;
+		/*
+		 * Send the DS ack while still holding ds_lock, atomically with
+		 * the DEV_SLEEP transition -- exactly as the device-wake path
+		 * sends its WAKE_ASSERT under the lock.  If the ack send is not
+		 * atomic against a racing device-wake, that wake takes ds_lock
+		 * in the window after we drop it, observes DEV_SLEEP, and issues
+		 * its WAKE_ASSERT first: the firmware leaves DEVICE_SLEEP_WAIT
+		 * for DEVICE_ACTIVE_WAIT (reject_device_sleep), and our later
+		 * ack then arrives as an invalid event in DEVICE_ACTIVE_WAIT,
+		 * which the firmware answers with osl_sys_halt().  Sending under
+		 * the lock forces the valid order (ack, then any assert).
+		 * brcmf_pcie_send_mb_data() only takes the commonring spinlock
+		 * and never sleeps.
+		 */
+		err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
+		if (err) {
+			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+			ack_failed = true;
+		} else {
+			devinfo->ds_state = BRCMF_PCIE_DS_DEV_SLEEP;
+			send_ds_ack = true;
+		}
 	}
 	new_state = devinfo->ds_state;
 	spin_unlock_irqrestore(&devinfo->ds_lock, flags);
 
-	if (send_ds_ack || old_state == BRCMF_PCIE_DS_DEV_SLEEP_PEND ||
-	    skip_ds_ack)
+	if (send_ds_ack || ack_failed ||
+	    old_state == BRCMF_PCIE_DS_DEV_SLEEP_PEND || skip_ds_ack)
 		brcmf_dbg(DS,
 			  "DS ack_pending: %s -> %s skip=%d active=%d send=%d\n",
 			  brcmf_pcie_ds_state_name(old_state),
 			  brcmf_pcie_ds_state_name(new_state), skip_ds_ack,
 			  active_count, send_ds_ack);
 
-	if (!send_ds_ack)
-		return;
-
-	err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
-	if (err) {
-		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+	if (ack_failed) {
 		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
 			  "failed to send in-band DS ack: %d\n", err);
 		return;
 	}
 
-	wake_up(&devinfo->ds_enter_wait);
+	if (send_ds_ack)
+		wake_up(&devinfo->ds_enter_wait);
 }
 
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)

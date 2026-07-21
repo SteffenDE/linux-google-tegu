@@ -3851,11 +3851,33 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 			   BRCMF_PCIE_MBDATA_TIMEOUT);
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
-		if (!runtime)
+		if (!runtime) {
 			brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+			brcmf_pcie_set_skip_ds_ack(devinfo, false);
+			brcmf_pcie_fwcon_timer(devinfo, true);
+			return -EIO;
+		}
+
+		/*
+		 * Runtime suspend must not poison the PM state on a transient D3
+		 * handshake timeout.  Any error other than -EAGAIN/-EBUSY sets
+		 * dev->power.runtime_error, after which every pm_runtime_resume()
+		 * -- including the one the OOB host-wake IRQ depends on -- returns
+		 * -EINVAL, so an inbound frame can never resume the device and the
+		 * firmware's host-wake watchdog eventually halts the chip.
+		 *
+		 * Abort the entry cleanly instead: the firmware may have entered
+		 * host-sleep late, so resume it to a known-active state (the
+		 * standard D0_INFORM path) and return -EBUSY, which the PM core
+		 * treats as "not now, retry later" without marking an error.
+		 */
+		if (brcmf_pcie_inband_ds(devinfo))
+			brcmf_pcie_set_inband_ds_state(devinfo,
+						       BRCMF_PCIE_DS_ACTIVE);
+		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM);
 		brcmf_pcie_set_skip_ds_ack(devinfo, false);
 		brcmf_pcie_fwcon_timer(devinfo, true);
-		return -EIO;
+		return -EBUSY;
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;

@@ -247,10 +247,6 @@ static const u32 zumapro_dpp_graphics_formats[] = {
 	DRM_FORMAT_BGR565,
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_ABGR2101010,
-	DRM_FORMAT_RGBA1010102,
-	DRM_FORMAT_BGRA1010102,
-	DRM_FORMAT_ARGB16161616F,
-	DRM_FORMAT_ABGR16161616F,
 };
 
 static const u32 zumapro_dpp_video_formats[] = {
@@ -266,8 +262,6 @@ static const u32 zumapro_dpp_video_formats[] = {
 	DRM_FORMAT_BGR565,
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_ABGR2101010,
-	DRM_FORMAT_RGBA1010102,
-	DRM_FORMAT_BGRA1010102,
 	DRM_FORMAT_NV12,
 	DRM_FORMAT_NV21,
 	DRM_FORMAT_NV16,
@@ -275,18 +269,27 @@ static const u32 zumapro_dpp_video_formats[] = {
 	DRM_FORMAT_P010,
 	DRM_FORMAT_YUV420_8BIT,
 	DRM_FORMAT_YUV420_10BIT,
-	DRM_FORMAT_ARGB16161616F,
-	DRM_FORMAT_ABGR16161616F,
 };
 
 /*
- * The hardware format names describe the component order in memory
- * (first byte first); DRM fourccs describe a little-endian packed word.
- * The hardware name matching a DRM fourcc is therefore its byte-reversed
- * counterpart, confirmed on the panel: a DRM XRGB8888 buffer scanned out
- * as ZUMAPRO_DMA_FORMAT_XRGB8888 shows (R,G,B) <- bytes (1,2,3) instead
- * of (2,1,0).  The downstream table maps names 1:1 because the Android
- * stack uses fourccs in byte order.
+ * The hardware names the 8888 and 565 formats by component order in
+ * memory while DRM fourccs describe a little-endian packed word, so
+ * those map to the byte-reversed name.  Panel-confirmed both ways: a
+ * DRM XRGB8888 buffer scanned out as ZUMAPRO_DMA_FORMAT_XRGB8888 shows
+ * (R,G,B) <- bytes (1,2,3) instead of (2,1,0), and both 565 fourccs
+ * render the test pattern correctly through the reversed names.
+ *
+ * The 2101010 pair does not follow that rule and its two hardware
+ * labels are additionally crossed: a per-fourcc-encoded test pattern
+ * scanned out as ZUMAPRO_DMA_FORMAT_ARGB2101010 or _ABGR2101010 comes
+ * out with red and blue exactly swapped (smooth ramp, no bit garble),
+ * so value 18 decodes DRM ARGB2101010 and value 19 DRM ABGR2101010.
+ *
+ * The A-at-LSB variants (RGBA/BGRA1010102, values 16 and 17) do not
+ * decode as any A-at-LSB layout on this hardware - both probe as the
+ * same wrapped-sawtooth garbage rather than a channel swap - and the
+ * FP16 values decode the component order correctly but wrap mid-tones
+ * into sawtooths.  Neither is exposed until their decode is understood.
  */
 static const struct zumapro_dpp_format zumapro_dpp_formats[] = {
 	{ DRM_FORMAT_ARGB8888, ZUMAPRO_DMA_FORMAT_BGRA8888,
@@ -309,13 +312,9 @@ static const struct zumapro_dpp_format zumapro_dpp_formats[] = {
 	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
 	{ DRM_FORMAT_BGR565, ZUMAPRO_DMA_FORMAT_RGB565,
 	  ZUMAPRO_DPP_FORMAT_ARGB8888 },
-	{ DRM_FORMAT_ARGB2101010, ZUMAPRO_DMA_FORMAT_BGRA1010102,
+	{ DRM_FORMAT_ARGB2101010, ZUMAPRO_DMA_FORMAT_ABGR2101010,
 	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
-	{ DRM_FORMAT_ABGR2101010, ZUMAPRO_DMA_FORMAT_RGBA1010102,
-	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
-	{ DRM_FORMAT_RGBA1010102, ZUMAPRO_DMA_FORMAT_ABGR2101010,
-	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
-	{ DRM_FORMAT_BGRA1010102, ZUMAPRO_DMA_FORMAT_ARGB2101010,
+	{ DRM_FORMAT_ABGR2101010, ZUMAPRO_DMA_FORMAT_ARGB2101010,
 	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
 	{ DRM_FORMAT_NV12, ZUMAPRO_DMA_FORMAT_NV12,
 	  ZUMAPRO_DPP_FORMAT_YUV420_8P },
@@ -331,10 +330,6 @@ static const struct zumapro_dpp_format zumapro_dpp_formats[] = {
 	  ZUMAPRO_DPP_FORMAT_YUV420_8P },
 	{ DRM_FORMAT_YUV420_10BIT, ZUMAPRO_DMA_FORMAT_YUV420_P010,
 	  ZUMAPRO_DPP_FORMAT_YUV420_P010 },
-	{ DRM_FORMAT_ARGB16161616F, ZUMAPRO_DMA_FORMAT_BGRA_FP16,
-	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
-	{ DRM_FORMAT_ABGR16161616F, ZUMAPRO_DMA_FORMAT_RGBA_FP16,
-	  ZUMAPRO_DPP_FORMAT_ARGB8101010 },
 };
 
 static const struct zumapro_dpp_restrictions zumapro_dpp_restrictions = {

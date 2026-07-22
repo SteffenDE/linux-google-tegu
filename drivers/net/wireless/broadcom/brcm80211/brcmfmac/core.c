@@ -92,6 +92,7 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 
 	return ifp;
 }
+BRCMF_EXPORT_SYMBOL_GPL(brcmf_get_ifp);
 
 void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 {

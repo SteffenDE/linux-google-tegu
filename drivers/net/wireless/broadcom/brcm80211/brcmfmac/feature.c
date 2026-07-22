@@ -456,6 +456,7 @@ bool brcmf_feat_is_enabled(struct brcmf_if *ifp, enum brcmf_feat_id id)
 {
 	return (ifp->drvr->feat_flags & BIT(id));
 }
+BRCMF_EXPORT_SYMBOL_GPL(brcmf_feat_is_enabled);
 
 bool brcmf_feat_is_quirk_enabled(struct brcmf_if *ifp,
 				 enum brcmf_feat_quirk quirk)

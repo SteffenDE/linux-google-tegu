@@ -33,6 +33,7 @@
  * SAE_EXT: SAE authentication handled by user-space supplicant
  * PMKID_V2: Version 2 PMKID
  * PMKID_V3: Version 3 PMKID
+ * PMKDB: PMKSA operations use the pmkdb iovar (carries the PMK)
  * EVENT_MSGS_EXT: Event messages extension
  * JOIN_V1: Version 1 join struct
  * GCMP: GCMP Cipher suite support
@@ -62,6 +63,7 @@
 	BRCMF_FEAT_DEF(DUMP_OBSS) \
 	BRCMF_FEAT_DEF(PMKID_V2) \
 	BRCMF_FEAT_DEF(PMKID_V3) \
+	BRCMF_FEAT_DEF(PMKDB) \
 	BRCMF_FEAT_DEF(SAE_EXT) \
 	BRCMF_FEAT_DEF(EVENT_MSGS_EXT) \
 	BRCMF_FEAT_DEF(GCMP)

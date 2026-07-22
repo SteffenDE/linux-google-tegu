@@ -7901,7 +7901,8 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 				      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 		wiphy_ext_feature_set(wiphy,
 				      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_1X);
-		if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_SAE))
+		if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_SAE) &&
+		    !brcmf_feat_is_enabled(ifp, BRCMF_FEAT_SAE_EXT))
 			wiphy_ext_feature_set(wiphy,
 					      NL80211_EXT_FEATURE_SAE_OFFLOAD);
 	}

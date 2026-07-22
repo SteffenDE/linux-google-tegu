@@ -186,6 +186,10 @@
 #define BRCMF_PMKSA_VER_3		3
 #define BRCMF_PMKSA_NO_EXPIRY		0xffffffff
 
+/* Flags for the "pmkdb" iovar operation (brcmf_pmk_op_v3_le.flag). */
+#define BRCMF_PMKDB_SET_IOVAR		0x0001
+#define BRCMF_PMKDB_CLEAR_IOVAR		0x0004
+
 /* MAX_CHUNK_LEN is the maximum length for data passing to firmware in each
  * ioctl. It is relatively small because firmware has small maximum size input
  * playload restriction for ioctls.
@@ -1196,7 +1200,7 @@ struct brcmf_pmk_op_v3_le {
 	__le16 version;
 	__le16 length;
 	__le16 count;
-	__le16 pad;
+	__le16 flag;
 	struct brcmf_pmksa_v3 pmk[BRCMF_MAXPMKID];
 };
 

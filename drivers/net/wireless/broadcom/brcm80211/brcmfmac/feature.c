@@ -152,7 +152,8 @@ struct brcmf_feat_wlcfeat {
 
 static const struct brcmf_feat_wlcfeat brcmf_feat_wlcfeat_map[] = {
 	{ 12, 0, BIT(BRCMF_FEAT_PMKID_V2) },
-	{ 13, 0, BIT(BRCMF_FEAT_PMKID_V3) }
+	{ 13, 0, BIT(BRCMF_FEAT_PMKID_V3) },
+	{ 14, 0, BIT(BRCMF_FEAT_PMKDB) }
 };
 
 static void brcmf_feat_wlc_version_overrides(struct brcmf_pub *drv)

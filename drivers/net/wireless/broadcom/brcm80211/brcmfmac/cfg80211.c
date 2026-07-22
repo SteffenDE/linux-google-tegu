@@ -4210,6 +4210,7 @@ brcmf_pmksa_v3_op(struct brcmf_if *ifp, struct cfg80211_pmksa *pmksa,
 		  bool alive)
 {
 	struct brcmf_pmk_op_v3_le *pmk_op;
+	bool pmkdb = brcmf_feat_is_enabled(ifp, BRCMF_FEAT_PMKDB);
 	int length = offsetof(struct brcmf_pmk_op_v3_le, pmk);
 	int ret;
 
@@ -4218,6 +4219,9 @@ brcmf_pmksa_v3_op(struct brcmf_if *ifp, struct cfg80211_pmksa *pmksa,
 		return -ENOMEM;
 
 	pmk_op->version = cpu_to_le16(BRCMF_PMKSA_VER_3);
+	if (pmkdb)
+		pmk_op->flag = cpu_to_le16(alive ? BRCMF_PMKDB_SET_IOVAR :
+						   BRCMF_PMKDB_CLEAR_IOVAR);
 
 	if (!pmksa) {
 		/* Flush operation, operate on entire list */
@@ -4232,6 +4236,14 @@ brcmf_pmksa_v3_op(struct brcmf_if *ifp, struct cfg80211_pmksa *pmksa,
 			memcpy(pmk_op->pmk[0].pmkid, pmksa->pmkid, WLAN_PMKID_LEN);
 			pmk_op->pmk[0].pmkid_len = WLAN_PMKID_LEN;
 		}
+		if (pmksa->pmk && pmksa->pmk_len) {
+			if (pmksa->pmk_len > sizeof(pmk_op->pmk[0].pmk)) {
+				ret = -ERANGE;
+				goto out;
+			}
+			memcpy(pmk_op->pmk[0].pmk, pmksa->pmk, pmksa->pmk_len);
+			pmk_op->pmk[0].pmk_len = pmksa->pmk_len;
+		}
 		if (pmksa->ssid && pmksa->ssid_len) {
 			memcpy(pmk_op->pmk[0].ssid.SSID, pmksa->ssid, pmksa->ssid_len);
 			pmk_op->pmk[0].ssid.SSID_len = pmksa->ssid_len;
@@ -4241,7 +4253,16 @@ brcmf_pmksa_v3_op(struct brcmf_if *ifp, struct cfg80211_pmksa *pmksa,
 
 	pmk_op->length = cpu_to_le16(length);
 
-	ret = brcmf_fil_iovar_data_set(ifp, "pmkid_info", pmk_op, sizeof(*pmk_op));
+	/* Newer firmware installs PMKSAs -- including the PMK that host-driven
+	 * SAE derives -- through the "pmkdb" iovar; older firmware only takes
+	 * the PMKID list via "pmkid_info".
+	 */
+	if (pmkdb)
+		ret = brcmf_fil_iovar_data_set(ifp, "pmkdb", pmk_op, length);
+	else
+		ret = brcmf_fil_iovar_data_set(ifp, "pmkid_info", pmk_op,
+					       sizeof(*pmk_op));
+out:
 	kfree(pmk_op);
 	return ret;
 }

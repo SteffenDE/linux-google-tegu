@@ -587,6 +587,13 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 	timeout = brcmf_msgbuf_ioctl_resp_wait(msgbuf);
 	if (!timeout) {
 		bphy_err(drvr, "Timeout on response for query command\n");
+		/*
+		 * A firmware trap taken during a power transition may never
+		 * deliver the FWHALT mailbox, so the command just times out.
+		 * Check the shared trap flag directly; if set, this kicks off
+		 * a coredump and firmware reload rather than looping forever.
+		 */
+		brcmf_bus_check_fw_trap(drvr->bus_if);
 		return -EIO;
 	}
 

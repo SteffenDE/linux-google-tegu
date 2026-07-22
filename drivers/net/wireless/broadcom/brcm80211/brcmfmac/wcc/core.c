@@ -4,6 +4,7 @@
  */
 #include <linux/errno.h>
 #include <linux/types.h>
+#include <linux/delay.h>
 #include <core.h>
 #include <bus.h>
 #include <fwvid.h>
@@ -127,6 +128,7 @@ brcmf_wcc_notify_auth_start(struct brcmf_if *ifp,
 	struct cfg80211_external_auth_params params;
 	struct brcmf_assoc_mgr_cmd_le cmd;
 	u32 ssid_len;
+	int tries;
 	int err;
 
 	if (e->datalen < sizeof(*evt)) {
@@ -144,7 +146,20 @@ brcmf_wcc_notify_auth_start(struct brcmf_if *ifp,
 	memcpy(params.ssid.ssid, evt->ssid.SSID, ssid_len);
 	memcpy(params.bssid, e->addr, ETH_ALEN);
 
-	err = cfg80211_external_auth_request(ifp->ndev, &params, GFP_KERNEL);
+	/* The firmware can raise this event while the connect request that
+	 * triggered it is still running (it fires during the join command,
+	 * before cfg80211 has recorded the owning socket), in which case
+	 * cfg80211_external_auth_request() rejects it with -EINVAL. Retry over
+	 * a short window to let the connect path catch up, otherwise the
+	 * firmware's paused authentication times out.
+	 */
+	for (tries = 0; tries < 20; tries++) {
+		err = cfg80211_external_auth_request(ifp->ndev, &params,
+						     GFP_KERNEL);
+		if (err != -EINVAL)
+			break;
+		msleep(10);
+	}
 	if (err) {
 		bphy_err(drvr, "failed to hand SAE auth to the supplicant (%d)\n",
 			 err);

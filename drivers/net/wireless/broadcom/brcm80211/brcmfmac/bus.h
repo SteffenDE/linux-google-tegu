@@ -109,6 +109,7 @@ struct brcmf_bus_ops {
 	int (*reset)(struct device *dev);
 	void (*remove)(struct device *dev);
 	void (*d2h_mb_rx)(struct device *dev, u32 data);
+	bool (*check_fw_trap)(struct device *dev);
 };
 
 
@@ -300,6 +301,19 @@ void brcmf_bus_d2h_mb_rx(struct brcmf_bus *bus, u32 data)
 		return;
 
 	return bus->ops->d2h_mb_rx(bus->dev, data);
+}
+
+/* Ask the bus whether the firmware has trapped/asserted.  Returns true (and
+ * kicks off crash recovery) only when a trap is positively detected, so a
+ * caller that hit an unrelated timeout can fall through unchanged.
+ */
+static inline
+bool brcmf_bus_check_fw_trap(struct brcmf_bus *bus)
+{
+	if (!bus->ops->check_fw_trap)
+		return false;
+
+	return bus->ops->check_fw_trap(bus->dev);
 }
 
 /*

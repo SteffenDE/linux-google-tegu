@@ -250,6 +250,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_MIN_SHARED_VERSION		5
 #define BRCMF_PCIE_MAX_SHARED_VERSION		BRCMF_PCIE_SHARED_VERSION_7
 #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
+#define BRCMF_PCIE_SHARED_ASSERT		0x200
+#define BRCMF_PCIE_SHARED_TRAP			0x400
 #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
 #define BRCMF_PCIE_SHARED_USE_MAILBOX		0x2000000
@@ -482,6 +484,7 @@ struct brcmf_pciedev_info {
 	bool ds_exit_completed;
 	bool skip_ds_ack;
 	bool runtime_pm_enabled;
+	bool fw_trap_reported;
 	int host_wake_irq;
 	bool irq_allocated;
 	bool irq_ready;
@@ -598,6 +601,8 @@ static struct brcmf_fw_request *
 brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
+					bool error);
 static void
 brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *devinfo, bool active);
 static void brcmf_pcie_debugfs_create(struct device *dev);
@@ -1387,6 +1392,47 @@ static void brcmf_pcie_d2h_mb_rx(struct device *dev, u32 data)
 }
 
 /*
+ * Positively detect a trapped/asserted firmware by reading the shared-info
+ * flags word over the still-live PCIe link.  The firmware's own trap handler
+ * sets these bits regardless of its power state, so this works even when the
+ * FWHALT mailbox is never delivered -- which is the norm for a trap taken in
+ * host-sleep, because pciedev_fwhalt() first asserts host-wake and waits for
+ * the host to resume the D3 link before it can post FWHALT.
+ *
+ * Report the crash and flush the firmware console (which holds the trap
+ * details) once, then let the caller fail the command.  Automatic recovery is
+ * deliberately not driven from here yet: the in-place bus reset cannot bring a
+ * trapped device back (its resume path is a firmware mailbox handshake the
+ * dead firmware cannot answer), so recovery needs a hardware reset / re-probe
+ * that is not wired up.  Until then a firmware trap is logged, not recovered.
+ */
+static bool brcmf_pcie_check_fw_trap(struct device *dev)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus_if->bus_priv.pcie->devinfo;
+	u32 flags;
+
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP ||
+	    !devinfo->shared.tcm_base_address)
+		return false;
+
+	flags = brcmf_pcie_read_tcm32(devinfo, devinfo->shared.tcm_base_address +
+				      BRCMF_SHARED_FLAGS_OFFSET);
+	/* All-ones means the link is down rather than a trap flag being set. */
+	if (flags == 0xffffffff ||
+	    !(flags & (BRCMF_PCIE_SHARED_TRAP | BRCMF_PCIE_SHARED_ASSERT)))
+		return false;
+
+	if (!devinfo->fw_trap_reported) {
+		devinfo->fw_trap_reported = true;
+		brcmf_err(bus_if, "firmware trap detected (flags=0x%08x)\n",
+			  flags);
+		brcmf_pcie_bus_console_read(devinfo, true);
+	}
+	return true;
+}
+
+/*
  * Wait for a mailbox event (the device-wake exit note or the D3 ack).  The
  * threaded PCIe IRQ delivers it via brcmf_pcie_handle_mb_data(); deliberately
  * do NOT pump the RX ring here -- this runs inside the H2D submission paths, so
@@ -1703,6 +1749,15 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		return;
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	newidx = brcmf_pcie_read_tcm32(devinfo, addr);
+	/*
+	 * A down or PHY-isolated link reads all-ones instead of a valid write
+	 * index.  Bail out rather than let the loop below chase an index that
+	 * read_idx (wrapping at bufsize) can never reach -- otherwise it spins
+	 * forever dumping 0xff bytes to the log.  This is exactly the state the
+	 * error-path callers hit on a dead firmware.
+	 */
+	if (newidx >= console->bufsize)
+		return;
 	while (newidx != console->read_idx) {
 		addr = console->buf_addr + console->read_idx;
 		ch = brcmf_pcie_read_tcm8(devinfo, addr);
@@ -2484,6 +2539,7 @@ static const struct brcmf_bus_ops brcmf_pcie_bus_ops = {
 	.reset = brcmf_pcie_reset,
 	.debugfs_create = brcmf_pcie_debugfs_create,
 	.d2h_mb_rx = brcmf_pcie_d2h_mb_rx,
+	.check_fw_trap = brcmf_pcie_check_fw_trap,
 };
 
 
@@ -3267,6 +3323,9 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	/* check firmware loading result */
 	if (ret)
 		goto fail;
+
+	/* Re-arm trap reporting for the freshly (re)loaded firmware. */
+	devinfo->fw_trap_reported = false;
 
 	brcmf_pcie_attach(devinfo);
 

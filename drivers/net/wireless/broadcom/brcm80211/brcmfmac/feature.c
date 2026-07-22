@@ -314,6 +314,12 @@ int brcmf_feat_attach(struct brcmf_pub *drvr)
 	s32 err;
 
 	brcmf_feat_firmware_capabilities(ifp);
+	/* BCM4383 firmware advertises SAE offload but does not perform it
+	 * correctly; it does support driving SAE from the host supplicant
+	 * (external auth). Enable that path for it.
+	 */
+	if (drvr->bus_if->chip == BRCM_CC_4383_CHIP_ID)
+		ifp->drvr->feat_flags |= BIT(BRCMF_FEAT_SAE_EXT);
 	memset(&gscan_cfg, 0, sizeof(gscan_cfg));
 	if (drvr->bus_if->chip != BRCM_CC_43430_CHIP_ID &&
 	    drvr->bus_if->chip != BRCM_CC_4345_CHIP_ID &&

@@ -2,14 +2,15 @@
 #
 # AoC ALSA: ASoC drivers for the AoC audio DSP.
 #
-# Downstream builds voice/compress/nohost/incall/voip/usb/dp into
-# aoc_alsa_dev_util as well; those stay unbuilt here until their
-# subsystems are brought up (the sources are imported for reference).
+# Downstream builds compress/nohost/incall/usb/dp into aoc_alsa_dev_util as
+# well; those stay unbuilt here until their subsystems are brought up (the
+# sources are imported for reference). voice is built for telephony bring-up.
 
 ccflags-y	+= -I$(src)/.. -I$(src)/../aoc_ipc
 
 obj-$(CONFIG_AOC_ALSA)		+= aoc_alsa_dev.o
 obj-$(CONFIG_AOC_ALSA)		+= aoc_alsa_dev_util.o
 aoc_alsa_dev_util-objs		:= aoc_alsa_path.o aoc_alsa_drv.o \
-				   aoc_alsa_pcm.o aoc_alsa_ctl.o aoc_alsa_hw.o
+				   aoc_alsa_pcm.o aoc_alsa_ctl.o aoc_alsa_hw.o \
+				   aoc_alsa_voice.o
 aoc_alsa_dev-objs		:= aoc_alsa_card.o

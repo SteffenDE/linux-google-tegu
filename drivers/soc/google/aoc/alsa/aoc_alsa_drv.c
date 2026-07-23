@@ -282,10 +282,15 @@ static int snd_aoc_alsa_probe(void)
 		goto out;
 	}
 
+	err = aoc_voice_init();
+	if (err) {
+		pr_err("ERR: fail to init aoc voice\n");
+		goto out;
+	}
+
 	/*
-	 * Downstream also inits voice, compress, nohost, incall, voip, usb
-	 * and dp platform drivers here; those sub-drivers are not built in
-	 * this tree yet (speaker/mic PCM only).
+	 * Downstream also inits compress, nohost, incall, usb and dp platform
+	 * drivers here; those sub-drivers are not built in this tree yet.
 	 */
 	err = aoc_path_init();
 	if (err) {
@@ -302,6 +307,7 @@ out:
 static int snd_aoc_alsa_remove(void)
 {
 	aoc_path_exit();
+	aoc_voice_exit();
 	aoc_pcm_exit();
 
 	return 0;

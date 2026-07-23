@@ -122,8 +122,8 @@ static int snd_aoc_pcm_open(struct snd_soc_component *component,
 
 	alsa_stream->timer_interval_ns = PCM_TIMER_INTERVAL_NANOSECS;
 	timer_setup(&(alsa_stream->timer), aoc_pcm_timer_irq_handler, 0);
-	hrtimer_init( &(alsa_stream->hr_timer), CLOCK_MONOTONIC, HRTIMER_MODE_REL );
-	alsa_stream->hr_timer.function = &aoc_pcm_hrtimer_irq_handler;
+	hrtimer_setup(&alsa_stream->hr_timer, aoc_pcm_hrtimer_irq_handler,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	chip->default_mic_hw_gain =
 		aoc_mic_hw_gain_get(chip, MIC_HIGH_POWER_GAIN);
@@ -297,26 +297,26 @@ static int aoc_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_r
 
 	dma_set_mask_and_coherent(component->dev, DMA_BIT_MASK(64));
 
-	/* Allocate DMA memory */
-	if (rtd->dai_link->dpcm_playback) {
-		substream =
-			rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+	/*
+	 * Allocate DMA memory.  Mainline dropped dpcm_playback/dpcm_capture;
+	 * the substream only exists for directions the link supports, so key
+	 * off that directly (matches aoc_alsa_pcm.c).
+	 */
+	substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+	if (substream)
 		snd_pcm_lib_preallocate_pages(
 			substream, SNDRV_DMA_TYPE_CONTINUOUS,
 			component->dev,
 			snd_aoc_playback_hw.buffer_bytes_max,
 			snd_aoc_playback_hw.buffer_bytes_max);
-	}
 
-	if (rtd->dai_link->dpcm_capture) {
-		substream =
-			rtd->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
+	substream = rtd->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
+	if (substream)
 		snd_pcm_lib_preallocate_pages(
 			substream, SNDRV_DMA_TYPE_CONTINUOUS,
 			component->dev,
 			snd_aoc_playback_hw.buffer_bytes_max,
 			snd_aoc_playback_hw.buffer_bytes_max);
-	}
 
 	rtd->pcm->nonatomic = true;
 	return 0;
@@ -329,7 +329,7 @@ static const struct snd_soc_component_driver aoc_pcm_component = {
 	.hw_params = snd_aoc_pcm_hw_params,
 	.hw_free = snd_aoc_pcm_hw_free,
 	.prepare = snd_aoc_pcm_prepare,
-	.pcm_construct = aoc_pcm_new,
+	.pcm_new = aoc_pcm_new,
 };
 
 static int aoc_pcm_probe(struct platform_device *pdev)

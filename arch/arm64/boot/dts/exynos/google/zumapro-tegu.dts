@@ -986,6 +986,10 @@
 		compatible = "google-aoc-snd-pcm";
 	};
 
+	aoc_voice: aoc-voice {
+		compatible = "google-aoc-snd-voice";
+	};
+
 	aoc_path: aoc-path {
 		compatible = "google-aoc-path";
 		#sound-dai-cells = <1>;
@@ -1068,6 +1072,14 @@
 				};
 			};
 
+			/*
+			 * Device 4 (EP5) is the telephony frontend: downstream
+			 * binds it to google-aoc-snd-voice (dumped.dts of_drv
+			 * 0x206), and aoc_alsa_hw.c prepare_phonecall() gates on
+			 * pcm->device == 4.  Route it through aoc_voice so opening
+			 * this PCM issues CMD_AUDIO_OUTPUT_TELEPHONY_MODEM_START
+			 * to bind modem<->AoC call audio.
+			 */
 			fe_ep5_rx {
 				dai-name = "audio_playback4";
 				stream-name = "EP5 playback";
@@ -1081,7 +1093,7 @@
 
 				platform {
 					rx1 {
-						of_drv = <&aoc_pcm>;
+						of_drv = <&aoc_voice>;
 					};
 				};
 			};

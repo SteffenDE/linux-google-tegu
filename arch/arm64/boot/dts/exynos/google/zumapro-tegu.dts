@@ -1178,6 +1178,72 @@
 				};
 			};
 
+			/*
+			 * Devices 9-11: EP2/EP3 capture placeholders (like the
+			 * compress/haptics playback slots) so the voice-call
+			 * capture frontend lands at device 11 = NORMAL in
+			 * aoc_audio_stream_type[], matching downstream
+			 * audio_capture1..3.  EP4 capture (id 0x40000003) is the
+			 * telephony *uplink*: aoc_audio_path_open() opens the
+			 * phone-call capture path for src_idx == 3, which starts
+			 * the modem mic input (aoc_telephony_mic_open); it binds
+			 * to google-aoc-snd-voice like the downlink FE.  EP2/EP3
+			 * open cleanly-fail until their subsystems come up.
+			 */
+			fe_ep2_tx {
+				dai-name = "audio_capture1";
+				stream-name = "EP2 capture";
+				id = <0x40000001>;
+				dynamic;
+				capture;
+
+				cpu {
+					sound-dai = <&aoc_path 0x40000001>;
+				};
+
+				platform {
+					tx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep3_tx {
+				dai-name = "audio_capture2";
+				stream-name = "EP3 capture";
+				id = <0x40000002>;
+				dynamic;
+				capture;
+
+				cpu {
+					sound-dai = <&aoc_path 0x40000002>;
+				};
+
+				platform {
+					tx1 {
+						of_drv = <&aoc_pcm>;
+					};
+				};
+			};
+
+			fe_ep4_tx {
+				dai-name = "audio_capture3";
+				stream-name = "EP4 capture";
+				id = <0x40000003>;
+				dynamic;
+				capture;
+
+				cpu {
+					sound-dai = <&aoc_path 0x40000003>;
+				};
+
+				platform {
+					tx1 {
+						of_drv = <&aoc_voice>;
+					};
+				};
+			};
+
 			be_tdm0_rx {
 				dai-name = "TDM_0_RX Playback";
 				stream-name = "TDM_0_RX Playback";

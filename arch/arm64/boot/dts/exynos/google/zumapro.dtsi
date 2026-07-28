@@ -1589,7 +1589,7 @@
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1014>;
 			samsung,mode = <USI_MODE_I2C>;
-			status = "okay";
+			status = "disabled";
 
 			hsi2c_6: i2c@108d0000 {
 				compatible = "google,gs101-hsi2c",
@@ -1603,7 +1603,7 @@
 				interrupts = <GIC_SPI 647 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c6_bus>;
-				status = "okay";
+				status = "disabled";
 			};
 		};
 
@@ -1688,7 +1688,7 @@
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1008>;
 			samsung,mode = <USI_MODE_I2C>;
-			status = "okay";
+			status = "disabled";
 
 			hsi2c_10: i2c@10ca0000 {
 				compatible = "google,gs101-hsi2c",
@@ -1703,13 +1703,7 @@
 				clock-frequency = <400000>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c10_bus>;
-				status = "okay";
-
-				battery_pack_eeprom: eeprom@50 {
-					compatible = "atmel,24c08";
-					reg = <0x50>;
-					read-only;
-				};
+				status = "disabled";
 			};
 		};
 

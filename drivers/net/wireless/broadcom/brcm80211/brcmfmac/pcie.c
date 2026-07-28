@@ -601,6 +601,9 @@ static struct brcmf_fw_request *
 brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_host_wake_init(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_host_wake_start(struct brcmf_pciedev_info *devinfo);
+static void brcmf_pcie_host_wake_fini(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 					bool error);
 static void
@@ -3412,6 +3415,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 			  brcmf_pcie_ds_state_name(devinfo->ds_state),
 			  atomic_read(&devinfo->ds_active_count));
 
+	brcmf_pcie_host_wake_init(devinfo);
+
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
@@ -3432,6 +3437,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
 	brcmf_pcie_runtime_pm_enable(devinfo);
+	brcmf_pcie_host_wake_start(devinfo);
 
 	if (brcmf_pcie_fw_console &&
 	    device_create_file(dev, &dev_attr_fw_console))
@@ -3809,6 +3815,7 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	devinfo = bus->bus_priv.pcie->devinfo;
 	if (brcmf_pcie_fw_console)
 		device_remove_file(&pdev->dev, &dev_attr_fw_console);
+	brcmf_pcie_host_wake_fini(devinfo);
 	brcmf_pcie_runtime_pm_disable(devinfo);
 	brcmf_pcie_bus_console_read(devinfo, false);
 	brcmf_pcie_fwcon_timer(devinfo, false);
@@ -3851,29 +3858,145 @@ brcmf_pcie_remove(struct pci_dev *pdev)
  * unbalance the core's own enable.  Defined outside CONFIG_PM (pm_runtime_*
  * stub out) because the call sites in setup/remove are unconditional.
  */
+/*
+ * Out-of-band host-wake.
+ *
+ * The firmware asserts a sideband line when it has traffic for a host it
+ * believes is asleep, because an inbound frame cannot raise an in-band MSI
+ * while the link is down.  The assert is not advisory: pciedev_trigger_host_wake
+ * latches a timestamp and the periodic health check calls osl_sys_halt() if the
+ * line is still asserted pd[0xc68] later (pciedev_host_wake_asserted_for_too_long),
+ * which kills the chip until it is re-probed.
+ *
+ * The host must therefore always be able to see and service this line.  The PM
+ * core's dedicated wake IRQ is not enough: it is only unmasked around *runtime*
+ * suspend, while the firmware's in-band device-sleep is autonomous and happens
+ * with the host runtime-active, so the assert lands on a masked interrupt and
+ * the watchdog fires.  Own the IRQ instead and keep it enabled for as long as
+ * in-band DS is negotiated, independent of runtime PM.
+ */
+static irqreturn_t brcmf_pcie_host_wake_isr(int irq, void *arg)
+{
+	struct brcmf_pciedev_info *devinfo = arg;
+
+	pm_wakeup_event(&devinfo->pdev->dev, 0);
+
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t brcmf_pcie_host_wake_thread(int irq, void *arg)
+{
+	struct brcmf_pciedev_info *devinfo = arg;
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	int err;
+
+	if (!bus)
+		return IRQ_HANDLED;
+
+	brcmf_dbg(DS, "OOB host-wake asserted\n");
+
+	/*
+	 * Resume the link if it is in D3 and take the firmware out of in-band
+	 * device-sleep, so the mailbox below is serviced from a known-awake
+	 * state.  Deliberately not gated on devinfo->state: runtime suspend
+	 * leaves that at BRCMFMAC_PCIE_STATE_DOWN, which is exactly the case
+	 * this handler exists for.
+	 */
+	err = brcmf_pcie_pm_enter_active(bus);
+	if (err) {
+		brcmf_err(bus, "OOB host-wake: resume failed, err=%d\n", err);
+		return IRQ_HANDLED;
+	}
+
+	/*
+	 * Only a host D0 entry clears the firmware's assert: it runs
+	 * pciedev_handle_d0_enter_bm(), which drops the wake line and resets
+	 * the counters that make it drop inbound frames.  Waking the device
+	 * out of in-band DS alone leaves the latch -- and the watchdog --
+	 * armed.  HOST_D0_INFORM is idempotent across the firmware's power
+	 * states, so sending it again after a D3 exit already did is harmless.
+	 */
+	err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM);
+	if (err)
+		brcmf_err(bus, "OOB host-wake: D0_INFORM failed, err=%d\n", err);
+
+	brcmf_pcie_pm_leave_active(bus);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * Request the line before brcmf_attach() so that brcmf_c_preinit_dcmds() can
+ * tell whether the host is able to service a wake before it lets the firmware
+ * assert one.  Requested disabled: it is unmasked in brcmf_pcie_host_wake_start()
+ * once the data path is up.
+ */
+static void brcmf_pcie_host_wake_init(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	int irq, err;
+
+	if (!brcmf_pcie_inband_ds(devinfo))
+		return;
+
+	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
+	if (irq <= 0)
+		return;
+
+	err = request_threaded_irq(irq, brcmf_pcie_host_wake_isr,
+				   brcmf_pcie_host_wake_thread,
+				   IRQF_ONESHOT | IRQF_NO_AUTOEN,
+				   "brcmf_host_wake", devinfo);
+	if (err) {
+		dev_warn(dev, "failed to request host-wake IRQ %d: %d\n", irq,
+			 err);
+		return;
+	}
+
+	devinfo->host_wake_irq = irq;
+	bus->oob_host_wake = true;
+
+	/*
+	 * Let the PM core arm it for system suspend when the device is allowed
+	 * to wake, leaving the existing WoWL policy unchanged.  Unlike
+	 * dev_pm_set_dedicated_wake_irq() this does not touch the runtime
+	 * suspend/resume path, so the handler above stays live throughout.
+	 */
+	if (dev_pm_set_wake_irq(dev, irq))
+		dev_warn(dev, "failed to arm host-wake IRQ %d for wakeup\n",
+			 irq);
+}
+
+static void brcmf_pcie_host_wake_start(struct brcmf_pciedev_info *devinfo)
+{
+	if (devinfo->host_wake_irq)
+		enable_irq(devinfo->host_wake_irq);
+}
+
+static void brcmf_pcie_host_wake_fini(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+
+	if (!devinfo->host_wake_irq)
+		return;
+
+	dev_pm_clear_wake_irq(dev);
+	/* Waits out an in-flight handler before anything below is torn down. */
+	free_irq(devinfo->host_wake_irq, devinfo);
+	devinfo->host_wake_irq = 0;
+	if (bus)
+		bus->oob_host_wake = false;
+}
+
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;
-	int irq;
 
 	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
 		return;
-
-	/*
-	 * Optional OOB host-wake: an inbound frame cannot raise an in-band MSI
-	 * while the link is in D3, so the chip pulses a sideband line instead.
-	 * As a dedicated wake IRQ the PM core arms it on runtime suspend and
-	 * resumes the device when it fires -- no handler here.  This does not
-	 * touch system-suspend wake (that stays gated on device_may_wakeup),
-	 * leaving the existing WoWL policy unchanged.
-	 */
-	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
-	if (irq > 0) {
-		if (dev_pm_set_dedicated_wake_irq(dev, irq))
-			dev_warn(dev, "failed to set up host-wake IRQ %d\n", irq);
-		else
-			devinfo->host_wake_irq = irq;
-	}
 
 	pm_runtime_set_autosuspend_delay(dev,
 					 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
@@ -3894,11 +4017,6 @@ static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
 	pm_runtime_get_sync(dev);		/* restore probe ref, resume */
 	pm_runtime_forbid(dev);			/* control=on again */
 	pm_runtime_dont_use_autosuspend(dev);
-
-	if (devinfo->host_wake_irq) {
-		dev_pm_clear_wake_irq(dev);
-		devinfo->host_wake_irq = 0;
-	}
 
 	devinfo->runtime_pm_enabled = false;
 }

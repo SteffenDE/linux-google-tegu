@@ -987,11 +987,32 @@
  * tegu battery model files (BC79_TG4_2mOhm_*), and scales the current and
  * charge readings.
  */
+&usi6 {
+	status = "okay";
+};
+
 &hsi2c_6 {
+	status = "okay";
+
 	fuel-gauge@36 {
 		compatible = "maxim,max77779fg";
 		reg = <0x36>;
 		shunt-resistor-micro-ohms = <2000>;
+	};
+};
+
+&usi10 {
+	status = "okay";
+};
+
+&hsi2c_10 {
+	status = "okay";
+
+	/* Battery pack ID EEPROM (downstream battery_pack_eeprom). */
+	battery_pack_eeprom: eeprom@50 {
+		compatible = "atmel,24c08";
+		reg = <0x50>;
+		read-only;
 	};
 };
 

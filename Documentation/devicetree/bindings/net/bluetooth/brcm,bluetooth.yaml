@@ -31,6 +31,7 @@ properties:
           - brcm,bcm43540-bt
           - brcm,bcm4335a0
           - brcm,bcm4349-bt
+          - brcm,bcm4383-bt
           - cypress,cyw4373a0-bt
           - infineon,cyw55572-bt
 
@@ -50,6 +51,13 @@ properties:
     description: GPIO specifier for the line BT_WAKE used to
       wakeup the controller. This is using the BT_GPIO_0
       pin on the chip when in use.
+
+  ble-dbo-gpios:
+    maxItems: 1
+    description: GPIO that clocks an external flip-flop gating the
+      controller's BT_REG_ON on some boards (e.g. Google Pixel 9a).
+      The driver pulses it after each shutdown-gpios change so the
+      controller latches the new power state.
 
   host-wakeup-gpios:
     maxItems: 1

@@ -784,6 +784,20 @@
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
+
+	/* BT_REG_ON: BCM4383 Bluetooth power enable (output). */
+	bt_reg_on: bt-reg-on-pins {
+		samsung,pins = "gpn8-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	/* BT_DEV_WAKE: host->device wake (output). */
+	bt_dev_wake: bt-dev-wake-pins {
+		samsung,pins = "gpn9-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
 };
 
 &pinctrl_peric0 {
@@ -796,6 +810,19 @@
 	/* Left speaker amp reset (downstream tas2572_1_rst). */
 	spk_amp_l_rst: spk-amp-l-rst-pins {
 		samsung,pins = "gpp6-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+};
+
+&pinctrl_peric1 {
+	/*
+	 * BT_BLE_DBO (gpp24-3): clock for the external flip-flop that gates the
+	 * BCM4383's BT_REG_ON.  hci_bcm pulses it after each REG_ON change so
+	 * the chip actually sees the new power state.  Driven as an output.
+	 */
+	bt_ble_dbo: bt-ble-dbo-pins {
+		samsung,pins = "gpp24-3";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 	};
@@ -852,6 +879,53 @@
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
+	/* BT_HOST_WAKE: device->host wake EINT (gpa5-6, pull-down). */
+	bt_host_wake: bt-host-wake-pins {
+		samsung,pins = "gpa5-6";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+};
+
+/*
+ * BCM4383 Bluetooth.  The same combo chip as WiFi (which is the brcmfmac
+ * side over PCIe); Bluetooth is the separate UART interface on the always-on
+ * APM USI1 UART (uart18, added in zumapro.dtsi).  The REG_ON / dev-wake
+ * outputs and the gpa5-6 host-wake EINT are from research/dumped.dts btbcm
+ * (the downstream goog,nitrous sideband node) and match the live dump.  The
+ * host driver is mainline hci_bcm over serdev; the Google nitrous driver is
+ * not ported.  Patchram firmware is brcm/BCM.hcd (btbcm derives exactly that
+ * name for this UART chip).  No local-bd-address: the per-device BD_ADDR
+ * lives in the vendor cfg partition, not in the SoC, so it is left to
+ * firmware / runtime provisioning rather than hardcoded here.
+ */
+&usi_apm_uart {
+	/*
+	 * clkreq-on keeps the ALIVE-block USI clock continuously fed so the
+	 * UART receiver can clock in the BCM4383's replies.  Without it HWACG
+	 * gates the RX clock when the bus is idle: the controller still
+	 * transmits (host-driven) but never receives, so the chip looks mute.
+	 */
+	samsung,clkreq-on; /* needed for UART mode */
+	status = "okay";
+};
+
+&serial_18 {
+	status = "okay";
+
+	bluetooth {
+		compatible = "brcm,bcm4383-bt";
+		shutdown-gpios = <&gpn8 0 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpn9 0 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&gpa5 6 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wakeup";
+		ble-dbo-gpios = <&gpp24 3 GPIO_ACTIVE_HIGH>;
+		max-speed = <3000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_reg_on &bt_dev_wake &bt_host_wake &bt_ble_dbo>;
 	};
 };
 

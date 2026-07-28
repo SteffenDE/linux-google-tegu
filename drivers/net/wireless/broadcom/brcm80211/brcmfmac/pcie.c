@@ -4009,6 +4009,17 @@ static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
 		return;
 
+	/*
+	 * brcmf_pcie_reset() re-enters brcmf_pcie_setup() without freeing the
+	 * device and without a matching brcmf_pcie_runtime_pm_disable(), so
+	 * this can run a second time on an already-handed-over device.  The
+	 * put below balances the PCI core's probe-time usage reference, of
+	 * which there is exactly one -- dropping it again on a reset underflows
+	 * the usage count.
+	 */
+	if (devinfo->runtime_pm_enabled)
+		return;
+
 	pm_runtime_set_autosuspend_delay(dev,
 					 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);

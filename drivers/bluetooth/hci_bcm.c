@@ -78,6 +78,8 @@ struct bcm_device_data {
  *	power up or power down Bluetooth device internal regulators
  * @reset: BT_RST_N pin,
  *	active low resets the Bluetooth logic core
+ * @ble_dbo: clock pin for an external flip-flop that gates BT_REG_ON on
+ *	some boards; pulsed after each BT_REG_ON change (optional)
  * @set_device_wakeup: callback to toggle BT_WAKE pin
  *	either by accessing @device_wakeup or by calling @btlp
  * @set_shutdown: callback to toggle BT_REG_ON pin
@@ -120,6 +122,7 @@ struct bcm_device {
 	struct gpio_desc	*device_wakeup;
 	struct gpio_desc	*shutdown;
 	struct gpio_desc	*reset;
+	struct gpio_desc	*ble_dbo;
 	int			(*set_device_wakeup)(struct bcm_device *, bool);
 	int			(*set_shutdown)(struct bcm_device *, bool);
 #ifdef CONFIG_ACPI
@@ -246,6 +249,26 @@ static bool bcm_device_exists(struct bcm_device *device)
 	return false;
 }
 
+/*
+ * Some boards (e.g. Google Pixel 9a "tegu") gate the BCM4383's BT_REG_ON
+ * through an external flip-flop whose clock is the "ble-dbo" line: the chip
+ * only sees a REG_ON change once the flip-flop is clocked. Pulse ble-dbo
+ * low->high->low; the rising edge latches the current REG_ON (shutdown GPIO)
+ * level into the chip. Mirrors the downstream nitrous toggle_dbo_ff(). No-op
+ * on boards without the line.
+ */
+static void bcm_toggle_dbo(struct bcm_device *dev)
+{
+	if (!dev->ble_dbo)
+		return;
+
+	gpiod_set_value_cansleep(dev->ble_dbo, 0);
+	udelay(1);
+	gpiod_set_value_cansleep(dev->ble_dbo, 1);
+	udelay(1);
+	gpiod_set_value_cansleep(dev->ble_dbo, 0);
+}
+
 static int bcm_gpio_set_power(struct bcm_device *dev, bool powered)
 {
 	int err;
@@ -280,6 +303,12 @@ static int bcm_gpio_set_power(struct bcm_device *dev, bool powered)
 	err = dev->set_shutdown(dev, powered);
 	if (err)
 		goto err_txco_clk_disable;
+
+	/* Latch the just-set REG_ON level through the ble-dbo flip-flop (if
+	 * present) before asserting device-wakeup, matching the downstream
+	 * power sequence.
+	 */
+	bcm_toggle_dbo(dev);
 
 	err = dev->set_device_wakeup(dev, powered);
 	if (err)
@@ -1116,6 +1145,11 @@ static int bcm_get_resources(struct bcm_device *dev)
 					     GPIOD_OUT_LOW);
 	if (IS_ERR(dev->reset))
 		return PTR_ERR(dev->reset);
+
+	dev->ble_dbo = devm_gpiod_get_optional(dev->dev, "ble-dbo",
+					       GPIOD_OUT_LOW);
+	if (IS_ERR(dev->ble_dbo))
+		return PTR_ERR(dev->ble_dbo);
 
 	dev->set_device_wakeup = bcm_gpio_set_device_wakeup;
 	dev->set_shutdown = bcm_gpio_set_shutdown;

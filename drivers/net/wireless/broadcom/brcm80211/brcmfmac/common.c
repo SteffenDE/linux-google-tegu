@@ -434,12 +434,19 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 
 	/*
 	 * Allow the firmware to assert its out-of-band host-wake GPIO so an
-	 * inbound frame can wake the host while the PCIe link is in a low-power
+	 * inbound frame can wake the host while the link is in a low-power
 	 * (in-band deep-sleep / D3) state.  Without this the firmware reaches
-	 * host-sleep but never drives the wake line.  Best-effort: not all
-	 * firmware exposes the iovar.
+	 * host-sleep but never drives the wake line.
+	 *
+	 * Only enable it when the bus reports that the host can actually see
+	 * and service that line.  The same firmware flag arms a watchdog: an
+	 * assert that is not serviced within the firmware's timeout halts the
+	 * chip.  Enabling this with no interrupt wired at the host end turns
+	 * every inbound frame that arrives during host-sleep into a firmware
+	 * trap.  Best-effort: not all firmware exposes the iovar.
 	 */
-	(void)brcmf_fil_iovar_int_set(ifp, "bus:host_access", 1);
+	if (bus->oob_host_wake)
+		(void)brcmf_fil_iovar_int_set(ifp, "bus:host_access", 1);
 done:
 	return err;
 }

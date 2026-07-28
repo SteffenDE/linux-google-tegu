@@ -1588,7 +1588,6 @@
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI6_USI>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1014>;
-			samsung,mode = <USI_MODE_I2C>;
 			status = "disabled";
 
 			hsi2c_6: i2c@108d0000 {
@@ -1687,7 +1686,6 @@
 				 <&cmu_peric1 CLK_DOUT_PERIC1_USI10_USI>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1008>;
-			samsung,mode = <USI_MODE_I2C>;
 			status = "disabled";
 
 			hsi2c_10: i2c@10ca0000 {
@@ -2084,7 +2082,6 @@
 				 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_hsi0 0x101c>;
-			samsung,mode = <USI_MODE_SPI>;
 			status = "disabled";
 
 			spi_20: spi@111d0000 {
@@ -2118,7 +2115,6 @@
 				 <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_CLK>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_hsi0 0x1024>;
-			samsung,mode = <USI_MODE_I2C>;
 			status = "disabled";
 
 			hsi2c_19: i2c@111f0000 {

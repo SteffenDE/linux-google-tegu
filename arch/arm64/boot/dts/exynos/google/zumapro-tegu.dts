@@ -930,6 +930,7 @@
 };
 
 &usi2_hsi0 {
+	samsung,mode = <USI_MODE_SPI>;
 	status = "okay";
 };
 
@@ -988,6 +989,7 @@
  * charge readings.
  */
 &usi6 {
+	samsung,mode = <USI_MODE_I2C>;
 	status = "okay";
 };
 
@@ -1002,6 +1004,7 @@
 };
 
 &usi10 {
+	samsung,mode = <USI_MODE_I2C>;
 	status = "okay";
 };
 
@@ -1017,6 +1020,7 @@
 };
 
 &usi4_hsi0 {
+	samsung,mode = <USI_MODE_I2C>;
 	status = "okay";
 };
 

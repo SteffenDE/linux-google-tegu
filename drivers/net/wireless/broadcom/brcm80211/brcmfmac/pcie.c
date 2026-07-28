@@ -2499,6 +2499,17 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	/*
+	 * Release the OOB host-wake before anything is torn down, symmetric
+	 * with brcmf_pcie_remove().  brcmf_pcie_setup() re-requests it below.
+	 * Leaving it live across the reset would let the handler run against a
+	 * detached device -- brcmf_detach() clears drvr->proto, which
+	 * brcmf_msgbuf_h2d_mb_write() dereferences unconditionally -- and would
+	 * make the re-request fail with -EBUSY and the second enable_irq()
+	 * warn about an unbalanced enable.
+	 */
+	brcmf_pcie_host_wake_fini(devinfo);
+
 	brcmf_pcie_intr_disable(devinfo);
 
 	brcmf_pcie_bus_console_read(devinfo, true);

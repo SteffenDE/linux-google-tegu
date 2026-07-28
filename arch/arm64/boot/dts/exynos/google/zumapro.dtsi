@@ -762,6 +762,20 @@
 	};
 
 	/*
+	 * BLK_ALIVE APM_USI1 UART (uart18 = Bluetooth HCI) baud clock.
+	 * Downstream dmesg reports "155d0000.serial: Clock rate : 200000000".
+	 * CMU_APM is not modeled yet and this rail is owned by ACPM and left
+	 * running, so model it as a fixed-clock; replace with the real
+	 * DOUT_CLK_APM_USI1_UART once CMU_APM lands.
+	 */
+	apm_usi1_uart_clk: clock-200000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "apm_usi1_uart";
+	};
+
+	/*
 	 * Source: PSCI compatible/method are from research/dumped.dts:3235-3239.
 	 */
 	psci {
@@ -1613,6 +1627,54 @@
 		sysreg_peric1: syscon@10c20000 {
 			compatible = "google,zumapro-peric1-sysreg", "syscon";
 			reg = <0x10c20000 0x10000>;
+		};
+
+		/*
+		 * BLK_ALIVE APM sysreg.  Hosts the APM USI SW_CONF (protocol
+		 * select) registers; APM_USI1 SW_CONF is at offset 0x4.  Base and
+		 * offset are from research/dumped.dts:5787 (syscon@154204E0) and
+		 * the downstream serial@155D0000 samsung,usi-offset = <0x4>.
+		 */
+		sysreg_apm: syscon@154204e0 {
+			compatible = "google,zumapro-apm-sysreg", "syscon";
+			reg = <0x154204e0 0x1000>;
+		};
+
+		/*
+		 * BLK_ALIVE APM_USI1 in UART mode = "uart18" (ttySAC18), the
+		 * Bluetooth HCI transport for the BCM4383 combo chip.  UART base,
+		 * IRQ (GIC_SPI 71) and the USI SW_CONF offset are from
+		 * research/dumped.dts serial@155D0000; the gpa3 4-wire pinmux is
+		 * uart18_bus.  Unlike the peric USI nodes the bootloader does not
+		 * pre-select UART mode on this always-on block, so the USI wrapper
+		 * sets samsung,mode = <USI_MODE_UART>.  Reg split (serial 0xc0,
+		 * USI at +0xc0) follows the exynosautov920 USI-UART pattern so the
+		 * two windows do not overlap.
+		 */
+		usi_apm_uart: usi@155d00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x155d00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&apm_usi1_uart_clk>, <&apm_usi1_uart_clk>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_apm 0x4>;
+			samsung,mode = <USI_MODE_UART>;
+			status = "disabled";
+
+			serial_18: serial@155d0000 {
+				compatible = "google,gs101-uart";
+				reg = <0x155d0000 0xc0>;
+				clocks = <&apm_usi1_uart_clk>,
+					 <&apm_usi1_uart_clk>;
+				clock-names = "uart", "clk_uart_baud0";
+				interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&uart18_bus>;
+				samsung,uart-fifosize = <256>;
+				status = "disabled";
+			};
 		};
 
 		usi10: usi@10ca00c0 {
@@ -2639,6 +2701,17 @@
 			gpa12: gpa12-gpio-bank {
 				gpio-controller;
 				#gpio-cells = <2>;
+			};
+
+			/*
+			 * uart18 (APM_USI1 UART) 4-wire bus = Bluetooth HCI.
+			 * gpa3-0..3 alt-func 2 from research/dumped.dts uart18_bus
+			 * (downstream zumapro-pinctrl.dtsi:1200).
+			 */
+			uart18_bus: uart18-bus-pins {
+				samsung,pins = "gpa3-0", "gpa3-1", "gpa3-2", "gpa3-3";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 			};
 
 			wakeup-interrupt-controller {

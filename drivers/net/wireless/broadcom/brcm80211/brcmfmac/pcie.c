@@ -601,6 +601,7 @@ static struct brcmf_fw_request *
 brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo);
+static bool brcmf_pcie_oob_host_wake_avail(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 					bool error);
 static void
@@ -3416,6 +3417,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 			  brcmf_pcie_ds_state_name(devinfo->ds_state),
 			  atomic_read(&devinfo->ds_active_count));
 
+	bus->oob_host_wake = brcmf_pcie_oob_host_wake_avail(devinfo);
+
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
@@ -3861,6 +3864,25 @@ brcmf_pcie_remove(struct pci_dev *pdev)
  * unbalance the core's own enable.  Defined outside CONFIG_PM (pm_runtime_*
  * stub out) because the call sites in setup/remove are unconditional.
  */
+/*
+ * Whether the host will be able to see the firmware's out-of-band host-wake.
+ * The line is optional and described per board, and the PM core only arms it
+ * as a dedicated wake IRQ while runtime PM has the device in D3, so all three
+ * conditions have to hold for a wake to ever reach us.
+ *
+ * Evaluated in brcmf_pcie_setup() before brcmf_attach(), so that
+ * brcmf_c_preinit_dcmds() can decide whether to let the firmware assert the
+ * line at all.  It only predicts what brcmf_pcie_runtime_pm_enable() will do
+ * below; that runs after attach and is the sole owner of the interrupt.
+ */
+static bool brcmf_pcie_oob_host_wake_avail(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+
+	return brcmf_pcie_runtime_pm && brcmf_pcie_inband_ds(devinfo) &&
+	       of_irq_get_byname(dev_of_node(dev), "host-wake") > 0;
+}
+
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;

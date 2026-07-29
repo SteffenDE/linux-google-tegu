@@ -184,6 +184,8 @@ struct brcmf_bus {
 	bool wowl_supported;
 	bool removing;		/* device removal in progress; quiesce async work */
 	struct mutex bus_reset_lock;
+	/* Host can see and service the firmware's OOB host-wake line. */
+	bool oob_host_wake;
 
 	const struct brcmf_bus_ops *ops;
 	struct brcmf_bus_msgbuf *msgbuf;

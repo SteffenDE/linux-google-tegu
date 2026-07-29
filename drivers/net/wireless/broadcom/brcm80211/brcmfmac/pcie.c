@@ -3870,6 +3870,18 @@ static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 		return;
 
 	/*
+	 * brcmf_pcie_reset() re-enters brcmf_pcie_setup() without freeing the
+	 * device and without a matching brcmf_pcie_runtime_pm_disable(), so
+	 * this can run a second time on an already-handed-over device.  The put
+	 * below balances the PCI core's probe-time usage reference, of which
+	 * there is exactly one -- dropping it again on a reset underflows the
+	 * usage count -- and dev_pm_set_dedicated_wake_irq() would fail on the
+	 * already-registered line.
+	 */
+	if (devinfo->runtime_pm_enabled)
+		return;
+
+	/*
 	 * Optional OOB host-wake: an inbound frame cannot raise an in-band MSI
 	 * while the link is in D3, so the chip pulses a sideband line instead.
 	 * As a dedicated wake IRQ the PM core arms it on runtime suspend and

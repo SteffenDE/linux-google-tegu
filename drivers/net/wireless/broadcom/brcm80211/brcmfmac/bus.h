@@ -181,6 +181,8 @@ struct brcmf_bus {
 	enum brcmf_fwvendor fwvid;
 	bool always_use_fws_queue;
 	bool wowl_supported;
+	/* Host can see and service the firmware's OOB host-wake line. */
+	bool oob_host_wake;
 
 	const struct brcmf_bus_ops *ops;
 	struct brcmf_bus_msgbuf *msgbuf;

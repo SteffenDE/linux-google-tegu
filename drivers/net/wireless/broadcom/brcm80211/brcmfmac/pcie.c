@@ -1296,25 +1296,61 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 			 * device-wake right away.  The device stays awake for
 			 * the host's ring work via the ds_active_count gate
 			 * (ack_pending_ds refuses DS_ACK while count != 0), not
-			 * by holding the assert.  Go to ACTIVE under the lock
-			 * *before* sending the deassert: the pulse must be the
-			 * only deassert on the wire, and a woken waiter's
-			 * pm_leave observing a transient DEV_WAKE here would
-			 * send a second one (downstream never double-sends).
+			 * by holding the assert.  The deassert is sent below,
+			 * still under the lock, so the pulse is the only
+			 * deassert on the wire: a woken waiter's pm_leave
+			 * observing a transient DEV_WAKE here would send a
+			 * second one (downstream never double-sends).
 			 */
-			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
-			devinfo->ds_exit_completed = true;
 			wake_ds_exit = true;
 			send_deassert = true;
 			break;
 		case BRCMF_PCIE_DS_DEV_SLEEP:
 			/* Firmware woke on its own; release device-wake. */
-			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
 			send_deassert = true;
 			break;
 		default:
 			break;
 		}
+
+		/*
+		 * Publish the deassert while still holding ds_lock, before
+		 * anything can observe the exit.  brcmf_pcie_send_mb_data()
+		 * only takes the commonring spinlock and never sleeps, and
+		 * ds_lock -> commonring is the nesting the wake and ack paths
+		 * already use.
+		 *
+		 * The ordering is load-bearing.  This handler used to go
+		 * ACTIVE, drop the lock, wake the D3 waiter and only then queue
+		 * the deassert.  The waiter saw ACTIVE, skipped its own
+		 * deassert and queued HOST_D3_INFORM, which won the ring lock
+		 * and overtook it.  The firmware entered host-sleep and stopped
+		 * draining H2D control submissions, so the deassert sat in the
+		 * ring across the sleep and was only consumed after the next D0
+		 * resume -- by then the firmware had moved on to
+		 * DEVICE_SLEEP_WAIT, where WAKE_DEASSERT is an illegal
+		 * transition and halts the chip.
+		 */
+		if (send_deassert) {
+			int err;
+
+			err = brcmf_pcie_send_mb_data(devinfo,
+						      BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT);
+			if (err)
+				/*
+				 * Pulse failed to go out; park in DEV_WAKE so
+				 * pm_leave_active retries the deassert.
+				 */
+				devinfo->ds_state = BRCMF_PCIE_DS_DEV_WAKE;
+			else
+				devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+		}
+		/*
+		 * Only now may the waiter proceed: it tests ds_exit_completed,
+		 * which is set after the deassert is already on the ring.
+		 */
+		if (wake_ds_exit)
+			devinfo->ds_exit_completed = true;
 		new_state = devinfo->ds_state;
 		spin_unlock_irqrestore(&devinfo->ds_lock, flags);
 
@@ -1326,16 +1362,6 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 
 		if (wake_ds_exit)
 			wake_up(&devinfo->ds_exit_wait);
-
-		if (send_deassert &&
-		    brcmf_pcie_send_mb_data(devinfo,
-					    BRCMF_H2D_HOST_DS_DEVICE_WAKE_DEASSERT))
-			/*
-			 * Pulse failed to go out; park in DEV_WAKE so
-			 * pm_leave_active retries the deassert.
-			 */
-			brcmf_pcie_set_inband_ds_state(devinfo,
-						       BRCMF_PCIE_DS_DEV_WAKE);
 
 		/*
 		 * bcmdhd runs its deassert path on every exit note; when the

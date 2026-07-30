@@ -42,6 +42,7 @@ struct exynos_irq_chip {
 	u32 eint_pend;
 	u32 eint_num_wakeup_reg;
 	u32 eint_wake_mask_reg;
+	bool has_eint_filter;
 	void (*set_eint_wakeup_mask)(struct samsung_pinctrl_drv_data *drvdata,
 				     struct exynos_irq_chip *irq_chip);
 };
@@ -670,6 +671,7 @@ static const struct exynos_irq_chip gs101_wkup_irq_chip __initconst = {
 	.eint_pend = EXYNOS7_WKUP_EPEND_OFFSET,
 	.eint_num_wakeup_reg = 3,
 	.eint_wake_mask_reg = GS101_EINT_WAKEUP_MASK,
+	.has_eint_filter = true,
 	.set_eint_wakeup_mask = gs101_pinctrl_set_eint_wakeup_mask,
 };
 
@@ -799,6 +801,9 @@ __init int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d)
 	for (i = 0; i < d->nr_banks; ++i, ++bank) {
 		if (bank->eint_type != EINT_TYPE_WKUP)
 			continue;
+
+		if (irq_chip->has_eint_filter)
+			exynos_eint_set_filter(bank, EXYNOS_FLTCON_DIGITAL);
 
 		bank->irq_chip = devm_kmemdup(dev, irq_chip, sizeof(*irq_chip),
 					      GFP_KERNEL);

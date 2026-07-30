@@ -47,15 +47,22 @@ properties:
               - cypress,cyw43012-fmac
               - infineon,cyw43439-fmac
           - const: brcm,bcm4329-fmac
-      - enum:
+      - enum: &pcie-ids
           - brcm,bcm4329-fmac
           - pci14e4,43dc  # BCM4355
           - pci14e4,4464  # BCM4364
           - pci14e4,4488  # BCM4377
           - pci14e4,4425  # BCM4378
+          - pci14e4,4449  # BCM4383
           - pci14e4,4433  # BCM4387
           - pci14e4,4434  # BCM4388
           - pci14e4,449d  # BCM43752
+      # A PCIe device may also carry the generic compatible as a fallback.
+      # That is not redundant: brcmf_of_probe() keys the OF country-code map
+      # and the MAC-from-DT lookup off "brcm,bcm4329-fmac" being present.
+      - items:
+          - enum: *pcie-ids
+          - const: brcm,bcm4329-fmac
 
   reg:
     description: SDIO function number for the device (for most cases

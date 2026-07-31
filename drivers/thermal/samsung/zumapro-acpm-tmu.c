@@ -42,10 +42,10 @@ static int zumapro_acpm_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 {
 	struct zumapro_acpm_tmu_zone *zone = thermal_zone_device_priv(tz);
 	struct zumapro_acpm_tmu *tmu = zone->tmu;
-	int t, stat, ret;
+	int t, ret;
 
 	ret = tmu->acpm->ops.tmu_ops.read_temp(tmu->acpm, tmu->acpm_chan_id,
-					       zone->tzid, &t, &stat);
+					       zone->tzid, &t);
 	if (ret)
 		return ret;
 

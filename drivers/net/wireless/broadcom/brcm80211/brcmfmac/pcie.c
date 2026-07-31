@@ -15,6 +15,7 @@
 #include <linux/sched/signal.h>
 #include <linux/kthread.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/random.h>
 #include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
@@ -4085,6 +4086,23 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 
 	/* Check if device is still up and running, if so we are ready */
 	intmask = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask);
+	if (!intmask) {
+		/*
+		 * A zero INTMASK is read as "the chip lost its state and has to
+		 * be re-probed", which the runtime path cannot do -- so a single
+		 * read is far too weak a basis for condemning the device.  The
+		 * register is firmware-owned, and this is the first TLP after
+		 * the link leaves PCI-PM L1.2, so poll briefly before believing
+		 * it.  Anything that settles here is logged: on a chip that
+		 * really kept its state it should have been nonzero already.
+		 */
+		if (!read_poll_timeout(brcmf_pcie_read_pcie32, intmask,
+				       intmask != 0, 200, 5000, false,
+				       devinfo, devinfo->reginfo->intmask))
+			brcmf_err(bus, "INTMASK settled late leaving D3: 0x%08x\n",
+				  intmask);
+	}
+
 	if (intmask != 0) {
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
 		/* Set the device up, so we can write the MB data message in ring mode */

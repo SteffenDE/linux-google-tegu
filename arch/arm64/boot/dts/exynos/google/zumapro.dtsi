@@ -103,18 +103,6 @@
 			 */
 			#clock-cells = <1>;
 
-			/*
-			 * The TMU is owned by the ACPM firmware; temperatures
-			 * are read over ACPM IPC channel 9 (hardware-verified,
-			 * research/tracing/acpm-channels.md).  The thermal-zone
-			 * cell is the firmware tzid: 0 BIG, 1 MID, 2 LITTLE,
-			 * 3 G3D, 4 ISP, 5 TPU, 6 AUR (downstream gs-tmu-v3
-			 * node ids, dumped.dts:17702-17878).
-			 */
-			acpm_tmu: thermal-sensor {
-				compatible = "google,zumapro-acpm-tmu";
-				#thermal-sensor-cells = <1>;
-			};
 		};
 	};
 
@@ -288,12 +276,18 @@
 	 * so their value is a never-actuated safety-net feed-forward.
 	 * Cluster<->sensor: cpu7 (X4)=BIG tzid0, cpu4 (A720)=MID tzid1, cpu0
 	 * (A520)=LITTLE tzid2.  G3D/ISP/TPU/AUR stay monitor-only.
+	 *
+	 * polling-delay = 0: the TMU raises an interrupt when the zone leaves
+	 * the thermal core's trip window, so nothing has to be found by polling
+	 * while the zone is cool.  polling-delay-passive stays at 25 ms because
+	 * IPA's PID needs periodic samples once it is regulating; the interrupt
+	 * arms that state immediately instead of up to a poll period late.
 	 */
 	thermal-zones {
 		big-thermal {
-			polling-delay = <250>;
+			polling-delay = <0>;
 			polling-delay-passive = <25>;
-			thermal-sensors = <&acpm_tmu 0>;
+			thermal-sensors = <&tmu_top 0>;
 			sustainable-power = <1200>;
 
 			trips {
@@ -330,9 +324,9 @@
 		};
 
 		mid-thermal {
-			polling-delay = <250>;
+			polling-delay = <0>;
 			polling-delay-passive = <25>;
-			thermal-sensors = <&acpm_tmu 1>;
+			thermal-sensors = <&tmu_top 1>;
 			/*
 			 * Measured ~1500 mW full-tilt (ODPM, all-core load); MID
 			 * peaks ~80 C, 15 C below its control trip, so like LITTLE
@@ -364,9 +358,9 @@
 		};
 
 		little-thermal {
-			polling-delay = <250>;
+			polling-delay = <0>;
 			polling-delay-passive = <25>;
-			thermal-sensors = <&acpm_tmu 2>;
+			thermal-sensors = <&tmu_top 2>;
 			/*
 			 * Measured ~1000 mW full-tilt (ODPM, all-core load -- the
 			 * EM estimate of ~440 mW was ~2x low for the A520).  LITTLE
@@ -401,25 +395,25 @@
 		g3d-thermal {
 			polling-delay = <0>;
 			polling-delay-passive = <0>;
-			thermal-sensors = <&acpm_tmu 3>;
+			thermal-sensors = <&tmu_sub 0>;
 		};
 
 		isp-thermal {
 			polling-delay = <0>;
 			polling-delay-passive = <0>;
-			thermal-sensors = <&acpm_tmu 4>;
+			thermal-sensors = <&tmu_sub 1>;
 		};
 
 		tpu-thermal {
 			polling-delay = <0>;
 			polling-delay-passive = <0>;
-			thermal-sensors = <&acpm_tmu 5>;
+			thermal-sensors = <&tmu_sub 2>;
 		};
 
 		aur-thermal {
 			polling-delay = <0>;
 			polling-delay-passive = <0>;
-			thermal-sensors = <&acpm_tmu 6>;
+			thermal-sensors = <&tmu_sub 3>;
 		};
 	};
 
@@ -935,6 +929,38 @@
 			clocks = <&ext_24_5m>,
 				 <&cmu_top CLK_DOUT_CMU_MISC_NOC>;
 			clock-names = "oscclk", "bus";
+		};
+
+		/*
+		 * The two TMU instances.  The firmware owns the TMU: the AP maps
+		 * only the INTPEND registers and takes the interrupt, and does
+		 * temperatures, thresholds and IRQ acknowledge over ACPM IPC
+		 * channel 9 (hardware-verified,
+		 * research/tracing/acpm-channels.md).
+		 *
+		 * The thermal-sensor cell is the index local to each instance;
+		 * the driver maps it to the global firmware tzid.  Sources:
+		 * downstream BIG/MID/LITTLE@100A0000 and G3D/ISP/TPU/AUR@100B0000
+		 * (research/dumped.dts:17702-17878).
+		 *
+		 * No clocks property: the TMU APB PCLK gates the INTPEND reads,
+		 * but CMU_MISC has no TMU gates modelled yet and the bootloader
+		 * leaves the clock running.  See research/thermal-acpm-tmu.md.
+		 */
+		tmu_top: tmu@100a0000 {
+			compatible = "google,zumapro-tmu-top";
+			reg = <0x100a0000 0x800>;
+			interrupts = <GIC_SPI 787 IRQ_TYPE_LEVEL_HIGH 0>;
+			samsung,acpm-ipc = <&acpm_ipc>;
+			#thermal-sensor-cells = <1>;
+		};
+
+		tmu_sub: tmu@100b0000 {
+			compatible = "google,zumapro-tmu-sub";
+			reg = <0x100b0000 0x800>;
+			interrupts = <GIC_SPI 804 IRQ_TYPE_LEVEL_HIGH 0>;
+			samsung,acpm-ipc = <&acpm_ipc>;
+			#thermal-sensor-cells = <1>;
 		};
 
 		/*

@@ -277,15 +277,30 @@
 	 * Cluster<->sensor: cpu7 (X4)=BIG tzid0, cpu4 (A720)=MID tzid1, cpu0
 	 * (A520)=LITTLE tzid2.  G3D/ISP/TPU/AUR stay monitor-only.
 	 *
-	 * polling-delay = 0: the TMU raises an interrupt when the zone leaves
-	 * the thermal core's trip window, so nothing has to be found by polling
-	 * while the zone is cool.  polling-delay-passive stays at 25 ms because
+	 * Trip *detection* is now the TMU interrupt's job: it fires when the zone
+	 * leaves the thermal core's trip window, so a hard ramp no longer waits
+	 * for a poll to be noticed.  polling-delay-passive stays at 25 ms because
 	 * IPA's PID needs periodic samples once it is regulating; the interrupt
 	 * arms that state immediately instead of up to a poll period late.
+	 *
+	 * polling-delay must NOT be 0, even with interrupts.  These zones have a
+	 * single passive trip, so gov_power_allocator's setup leaves
+	 * params->trip_switch_on NULL (it is the *first* of two or more passive
+	 * trips), and power_allocator_manage() gates allow_maximum_power() on it.
+	 * IPA therefore has no explicit release path here: it only unwinds a
+	 * throttle through repeated allocate_power() calls as the zone cools.
+	 * Once the zone drops out of the trip's hysteresis band tz->passive falls
+	 * to 0 and the 25 ms passive poll stops, so with polling-delay = 0 nothing
+	 * would ever run the governor again and the last cooling state would stick
+	 * forever -- HW-observed: cpu7 pinned at 13/17 (1745 of 3105 MHz) at 41 C
+	 * idle until something else poked the zone.  The cool-side poll is what
+	 * releases the throttle, which is why 1 s is enough now that it no longer
+	 * has to *detect* anything.  (Upstream gs101 can use 0 because its ladder
+	 * has two passive trips, so allow_maximum_power() is reachable there.)
 	 */
 	thermal-zones {
 		big-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <25>;
 			thermal-sensors = <&tmu_top 0>;
 			sustainable-power = <1200>;
@@ -324,7 +339,7 @@
 		};
 
 		mid-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <25>;
 			thermal-sensors = <&tmu_top 1>;
 			/*
@@ -358,7 +373,7 @@
 		};
 
 		little-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <25>;
 			thermal-sensors = <&tmu_top 2>;
 			/*

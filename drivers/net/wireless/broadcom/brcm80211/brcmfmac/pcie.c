@@ -4074,6 +4074,7 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct pci_dev *pdev;
+	u32 intmask;
 	int err;
 
 	brcmf_dbg(PCIE, "Enter\n");
@@ -4083,7 +4084,8 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
 
 	/* Check if device is still up and running, if so we are ready */
-	if (brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask) != 0) {
+	intmask = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask);
+	if (intmask != 0) {
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
 		/* Set the device up, so we can write the MB data message in ring mode */
 		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
@@ -4093,8 +4095,10 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 			brcmf_pcie_set_inband_ds_state(devinfo,
 						       BRCMF_PCIE_DS_ACTIVE);
 		}
-		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM))
+		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM)) {
+			brcmf_err(bus, "D0_INFORM failed leaving D3\n");
 			goto cleanup;
+		}
 		brcmf_dbg(PCIE, "Hot resume, continue....\n");
 		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
@@ -4104,6 +4108,8 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 		return 0;
 	}
 
+	brcmf_err(bus, "device unresponsive leaving D3 (intmask=0)\n");
+
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 
@@ -4112,11 +4118,22 @@ cleanup:
 	 * resume must not: it runs inside this device's own PM callback, and
 	 * brcmf_pcie_remove() -> brcmf_pcie_runtime_pm_disable() ->
 	 * pm_runtime_get_sync() would wait for this in-flight resume to finish,
-	 * deadlocking on itself.  Fail the runtime resume instead and leave
-	 * recovery to a later system resume or reset.
+	 * deadlocking on itself.  Leave recovery to a later system resume or
+	 * reset.
+	 *
+	 * Report it as -EBUSY, never -EIO: rpm_callback() records every
+	 * callback error other than -EAGAIN/-EBUSY in dev->power.runtime_error,
+	 * and from then on *every* pm_runtime_resume() returns -EINVAL for the
+	 * lifetime of the binding.  That is terminal here -- the OOB host-wake
+	 * IRQ can no longer pull the device out of D3 and every ring access
+	 * fails -EINVAL, so the interface stays dead until the driver is
+	 * rebound, even though the chip is still alive on the far side of the
+	 * link.  -EBUSY leaves the device suspended without recording an error
+	 * and the PM core re-arms the wake IRQ, so the next inbound frame or
+	 * ring access simply retries the D3 exit.
 	 */
 	if (runtime)
-		return -EIO;
+		return -EBUSY;
 
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;

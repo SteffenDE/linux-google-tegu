@@ -186,6 +186,16 @@ int brcmf_commonring_write_complete(struct brcmf_commonring *commonring)
 
 	commonring->f_ptr = commonring->w_ptr;
 
+	/*
+	 * The items just written live in coherent DMA memory, and on the
+	 * BRCMF_PCIE_SHARED_DMA_INDEX path so does the write index published
+	 * below -- both are plain stores to normal memory.  Without a barrier a
+	 * weakly ordered CPU lets the device observe the new index before the
+	 * items it points at, so the device consumes a slot the host has not
+	 * filled in yet and reads whatever was there before.
+	 */
+	dma_wmb();
+
 	if (commonring->cr_write_wptr)
 		commonring->cr_write_wptr(commonring->cr_ctx);
 	if (commonring->cr_ring_bell)
@@ -217,6 +227,14 @@ void *brcmf_commonring_get_read_ptr(struct brcmf_commonring *commonring,
 
 	if (*n_items == 0)
 		return NULL;
+
+	/*
+	 * Pair with the dma_wmb() on the device side of the same problem: the
+	 * index was just read from coherent DMA memory and the items it makes
+	 * visible are read by the caller, so order the two loads.  Otherwise
+	 * the items may be read before the index that published them.
+	 */
+	dma_rmb();
 
 	return commonring->buf_addr +
 	       (commonring->r_ptr * commonring->item_len);

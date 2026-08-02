@@ -1991,10 +1991,12 @@ clear_fifo:
 	} while (--length);
 }
 
-static void samsung_dsim_transfer_start(struct samsung_dsim *dsi)
+static void __samsung_dsim_transfer_start(struct samsung_dsim *dsi)
 {
 	unsigned long flags;
 	struct samsung_dsim_transfer *xfer;
+
+	lockdep_assert_held(&dsi->cmd_lock);
 
 	spin_lock_irqsave(&dsi->transfer_lock, flags);
 
@@ -2018,12 +2020,11 @@ static void samsung_dsim_transfer_start(struct samsung_dsim *dsi)
 		 * Short packets complete here.  Unlink the xfer from the list
 		 * *before* signalling completion: once complete() wakes the
 		 * waiter (samsung_dsim_host_transfer) it takes the success path
-		 * and frees this on-stack xfer immediately.  transfer_start()
-		 * also runs off the waiter's thread (from the threaded IRQ and
-		 * from samsung_dsim_remove_transfer()), so a concurrent
-		 * samsung_dsim_transfer_finish() must no longer be able to reach
-		 * the freed xfer via list_first_entry().  This mirrors the
-		 * ordering already used by samsung_dsim_transfer_finish()
+		 * and frees this on-stack xfer immediately, so it must already
+		 * be off the list by then -- cmd_lock keeps concurrent owners
+		 * out, but a later transfer_finish() would still find a freed
+		 * xfer via list_first_entry() if it were left linked.  This
+		 * mirrors the ordering used by samsung_dsim_transfer_finish()
 		 * (list_del_init then complete); keep complete() outside
 		 * transfer_lock to avoid a transfer_lock -> wait.lock nesting.
 		 */
@@ -2040,11 +2041,20 @@ static void samsung_dsim_transfer_start(struct samsung_dsim *dsi)
 	spin_unlock_irqrestore(&dsi->transfer_lock, flags);
 }
 
-static bool samsung_dsim_transfer_finish(struct samsung_dsim *dsi)
+static void samsung_dsim_transfer_start(struct samsung_dsim *dsi)
+{
+	mutex_lock(&dsi->cmd_lock);
+	__samsung_dsim_transfer_start(dsi);
+	mutex_unlock(&dsi->cmd_lock);
+}
+
+static bool __samsung_dsim_transfer_finish(struct samsung_dsim *dsi)
 {
 	struct samsung_dsim_transfer *xfer;
 	unsigned long flags;
 	bool start = true;
+
+	lockdep_assert_held(&dsi->cmd_lock);
 
 	spin_lock_irqsave(&dsi->transfer_lock, flags);
 
@@ -2092,6 +2102,15 @@ static void samsung_dsim_remove_transfer(struct samsung_dsim *dsi,
 	unsigned long flags;
 	bool start;
 
+	/*
+	 * Taking cmd_lock here is what makes the caller's on-stack xfer safe to
+	 * free once this returns: any other context that might still hold a
+	 * pointer to it -- the threaded IRQ in samsung_dsim_transfer_finish(),
+	 * or another waiter's samsung_dsim_transfer_start() -- can only be
+	 * there while holding cmd_lock, so it has drained by the time we get
+	 * it.  Once we drop the lock the xfer is off the list and unreachable.
+	 */
+	mutex_lock(&dsi->cmd_lock);
 	spin_lock_irqsave(&dsi->transfer_lock, flags);
 
 	if (!list_empty(&dsi->transfer_list) &&
@@ -2101,13 +2120,15 @@ static void samsung_dsim_remove_transfer(struct samsung_dsim *dsi,
 		start = !list_empty(&dsi->transfer_list);
 		spin_unlock_irqrestore(&dsi->transfer_lock, flags);
 		if (start)
-			samsung_dsim_transfer_start(dsi);
+			__samsung_dsim_transfer_start(dsi);
+		mutex_unlock(&dsi->cmd_lock);
 		return;
 	}
 
 	list_del_init(&xfer->list);
 
 	spin_unlock_irqrestore(&dsi->transfer_lock, flags);
+	mutex_unlock(&dsi->cmd_lock);
 }
 
 static int samsung_dsim_transfer(struct samsung_dsim *dsi,
@@ -2150,11 +2171,12 @@ static int samsung_dsim_transfer(struct samsung_dsim *dsi,
 
 		samsung_dsim_remove_transfer(dsi, xfer);
 		/*
-		 * The handler dequeues the xfer under transfer_lock but then drops
-		 * the lock and keeps using the pointer, finally complete()ing it.
-		 * The xfer is now off the list, so no later IRQ can reach it; wait
-		 * for any handler still in that window to drain before the stack
-		 * frame holding the xfer and its completion is freed on return.
+		 * samsung_dsim_remove_transfer() already drained every context
+		 * that could still hold this xfer, via cmd_lock. Keep
+		 * synchronize_irq() as a cheap backstop on a path that has
+		 * already waited DSI_XFER_TIMEOUT_MS: it costs nothing here and
+		 * still catches a handler that touches an xfer outside
+		 * cmd_lock, which is exactly the mistake this used to be.
 		 */
 		synchronize_irq(dsi->irq);
 		dev_err(dsi->dev, "xfer timed out: %*ph %*ph\n", 4, pkt->header,
@@ -2210,8 +2232,15 @@ static irqreturn_t samsung_dsim_irq(int irq, void *dev_id)
 			DSIM_INT_PLL_STABLE)))
 		return IRQ_HANDLED;
 
-	if (samsung_dsim_transfer_finish(dsi))
-		samsung_dsim_transfer_start(dsi);
+	/*
+	 * One cmd_lock section for both halves: transfer_finish() hands the
+	 * list straight over to transfer_start(), and dropping the lock in
+	 * between would reopen the window this lock exists to close.
+	 */
+	mutex_lock(&dsi->cmd_lock);
+	if (__samsung_dsim_transfer_finish(dsi))
+		__samsung_dsim_transfer_start(dsi);
+	mutex_unlock(&dsi->cmd_lock);
 
 	return IRQ_HANDLED;
 }
@@ -2886,6 +2915,7 @@ int samsung_dsim_probe(struct platform_device *pdev)
 		return PTR_ERR(dsi);
 
 	init_completion(&dsi->completed);
+	mutex_init(&dsi->cmd_lock);
 	spin_lock_init(&dsi->transfer_lock);
 	INIT_LIST_HEAD(&dsi->transfer_list);
 

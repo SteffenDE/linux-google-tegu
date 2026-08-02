@@ -2068,28 +2068,28 @@ static const struct samsung_pin_ctrl gs101_pin_ctrl[] __initconst = {
 		/* pin banks of gs101 pin-controller (PERIC0) */
 		.pin_banks	= gs101_pin_peric0,
 		.nr_banks	= ARRAY_SIZE(gs101_pin_peric0),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	}, {
 		/* pin banks of gs101 pin-controller (PERIC1) */
 		.pin_banks	= gs101_pin_peric1,
 		.nr_banks	= ARRAY_SIZE(gs101_pin_peric1),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	}, {
 		/* pin banks of gs101 pin-controller (HSI1) */
 		.pin_banks	= gs101_pin_hsi1,
 		.nr_banks	= ARRAY_SIZE(gs101_pin_hsi1),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	}, {
 		/* pin banks of gs101 pin-controller (HSI2) */
 		.pin_banks	= gs101_pin_hsi2,
 		.nr_banks	= ARRAY_SIZE(gs101_pin_hsi2),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
@@ -2253,35 +2253,35 @@ static const struct samsung_pin_ctrl zumapro_pin_ctrl[] __initconst = {
 	[ZUMAPRO_PINCTRL_HSI1] = {
 		.pin_banks	= zumapro_pin_hsi1,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi1),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
 	[ZUMAPRO_PINCTRL_HSI2] = {
 		.pin_banks	= zumapro_pin_hsi2,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi2),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
 	[ZUMAPRO_PINCTRL_HSI2UFS] = {
 		.pin_banks	= zumapro_pin_hsi2ufs,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_hsi2ufs),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
 	[ZUMAPRO_PINCTRL_PERIC0] = {
 		.pin_banks	= zumapro_pin_peric0,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_peric0),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},
 	[ZUMAPRO_PINCTRL_PERIC1] = {
 		.pin_banks	= zumapro_pin_peric1,
 		.nr_banks	= ARRAY_SIZE(zumapro_pin_peric1),
-		.eint_gpio_init = exynos_eint_gpio_init,
+		.eint_gpio_init = gs101_eint_gpio_init,
 		.suspend	= gs101_pinctrl_suspend,
 		.resume		= gs101_pinctrl_resume,
 	},

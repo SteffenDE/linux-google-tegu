@@ -474,6 +474,40 @@ err_domains:
 	return ret;
 }
 
+/*
+ * GPIO banks have a per-pin EINT filter too, but the bootloader leaves it
+ * disabled and nothing ever turns it on, so a mainline boot runs with no
+ * filter at all: exynos_pinctrl_suspend_bank()/resume_bank() only save and
+ * restore whatever is there, which is zero.  With the filter disabled the edge
+ * detector intermittently fails to latch, the same defect already fixed for
+ * the alive block in exynos_eint_wkup_init().
+ *
+ * Enable it on every GPIO bank at probe, matching the vendor pinctrl driver
+ * for this SoC.  Pass no selection bit: the filter *selection* register exists
+ * only on the alive block, so on a GPIO bank that field is not ours to set and
+ * the (digital) filter is the only one there is.
+ */
+__init int gs101_eint_gpio_init(struct samsung_pinctrl_drv_data *d)
+{
+	struct samsung_pin_bank *bank;
+	unsigned int i;
+	int ret;
+
+	ret = exynos_eint_gpio_init(d);
+	if (ret)
+		return ret;
+
+	bank = d->pin_banks;
+	for (i = 0; i < d->nr_banks; ++i, ++bank) {
+		if (bank->eint_type != EINT_TYPE_GPIO)
+			continue;
+
+		exynos_eint_set_filter(bank, 0);
+	}
+
+	return 0;
+}
+
 #define BITS_PER_U32 32
 static int gs101_wkup_irq_set_wake(struct irq_data *irqd, unsigned int on)
 {

@@ -269,6 +269,7 @@ struct exynos_muxed_weint_data {
 };
 
 int exynos_eint_gpio_init(struct samsung_pinctrl_drv_data *d);
+int gs101_eint_gpio_init(struct samsung_pinctrl_drv_data *d);
 int exynos_eint_wkup_init(struct samsung_pinctrl_drv_data *d);
 void exynosautov920_pinctrl_resume(struct samsung_pin_bank *bank);
 void exynosautov920_pinctrl_suspend(struct samsung_pin_bank *bank);

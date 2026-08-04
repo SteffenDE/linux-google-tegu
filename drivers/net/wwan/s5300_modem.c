@@ -271,6 +271,12 @@
  * iodev per channel, so a PDP context's channel is what picks its interface.
  * The CP places small DL packets (e.g. DNS replies) on the legacy NORM_RAW ring
  * on these channels instead of PKTPROC; both feed the data netdevs.
+ *
+ * The count comes from the device tree (iod,ch_count), which is the authority
+ * here.  Downstream's EXYNOS_CH_EX_ID_PDP_MAX is 211, one past the last channel
+ * this board actually has -- it is a loose bound on a range predicate, and the
+ * next iodev (umts_dummy) sits on 211.  Do not "correct" LAST to match it: it
+ * indexes the netdev table.
  */
 #define S5300_PDP_CH_FIRST		0xb5	/* EXYNOS_CH_EX_ID_PDP_0 = 181 (rmnet0) */
 #define S5300_PDP_CH_COUNT		30
@@ -1699,6 +1705,10 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 				ndev->stats.rx_length_errors++;
 			} else if (ndev) {
 				ndev->stats.rx_dropped++;
+			} else {
+				dev_warn_ratelimited(sm->dev,
+						     "raw-ring PDP ch %#x has no netdev\n",
+						     hdr[8]);
 			}
 		} else if (!READ_ONCE(sm->online) && hdr[8] == S5300_BOOT_CH &&
 			   payload && payload <= sizeof(frame) - S5300_HDR_SIZE) {
@@ -3171,9 +3181,11 @@ static void s5300_pktproc_dl_init(struct s5300_modem *sm)
  *
  * A packet whose channel has no netdev is dropped rather than left in the ring:
  * the descriptor still has to be consumed and refilled or the CP's DL engine
- * wedges behind it.  It is warned about because it should not happen -- every
- * PDP channel has a netdev whenever the CP is ONLINE -- and because it is what
- * a wrong channel_id assumption would look like.
+ * wedges behind it.  It is warned about because in steady state it should not
+ * happen, and because a wrong channel_id offset would look exactly like this --
+ * every packet dropped, nothing misdelivered.  It is not impossible, though:
+ * sm->online is published from hard IRQ and ports_work registers the netdevs
+ * later, so a packet landing in that window has nowhere to go.
  */
 static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 {

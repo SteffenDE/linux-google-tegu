@@ -3185,7 +3185,9 @@ static void s5300_pktproc_dl_init(struct s5300_modem *sm)
  * happen, and because a wrong channel_id offset would look exactly like this --
  * every packet dropped, nothing misdelivered.  It is not impossible, though:
  * sm->online is published from hard IRQ and ports_work registers the netdevs
- * later, so a packet landing in that window has nowhere to go.
+ * later, so a packet landing in that window has nowhere to go -- and a netdev
+ * that failed to register is a steady-state source of it for one channel, so
+ * check for a register_netdev() error before suspecting the channel_id.
  */
 static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 {
@@ -3323,21 +3325,29 @@ static void s5300_pktproc_ul_activate(struct s5300_modem *sm)
 	void __iomem *qi = info + S5300_PKTPROC_UL_QINFO(S5300_PKTPROC_UL_TXQ);
 	unsigned long flags;
 
+	spin_lock_irqsave(&sm->ul_lock, flags);
 	sm->ul_end_bit_owner = (readl(info) >> 24) & 1;
 	sm->ul_cp_quota = readl(info + 4) & 0xffff;
-	spin_lock_irqsave(&sm->ul_lock, flags);
 	sm->ul_done = 0;
 	writel(0, qi + S5300_QINFO_FORE);
 	writel(0, qi + S5300_QINFO_REAR);
-	/* Only transmit once PKTPROC_UL is advertised; otherwise the CP does not
+	/*
+	 * Only transmit once PKTPROC_UL is advertised; otherwise the CP does not
 	 * consume the UL ring and an up'd rmnet would ring spurious doorbells.
-	 * Opening TX last publishes end_bit_owner to the transmit path with it.
+	 * Opening TX last publishes end_bit_owner with it.
+	 *
+	 * The ring geometry is part of the gate rather than an assumption about
+	 * ordering: PHONE_START is what opens TX but INIT_START is what
+	 * provisions the ring, and a PHONE_START without one before it -- a bind
+	 * to an already-running CP -- would otherwise open TX on num_desc 0 and
+	 * take the transmit path's modulo by zero.
 	 */
-	sm->ul_active = S5300_AP_CAPABILITY_0 & 0x1;
+	sm->ul_active = (S5300_AP_CAPABILITY_0 & 0x1) && sm->ul_num_desc;
 	spin_unlock_irqrestore(&sm->ul_lock, flags);
 
 	dev_info(sm->dev, "pktproc UL %s: end_bit_owner=%u cp_quota=%u\n",
-		 sm->ul_active ? "active" : "provisioned (UL cap withheld)",
+		 sm->ul_active ? "active" :
+		 sm->ul_num_desc ? "provisioned (UL cap withheld)" : "unprovisioned",
 		 sm->ul_end_bit_owner, sm->ul_cp_quota);
 }
 

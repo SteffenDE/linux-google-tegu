@@ -245,6 +245,22 @@ static int google_tg4c_on(struct google_tg4c *ctx)
 
 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
 
+	/*
+	 * Re-issue the tear-effect configuration after display-on.  The init
+	 * sequence above already sets TEAR_ON, but that happens before
+	 * sleep-out, and the panel intermittently comes up with its tear output
+	 * not running -- no TE at all until the next re-init, which stalls every
+	 * command-mode frame behind it.  Downstream programs it a second time
+	 * once the panel is up (tg4c_update_te2(), its .update_te2 op); do the
+	 * same.  Parameters are downstream's defaults: scanline rising = 0, TE2
+	 * width = 0x2d (45H).  0x35 takes (byte0, byte1) here exactly as the
+	 * 0x6f/0x01 offset write in the init sequence does.
+	 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_SCANLINE,
+				     0x00, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON,
+				     0x00, 0x2d);
+
 	return dsi_ctx.accum_err;
 }
 

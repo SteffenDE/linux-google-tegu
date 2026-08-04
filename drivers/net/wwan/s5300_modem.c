@@ -264,11 +264,15 @@
 
 /*
  * rmnet PDP data channels: EXYNOS_CH_EX_ID_PDP_0 (181) through +29 (210) =
- * rmnet0..29.  The CP places small DL packets (e.g. DNS replies) on the legacy
- * NORM_RAW ring on these channels instead of PKTPROC; both feed the data netdev.
+ * rmnet0..rmnet29.  Downstream declares a single rmnet iodev (ch 0xb5,
+ * IO_ATTR_MULTI_CH, ch_count=30) which parse_dt_iodevs_pdata() expands into one
+ * iodev per channel, so a PDP context's channel is what picks its interface.
+ * The CP places small DL packets (e.g. DNS replies) on the legacy NORM_RAW ring
+ * on these channels instead of PKTPROC; both feed the data netdevs.
  */
-#define S5300_PDP_CH_MIN		0xb5	/* EXYNOS_CH_EX_ID_PDP_0 = 181 (rmnet0) */
-#define S5300_PDP_CH_MAX		0xd2	/* +29 = 210 (rmnet29) */
+#define S5300_PDP_CH_FIRST		0xb5	/* EXYNOS_CH_EX_ID_PDP_0 = 181 (rmnet0) */
+#define S5300_PDP_CH_COUNT		30
+#define S5300_PDP_CH_LAST		(S5300_PDP_CH_FIRST + S5300_PDP_CH_COUNT - 1)
 
 /*
  * EXYNOS link header (downstream include/exynos_ipc.h struct
@@ -379,10 +383,6 @@
 #define S5300_DESC_CHID			0xc	/* word @0xc; chid = (val >> 16) & 0xff */
 #define S5300_PKTPROC_CTRL_HEAD		0x80	/* control bit7: first descriptor */
 #define S5300_PKTPROC_CTRL_RINGEND	0x08	/* control bit3: last descriptor */
-
-/* Data PDP channels with CH_EXTENSION on: EXYNOS_CH_EX_ID_PDP_0.. = 181.. */
-#define S5300_PKTPROC_CH_PDP_FIRST	0xb5	/* 181 */
-#define S5300_PKTPROC_CH_PDP_COUNT	30
 
 /*
  * PKTPROC UL (uplink transmit).  Separate sub-regions in the same carveout; two
@@ -1614,7 +1614,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 					 payload);
 			}
 		} else if (READ_ONCE(sm->online) && ndev && payload &&
-			   hdr[8] >= S5300_PDP_CH_MIN && hdr[8] <= S5300_PDP_CH_MAX) {
+			   hdr[8] >= S5300_PDP_CH_FIRST && hdr[8] <= S5300_PDP_CH_LAST) {
 			/*
 			 * Raw-IP DL data the CP places on the legacy NORM_RAW ring
 			 * instead of PKTPROC for small packets (DNS replies); cpif's
@@ -3294,7 +3294,7 @@ static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb)
 	writel(cp_buf, desc + 0x8);		/* sktbuf_point[31:0] */
 	writel(0, desc + 0xc);			/* sktbuf_point[35:32] + ap2cp */
 	writel(last, desc + 0x10);		/* last_desc */
-	writel(S5300_PKTPROC_CH_PDP_FIRST << 8, desc + 0x14);	/* lcid @ bits 8-15 */
+	writel(S5300_PDP_CH_FIRST << 8, desc + 0x14);	/* lcid @ bits 8-15 */
 	writel(0, desc + 0x18);
 	writel(0, desc + 0x1c);
 

@@ -3532,28 +3532,36 @@ static int s5300_register_modem_ports(struct s5300_modem *sm)
 	 * explicitly instead of letting "rmnet%d" enumerate: the trailing index
 	 * *is* the channel offset, and a userspace bearer picks its interface by
 	 * that name, so it must not slide if some other rmnet is already up.
+	 *
+	 * A netdev that will not register (a name already taken, no memory) is
+	 * logged and skipped rather than failing the whole registration: that
+	 * would take the SIT control ports down with it and leave the modem
+	 * unusable -- no voice, no SMS -- until the next CP cycle, over one
+	 * missing data context.  Its slot stays NULL, which every path that
+	 * looks a netdev up by channel already handles.
 	 */
 	for (i = 0; i < S5300_PDP_CH_COUNT; i++) {
 		struct s5300_netdev_priv *priv;
 		struct net_device *ndev;
 		char name[IFNAMSIZ];
+		int err;
 
 		snprintf(name, sizeof(name), "rmnet%d", i);
 		ndev = alloc_netdev(sizeof(*priv), name, NET_NAME_PREDICTABLE,
 				    s5300_netdev_setup);
 		if (!ndev) {
-			ret = -ENOMEM;
-			goto err;
+			dev_err(sm->dev, "alloc_netdev(%s) failed\n", name);
+			continue;
 		}
 		priv = netdev_priv(ndev);
 		priv->sm = sm;
 		priv->ch = S5300_PDP_CH_FIRST + i;
 		SET_NETDEV_DEV(ndev, sm->dev);
-		ret = register_netdev(ndev);
-		if (ret) {
-			dev_err(sm->dev, "register_netdev(%s): %d\n", name, ret);
-			free_netdev(ndev);
-			goto err;
+		err = register_netdev(ndev);
+		if (err) {
+			dev_err(sm->dev, "register_netdev(%s): %d\n", name, err);
+			free_netdev(ndev);	/* never registered: not freed for us */
+			continue;
 		}
 		/*
 		 * The ring drains (hard IRQ) look this up by channel and

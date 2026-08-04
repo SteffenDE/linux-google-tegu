@@ -641,9 +641,10 @@ struct s5300_modem {
 	u32			dl_done[S5300_PKTPROC_DL_NUM_Q];
 	/*
 	 * UL TX ring (NORM queue), shared by every context's netdev.  ul_lock
-	 * protects the producer state -- ul_done and the fore_ptr it publishes
-	 * -- against the per-netdev transmit locks racing each other and against
-	 * a CP restart resetting the ring from hard IRQ.
+	 * protects the producer state -- ul_done, the fore_ptr it publishes, and
+	 * the ul_active gate that closes TX while the ring is being reset --
+	 * against the per-netdev transmit locks racing each other and against a
+	 * CP restart resetting the ring from hard IRQ.
 	 */
 	spinlock_t		ul_lock;
 	u32			ul_num_desc;
@@ -3269,8 +3270,14 @@ static void s5300_pktproc_ul_setup(struct s5300_modem *sm)
 	unsigned long flags;
 	u32 i;
 
-	sm->ul_active = false;
+	/*
+	 * Close TX before touching the ring.  A transmit already holding ul_lock
+	 * finishes publishing its fore_ptr first; one that arrives afterwards
+	 * sees ul_active clear and bails, so the reset below cannot land between
+	 * a descriptor and the pointer that hands it to the CP.
+	 */
 	spin_lock_irqsave(&sm->ul_lock, flags);
+	sm->ul_active = false;
 	sm->ul_num_desc = S5300_PKTPROC_UL_NUM_DESC;	/* NORM (TX) queue */
 	sm->ul_done = 0;
 	spin_unlock_irqrestore(&sm->ul_lock, flags);
@@ -3310,11 +3317,12 @@ static void s5300_pktproc_ul_activate(struct s5300_modem *sm)
 	sm->ul_done = 0;
 	writel(0, qi + S5300_QINFO_FORE);
 	writel(0, qi + S5300_QINFO_REAR);
-	spin_unlock_irqrestore(&sm->ul_lock, flags);
 	/* Only transmit once PKTPROC_UL is advertised; otherwise the CP does not
-	 * consume the UL ring and an up'd rmnet0 would ring spurious doorbells.
+	 * consume the UL ring and an up'd rmnet would ring spurious doorbells.
+	 * Opening TX last publishes end_bit_owner to the transmit path with it.
 	 */
 	sm->ul_active = S5300_AP_CAPABILITY_0 & 0x1;
+	spin_unlock_irqrestore(&sm->ul_lock, flags);
 
 	dev_info(sm->dev, "pktproc UL %s: end_bit_owner=%u cp_quota=%u\n",
 		 sm->ul_active ? "active" : "provisioned (UL cap withheld)",
@@ -3328,8 +3336,11 @@ static void s5300_pktproc_ul_activate(struct s5300_modem *sm)
  * netdev -- so a context's uplink reaches the PDN its downlink came from.
  *
  * Every context's netdev feeds this one ring, and each has its own transmit
- * lock, so the ring pointers and the descriptor slot are serialised here
- * instead.  Returns false if the ring is full (caller drops).
+ * lock, so the ring pointers, the descriptor slot and the ul_active gate are
+ * serialised here instead -- the gate included, because a CP restart resets the
+ * ring from hard IRQ and a transmit that straddled that would hand the fresh CP
+ * a stale descriptor.  Returns false if TX is closed or the ring is full
+ * (caller drops).
  */
 static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb,
 				  u8 ch)
@@ -3338,17 +3349,21 @@ static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb,
 	void __iomem *qi = info + S5300_PKTPROC_UL_QINFO(S5300_PKTPROC_UL_TXQ);
 	u32 q_off = S5300_PKTPROC_UL_TXQ * S5300_PKTPROC_UL_BUFF_BY_Q;
 	u32 dsize = skb->len + S5300_PKTPROC_UL_CP_PADDING;
-	u32 last = sm->ul_end_bit_owner == S5300_UL_END_BIT_AP ? 1 : 0;
 	void __iomem *desc, *buf;
-	u32 n, rear, slot, cp_buf;
+	u32 n, rear, slot, cp_buf, last;
 	unsigned long flags;
 
 	if (dsize > S5300_PKTPROC_UL_MAX_PKT)
 		return false;
 
 	spin_lock_irqsave(&sm->ul_lock, flags);
+	if (!sm->ul_active) {
+		spin_unlock_irqrestore(&sm->ul_lock, flags);
+		return false;
+	}
 	n = sm->ul_num_desc;
 	slot = sm->ul_done;
+	last = sm->ul_end_bit_owner == S5300_UL_END_BIT_AP ? 1 : 0;
 	rear = readl(qi + S5300_QINFO_REAR) % n;
 
 	/* circ_get_space(n, done, rear): need at least one free descriptor. */
@@ -3426,7 +3441,7 @@ static netdev_tx_t s5300_ndo_start_xmit(struct sk_buff *skb,
 	}
 	len = skb->len;
 
-	if (sm->ul_active && s5300_pktproc_ul_xmit(sm, skb, priv->ch)) {
+	if (s5300_pktproc_ul_xmit(sm, skb, priv->ch)) {
 		ndev->stats.tx_packets++;
 		ndev->stats.tx_bytes += len;
 	} else {

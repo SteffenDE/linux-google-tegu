@@ -65,6 +65,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
@@ -73,6 +74,7 @@
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/rcupdate.h>
+#include <linux/rtnetlink.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -488,6 +490,17 @@ struct s5300_sit_port {
 };
 
 /*
+ * Private area of a raw-IP data netdev: the PDP channel it carries.  One PDP
+ * context == one channel == one netdev, so the channel is not a property of the
+ * driver but of the interface -- it is what the uplink descriptor's lcid is
+ * stamped with and what the downlink demux matches on.
+ */
+struct s5300_netdev_priv {
+	struct s5300_modem	*sm;
+	u8			ch;
+};
+
+/*
  * A generic cpif channel exposed as a misc chardev.  Received frames (link
  * header already stripped by the ring drain) are queued as skbs, one delivered
  * per read(); write() wraps one app message in the 12-byte EXYNOS link header
@@ -621,11 +634,18 @@ struct s5300_modem {
 	phys_addr_t		pktproc_phys;
 	resource_size_t		pktproc_size;
 	void __iomem		*pktproc;
-	struct net_device	*ndev;		/* raw-IP data netdev (ch 181..) */
+	/* Raw-IP data netdevs, indexed by PDP channel - S5300_PDP_CH_FIRST. */
+	struct net_device	*ndev[S5300_PDP_CH_COUNT];
 	u32			dl_num_desc;
 	u32			dl_fore[S5300_PKTPROC_DL_NUM_Q];
 	u32			dl_done[S5300_PKTPROC_DL_NUM_Q];
-	/* UL TX ring (NORM queue).  ul_done is touched only under the tx lock. */
+	/*
+	 * UL TX ring (NORM queue), shared by every context's netdev.  ul_lock
+	 * protects the producer state -- ul_done and the fore_ptr it publishes
+	 * -- against the per-netdev transmit locks racing each other and against
+	 * a CP restart resetting the ring from hard IRQ.
+	 */
+	spinlock_t		ul_lock;
 	u32			ul_num_desc;
 	u32			ul_done;
 	u16			ul_cp_quota;
@@ -633,6 +653,20 @@ struct s5300_modem {
 	bool			ul_active;
 	bool			tx_suspended;	/* CP TX flow control (vector-1 cp2ap_status) */
 };
+
+/*
+ * The netdev carrying PDP channel @ch, or NULL if @ch is not a data channel or
+ * its netdev is not registered.  s5300_unregister_modem_ports() clears the slot
+ * before it destroys the netdev and then waits out both IPC vectors and an RCU
+ * grace period, so a hard-IRQ caller that reads a non-NULL pointer keeps a live
+ * netdev for the rest of its handler.
+ */
+static struct net_device *s5300_pdp_ndev(struct s5300_modem *sm, u8 ch)
+{
+	if (ch < S5300_PDP_CH_FIRST || ch > S5300_PDP_CH_LAST)
+		return NULL;
+	return READ_ONCE(sm->ndev[ch - S5300_PDP_CH_FIRST]);
+}
 
 /* --- circular-ring helpers (downstream include/circ_queue.h) ------------- */
 
@@ -1344,6 +1378,28 @@ static irqreturn_t s5300_cp_crash_irq(int irq, void *data)
 }
 
 /*
+ * Stop or wake every context's transmit queue.  The CP's flow control is
+ * global (one bit in cp2ap_united_status for the whole UL ring), so it applies
+ * to all of them at once.
+ */
+static void s5300_pdp_flowctl(struct s5300_modem *sm, bool suspend)
+{
+	unsigned int i;
+
+	for (i = 0; i < S5300_PDP_CH_COUNT; i++) {
+		/* Snapshot: ports_work clears the slot before unregistering. */
+		struct net_device *ndev = READ_ONCE(sm->ndev[i]);
+
+		if (!ndev)
+			continue;
+		if (suspend)
+			netif_stop_queue(ndev);
+		else
+			netif_wake_queue(ndev);
+	}
+}
+
+/*
  * MSI vector 1: the CP's cp2ap_status interrupt (downstream
  * shmem_tx_state_handler).  Its one runtime payload is the global TX
  * flow-control bit in cp2ap_united_status: the CP asks the AP to stop feeding
@@ -1357,20 +1413,12 @@ static irqreturn_t s5300_tx_state_irq(int irq, void *data)
 	struct s5300_modem *sm = data;
 	u32 status = readl(sm->ipc + S5300_IPC_CP2AP_STATUS);
 	bool suspend = status & S5300_CP2AP_FLOWCTL;
-	struct net_device *ndev;
 
 	if (suspend == READ_ONCE(sm->tx_suspended))
 		return IRQ_HANDLED;
 
 	WRITE_ONCE(sm->tx_suspended, suspend);
-	/* Snapshot: ports_work clears sm->ndev before unregistering it. */
-	ndev = READ_ONCE(sm->ndev);
-	if (ndev) {
-		if (suspend)
-			netif_stop_queue(ndev);
-		else
-			netif_wake_queue(ndev);
-	}
+	s5300_pdp_flowctl(sm, suspend);
 	dev_info_ratelimited(sm->dev, "CP TX flow control: %s (cp2ap status %#x)\n",
 			     suspend ? "suspend" : "resume", status);
 	return IRQ_HANDLED;
@@ -1558,8 +1606,6 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 	}
 
 	while (in != out) {
-		/* Snapshot per frame: ports_work clears it before unregister. */
-		struct net_device *ndev = READ_ONCE(sm->ndev);
 		u8 frame[S5300_HDR_SIZE + 64];
 		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
 		u32 flen, total, payload, body;
@@ -1613,21 +1659,24 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 				dev_warn(sm->dev, "at rxq drop payload %u\n",
 					 payload);
 			}
-		} else if (READ_ONCE(sm->online) && ndev && payload &&
+		} else if (READ_ONCE(sm->online) && payload &&
 			   hdr[8] >= S5300_PDP_CH_FIRST && hdr[8] <= S5300_PDP_CH_LAST) {
 			/*
 			 * Raw-IP DL data the CP places on the legacy NORM_RAW ring
 			 * instead of PKTPROC for small packets (DNS replies); cpif's
 			 * rx_multi_pdp does the same on these PDP channels.  Feed the
-			 * data netdev like s5300_pktproc_dl_drain().  Like every
-			 * other channel we send the CP NOTHING on RX: downstream
-			 * acks nothing either, and s5300_send_ipc_irq() overwrites the
-			 * shared ap2cp_msg word, so a spurious ack would clobber a
-			 * pending SEND_* notification and desync the CP.
+			 * netdev owning this PDP channel, like s5300_pktproc_dl_drain().
+			 * Like every other channel we send the CP NOTHING on RX:
+			 * downstream acks nothing either, and s5300_send_ipc_irq()
+			 * overwrites the shared ap2cp_msg word, so a spurious ack would
+			 * clobber a pending SEND_* notification and desync the CP.
 			 */
-			struct sk_buff *skb = netdev_alloc_skb(ndev, payload);
+			struct net_device *ndev = s5300_pdp_ndev(sm, hdr[8]);
+			struct sk_buff *skb = NULL;
 			u8 ver = 0;
 
+			if (ndev)
+				skb = netdev_alloc_skb(ndev, payload);
 			if (skb) {
 				s5300_circ_read(skb_put(skb, payload), buff,
 						S5300_RAW_RXQ_SIZE, body, payload);
@@ -1647,7 +1696,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			} else if (skb) {
 				dev_kfree_skb_any(skb);
 				ndev->stats.rx_length_errors++;
-			} else {
+			} else if (ndev) {
 				ndev->stats.rx_dropped++;
 			}
 		} else if (!READ_ONCE(sm->online) && hdr[8] == S5300_BOOT_CH &&
@@ -1951,23 +2000,19 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	case S5300_CMD_PHONE_START:
 		dev_info(sm->dev, "CP PHONE_START\n");
 		if (!READ_ONCE(sm->online)) {
-			struct net_device *ndev;
-
 			s5300_check_cp_capabilities(sm);
 			s5300_pktproc_ul_activate(sm);
 			s5300_init_ipc_queues(sm);
 			/*
 			 * A rebooted CP starts un-flow-controlled.  Normally
-			 * ports_work removed the netdev with the dead CP and a
-			 * fresh one comes up with an awake queue; but if the
-			 * work sat queued across the whole down-up cycle, the
-			 * transitions cancel out and the surviving netdev may
-			 * still hold a pre-crash flow-control stop -- wake it.
+			 * ports_work removed the netdevs with the dead CP and
+			 * fresh ones come up with awake queues; but if the work
+			 * sat queued across the whole down-up cycle, the
+			 * transitions cancel out and the surviving netdevs may
+			 * still hold a pre-crash flow-control stop -- wake them.
 			 */
 			WRITE_ONCE(sm->tx_suspended, false);
-			ndev = READ_ONCE(sm->ndev);
-			if (ndev)
-				netif_wake_queue(ndev);
+			s5300_pdp_flowctl(sm, false);
 			/* Publish only after the FMT ring is armed (magic 0xAA). */
 			WRITE_ONCE(sm->online, true);
 			sm->cp_status = S5300_STATE_ONLINE;
@@ -3120,19 +3165,23 @@ static void s5300_pktproc_dl_init(struct s5300_modem *sm)
  * Drain filled DL descriptors [done..rear) into skbs and refill the freed
  * slots.  Runs from the MSI handler once ONLINE.  Copy-out (no CP IOMMU): the
  * packet sits at buff_vbase + max_pkt*done, length from the descriptor.  Raw IP:
- * sniff the version nibble and hand it to the data netdev.  Bounded by num_desc
- * so a garbled rear cannot spin.
+ * sniff the version nibble and hand it to the netdev owning the descriptor's
+ * PDP channel.  Bounded by num_desc so a garbled rear cannot spin.
+ *
+ * A packet whose channel has no netdev is dropped rather than left in the ring:
+ * the descriptor still has to be consumed and refilled or the CP's DL engine
+ * wedges behind it.  It is warned about because it should not happen -- every
+ * PDP channel has a netdev whenever the CP is ONLINE -- and because it is what
+ * a wrong channel_id assumption would look like.
  */
 static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5300_PKTPROC_DL_INFO_OFF;
-	/* Snapshot: ports_work clears sm->ndev before unregistering it. */
-	struct net_device *ndev = READ_ONCE(sm->ndev);
 	u32 n = sm->dl_num_desc;
 	unsigned long flags;
 	u32 q;
 
-	if (!n || !ndev)
+	if (!n)
 		return;
 
 	/*
@@ -3155,8 +3204,16 @@ static void s5300_pktproc_dl_drain(struct s5300_modem *sm)
 		for (guard = 0; done != rear && guard < n; guard++) {
 			void __iomem *d = descs + done * S5300_PKTPROC_DESC_SZ;
 			u32 len = readl(d + S5300_DESC_LEN) & 0xffff;
+			u8 ch = (readl(d + S5300_DESC_CHID) >> 16) & 0xff;
+			struct net_device *ndev = s5300_pdp_ndev(sm, ch);
 			struct sk_buff *skb;
 
+			if (!ndev) {
+				dev_warn_ratelimited(sm->dev,
+						     "pktproc DL q%u ch %#x has no netdev\n",
+						     q, ch);
+				goto next;
+			}
 			if (len == 0 || len > S5300_PKTPROC_MAX_PKT) {
 				ndev->stats.rx_length_errors++;
 				goto next;
@@ -3209,11 +3266,14 @@ static void s5300_pktproc_ul_setup(struct s5300_modem *sm)
 		S5300_PKTPROC_UL_HI_NUM_DESC, S5300_PKTPROC_UL_NUM_DESC };
 	static const u32 desc_off[S5300_PKTPROC_UL_NUM_Q] = {
 		0, S5300_PKTPROC_UL_HI_DESC_SZ };
+	unsigned long flags;
 	u32 i;
 
+	sm->ul_active = false;
+	spin_lock_irqsave(&sm->ul_lock, flags);
 	sm->ul_num_desc = S5300_PKTPROC_UL_NUM_DESC;	/* NORM (TX) queue */
 	sm->ul_done = 0;
-	sm->ul_active = false;
+	spin_unlock_irqrestore(&sm->ul_lock, flags);
 
 	memset_io(info, 0, SZ_4K);
 	writel(S5300_PKTPROC_UL_NUM_Q, info);	/* num_queues; CP fills the rest */
@@ -3242,12 +3302,15 @@ static void s5300_pktproc_ul_activate(struct s5300_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5300_PKTPROC_UL_INFO_OFF;
 	void __iomem *qi = info + S5300_PKTPROC_UL_QINFO(S5300_PKTPROC_UL_TXQ);
+	unsigned long flags;
 
 	sm->ul_end_bit_owner = (readl(info) >> 24) & 1;
 	sm->ul_cp_quota = readl(info + 4) & 0xffff;
+	spin_lock_irqsave(&sm->ul_lock, flags);
 	sm->ul_done = 0;
 	writel(0, qi + S5300_QINFO_FORE);
 	writel(0, qi + S5300_QINFO_REAR);
+	spin_unlock_irqrestore(&sm->ul_lock, flags);
 	/* Only transmit once PKTPROC_UL is advertised; otherwise the CP does not
 	 * consume the UL ring and an up'd rmnet0 would ring spurious doorbells.
 	 */
@@ -3259,33 +3322,47 @@ static void s5300_pktproc_ul_activate(struct s5300_modem *sm)
 }
 
 /*
- * Transmit one skb on the NORM UL queue: copy into the ring buffer, write the
- * 32-byte descriptor, publish fore_ptr and ring the CP.  Runs under the netdev
- * tx lock (serialised), so ul_done needs no extra lock.  Returns false if the
- * ring is full (caller drops).
+ * Transmit one skb on the NORM UL queue for PDP channel @ch: copy into the ring
+ * buffer, write the 32-byte descriptor, publish fore_ptr and ring the CP.  The
+ * lcid the CP demultiplexes on is the caller's channel -- one PDP context per
+ * netdev -- so a context's uplink reaches the PDN its downlink came from.
+ *
+ * Every context's netdev feeds this one ring, and each has its own transmit
+ * lock, so the ring pointers and the descriptor slot are serialised here
+ * instead.  Returns false if the ring is full (caller drops).
  */
-static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb)
+static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb,
+				  u8 ch)
 {
 	void __iomem *info = sm->pktproc + S5300_PKTPROC_UL_INFO_OFF;
 	void __iomem *qi = info + S5300_PKTPROC_UL_QINFO(S5300_PKTPROC_UL_TXQ);
-	void __iomem *desc = sm->pktproc + S5300_PKTPROC_UL_DESC_BASE +
-			     sm->ul_done * S5300_PKTPROC_UL_DESC_SZ;
-	void __iomem *buf = sm->pktproc + S5300_PKTPROC_UL_BUFF_OFF +
-			    S5300_PKTPROC_UL_TXQ * S5300_PKTPROC_UL_BUFF_BY_Q +
-			    sm->ul_done * S5300_PKTPROC_UL_MAX_PKT;
-	u32 cp_buf = S5300_PKTPROC_CP_BASE + S5300_PKTPROC_UL_BUFF_OFF +
-		     S5300_PKTPROC_UL_TXQ * S5300_PKTPROC_UL_BUFF_BY_Q +
-		     sm->ul_done * S5300_PKTPROC_UL_MAX_PKT;
-	u32 n = sm->ul_num_desc;
-	u32 rear = readl(qi + S5300_QINFO_REAR) % n;
+	u32 q_off = S5300_PKTPROC_UL_TXQ * S5300_PKTPROC_UL_BUFF_BY_Q;
 	u32 dsize = skb->len + S5300_PKTPROC_UL_CP_PADDING;
 	u32 last = sm->ul_end_bit_owner == S5300_UL_END_BIT_AP ? 1 : 0;
+	void __iomem *desc, *buf;
+	u32 n, rear, slot, cp_buf;
+	unsigned long flags;
+
+	if (dsize > S5300_PKTPROC_UL_MAX_PKT)
+		return false;
+
+	spin_lock_irqsave(&sm->ul_lock, flags);
+	n = sm->ul_num_desc;
+	slot = sm->ul_done;
+	rear = readl(qi + S5300_QINFO_REAR) % n;
 
 	/* circ_get_space(n, done, rear): need at least one free descriptor. */
-	if (((rear + n - sm->ul_done - 1) % n) < 1)
+	if (((rear + n - slot - 1) % n) < 1) {
+		spin_unlock_irqrestore(&sm->ul_lock, flags);
 		return false;
-	if (skb->len + S5300_PKTPROC_UL_CP_PADDING > S5300_PKTPROC_UL_MAX_PKT)
-		return false;
+	}
+
+	desc = sm->pktproc + S5300_PKTPROC_UL_DESC_BASE +
+	       slot * S5300_PKTPROC_UL_DESC_SZ;
+	buf = sm->pktproc + S5300_PKTPROC_UL_BUFF_OFF + q_off +
+	      slot * S5300_PKTPROC_UL_MAX_PKT;
+	cp_buf = S5300_PKTPROC_CP_BASE + S5300_PKTPROC_UL_BUFF_OFF + q_off +
+		 slot * S5300_PKTPROC_UL_MAX_PKT;
 
 	memcpy_toio(buf, skb->data, skb->len);
 
@@ -3294,13 +3371,15 @@ static bool s5300_pktproc_ul_xmit(struct s5300_modem *sm, struct sk_buff *skb)
 	writel(cp_buf, desc + 0x8);		/* sktbuf_point[31:0] */
 	writel(0, desc + 0xc);			/* sktbuf_point[35:32] + ap2cp */
 	writel(last, desc + 0x10);		/* last_desc */
-	writel(S5300_PDP_CH_FIRST << 8, desc + 0x14);	/* lcid @ bits 8-15 */
+	writel(ch << 8, desc + 0x14);		/* lcid @ bits 8-15 */
 	writel(0, desc + 0x18);
 	writel(0, desc + 0x1c);
 
-	sm->ul_done = (sm->ul_done + 1 == n) ? 0 : sm->ul_done + 1;
+	sm->ul_done = (slot + 1 == n) ? 0 : slot + 1;
 	wmb();				/* descriptor + data land before fore_ptr */
 	writel(sm->ul_done, qi + S5300_QINFO_FORE);
+	spin_unlock_irqrestore(&sm->ul_lock, flags);
+
 	s5300_send_ipc_irq(sm, S5300_MASK(S5300_MASK_SEND_DATA));
 	return true;
 }
@@ -3320,7 +3399,8 @@ static int s5300_ndo_stop(struct net_device *ndev)
 static netdev_tx_t s5300_ndo_start_xmit(struct sk_buff *skb,
 					struct net_device *ndev)
 {
-	struct s5300_modem *sm = *(struct s5300_modem **)netdev_priv(ndev);
+	struct s5300_netdev_priv *priv = netdev_priv(ndev);
+	struct s5300_modem *sm = priv->sm;
 	unsigned int len;
 
 	/*
@@ -3346,7 +3426,7 @@ static netdev_tx_t s5300_ndo_start_xmit(struct sk_buff *skb,
 	}
 	len = skb->len;
 
-	if (sm->ul_active && s5300_pktproc_ul_xmit(sm, skb)) {
+	if (sm->ul_active && s5300_pktproc_ul_xmit(sm, skb, priv->ch)) {
 		ndev->stats.tx_packets++;
 		ndev->stats.tx_bytes += len;
 	} else {
@@ -3380,7 +3460,7 @@ static void s5300_unregister_modem_ports(struct s5300_modem *sm);
 
 /*
  * The userspace-facing ports -- the two logical SIT control stacks, the
- * vendor AT channel and the raw-IP data netdev -- exist only while the CP is
+ * vendor AT channel and the raw-IP data netdevs -- exist only while the CP is
  * ONLINE, the way other PCIe WWAN drivers (t7xx, iosm) expose ports only once
  * their firmware is up.  A port that exists but cannot answer is worse than
  * no port: modem stacks probe ports as they appear, and on a cold boot the
@@ -3388,16 +3468,20 @@ static void s5300_unregister_modem_ports(struct s5300_modem *sm);
  * out gets the device blacklisted as unusable with no later re-probe.  Port
  * add/remove is the readiness signal userspace already understands, and it
  * makes CP crash recovery symmetric: the ports go away with the dead CP and
- * return once the recovered CP is back up.  All four are registered together
- * so they enumerate as one modem device (a lone early data netdev would be
+ * return once the recovered CP is back up.  They are registered together so
+ * they enumerate as one modem device (a lone early data netdev would be
  * probed -- and dismissed -- without its control ports).
+ *
+ * The whole rmnet0..rmnet29 range comes up at once rather than on demand:
+ * there is no control path for userspace to ask for a netdev, and a modem
+ * stack picks the interface for a PDP context by name.  They are cheap while
+ * down, and downstream registers all thirty the same way.
  *
  * The boot/RFS/OEM chardevs are NOT managed here: the boot daemon needs them
  * before ONLINE to boot the CP in the first place.
  */
 static int s5300_register_modem_ports(struct s5300_modem *sm)
 {
-	struct net_device *ndev;
 	struct wwan_port *port;
 	int i, ret;
 
@@ -3427,21 +3511,42 @@ static int s5300_register_modem_ports(struct s5300_modem *sm)
 	}
 	smp_store_release(&sm->at_port, port);
 
-	ndev = alloc_netdev(sizeof(struct s5300_modem *), "rmnet%d",
-			    NET_NAME_ENUM, s5300_netdev_setup);
-	if (!ndev) {
-		ret = -ENOMEM;
-		goto err;
+	/*
+	 * rmnet<i> carries PDP channel S5300_PDP_CH_FIRST + i, the mapping
+	 * downstream's multi-channel rmnet iodev expands to.  Name the netdevs
+	 * explicitly instead of letting "rmnet%d" enumerate: the trailing index
+	 * *is* the channel offset, and a userspace bearer picks its interface by
+	 * that name, so it must not slide if some other rmnet is already up.
+	 */
+	for (i = 0; i < S5300_PDP_CH_COUNT; i++) {
+		struct s5300_netdev_priv *priv;
+		struct net_device *ndev;
+		char name[IFNAMSIZ];
+
+		snprintf(name, sizeof(name), "rmnet%d", i);
+		ndev = alloc_netdev(sizeof(*priv), name, NET_NAME_PREDICTABLE,
+				    s5300_netdev_setup);
+		if (!ndev) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		priv = netdev_priv(ndev);
+		priv->sm = sm;
+		priv->ch = S5300_PDP_CH_FIRST + i;
+		SET_NETDEV_DEV(ndev, sm->dev);
+		ret = register_netdev(ndev);
+		if (ret) {
+			dev_err(sm->dev, "register_netdev(%s): %d\n", name, ret);
+			free_netdev(ndev);
+			goto err;
+		}
+		/*
+		 * The ring drains (hard IRQ) look this up by channel and
+		 * dereference it: release-publish so the netdev is fully
+		 * initialised before the pointer store.
+		 */
+		smp_store_release(&sm->ndev[i], ndev);
 	}
-	*(struct s5300_modem **)netdev_priv(ndev) = sm;
-	SET_NETDEV_DEV(ndev, sm->dev);
-	ret = register_netdev(ndev);
-	if (ret) {
-		dev_err(sm->dev, "register_netdev: %d\n", ret);
-		free_netdev(ndev);
-		goto err;
-	}
-	smp_store_release(&sm->ndev, ndev);
 	return 0;
 
 err:
@@ -3451,9 +3556,10 @@ err:
 
 static void s5300_unregister_modem_ports(struct s5300_modem *sm)
 {
+	struct net_device *ndev[S5300_PDP_CH_COUNT];
 	struct wwan_port *sit_port[S5300_SIT_PORT_COUNT];
 	struct wwan_port *at_port;
-	struct net_device *ndev;
+	LIST_HEAD(unreg);
 	int i;
 
 	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
@@ -3462,8 +3568,10 @@ static void s5300_unregister_modem_ports(struct s5300_modem *sm)
 	}
 	at_port = sm->at_port;
 	WRITE_ONCE(sm->at_port, NULL);
-	ndev = sm->ndev;
-	WRITE_ONCE(sm->ndev, NULL);
+	for (i = 0; i < S5300_PDP_CH_COUNT; i++) {
+		ndev[i] = sm->ndev[i];
+		WRITE_ONCE(sm->ndev[i], NULL);
+	}
 
 	/*
 	 * The ring drains and the flow-control handler run in hard IRQ and
@@ -3476,8 +3584,16 @@ static void s5300_unregister_modem_ports(struct s5300_modem *sm)
 	synchronize_irq(pci_irq_vector(sm->pdev, 1));
 	synchronize_rcu();
 
-	if (ndev)
-		unregister_netdev(ndev);	/* needs_free_netdev frees it */
+	/* Batched: thirty separate unregister_netdev()s would each pay for a
+	 * full RCU grace period, on every CP crash-recovery cycle.
+	 */
+	rtnl_lock();
+	for (i = 0; i < S5300_PDP_CH_COUNT; i++)
+		if (ndev[i])
+			unregister_netdevice_queue(ndev[i], &unreg);
+	unregister_netdevice_many(&unreg);	/* needs_free_netdev frees them */
+	rtnl_unlock();
+
 	if (at_port)
 		wwan_remove_port(at_port);
 	for (i = S5300_SIT_PORT_COUNT; i-- > 0;)
@@ -3561,6 +3677,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->dev = dev;
 	spin_lock_init(&sm->lock);
 	spin_lock_init(&sm->dl_lock);
+	spin_lock_init(&sm->ul_lock);
 	spin_lock_init(&sm->rx_lock);
 	mutex_init(&sm->io_lock);
 	mutex_init(&sm->pcie_onoff_lock);

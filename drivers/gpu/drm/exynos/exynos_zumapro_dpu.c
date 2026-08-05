@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/spinlock.h>
+#include <linux/timer.h>
 #include <drm/display/drm_dsc.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -74,6 +75,8 @@ struct zumapro_decon {
 	bool win_dirty;
 	/* gates frame_start vblank delivery; the HW interrupt stays enabled */
 	bool vblank_enabled;
+	/* completes the vblank when a triggered frame never starts */
+	struct timer_list frame_start_timer;
 };
 
 struct zumapro_decon_desc {
@@ -1216,6 +1219,7 @@ static void zumapro_decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	zumapro_decon_stop(decon);
 	decon->enabled = false;
 	decon->start_pending = false;
+	timer_delete_sync(&decon->frame_start_timer);
 	pm_runtime_put_sync(decon->dev);
 }
 
@@ -1250,9 +1254,61 @@ static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 	spin_unlock_irqrestore(&decon->slock, flags);
 }
 
+/*
+ * A command-mode frame is triggered by the panel's TE, so a frame that never
+ * starts strands the commit that armed it: the vblank counter never advances
+ * and the flip event queued by exynos_crtc_handle_event() is never delivered.
+ * drm_atomic_helper_wait_for_vblanks() then warns after 100 ms, and the *next*
+ * commit blocks 10 s per object in drm_atomic_helper_wait_for_dependencies(),
+ * so one lost frame_start freezes the display for ~30 s.
+ *
+ * Downstream treats a missing frame_start as an expected condition rather than
+ * an impossibility, and recovers: decon_wait_for_flip_done() gives the frame a
+ * bounded time to start and otherwise calls decon_force_vblank_event().  Do the
+ * same here with a timer, since this driver uses the generic commit tail.
+ *
+ * The timeout is deliberately shorter than the 100 ms
+ * drm_atomic_helper_wait_for_vblanks() allows, so recovery lands before the
+ * helper gives up and the stall never reaches the commit chain at all.  At
+ * 60 Hz it is still more than three TE periods, and as downstream does, a
+ * frame_start that is merely *pending* (the threaded handler has not run yet)
+ * is not counted as a miss, so scheduler latency cannot trigger this.
+ *
+ * This is damage control, not a cure: the frame genuinely did not scan out, and
+ * completing the vblank only keeps the pipeline moving.  The underlying cause
+ * of a lost TE belongs in the panel/DSIM path.
+ */
+#define ZUMAPRO_DECON_FRAME_START_TIMEOUT_MS	60
+
+static void zumapro_decon_frame_start_timeout(struct timer_list *t)
+{
+	struct zumapro_decon *decon = timer_container_of(decon, t,
+							frame_start_timer);
+	unsigned long flags;
+	bool armed;
+	u32 pend;
+
+	spin_lock_irqsave(&decon->slock, flags);
+	armed = decon->enabled;
+	pend = armed ? readl(decon->main_regs + ZUMAPRO_DECON_INT_PEND) &
+		       ZUMAPRO_DECON_INT_FRAME_START : 0;
+	spin_unlock_irqrestore(&decon->slock, flags);
+
+	if (!armed || pend)
+		return;
+
+	dev_warn_ratelimited(decon->dev,
+			     "DECON%u frame start timed out, completing vblank\n",
+			     decon->id);
+
+	if (decon->crtc)
+		drm_crtc_handle_vblank(&decon->crtc->base);
+}
+
 static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 {
 	struct zumapro_decon *decon = crtc->ctx;
+	bool frame_expected = false;
 	unsigned long flags;
 
 	if (!decon->enabled)
@@ -1262,6 +1318,7 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 		zumapro_decon_start(decon);
 		decon->start_pending = false;
 		decon->win_dirty = false;
+		frame_expected = true;
 	} else if (decon->win_dirty) {
 		int ret;
 
@@ -1307,7 +1364,18 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 					ZUMAPRO_DECON_HW_TRIG_MASK, 0);
 		spin_unlock_irqrestore(&decon->slock, flags);
 		decon->win_dirty = false;
+		frame_expected = true;
 	}
+
+	/*
+	 * A frame is now expected: either decon_start() or the win_dirty branch
+	 * unmasked the trigger.  Arm the recovery timer before handing the event
+	 * over, so a frame that never starts cannot strand this commit.
+	 */
+	if (frame_expected)
+		mod_timer(&decon->frame_start_timer,
+			  jiffies +
+			  msecs_to_jiffies(ZUMAPRO_DECON_FRAME_START_TIMEOUT_MS));
 
 	/* Arm the commit's flip event for delivery on the next frame_start. */
 	exynos_crtc_handle_event(crtc);
@@ -1356,6 +1424,9 @@ static irqreturn_t zumapro_decon_frame_start_irq(int irq, void *dev_id)
 
 	if (!pend)
 		return IRQ_NONE;
+
+	/* The frame started, so the recovery timer is not needed. */
+	timer_delete(&decon->frame_start_timer);
 
 	if (deliver && decon->crtc)
 		drm_crtc_handle_vblank(&decon->crtc->base);
@@ -1871,6 +1942,8 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	}
 
 	spin_lock_init(&decon->slock);
+	timer_setup(&decon->frame_start_timer,
+		    zumapro_decon_frame_start_timeout, 0);
 
 	/*
 	 * The DPU power domains are always on, so the registers are reachable
@@ -1918,9 +1991,11 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 
 static void zumapro_decon_remove(struct platform_device *pdev)
 {
+	struct zumapro_decon *decon = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
 
 	component_del(dev, &zumapro_decon_component_ops);
+	timer_delete_sync(&decon->frame_start_timer);
 	pm_runtime_disable(dev);
 }
 

@@ -15,7 +15,7 @@
  * protocol support") onto our 7.1 base, adapted to the pre-7.2 handle API
  * (ops.tmu_ops, no acpm_set_xfer() helper).  The wire format is unchanged and
  * matches what was hardware-verified on zumapro, see
- * research/thermal-acpm-tmu.md.
+ * docs/subsystems/power/reference/thermal-acpm-tmu.md.
  */
 #include <linux/array_size.h>
 #include <linux/errno.h>

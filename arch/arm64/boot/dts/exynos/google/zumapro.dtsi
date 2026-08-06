@@ -111,7 +111,7 @@
 	 * no MMIO.  Children are the IRQ forwarder, the log, and the virtio
 	 * transport that carries tipc.  ipi-range mirrors research/dumped.dts
 	 * (trusty/irq ipi-range = <8 15 8>).  Needed for the AoC GSA-hwmgr
-	 * firmware-start path (research/aoc.md).
+	 * firmware-start path (docs/platform/aoc.md).
 	 */
 	trusty {
 		compatible = "android,trusty-smc-v1";
@@ -136,7 +136,7 @@
 	 * channel (hwmgr) for coprocessor start.  The s2mpu phandle and the
 	 * log-region / gsa_gsc child are omitted -- pKVM, GSC and the GSA log
 	 * are disabled for this minimal bring-up.  Needed to authenticate and
-	 * start AoC (research/aoc.md).  IRQ from research/dumped.dts
+	 * start AoC (docs/platform/aoc.md).  IRQ from research/dumped.dts
 	 * (gsa-ns interrupts = <0 0x177 4>).
 	 */
 	gsa: gsa@16490000 {
@@ -675,7 +675,7 @@
 	 * oscillate.  These values are an ESTIMATED monotonic V/f curve (~0.6 V min
 	 * to ~1.05 V max); IPA's feedback tolerates the approximation.
 	 * TODO: replace with the real per-chip ASV ladder read from the ACPM fvmap
-	 * at runtime (a small fvmap-reader EM driver; see research/thermal-acpm-tmu.md).
+	 * at runtime (a small fvmap-reader EM driver; see docs/subsystems/power/reference/thermal-acpm-tmu.md).
 	 */
 	cpucl0_opp_table: opp-table-cpucl0 {
 		compatible = "operating-points-v2";
@@ -795,7 +795,7 @@
 	/*
 	 * GPU (Mali-G715 / Tensor G4 "G3D") PM domains.  Source: downstream
 	 * research/dumped_uart.dts:2699-2719 and the Phase-0 power-on trace
-	 * (research/gpu-power-trace-results.md).  Two domains: pd_g3d (top, the
+	 * (docs/subsystems/gpu/reference/gpu-power-trace-results.md).  Two domains: pd_g3d (top, the
 	 * EL3-protected PMU register -> secure SMC path) and pd_embedded_g3d
 	 * (the shader cores, a child of pd_g3d).
 	 *
@@ -960,7 +960,7 @@
 		 *
 		 * No clocks property: the TMU APB PCLK gates the INTPEND reads,
 		 * but CMU_MISC has no TMU gates modelled yet and the bootloader
-		 * leaves the clock running.  See research/thermal-acpm-tmu.md.
+		 * leaves the clock running.  See docs/subsystems/power/reference/thermal-acpm-tmu.md.
 		 */
 		tmu_top: tmu@100a0000 {
 			compatible = "google,zumapro-tmu-top";
@@ -983,7 +983,7 @@
 		 * base and the CMU_TOP NOC feed come from research/dumped.dts and
 		 * the downstream zuma cmucal tables.  The USB reference clock is
 		 * not a CMU_TOP feed; it is derived from the CMU_HSI0-internal
-		 * PLL_USB (see clk-zumapro.c and research/NEEDS-HARDWARE.md).
+		 * PLL_USB (see clk-zumapro.c and docs/archive/usb/needs-hardware-2026-05.md).
 		 * USB is already running at fastboot handoff.
 		 */
 		cmu_hsi0: clock-controller@11000000 {
@@ -1453,7 +1453,7 @@
 		/*
 		 * GPU: Mali-G715 (Valhall CSF, arch 11.2, product tTUx), driven by
 		 * mainline panthor.  Source: downstream research/dumped_uart.dts:5592
-		 * (mali@1F000000) and research/gpu.md.  Disabled here; enabled per
+		 * (mali@1F000000) and docs/subsystems/gpu/reference/gpu.md.  Disabled here; enabled per
 		 * board in zumapro-tegu.dts once the CSF firmware blob is staged.
 		 *
 		 * Clocks are ACPM-backed (Route B).  The two GPU DVFS domains are
@@ -1968,7 +1968,7 @@
 		 * USB is live at handoff).  Structural template: the in-tree
 		 * exynos2200.dtsi USB block; all addresses/clocks/IRQs are zumapro's
 		 * own, from research/dumped.dts and the hardware MMIO trace
-		 * (research/NEEDS-HARDWARE.md H1/H2/H3, decisions/0004).
+		 * (docs/archive/usb/needs-hardware-2026-05.md H1/H2/H3, docs/decisions/0002).
 		 *
 		 * The combo USB32DRD PHY's "phy" reg (0x11100000) holds the DRD
 		 * link-control registers the driver writes (LINKCTRL 0x04, CLKRST
@@ -2007,7 +2007,7 @@
 		 * MMIO resource at 0x11110000 (downstream reg index 1); its register
 		 * offsets (RST 0x0, COMMON 0x4, PLLCFG0 0x8, PLLCFG1 0xc, TX 0x14,
 		 * TESTSE 0x20) match the mainline phy-snps-eusb2 Exynos variant and
-		 * the downstream eusb-con-reg.h exactly (decisions/0004).  "ref" is
+		 * the downstream eusb-con-reg.h exactly (docs/decisions/0002).  "ref" is
 		 * the 19.2 MHz USB reference (PLL_USB/32, trace-confirmed), which
 		 * selects the eUSB2 PLL config (fb_div 0x170, ref_div 0 — matches
 		 * downstream).

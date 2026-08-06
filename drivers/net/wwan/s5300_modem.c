@@ -258,7 +258,7 @@
  * byte-stream -- AT command lines out, response/URC lines in -- with no framing
  * beyond the 12-byte link header.  Exposed as a diagnostic WWAN AT port for an
  * encoding-independent radio cross-check; the SIT channel stays the RIL control
- * plane (research/modem-at-commands.md).  AT lines are small, so bound a corrupt
+ * plane (docs/archive/modem/modem-at-commands.md).  AT lines are small, so bound a corrupt
  * CP length tightly.
  */
 #define S5300_AT_CH			0x15	/* EXYNOS_CH_ID_BT_DUN (umts_router) */
@@ -328,7 +328,7 @@
 #define S5300_DB_LINK_ACK		(S5300_DB_TRIGGER | 0xe)
 
 /*
- * PKTPROC PS-data path (research/pktproc-plan.md).  The bulk data rings live in
+ * PKTPROC PS-data path (docs/subsystems/modem/reference/pktproc-plan.md).  The bulk data rings live in
  * a separate carveout (the "pktproc" region, AP-phys 0xe8000000); the CP
  * addresses it at pktproc_cp_base and self-translates to the AP-phys before the
  * TLP, so no AP-side window is needed.  tegu is V2/SKTBUF with hw_iocc and no CP

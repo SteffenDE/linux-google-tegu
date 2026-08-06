@@ -351,7 +351,7 @@
 			 * DL/UL data rings + buffers; the CP addresses it at
 			 * pktproc_cp_base 0x20000000 and self-translates to this
 			 * AP-phys before the TLP, so no AP-side window is needed
-			 * (research/pktproc-plan.md "Risk #1").  no-map for the
+			 * (docs/subsystems/modem/reference/pktproc-plan.md "Risk #1").  no-map for the
 			 * same reason as cp_rmem: the driver maps it non-cached
 			 * and the CP DMAs into it (HSI1 IO-coherency is not set
 			 * up on mainline).

@@ -36,7 +36,7 @@ struct aoc_service_resource {
  * service directory.  Downstream lists ~34 services (plus SoC-#if'd
  * extras); this tree only builds the PCM/path/control sub-drivers, so
  * list exactly the services that code can address — all verified present
- * on tegu firmware 15231849 (research/audio.md, on-device capture).
+ * on tegu firmware 15231849 (docs/subsystems/audio/reference/audio-stack.md, on-device capture).
  * Grow the list together with the voip/incall/compress/etc. bring-up.
  */
 static const char *const audio_service_names[] = {

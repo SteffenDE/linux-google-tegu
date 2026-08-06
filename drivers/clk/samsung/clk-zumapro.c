@@ -991,7 +991,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
  * Register offsets for CMU_HSI0 (0x11000000).
  *
  * USB is live at handoff and this driver only observes the tree.  Per the
- * hardware trace (research/NEEDS-HARDWARE.md H1/H3), the USB reference is the
+ * hardware trace (docs/archive/usb/needs-hardware-2026-05.md H1/H3), the USB reference is the
  * internal PLL_USB / DIV_CLK_HSI0_USB path (19.2 MHz), not the CMU_TOP USB32DRD
  * USER path; model only the NOC USER mux, USB/eUSB dividers, the USB32DRD
  * link Q-channel gate, and the clocks needed by early HSI0 consumers.

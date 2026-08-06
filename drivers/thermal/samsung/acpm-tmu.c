@@ -511,7 +511,7 @@ static int acpm_tmu_probe(struct platform_device *pdev)
 	 * TMU gates modelled yet, and the bootloader leaves the clock running
 	 * -- our IPC-only reads have relied on that since bring-up.  Treat the
 	 * clock as optional until those gates exist; see
-	 * research/thermal-acpm-tmu.md (TRACE NEEDED).
+	 * docs/subsystems/power/reference/thermal-acpm-tmu.md (TRACE NEEDED).
 	 */
 	priv->clk = devm_clk_get_optional(dev, NULL);
 	if (IS_ERR(priv->clk))

@@ -6,7 +6,7 @@
  * firmware to Linux IIO. The AoC sensor registry is loaded out of band by a
  * userspace daemon; once it is loaded this driver enumerates the sensors over
  * the com.google.usf AOCC channel and exposes them as IIO devices. This is the
- * data-plane half described in research/usf-iio-bridge.md.
+ * data-plane half described in docs/subsystems/sensors/reference/usf-iio-bridge.md.
  *
  * The registry-load daemon "pokes" this driver once the registry is ready by
  * writing the "enumerate" sysfs attribute; the driver stays inert until then.

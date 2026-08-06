@@ -388,7 +388,7 @@ static void zumapro_pcie_assert_phy_reset(struct zumapro_pcie *zp)
  * inside assert_phy_reset (pre-PLL).  Restoring the exact downstream
  * reset/clock profile matters because the modem's PERST-domain doorbell-generate
  * decode must survive the bounce, and its survival depends on precisely this
- * profile -- see research/modem-issues.md ("2026-07-06 prior-art deep-dive") and
+ * profile -- see docs/archive/modem/modem-issues.md ("2026-07-06 prior-art deep-dive") and
  * research/prior-art/findings/A-rc-bounce.md.  Bits are active-low (1 released,
  * 0 asserted); downstream RMWs single bits and holds the assert for mdelay(1).
  */
@@ -937,7 +937,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev, bool guarded)
 	 * PM_TO_ACK, then WAIT FOR THE LINK TO ENTER L2_IDLE before tearing
 	 * down.  The golden trace reaches RDLH 0x15 (S_L2_IDLE) at t=265.99
 	 * before the relink -- an orderly L2/L3 power-down.  The PBL
-	 * disassembly (research/modem-pbl-re.md) proved BL1 never rebuilds its
+	 * disassembly (docs/subsystems/modem/reference/modem-pbl-re.md) proved BL1 never rebuilds its
 	 * inbound doorbell decode after a link event, so that decode (in the
 	 * PERST-reset 0x14E00000 controller) must survive the bounce; the
 	 * working theory is it survives an orderly L2 entry but not a surprise

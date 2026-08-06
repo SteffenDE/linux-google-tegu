@@ -5,7 +5,7 @@
  * Hand-rolled FlatBuffer encoder/decoder for the handful of USF message types
  * the mainline sensor bridge needs. The layouts are reverse-engineered from the
  * unstripped libusf.so and validated byte-for-byte against on-device captures;
- * research/usf-driver-plan.md is the protocol reference. This is a kernel port
+ * docs/subsystems/sensors/reference/usf-driver-plan.md is the protocol reference. This is a kernel port
  * of the codec in tools/usf-client.c.
  *
  * Transport is packet/datagram: one message == one complete outer FlatBuffer,

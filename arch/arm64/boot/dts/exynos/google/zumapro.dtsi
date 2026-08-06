@@ -1527,10 +1527,13 @@
 		/*
 		 * v3 MCT: free-running counter + per-CPU comparators in the
 		 * always-on MISC block.  The comparators keep counting across the
-		 * c2 CPU power-down state, so they serve as the always-on per-CPU
-		 * tick (the ARM architected timer stops in c2).  Interrupts are the
-		 * nine local lines L0-L8 (GIC_SPI 758-766); the driver uses one per
-		 * possible CPU.  reg/clocks/div from downstream zuma cmucal + DT.
+		 * c2 CPU power-down state in which the ARM architected timer stops,
+		 * so each one is registered below the architected timer's rating and
+		 * becomes its CPU's one-shot wakeup device -- no broadcast timer is
+		 * needed (and this SoC has no usable global comparator).  Interrupts
+		 * are the nine local lines L0-L8 (GIC_SPI 758-766); the driver uses
+		 * one per possible CPU.  reg/clocks/div from downstream zuma cmucal
+		 * + DT.
 		 */
 		mct_v3: timer@100d0000 {
 			compatible = "samsung,exynos-mct-v3";

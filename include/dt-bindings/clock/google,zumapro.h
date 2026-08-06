@@ -49,7 +49,7 @@
 
 /* CMU_TOP HSI0 (USB) feeds.  Only the NOC feed is used: the USB reference is
  * derived from CMU_HSI0's internal PLL_USB, not a CMU_TOP USB32DRD feed (see
- * the CMU_HSI0 block below and the hardware trace in research/NEEDS-HARDWARE.md).
+ * the CMU_HSI0 block below and the hardware trace in docs/archive/usb/needs-hardware-2026-05.md).
  */
 #define CLK_MOUT_CMU_HSI0_NOC			32
 #define CLK_GOUT_CMU_HSI0_NOC			34
@@ -191,7 +191,7 @@
  * USB is already running at handoff (the device boots over fastboot), so this
  * driver observes the bootloader-programmed tree rather than reprogramming it.
  *
- * A hardware trace (research/NEEDS-HARDWARE.md H1/H3) showed the USB reference
+ * A hardware trace (docs/archive/usb/needs-hardware-2026-05.md H1/H3) showed the USB reference
  * does NOT come from the CMU_TOP USB32DRD USER path (that reads 26 MHz and is
  * unused); the internal MUX_CLK_HSI0_USB32DRD selects DIV_CLK_HSI0_USB off the
  * CMU_HSI0-internal PLL_USB (614.4 MHz / 32 = 19.2 MHz).  The eUSB2 PHY "ref"

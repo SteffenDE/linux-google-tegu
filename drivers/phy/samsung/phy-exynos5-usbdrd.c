@@ -2034,7 +2034,7 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
  * CLKRST 0x0c, UTMI 0x10, HSP_MISC 0x114) and HS is delegated to an external
  * Synopsys eUSB2 "hs" phy (phy-snps-eusb2), so the exynos2200 ops/phy_cfg are
  * reused verbatim (hardware trace confirmed these DRD offsets at 0x11100000 —
- * research/NEEDS-HARDWARE.md H2, decisions/0004).
+ * docs/archive/usb/needs-hardware-2026-05.md H2, docs/decisions/0002).
  *
  * The only delta is the PMU USB2.0 isolation/enable offset: zumapro uses the
  * same offset as gs101 (0x3eb0), NOT exynos2200's 0x72c (hardware trace +

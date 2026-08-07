@@ -279,8 +279,31 @@ static ssize_t armed_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(armed);
 
+/*
+ * The USF registry is uploaded by a userspace daemon, so "no sensors yet" is a
+ * timing accident rather than a verdict -- this re-runs the search.
+ */
+static ssize_t rescan_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct agw *agw = dev_get_drvdata(dev);
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+	if (val && !agw->ready) {
+		agw->retries = 0;
+		mod_delayed_work(system_wq, &agw->bootstrap_work, 0);
+	}
+	return count;
+}
+static DEVICE_ATTR_WO(rescan);
+
 static struct attribute *agw_attrs[] = {
 	&dev_attr_gestures.attr,
+	&dev_attr_rescan.attr,
 	&dev_attr_armed.attr,
 	&dev_attr_single_tap.attr,
 	&dev_attr_lift_to_wake.attr,
@@ -375,8 +398,9 @@ static void agw_retry(struct agw *agw, const char *why)
 				      msecs_to_jiffies(AGW_RETRY_MS));
 		return;
 	}
-	dev_warn(agw->dev, "giving up after %u retries: %s\n", agw->retries,
-		 why);
+	dev_warn(agw->dev,
+		 "no gestures after %u retries: %s -- write 1 to rescan once the registry is loaded\n",
+		 agw->retries, why);
 }
 
 static void agw_bootstrap_work(struct work_struct *work)
@@ -388,6 +412,11 @@ static void agw_bootstrap_work(struct work_struct *work)
 	if (agw->ready)
 		return;
 
+	/*
+	 * Opened once and kept: usf_session_open() is idempotent, and closing
+	 * between attempts would tear the AoC-side transport down and stand a
+	 * new one up on every retry.
+	 */
 	ret = usf_session_open(agw->usf);
 	if (ret) {
 		/* AoC / AOCC not up yet: transient, keep retrying. */
@@ -398,14 +427,12 @@ static void agw_bootstrap_work(struct work_struct *work)
 	ret = usf_session_bootstrap(agw->usf);
 	if (ret) {
 		/* -EAGAIN: the servers are dormant, i.e. no registry yet. */
-		usf_session_close(agw->usf);
 		agw_retry(agw, "USF servers not responding (registry loaded?)");
 		return;
 	}
 
 	ret = agw_resolve_handles(agw);
 	if (ret <= 0) {
-		usf_session_close(agw->usf);
 		agw_retry(agw, "no wake gestures in the USF sensor list");
 		return;
 	}

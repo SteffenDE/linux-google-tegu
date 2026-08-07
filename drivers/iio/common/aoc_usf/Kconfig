@@ -3,6 +3,7 @@ config AOC_USF_IIO
 	tristate "AoC USF sensor framework to IIO bridge"
 	depends on IIO
 	depends on AOC_CHAN_DRIVER
+	select AOC_USF_CORE
 	select IIO_BUFFER
 	select IIO_KFIFO_BUF
 	help

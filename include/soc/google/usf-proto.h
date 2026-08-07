@@ -3,10 +3,8 @@
  * USF (AoC Unified Sensor Framework) wire-protocol codec.
  *
  * Hand-rolled FlatBuffer encoder/decoder for the handful of USF message types
- * the mainline sensor bridge needs. The layouts are reverse-engineered from the
- * unstripped libusf.so and validated byte-for-byte against on-device captures;
- * docs/subsystems/sensors/reference/usf-driver-plan.md is the protocol reference. This is a kernel port
- * of the codec in tools/usf-client.c.
+ * the mainline USF drivers need. The layouts are reverse-engineered from the
+ * unstripped libusf.so and validated byte-for-byte against on-device captures.
  *
  * Transport is packet/datagram: one message == one complete outer FlatBuffer,
  * little-endian, fields matched by FlatBuffer field-id (stable), not byte
@@ -45,6 +43,19 @@ enum usf_env_type {
 #define USF_SERVER_MGR_HANDLE 1	/* fixed dst_handle for GetServer */
 
 /*
+ * CreateSampling fid0. The firmware validates this: 0 and 4 are rejected (the
+ * response carries sampling_id 0). It also decides delivery -- a
+ * USF_MODE_WAKE_GESTURE stream arrives on the wake service and can resume a
+ * suspended AP, while the streaming modes arrive on com.google.usf.non_wake_up,
+ * whose mailbox doorbell is masked across suspend.
+ */
+enum usf_sampling_mode {
+	USF_MODE_PHYSICAL     = 1,	/* on-chip sensor (accel, gyro, ...) */
+	USF_MODE_FUSED        = 2,	/* AoC-fused / VSC sensor */
+	USF_MODE_WAKE_GESTURE = 3,	/* wake-up gesture (tap, lift-to-wake) */
+};
+
+/*
  * Builder scratch. Control messages are tiny; 512 B per region is ample. A
  * single fbb is reused across calls under the caller's serialization. buf holds
  * the message under construction; scratch_body/scratch_inner hold the two
@@ -73,8 +84,8 @@ int usf_build_get_server(struct usf_fbb *b, u32 txn, const u8 uuid[16],
 int usf_build_no_body(struct usf_fbb *b, u32 msg_id, u32 txn, u32 dst,
 		      const u8 **out, size_t *out_len);
 int usf_build_create_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
-			      s64 period_ns, u32 client_id,
-			      const u8 **out, size_t *out_len);
+			      enum usf_sampling_mode mode, s64 period_ns,
+			      u32 client_id, const u8 **out, size_t *out_len);
 int usf_build_reconfig(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 		       u32 sampling_id, s64 period_ns, s64 max_latency_ns,
 		       bool enable, const u8 **out, size_t *out_len);

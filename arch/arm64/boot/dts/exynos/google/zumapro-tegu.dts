@@ -1503,6 +1503,19 @@
 		tbn,max_devices = <1>;
 	};
 
+	/*
+	 * Wake gestures watched by the AoC while the AP sleeps: a single tap
+	 * on the powered-down panel, and lift-to-wake.  There is no hardware
+	 * here to describe -- the sensors live in AoC firmware and are reached
+	 * over the com.google.usf AOCC service -- but the driver has to know
+	 * which panel it follows, since the gestures are armed only while that
+	 * panel is off.
+	 */
+	aoc-gesture-wake {
+		compatible = "google,aoc-gesture-wake";
+		panel = <&panel>;
+	};
+
 	modem {
 		compatible = "samsung,s5300-modem";
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,

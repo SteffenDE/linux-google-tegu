@@ -958,7 +958,12 @@
 		 * the SPI bus to AoC (see the /tbn node), so AoC can watch for a
 		 * tap and wake the AP over its mailbox.  Without this the driver
 		 * uses the plain deep-sleep path and owns the bus throughout.
+		 *
+		 * The handoff follows the panel: AoC has to own the bus for the
+		 * whole time the screen is dark, which starts when the panel is
+		 * unprepared and not when the AP later suspends.
 		 */
+		panel = <&panel>;
 		goog,tbn-enabled;
 	};
 };

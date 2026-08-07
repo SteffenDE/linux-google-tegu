@@ -15,7 +15,6 @@
 #include <linux/sched/signal.h>
 #include <linux/kthread.h>
 #include <linux/io.h>
-#include <linux/iopoll.h>
 #include <linux/random.h>
 #include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
@@ -4084,49 +4083,69 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev, bool runtime)
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
 
-	/* Check if device is still up and running, if so we are ready */
+	/*
+	 * Check if device is still up and running, if so we are ready.
+	 *
+	 * This question is only meaningful on a system resume, where the chip
+	 * may genuinely have lost power and the cleanup path below can act on
+	 * the answer by re-probing.  INTMASK is a fair proxy there: the driver
+	 * never writes it, so a chip that came back from D3cold reads zero
+	 * until its firmware reinitialises.
+	 *
+	 * A runtime resume is a different question, and INTMASK is the wrong
+	 * register to ask.  The chip was never powered off and its firmware has
+	 * been running the whole time -- and INTMASK is precisely what that
+	 * firmware clears on every interrupt it takes.  pciedev_intrsoff()
+	 * (RAM 0x6f4286) is the first call in pciedev_isr(), and it BICs
+	 * exactly the bits pciedev_intrson() set, so INTMASK reads 0 for the
+	 * whole of interrupt processing.  Sampling it here asks "is the
+	 * firmware idle?" and reports the answer as "is the firmware alive?",
+	 * which inverts: the busier the chip, the deader it looks.
+	 *
+	 * That is not just imprecise, it deadlocks.  The handshake below is
+	 * what releases the firmware from host-sleep, so refusing to send it
+	 * until the firmware looks idle means a firmware that is waiting on us
+	 * never gets to look idle.  With bus:host_access set, its host-wake
+	 * watchdog resolves the standoff after 10 s by halting the chip --
+	 * an unrecoverable trap in pciedev_host_wake_asserted_for_too_long(),
+	 * observed on hardware 2026-08-07.
+	 *
+	 * So on the runtime path, skip the guess and just do the handshake.
+	 * brcmf_pcie_send_mb_data() is the real liveness test: it fails if the
+	 * firmware never consumes the pending mailbox word.  A chip that truly
+	 * did lose its state still gets caught, one message later, by something
+	 * that actually asked the firmware.  The read is kept for its
+	 * diagnostic value -- it counts how often the old test would have
+	 * condemned a live device.
+	 */
 	intmask = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask);
 	if (!intmask) {
-		/*
-		 * A zero INTMASK is read as "the chip lost its state and has to
-		 * be re-probed", which the runtime path cannot do -- so a single
-		 * read is far too weak a basis for condemning the device.  The
-		 * register is firmware-owned, and this is the first TLP after
-		 * the link leaves PCI-PM L1.2, so poll briefly before believing
-		 * it.  Anything that settles here is logged: on a chip that
-		 * really kept its state it should have been nonzero already.
-		 */
-		if (!read_poll_timeout(brcmf_pcie_read_pcie32, intmask,
-				       intmask != 0, 200, 5000, false,
-				       devinfo, devinfo->reginfo->intmask))
-			brcmf_err(bus, "INTMASK settled late leaving D3: 0x%08x\n",
-				  intmask);
-	}
-
-	if (intmask != 0) {
-		brcmf_dbg(PCIE, "Try to wakeup device....\n");
-		/* Set the device up, so we can write the MB data message in ring mode */
-		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
-		if (brcmf_pcie_inband_ds(devinfo)) {
-			brcmf_pcie_set_skip_ds_ack(devinfo, false);
-			devinfo->ds_exit_completed = false;
-			brcmf_pcie_set_inband_ds_state(devinfo,
-						       BRCMF_PCIE_DS_ACTIVE);
-		}
-		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM)) {
-			brcmf_err(bus, "D0_INFORM failed leaving D3\n");
+		if (!runtime) {
+			brcmf_err(bus, "device unresponsive leaving D3 (intmask=0)\n");
 			goto cleanup;
 		}
-		brcmf_dbg(PCIE, "Hot resume, continue....\n");
-		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
-		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
-		brcmf_pcie_intr_enable(devinfo);
-		brcmf_pcie_hostready(devinfo);
-		brcmf_pcie_fwcon_timer(devinfo, true);
-		return 0;
+		brcmf_dbg(PCIE, "INTMASK 0 leaving D3, continuing to handshake\n");
 	}
 
-	brcmf_err(bus, "device unresponsive leaving D3 (intmask=0)\n");
+	brcmf_dbg(PCIE, "Try to wakeup device....\n");
+	/* Set the device up, so we can write the MB data message in ring mode */
+	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+	if (brcmf_pcie_inband_ds(devinfo)) {
+		brcmf_pcie_set_skip_ds_ack(devinfo, false);
+		devinfo->ds_exit_completed = false;
+		brcmf_pcie_set_inband_ds_state(devinfo, BRCMF_PCIE_DS_ACTIVE);
+	}
+	if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM)) {
+		brcmf_err(bus, "D0_INFORM failed leaving D3\n");
+		goto cleanup;
+	}
+	brcmf_dbg(PCIE, "Hot resume, continue....\n");
+	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+	brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+	brcmf_pcie_intr_enable(devinfo);
+	brcmf_pcie_hostready(devinfo);
+	brcmf_pcie_fwcon_timer(devinfo, true);
+	return 0;
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;

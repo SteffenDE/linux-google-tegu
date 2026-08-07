@@ -42,6 +42,19 @@ config AOC_TBN_DRIVER
 	help
 		Say yes here to add TBN service for the AoC
 
+config AOC_USF_CORE
+	tristate "AoC USF client session"
+	depends on AOC_CHAN_DRIVER
+	help
+	  Shared client for the AoC USF (Unified Sensor Framework) firmware:
+	  the AOCC channels, the request/response transactions, sensor
+	  enumeration and sampling control. Selected by the drivers that
+	  consume USF -- the USF to IIO sensor bridge and the gesture wake
+	  input driver -- rather than enabled directly.
+
+	  To compile this as a module, choose M here: the module will be
+	  called aoc-usf-core.
+
 config AOC_ALSA
 	tristate "WhiteChapel AoC ALSA support"
 	depends on AOC_DRIVER && SND_SOC

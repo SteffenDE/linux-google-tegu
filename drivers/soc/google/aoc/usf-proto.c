@@ -15,7 +15,7 @@
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
-#include "usf-proto.h"
+#include <soc/google/usf-proto.h>
 
 /* 16-byte service UUIDs, on the wire as raw bytes (NOT endian-swapped). */
 const u8 usf_uuid_sensor_mgr[16] = {
@@ -299,8 +299,8 @@ int usf_build_no_body(struct usf_fbb *b, u32 msg_id, u32 txn, u32 dst,
 }
 
 int usf_build_create_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
-			      s64 period_ns, u32 client_id,
-			      const u8 **out, size_t *out_len)
+			      enum usf_sampling_mode mode, s64 period_ns,
+			      u32 client_id, const u8 **out, size_t *out_len)
 {
 	const u8 *body;
 	size_t blen;
@@ -308,9 +308,17 @@ int usf_build_create_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 
 	fbb_init(b);
 	fbb_start_table(b);
-	fbb_add_i32(b, 0, 2);			/* fid0 mode = 2 (periodic) */
+	fbb_add_i32(b, 0, mode);			/* fid0 sampling mode */
 	fbb_add_i64(b, 1, period_ns);		/* fid1 period_ns:int64 */
-	fbb_add_bool(b, 5, 1);			/* fid5 = 1 */
+	/*
+	 * fid5 accompanies the streaming modes only. The firmware routes a
+	 * USF_MODE_WAKE_GESTURE stream to the wake service (com.google.usf)
+	 * instead of com.google.usf.non_wake_up, whose doorbell is masked while
+	 * the AP is suspended -- that routing is what makes a gesture able to
+	 * wake the AP at all.
+	 */
+	if (mode != USF_MODE_WAKE_GESTURE)
+		fbb_add_bool(b, 5, 1);		/* fid5 = 1 */
 	fbb_add_i32(b, 10, client_id);		/* fid10 client_id */
 	fbb_add_bool(b, 11, 1);			/* fid11 = 1 */
 	bt = fbb_end_table(b);

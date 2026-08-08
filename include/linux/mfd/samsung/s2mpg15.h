@@ -4,8 +4,8 @@
  *
  * Samsung S2MPG15 PMIC (Google Tensor G4 "zumapro" sub PMIC).
  *
- * Like s2mpg14.h this is intentionally partial: only the blocks the
- * mainline driver currently uses are described.  The meter block is
+ * Like s2mpg14.h, the regulator block describes every rail while the other
+ * blocks cover only what the mainline driver uses.  The meter block is
  * register-identical to the S2MPG14 and is shared from s2mpg14.h
  * (S2MPG14_METER_*) by the common s2mpg1x meter driver, so it is not
  * repeated here.
@@ -21,18 +21,130 @@ enum s2mpg15_common_reg {
 };
 
 /* PMIC registers (type 0x100) */
+/* Rail startup times, from the vendor driver's per-type constants. */
+#define S2MPG15_ENABLE_TIME_LDO	128
+#define S2MPG15_ENABLE_TIME_BUCK	130
+
+/*
+ * Rail registers.  The layout is per-rail, not uniform: the enable field is
+ * bit 7 on some rails and bits 7:6 on others, several rails have no enable
+ * field of their own and live in LDO_CTRL1/LDO_CTRL2, and selectors are 6, 7
+ * or 8 bits wide.  drivers/regulator/s2mps11.c carries the per-rail truth.
+ */
 enum s2mpg15_pmic_reg {
 	S2MPG15_PMIC_INT1 = 0x00,
-	/* LxS_CTRL: bit 7 is the rail enable, bits 5:0 the voltage selector. */
-	S2MPG15_PMIC_L5S_CTRL = 0x33,	/* L5S_PROX,    sensor 3.3 V */
-	S2MPG15_PMIC_L7S_CTRL = 0x35,	/* L7S_SENSORS, sensor 1.8 V */
+	S2MPG15_PMIC_B1S_CTRL = 0x0e,
+	S2MPG15_PMIC_B1S_OUT1 = 0x0f,
+	S2MPG15_PMIC_B2S_CTRL = 0x10,
+	S2MPG15_PMIC_B2S_OUT1 = 0x11,
+	S2MPG15_PMIC_B3S_CTRL = 0x12,
+	S2MPG15_PMIC_B3S_OUT1 = 0x13,
+	S2MPG15_PMIC_B4S_CTRL = 0x14,
+	S2MPG15_PMIC_B4S_OUT1 = 0x15,
+	S2MPG15_PMIC_B5S_CTRL = 0x16,
+	S2MPG15_PMIC_B5S_OUT1 = 0x17,
+	S2MPG15_PMIC_B6S_CTRL = 0x18,
+	S2MPG15_PMIC_B6S_OUT1 = 0x19,
+	S2MPG15_PMIC_B7S_CTRL = 0x1a,
+	S2MPG15_PMIC_B7S_OUT1 = 0x1b,
+	S2MPG15_PMIC_B8S_CTRL = 0x1c,
+	S2MPG15_PMIC_B8S_OUT1 = 0x1d,
+	S2MPG15_PMIC_B9S_CTRL = 0x1e,
+	S2MPG15_PMIC_B9S_OUT0 = 0x1f,
+	S2MPG15_PMIC_B10S_CTRL = 0x21,
+	S2MPG15_PMIC_B10S_OUT1 = 0x22,
+	S2MPG15_PMIC_B11S_CTRL = 0x23,
+	S2MPG15_PMIC_B11S_OUT1 = 0x24,
+	S2MPG15_PMIC_B12S_CTRL = 0x25,
+	S2MPG15_PMIC_B12S_OUT1 = 0x26,
+	S2MPG15_PMIC_BUCKD_CTRL = 0x27,
+	S2MPG15_PMIC_BUCKD_OUT = 0x28,
+	S2MPG15_PMIC_BUCKA_CTRL = 0x29,
+	S2MPG15_PMIC_BUCKA_OUT = 0x2a,
+	S2MPG15_PMIC_BUCKC_CTRL = 0x2b,
+	S2MPG15_PMIC_BUCKC_OUT = 0x2c,
+	S2MPG15_PMIC_BB_CTRL = 0x2d,
+	S2MPG15_PMIC_BB_OUT = 0x2e,
+	S2MPG15_PMIC_L1S_CTRL = 0x2f,
+	S2MPG15_PMIC_L2S_CTRL = 0x30,
+	S2MPG15_PMIC_L3S_CTRL = 0x31,
+	S2MPG15_PMIC_L4S_CTRL = 0x32,
+	S2MPG15_PMIC_L5S_CTRL = 0x33,
+	S2MPG15_PMIC_L6S_CTRL = 0x34,
+	S2MPG15_PMIC_L7S_CTRL = 0x35,
+	S2MPG15_PMIC_L8S_CTRL = 0x36,
+	S2MPG15_PMIC_L9S_CTRL = 0x37,
+	S2MPG15_PMIC_L10S_CTRL = 0x38,
+	S2MPG15_PMIC_L11S_CTRL = 0x39,
+	S2MPG15_PMIC_L12S_CTRL = 0x3a,
+	S2MPG15_PMIC_L13S_CTRL = 0x3b,
+	S2MPG15_PMIC_L14S_CTRL = 0x3c,
+	S2MPG15_PMIC_L15S_CTRL = 0x3d,
+	S2MPG15_PMIC_L16S_CTRL = 0x3e,
+	S2MPG15_PMIC_L17S_CTRL = 0x3f,
+	S2MPG15_PMIC_L18S_CTRL = 0x40,
+	S2MPG15_PMIC_L19S_CTRL = 0x41,
+	S2MPG15_PMIC_L20S_CTRL = 0x42,
+	S2MPG15_PMIC_L21S_CTRL = 0x43,
+	S2MPG15_PMIC_L22S_CTRL = 0x44,
+	S2MPG15_PMIC_L23S_CTRL = 0x45,
+	S2MPG15_PMIC_L24S_CTRL = 0x46,
+	S2MPG15_PMIC_L25S_CTRL = 0x47,
+	S2MPG15_PMIC_L26S_CTRL = 0x48,
+	S2MPG15_PMIC_L27S_CTRL = 0x49,
+	S2MPG15_PMIC_L28S_CTRL = 0x4a,
+	S2MPG15_PMIC_L29S_CTRL = 0x4b,
+	S2MPG15_PMIC_LDO_CTRL1 = 0x4c,
 	S2MPG15_PMIC_BB_USONIC = 0xea,
 };
 
-/* Regulator ids -- only the sensor rails the AoC currently powers. */
+/* Regulator ids -- every rail; see the s2mpg14.h counterpart. */
 enum s2mpg15_regulators {
+	S2MPG15_LDO1,
+	S2MPG15_LDO2,
+	S2MPG15_LDO3,
+	S2MPG15_LDO4,
 	S2MPG15_LDO5,
+	S2MPG15_LDO6,
 	S2MPG15_LDO7,
+	S2MPG15_LDO8,
+	S2MPG15_LDO9,
+	S2MPG15_LDO10,
+	S2MPG15_LDO11,
+	S2MPG15_LDO12,
+	S2MPG15_LDO13,
+	S2MPG15_LDO14,
+	S2MPG15_LDO15,
+	S2MPG15_LDO16,
+	S2MPG15_LDO17,
+	S2MPG15_LDO18,
+	S2MPG15_LDO19,
+	S2MPG15_LDO20,
+	S2MPG15_LDO21,
+	S2MPG15_LDO22,
+	S2MPG15_LDO23,
+	S2MPG15_LDO24,
+	S2MPG15_LDO25,
+	S2MPG15_LDO26,
+	S2MPG15_LDO27,
+	S2MPG15_LDO28,
+	S2MPG15_LDO29,
+	S2MPG15_BUCK1,
+	S2MPG15_BUCK2,
+	S2MPG15_BUCK3,
+	S2MPG15_BUCK4,
+	S2MPG15_BUCK5,
+	S2MPG15_BUCK6,
+	S2MPG15_BUCK7,
+	S2MPG15_BUCK8,
+	S2MPG15_BUCK9,
+	S2MPG15_BUCK10,
+	S2MPG15_BUCK11,
+	S2MPG15_BUCK12,
+	S2MPG15_BUCKD,
+	S2MPG15_BUCKA,
+	S2MPG15_BUCKC,
+	S2MPG15_BUCKBOOST,
 	S2MPG15_REGULATOR_MAX,
 };
 

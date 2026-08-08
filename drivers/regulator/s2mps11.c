@@ -1261,17 +1261,29 @@ static const struct s2mpg10_regulator_desc s2mpg11_regulators[] = {
 
 /*
  * S2MPG14 (Google Tensor G4 "zumapro" main PMIC): enable-only descriptors
- * for the rails mainline currently consumes, addressed through the ACPM
- * firmware like s2mpg10/11 above.
+ * for every rail, addressed through the ACPM firmware like s2mpg10/11 above.
  *
- * Voltage control is deliberately not wired up: the bootloader leaves
- * every voltage selector at the correct value, and the downstream kernel
- * never rewrites them for these rails either (it only flips the enable
- * bit; hardware-verified by tracing the ACPM PMIC channel on the
- * Pixel 9a).  Without voltage ops a wrong device tree constraint fails
- * regulator registration instead of programming the rail.  Add per-rail
- * voltage ranges only when a consumer actually needs to change a voltage,
- * with datasheet-verified selector encodings.
+ * Voltage control is deliberately not wired up.  The safety this buys is
+ * narrow and worth stating exactly: with no voltage ops, nothing here can
+ * change a rail's voltage, and a wrong device tree constraint fails
+ * registration instead of programming the rail.  It does not mean a rail
+ * cannot come up at the wrong voltage -- enabling one applies whatever
+ * selector it already holds.  For a rail the bootloader leaves on that is
+ * self-evidently the voltage the board runs at; for a rail it leaves off,
+ * decode the selector first and check it against the intended net.
+ *
+ * Do not read this as "the selectors are never written": on this hardware
+ * the downstream kernel does write one, applying a consumer's device tree
+ * voltage to a rail while it is disabled and before its first enable.
+ *
+ * Adding a consumer for a rail described here is therefore usually, but not
+ * always, a device tree change.  A consumer that needs a voltage set, or a
+ * buck, or a rail whose enable field is an operating mode selecting
+ * hardware PWREN control, needs the missing pieces first: per-rail voltage
+ * ranges with datasheet-verified encodings, mode mapping, and the
+ * PCTRLSEL/ext-control handling the s2mpg10 rails above already have.
+ * regulator_enable_regmap() writes the whole enable field, so on a two-bit
+ * field it selects always-on rather than any PWREN-linked mode.
  */
 static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
@@ -1283,10 +1295,9 @@ static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
  * Where a rail's enable bit lives does not follow from its number.  Most sit in
  * the rail's own LxM_CTRL -- some as plain on/off in bit 7, some as an
  * operating mode in bits 7:6 -- but several are packed into the shared
- * LDO_CTRL1/LDO_CTRL2 registers instead, up to four rails to a register.
- * Take the register and mask as parameters so each rail states its own,
- * rather than inheriting an assumption that happens to hold for the rail
- * next to it.
+ * LDO_CTRL1/LDO_CTRL2 registers instead, four rails to a register.  Take the
+ * register and mask as parameters so each rail states its own, rather than
+ * inheriting an assumption that happens to hold for the rail next to it.
  */
 #define regulator_desc_s2mpg14_ldo_cmn(_num, _en_reg, _en_mask)		\
 	[S2MPG14_LDO##_num] = {						\
@@ -1299,7 +1310,7 @@ static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
 		.owner		= THIS_MODULE,				\
 		.enable_reg	= S2MPG14_PMIC_##_en_reg,		\
 		.enable_mask	= _en_mask,				\
-		.enable_time	= 130,					\
+		.enable_time	= S2MPG14_ENABLE_TIME_LDO,					\
 	}
 
 /* enable is plain on/off in bit 7 of the rail's own CTRL register */
@@ -1310,18 +1321,77 @@ static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
 #define regulator_desc_s2mpg14_ldo_opmode(_num)				\
 	regulator_desc_s2mpg14_ldo_cmn(_num, L##_num##M_CTRL, GENMASK(7, 6))
 
+/* Bucks follow the same per-rail variation as the LDOs.  The name suffix is a
+ * token rather than the rail number for symmetry with S2MPG15, whose bucks
+ * are not all numbered: BUCKA, BUCKC, BUCKD and BUCKBOOST have no number at
+ * all.  S2MPG14's own bucks are all B1M..B9M.
+ */
+#define regulator_desc_s2mpg14_buck_cmn(_id, _sfx, _en_reg, _en_mask)	\
+	[S2MPG14_BUCK##_id] = {						\
+		.name		= "buck" #_sfx,				\
+		.of_match	= of_match_ptr("buck" #_sfx),		\
+		.regulators_node = of_match_ptr("regulators"),		\
+		.id		= S2MPG14_BUCK##_id,			\
+		.ops		= &s2mpg14_reg_enable_only_ops,		\
+		.type		= REGULATOR_VOLTAGE,			\
+		.owner		= THIS_MODULE,				\
+		.enable_reg	= S2MPG14_PMIC_##_en_reg,		\
+		.enable_mask	= _en_mask,				\
+		.enable_time	= S2MPG14_ENABLE_TIME_BUCK,		\
+	}
+
+/* enable is plain on/off in bit 7 of the rail's own CTRL register */
+#define regulator_desc_s2mpg14_buck(_num)				\
+	regulator_desc_s2mpg14_buck_cmn(_num, _num##m,		\
+					 B##_num##M_CTRL, BIT(7))
+
+/* enable is the operating mode in bits 7:6 of the rail's own CTRL register */
+#define regulator_desc_s2mpg14_buck_opmode(_num)			\
+	regulator_desc_s2mpg14_buck_cmn(_num, _num##m,		\
+					 B##_num##M_CTRL, GENMASK(7, 6))
+
 static const struct regulator_desc s2mpg14_regulators[] = {
+	/* generated by scripts/extract-pmic-rails.py --emit-desc s2mpg14 */
+	regulator_desc_s2mpg14_ldo(1),
+	regulator_desc_s2mpg14_ldo(2),
+	regulator_desc_s2mpg14_ldo_cmn(3, L3M_CTRL1, BIT(7)),
 	regulator_desc_s2mpg14_ldo(4),
+	regulator_desc_s2mpg14_ldo_opmode(5),
+	regulator_desc_s2mpg14_ldo_opmode(6),
+	regulator_desc_s2mpg14_ldo(7),
+	regulator_desc_s2mpg14_ldo_cmn(8, LDO_CTRL1, GENMASK(1, 0)),
+	regulator_desc_s2mpg14_ldo_opmode(9),
+	regulator_desc_s2mpg14_ldo(10),
+	regulator_desc_s2mpg14_ldo_cmn(11, LDO_CTRL1, GENMASK(3, 2)),
+	regulator_desc_s2mpg14_ldo_cmn(12, LDO_CTRL1, GENMASK(5, 4)),
+	regulator_desc_s2mpg14_ldo_cmn(13, LDO_CTRL1, GENMASK(7, 6)),
+	regulator_desc_s2mpg14_ldo(14),
+	regulator_desc_s2mpg14_ldo_cmn(15, LDO_CTRL2, GENMASK(1, 0)),
+	regulator_desc_s2mpg14_ldo_opmode(16),
+	regulator_desc_s2mpg14_ldo_cmn(17, LDO_CTRL2, GENMASK(3, 2)),
+	regulator_desc_s2mpg14_ldo_opmode(18),
+	regulator_desc_s2mpg14_ldo_opmode(19),
+	regulator_desc_s2mpg14_ldo_opmode(20),
+	regulator_desc_s2mpg14_ldo(21),
+	regulator_desc_s2mpg14_ldo(22),
+	regulator_desc_s2mpg14_ldo_opmode(23),
+	regulator_desc_s2mpg14_ldo(24),
 	regulator_desc_s2mpg14_ldo(25),
+	regulator_desc_s2mpg14_buck_opmode(1),
+	regulator_desc_s2mpg14_buck_opmode(2),
+	regulator_desc_s2mpg14_buck_opmode(3),
+	regulator_desc_s2mpg14_buck_opmode(4),
+	regulator_desc_s2mpg14_buck_opmode(5),
+	regulator_desc_s2mpg14_buck(6),
+	regulator_desc_s2mpg14_buck_opmode(7),
+	regulator_desc_s2mpg14_buck(8),
+	regulator_desc_s2mpg14_buck_opmode(9),
 };
 
 /*
- * S2MPG15 (zumapro sub PMIC): enable-only descriptors for the two sensor
- * rails the AoC powers -- LDO7S (L7S_SENSORS, 1.8 V) and LDO5S (L5S_PROX,
- * 3.3 V).  Same rationale as the S2MPG14 rails above: bootloader leaves the
- * voltage selectors correct, so only the enable bit is wired.  The AoC
- * driver enables them via its sensor_power_list; without them the AoC
- * sensor stack has no power and enumerates no physical sensors.
+ * S2MPG15 (zumapro sub PMIC): enable-only descriptors for every rail.  Same
+ * rationale as the S2MPG14 rails above: the bootloader leaves the voltage
+ * selectors correct, so only the enable bit is wired.
  */
 static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
@@ -1341,7 +1411,7 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 		.owner		= THIS_MODULE,				\
 		.enable_reg	= S2MPG15_PMIC_##_en_reg,		\
 		.enable_mask	= _en_mask,				\
-		.enable_time	= 130,					\
+		.enable_time	= S2MPG15_ENABLE_TIME_LDO,					\
 	}
 
 /* enable is plain on/off in bit 7 of the rail's own CTRL register */
@@ -1352,9 +1422,81 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 #define regulator_desc_s2mpg15_ldo_opmode(_num)				\
 	regulator_desc_s2mpg15_ldo_cmn(_num, L##_num##S_CTRL, GENMASK(7, 6))
 
+/* Bucks follow the same per-rail variation as the LDOs.  The name suffix is a
+ * token rather than the rail number because S2MPG15's bucks are not all
+ * numbered: BUCKA, BUCKC, BUCKD and BUCKBOOST have no number at all.
+ */
+#define regulator_desc_s2mpg15_buck_cmn(_id, _sfx, _en_reg, _en_mask)	\
+	[S2MPG15_BUCK##_id] = {						\
+		.name		= "buck" #_sfx,				\
+		.of_match	= of_match_ptr("buck" #_sfx),		\
+		.regulators_node = of_match_ptr("regulators"),		\
+		.id		= S2MPG15_BUCK##_id,			\
+		.ops		= &s2mpg15_reg_enable_only_ops,		\
+		.type		= REGULATOR_VOLTAGE,			\
+		.owner		= THIS_MODULE,				\
+		.enable_reg	= S2MPG15_PMIC_##_en_reg,		\
+		.enable_mask	= _en_mask,				\
+		.enable_time	= S2MPG15_ENABLE_TIME_BUCK,		\
+	}
+
+/* enable is plain on/off in bit 7 of the rail's own CTRL register */
+#define regulator_desc_s2mpg15_buck(_num)				\
+	regulator_desc_s2mpg15_buck_cmn(_num, _num##s,		\
+					 B##_num##S_CTRL, BIT(7))
+
+/* enable is the operating mode in bits 7:6 of the rail's own CTRL register */
+#define regulator_desc_s2mpg15_buck_opmode(_num)			\
+	regulator_desc_s2mpg15_buck_cmn(_num, _num##s,		\
+					 B##_num##S_CTRL, GENMASK(7, 6))
+
 static const struct regulator_desc s2mpg15_regulators[] = {
+	/* generated by scripts/extract-pmic-rails.py --emit-desc s2mpg15 */
+	regulator_desc_s2mpg15_ldo_cmn(1, LDO_CTRL1, GENMASK(1, 0)),
+	regulator_desc_s2mpg15_ldo_cmn(2, LDO_CTRL1, GENMASK(3, 2)),
+	regulator_desc_s2mpg15_ldo_opmode(3),
+	regulator_desc_s2mpg15_ldo(4),
 	regulator_desc_s2mpg15_ldo(5),
+	regulator_desc_s2mpg15_ldo(6),
 	regulator_desc_s2mpg15_ldo(7),
+	regulator_desc_s2mpg15_ldo(8),
+	regulator_desc_s2mpg15_ldo(9),
+	regulator_desc_s2mpg15_ldo(10),
+	regulator_desc_s2mpg15_ldo(11),
+	regulator_desc_s2mpg15_ldo(12),
+	regulator_desc_s2mpg15_ldo_opmode(13),
+	regulator_desc_s2mpg15_ldo(14),
+	regulator_desc_s2mpg15_ldo(15),
+	regulator_desc_s2mpg15_ldo(16),
+	regulator_desc_s2mpg15_ldo(17),
+	regulator_desc_s2mpg15_ldo_opmode(18),
+	regulator_desc_s2mpg15_ldo_opmode(19),
+	regulator_desc_s2mpg15_ldo_opmode(20),
+	regulator_desc_s2mpg15_ldo(21),
+	regulator_desc_s2mpg15_ldo(22),
+	regulator_desc_s2mpg15_ldo_cmn(23, LDO_CTRL1, GENMASK(5, 4)),
+	regulator_desc_s2mpg15_ldo_opmode(24),
+	regulator_desc_s2mpg15_ldo(25),
+	regulator_desc_s2mpg15_ldo(26),
+	regulator_desc_s2mpg15_ldo_opmode(27),
+	regulator_desc_s2mpg15_ldo(28),
+	regulator_desc_s2mpg15_ldo(29),
+	regulator_desc_s2mpg15_buck_opmode(1),
+	regulator_desc_s2mpg15_buck_opmode(2),
+	regulator_desc_s2mpg15_buck(3),
+	regulator_desc_s2mpg15_buck(4),
+	regulator_desc_s2mpg15_buck_opmode(5),
+	regulator_desc_s2mpg15_buck_opmode(6),
+	regulator_desc_s2mpg15_buck(7),
+	regulator_desc_s2mpg15_buck_opmode(8),
+	regulator_desc_s2mpg15_buck(9),
+	regulator_desc_s2mpg15_buck_opmode(10),
+	regulator_desc_s2mpg15_buck_opmode(11),
+	regulator_desc_s2mpg15_buck_opmode(12),
+	regulator_desc_s2mpg15_buck_cmn(D, d, BUCKD_CTRL, GENMASK(7, 6)),
+	regulator_desc_s2mpg15_buck_cmn(A, a, BUCKA_CTRL, GENMASK(7, 6)),
+	regulator_desc_s2mpg15_buck_cmn(C, c, BUCKC_CTRL, GENMASK(7, 6)),
+	regulator_desc_s2mpg15_buck_cmn(BOOST, boost, BB_CTRL, GENMASK(7, 6)),
 };
 
 static const struct regulator_ops s2mps11_ldo_ops = {

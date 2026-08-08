@@ -36,6 +36,20 @@ enum s2mpg14_common_reg {
 };
 
 /* PMIC registers (type 0x100) */
+/*
+ * Voltage-selector groups: a rail's voltage is MIN + selector * STEP for
+ * its group, with the selector width given by the rail's n_voltages.
+ */
+#define S2MPG14_REG_MIN1		200000
+#define S2MPG14_REG_STEP1		6250
+#define S2MPG14_REG_MIN2		300000
+#define S2MPG14_REG_STEP2		12500
+#define S2MPG14_REG_MIN3		725000
+#define S2MPG14_REG_STEP3		12500
+#define S2MPG14_REG_MIN4		700000
+#define S2MPG14_REG_STEP4		25000
+#define S2MPG14_REG_MIN5		1800000
+#define S2MPG14_REG_STEP5		25000
 /* Rail startup times, from the vendor driver's per-type constants. */
 #define S2MPG14_ENABLE_TIME_LDO	128
 #define S2MPG14_ENABLE_TIME_BUCK	130

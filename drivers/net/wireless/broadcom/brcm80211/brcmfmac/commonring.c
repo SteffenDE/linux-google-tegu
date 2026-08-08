@@ -46,6 +46,8 @@ void brcmf_commonring_config(struct brcmf_commonring *commonring, u16 depth,
 		commonring->cr_write_wptr(commonring->cr_ctx);
 	commonring->f_ptr = 0;
 	commonring->seqnum = 254;
+	commonring->phase = BRCMF_COMMONRING_PHASE_INIT;
+	commonring->item_phase = BRCMF_COMMONRING_PHASE_INIT;
 }
 
 
@@ -122,9 +124,12 @@ again:
 	if (available > 1) {
 		ret_ptr = commonring->buf_addr +
 			  (commonring->w_ptr * commonring->item_len);
+		commonring->item_phase = commonring->phase;
 		commonring->w_ptr++;
-		if (commonring->w_ptr == commonring->depth)
+		if (commonring->w_ptr == commonring->depth) {
 			commonring->w_ptr = 0;
+			commonring->phase ^= BRCMF_COMMONRING_PHASE_BIT;
+		}
 		return ret_ptr;
 	}
 
@@ -161,9 +166,12 @@ again:
 		*alloced = min_t(u16, n_items, available - 1);
 		if (*alloced + commonring->w_ptr > commonring->depth)
 			*alloced = commonring->depth - commonring->w_ptr;
+		commonring->item_phase = commonring->phase;
 		commonring->w_ptr += *alloced;
-		if (commonring->w_ptr == commonring->depth)
+		if (commonring->w_ptr == commonring->depth) {
 			commonring->w_ptr = 0;
+			commonring->phase ^= BRCMF_COMMONRING_PHASE_BIT;
+		}
 		return ret_ptr;
 	}
 

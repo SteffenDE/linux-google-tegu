@@ -64,7 +64,7 @@ static const struct mfd_cell s2mpg14_devs[] = {
 	MFD_CELL_OF("s2mpg14-meter", NULL, NULL, 0, 0, "samsung,s2mpg14-meter"),
 };
 
-/* Sensor-rail regulators and the read-only power meter; clk/gpio can follow. */
+/* Regulators and the read-only power meter; clk/gpio can follow. */
 static const struct mfd_cell s2mpg15_devs[] = {
 	MFD_CELL_NAME("s2mpg15-regulator"),
 	MFD_CELL_OF("s2mpg15-meter", NULL, NULL, 0, 0, "samsung,s2mpg15-meter"),

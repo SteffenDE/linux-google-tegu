@@ -1497,6 +1497,17 @@ static int exynos2200_usbdrd_phy_exit(struct phy *phy)
 	u32 reg;
 	int ret;
 
+	/*
+	 * Undo the phy_init() that exynos2200_usbdrd_utmi_init() performed on
+	 * the separate high-speed PHY.  phy_init() only runs the provider's
+	 * .init when the init count is zero, so leaving this unbalanced pins
+	 * that count above zero forever: the eUSB2 PHY is then initialised
+	 * exactly once, and every later init -- including the one on every
+	 * system resume -- silently does nothing to the hardware.
+	 */
+	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
+		phy_exit(phy_drd->hs_phy);
+
 	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
 	if (ret)
 		return ret;

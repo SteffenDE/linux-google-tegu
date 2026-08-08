@@ -1008,6 +1008,27 @@
 	};
 };
 
+/*
+ * USI9 in I2C mode: the eUSB2 repeater at 0x3e, NFC at 0x08 and the
+ * cs40l26a haptics codec at 0x43.
+ *
+ * No child nodes yet, deliberately.  The repeater is the reason this bus is
+ * enabled -- it converts eUSB2 signalling to USB2 levels at the connector, and
+ * nothing in mainline has ever programmed it -- but there is no driver for it
+ * yet, and instantiating a client at 0x3e would make i2c-dev refuse the address
+ * with -EBUSY.  Leaving the address unclaimed keeps it reachable from
+ * userspace, which is how the repeater's registers get characterised before a
+ * driver is written.
+ */
+&usi9 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_9 {
+	status = "okay";
+};
+
 &usi10 {
 	samsung,mode = <USI_MODE_I2C>;
 	status = "okay";

@@ -156,6 +156,7 @@ static const char * const eusb2_hsphy_vreg_names[] = {
 
 struct snps_eusb2_phy_drvdata {
 	int (*phy_init)(struct phy *p);
+	int (*phy_exit)(struct phy *p);
 	const char * const *clk_names;
 	int num_clks;
 };
@@ -354,12 +355,39 @@ static int exynos_snps_eusb2_hsphy_init(struct phy *p)
 	return 0;
 }
 
+/*
+ * Undo exynos_snps_eusb2_hsphy_init(): stop the PHY, hold it in reset and put
+ * it in IDDQ.  Without this the eUSB2 state machine keeps running across an
+ * init/exit cycle -- clearing the reset bits alone does not restart it -- and a
+ * link that was lost while the PHY was up is never rebuilt, because the next
+ * init reconfigures a PHY that never stopped.
+ */
+static int exynos_snps_eusb2_hsphy_exit(struct phy *p)
+{
+	struct snps_eusb2_hsphy *phy = phy_get_drvdata(p);
+
+	/* let the PHY settle before powering it down, as the vendor driver does */
+	fsleep(2500);
+
+	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_USB_PHY_HS_PHY_CTRL_COMMON,
+				    PHY_ENABLE, 0);
+
+	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_USB_PHY_HS_PHY_CTRL_RST,
+				    USB_PHY_RST_MASK, USB_PHY_RST_MASK);
+
+	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_USB_PHY_UTMI_TESTSE,
+				    TEST_IDDQ, TEST_IDDQ);
+
+	return 0;
+}
+
 static const char * const exynos_eusb2_hsphy_clock_names[] = {
 	"ref", "bus", "ctrl",
 };
 
 static const struct snps_eusb2_phy_drvdata exynos2200_snps_eusb2_phy = {
 	.phy_init	= exynos_snps_eusb2_hsphy_init,
+	.phy_exit	= exynos_snps_eusb2_hsphy_exit,
 	.clk_names	= exynos_eusb2_hsphy_clock_names,
 	.num_clks	= ARRAY_SIZE(exynos_eusb2_hsphy_clock_names),
 };
@@ -507,6 +535,10 @@ disable_vreg:
 static int snps_eusb2_hsphy_exit(struct phy *p)
 {
 	struct snps_eusb2_hsphy *phy = phy_get_drvdata(p);
+
+	/* while the register clocks are still running */
+	if (phy->data->phy_exit)
+		phy->data->phy_exit(p);
 
 	clk_bulk_disable_unprepare(phy->data->num_clks, phy->clks);
 

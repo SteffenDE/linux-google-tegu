@@ -641,17 +641,50 @@ static void brcmf_msgbuf_rxreorder(struct brcmf_if *ifp, struct sk_buff *skb)
 static void
 brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 {
-	u32 dma_sz;
-	void *dma_buf;
-
 	brcmf_dbg(MSGBUF, "Removing flowring %d\n", flowid);
 
-	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * BRCMF_H2D_TXFLOWRING_ITEMSIZE;
-	dma_buf = msgbuf->flowrings[flowid]->buf_addr;
-	dma_free_coherent(msgbuf->drvr->bus_if->dev, dma_sz, dma_buf,
-			  msgbuf->flowring_dma_handle[flowid]);
-
+	/*
+	 * Only the host-side bookkeeping goes away here.  The ring's DMA buffer
+	 * is kept, reused if this flowid is created again, and released once in
+	 * brcmf_proto_msgbuf_detach().
+	 *
+	 * The device learns a flow ring's address from the FLOW_RING_CREATE
+	 * request, and most paths that reach this function never tell it the
+	 * ring is gone: brcmf_msgbuf_delete_flowring() removes the ring
+	 * directly whenever the bus is not up, when it cannot reserve
+	 * control-ring space ("FW unaware"), or when the submission fails, and
+	 * a create the device rejects removes it too.  Handing those pages back
+	 * to the allocator would leave the device holding a pointer into memory
+	 * that now belongs to something else, so an H2D fetch it had already
+	 * queued reads whatever ended up there.  Recycled pages are very often
+	 * zero, and a TX_POST whose request_id reads back as 0 halts this
+	 * firmware in pciedev_queue_txstatus().
+	 *
+	 * Keeping the buffer bounds the worst case to re-reading the ring's own
+	 * previous contents, which carry a nonzero request_id and cannot trip
+	 * that assert.  bcmdhd avoids the whole class by allocating a pool of
+	 * flow rings once and never freeing them -- its release path only
+	 * clears ->inited -- which is the same guarantee reached lazily.
+	 */
 	brcmf_flowring_delete(msgbuf->flow, flowid);
+}
+
+/* Release the flow ring buffers held back by brcmf_msgbuf_remove_flowring(). */
+static void brcmf_msgbuf_release_flowrings(struct brcmf_msgbuf *msgbuf)
+{
+	u32 dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * BRCMF_H2D_TXFLOWRING_ITEMSIZE;
+	struct brcmf_commonring *ring;
+	u16 flowid;
+
+	for (flowid = 0; flowid < msgbuf->max_flowrings; flowid++) {
+		ring = msgbuf->flowrings[flowid];
+		if (!ring || !ring->buf_addr)
+			continue;
+		dma_free_coherent(msgbuf->drvr->bus_if->dev, dma_sz,
+				  ring->buf_addr,
+				  msgbuf->flowring_dma_handle[flowid]);
+		ring->buf_addr = NULL;
+	}
 }
 
 
@@ -689,13 +722,24 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 
 	flowid = work->flowid;
 	dma_sz = BRCMF_H2D_TXFLOWRING_MAX_ITEM * BRCMF_H2D_TXFLOWRING_ITEMSIZE;
-	dma_buf = dma_alloc_coherent(msgbuf->drvr->bus_if->dev, dma_sz,
-				     &msgbuf->flowring_dma_handle[flowid],
-				     GFP_KERNEL);
+
+	/*
+	 * Reuse this flowid's ring if it still has one -- see
+	 * brcmf_msgbuf_remove_flowring() for why the buffer outlives the ring.
+	 * Deliberately not cleared before reuse: stale contents of the ring's
+	 * own previous life are harmless, and zeroed memory is the dangerous
+	 * case, which is the opposite of the usual instinct.
+	 */
+	dma_buf = msgbuf->flowrings[flowid]->buf_addr;
 	if (!dma_buf) {
-		bphy_err(drvr, "dma_alloc_coherent failed\n");
-		brcmf_flowring_delete(msgbuf->flow, flowid);
-		return BRCMF_FLOWRING_INVALID_ID;
+		dma_buf = dma_alloc_coherent(msgbuf->drvr->bus_if->dev, dma_sz,
+					     &msgbuf->flowring_dma_handle[flowid],
+					     GFP_KERNEL);
+		if (!dma_buf) {
+			bphy_err(drvr, "dma_alloc_coherent failed\n");
+			brcmf_flowring_delete(msgbuf->flow, flowid);
+			return BRCMF_FLOWRING_INVALID_ID;
+		}
 	}
 
 	brcmf_commonring_config(msgbuf->flowrings[flowid],
@@ -1870,6 +1914,7 @@ void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr)
 			destroy_workqueue(msgbuf->txflow_wq);
 
 		brcmf_flowring_detach(msgbuf->flow);
+		brcmf_msgbuf_release_flowrings(msgbuf);
 		dma_free_coherent(drvr->bus_if->dev,
 				  BRCMF_TX_IOCTL_MAX_MSG_SIZE,
 				  msgbuf->ioctbuf, msgbuf->ioctbuf_handle);

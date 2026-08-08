@@ -46,6 +46,7 @@
 		pinctrl11 = &pinctrl_peric0;
 		pinctrl12 = &pinctrl_peric1;
 		i2c6 = &hsi2c_6;
+		i2c9 = &hsi2c_9;
 		i2c10 = &hsi2c_10;
 		ufs0 = &ufs_0;
 	};
@@ -1720,6 +1721,47 @@
 			};
 		};
 
+		/*
+		 * USI9 in I2C mode.  The bus carries the eUSB2 repeater at
+		 * 0x3e, which is what converts the eUSB2 PHY's 1.0 V
+		 * signalling to the 3.3 V D+/D- on the USB connector; on tegu
+		 * it also carries NFC at 0x08 and the haptics codec at 0x43.
+		 * The USI SW_CONF selector for USI9 is at sysreg_peric1 +
+		 * 0x1004, one word below USI10's, as on gs101.
+		 *
+		 * clock-frequency is 400 kHz for bring-up; the vendor kernel
+		 * runs this bus at 950 kHz, which every device on it tolerates
+		 * but none requires.
+		 */
+		usi9: usi@10c900c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x10c900c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric1 CLK_GOUT_PERIC1_USI9_USI_PCLK>,
+				 <&cmu_peric1 CLK_DOUT_PERIC1_USI9_USI>;
+			clock-names = "pclk", "ipclk";
+			samsung,sysreg = <&sysreg_peric1 0x1004>;
+			status = "disabled";
+
+			hsi2c_9: i2c@10c90000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x10c90000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric1 CLK_DOUT_PERIC1_USI9_USI>,
+					 <&cmu_peric1 CLK_GOUT_PERIC1_USI9_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 657 IRQ_TYPE_LEVEL_HIGH 0>;
+				clock-frequency = <400000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c9_bus>;
+				status = "disabled";
+			};
+		};
+
 		usi10: usi@10ca00c0 {
 			compatible = "google,gs101-usi", "samsung,exynos850-usi";
 			reg = <0x10ca00c0 0x20>;
@@ -2400,6 +2442,13 @@
 
 			hsi2c10_bus: hsi2c10-bus-pins {
 				samsung,pins = "gpp20-0", "gpp20-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			hsi2c9_bus: hsi2c9-bus-pins {
+				samsung,pins = "gpp19-4", "gpp19-5";
 				samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;

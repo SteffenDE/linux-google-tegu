@@ -882,7 +882,18 @@ static void s5300_verify_msi_target(struct s5300_modem *sm)
 		pci_restore_msi_state(sm->pdev);
 	}
 
-	dev_err(sm->dev, "MSI address won't hold %pap\n", &sm->msi_phys);
+	/*
+	 * Name the two states that make the re-drive a no-op rather than a
+	 * rejected write, because they read identically from here and point in
+	 * opposite directions: outside D0 (or with MSI disabled) the core never
+	 * touches the hardware, so the endpoint is innocent and the bug is on
+	 * this side; in D0 with MSI enabled the write really was issued and
+	 * dropped, which is the half-alive ROM a warm reset of a running CP
+	 * leaves behind (see zumapro_pcie_cp_power_on()).
+	 */
+	dev_err(sm->dev, "MSI address won't hold %pap (endpoint %s, msi %s)\n",
+		&sm->msi_phys, pci_power_name(sm->pdev->current_state),
+		sm->pdev->msi_enabled ? "enabled" : "disabled");
 }
 
 /*

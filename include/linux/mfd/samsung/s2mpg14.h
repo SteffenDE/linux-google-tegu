@@ -5,10 +5,9 @@
  * Samsung S2MPG14 PMIC (Google Tensor G4 "zumapro" main PMIC).
  *
  * Register addresses are taken from the downstream Pixel kernel header
- * s2mpg14-register.h.  This is intentionally a partial description: only
- * the blocks and rails that mainline currently uses are listed.  Extend it
- * register by register as consumers appear instead of transcribing the
- * whole downstream header at once.
+ * s2mpg14-register.h.  The regulator block describes every rail; the other
+ * blocks list only what mainline currently uses, and are extended register
+ * by register as consumers appear.
  */
 
 #ifndef __LINUX_MFD_S2MPG14_H
@@ -37,6 +36,10 @@ enum s2mpg14_common_reg {
 };
 
 /* PMIC registers (type 0x100) */
+/* Rail startup times, from the vendor driver's per-type constants. */
+#define S2MPG14_ENABLE_TIME_LDO	128
+#define S2MPG14_ENABLE_TIME_BUCK	130
+
 enum s2mpg14_pmic_reg {
 	S2MPG14_PMIC_INT1,
 	S2MPG14_PMIC_INT2,
@@ -53,8 +56,51 @@ enum s2mpg14_pmic_reg {
 	S2MPG14_PMIC_PWRONSRC,
 	S2MPG14_PMIC_OFFSRC1,
 	S2MPG14_PMIC_OFFSRC2,
+	S2MPG14_PMIC_B1M_CTRL = 0x17,
+	S2MPG14_PMIC_B1M_OUT1 = 0x18,
+	S2MPG14_PMIC_B2M_CTRL = 0x19,
+	S2MPG14_PMIC_B2M_OUT1 = 0x1a,
+	S2MPG14_PMIC_B3M_CTRL = 0x1b,
+	S2MPG14_PMIC_B3M_OUT1 = 0x1c,
+	S2MPG14_PMIC_B4M_CTRL = 0x1d,
+	S2MPG14_PMIC_B4M_OUT1 = 0x1e,
+	S2MPG14_PMIC_B5M_CTRL = 0x1f,
+	S2MPG14_PMIC_B5M_OUT1 = 0x20,
+	S2MPG14_PMIC_B6M_CTRL = 0x21,
+	S2MPG14_PMIC_B6M_OUT1 = 0x22,
+	S2MPG14_PMIC_B7M_CTRL = 0x23,
+	S2MPG14_PMIC_B7M_OUT0 = 0x24,
+	S2MPG14_PMIC_B8M_CTRL = 0x26,
+	S2MPG14_PMIC_B8M_OUT1 = 0x27,
+	S2MPG14_PMIC_B9M_CTRL = 0x28,
+	S2MPG14_PMIC_B9M_OUT1 = 0x29,
+	S2MPG14_PMIC_L1M_CTRL = 0x2a,
+	S2MPG14_PMIC_L2M_CTRL = 0x2b,
+	S2MPG14_PMIC_L3M_CTRL1 = 0x2c,
 	S2MPG14_PMIC_L4M_CTRL = 0x2e,
+	S2MPG14_PMIC_L5M_CTRL = 0x2f,
+	S2MPG14_PMIC_L6M_CTRL = 0x30,
+	S2MPG14_PMIC_L7M_CTRL = 0x31,
+	S2MPG14_PMIC_L8M_CTRL = 0x32,
+	S2MPG14_PMIC_L9M_CTRL = 0x33,
+	S2MPG14_PMIC_L10M_CTRL = 0x34,
+	S2MPG14_PMIC_L11M_CTRL1 = 0x35,
+	S2MPG14_PMIC_L12M_CTRL1 = 0x36,
+	S2MPG14_PMIC_L13M_CTRL1 = 0x37,
+	S2MPG14_PMIC_L14M_CTRL = 0x38,
+	S2MPG14_PMIC_L15M_CTRL1 = 0x39,
+	S2MPG14_PMIC_L16M_CTRL = 0x3a,
+	S2MPG14_PMIC_L17M_CTRL1 = 0x3b,
+	S2MPG14_PMIC_L18M_CTRL = 0x3c,
+	S2MPG14_PMIC_L19M_CTRL = 0x3d,
+	S2MPG14_PMIC_L20M_CTRL = 0x3e,
+	S2MPG14_PMIC_L21M_CTRL = 0x3f,
+	S2MPG14_PMIC_L22M_CTRL = 0x40,
+	S2MPG14_PMIC_L23M_CTRL = 0x41,
+	S2MPG14_PMIC_L24M_CTRL = 0x42,
 	S2MPG14_PMIC_L25M_CTRL = 0x43,
+	S2MPG14_PMIC_LDO_CTRL1 = 0x44,
+	S2MPG14_PMIC_LDO_CTRL2 = 0x45,
 	S2MPG14_PMIC_SW_RESET = 0xe4,
 };
 
@@ -117,13 +163,48 @@ enum s2mpg14_meter_reg {
 					    S2MPG14_METER_ACC_COUNT_BITS)
 
 /*
- * Regulators.  Deliberately partial: just the touchscreen rails for now.
- * Append new IDs here (and a matching descriptor in s2mps11.c) when a
- * consumer for another rail shows up.
+ * Regulators.  Every rail the PMIC has, so that adding a consumer is a device
+ * tree change rather than a driver change: where a rail's enable bit lives
+ * varies per rail and is not derivable, so each one having been transcribed
+ * once, from the vendor tables, is worth more than transcribing them one at a
+ * time under deadline.  A rail with no device tree node gets no constraints and
+ * cannot be touched.
  */
 enum s2mpg14_regulators {
+	S2MPG14_LDO1,
+	S2MPG14_LDO2,
+	S2MPG14_LDO3,
 	S2MPG14_LDO4,
+	S2MPG14_LDO5,
+	S2MPG14_LDO6,
+	S2MPG14_LDO7,
+	S2MPG14_LDO8,
+	S2MPG14_LDO9,
+	S2MPG14_LDO10,
+	S2MPG14_LDO11,
+	S2MPG14_LDO12,
+	S2MPG14_LDO13,
+	S2MPG14_LDO14,
+	S2MPG14_LDO15,
+	S2MPG14_LDO16,
+	S2MPG14_LDO17,
+	S2MPG14_LDO18,
+	S2MPG14_LDO19,
+	S2MPG14_LDO20,
+	S2MPG14_LDO21,
+	S2MPG14_LDO22,
+	S2MPG14_LDO23,
+	S2MPG14_LDO24,
 	S2MPG14_LDO25,
+	S2MPG14_BUCK1,
+	S2MPG14_BUCK2,
+	S2MPG14_BUCK3,
+	S2MPG14_BUCK4,
+	S2MPG14_BUCK5,
+	S2MPG14_BUCK6,
+	S2MPG14_BUCK7,
+	S2MPG14_BUCK8,
+	S2MPG14_BUCK9,
 	S2MPG14_REGULATOR_MAX,
 };
 

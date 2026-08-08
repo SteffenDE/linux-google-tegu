@@ -2336,6 +2336,25 @@ static int s5300_start_bootloader(struct s5300_modem *sm)
 		s5300_open_bridge_window(sm);
 	}
 
+	/*
+	 * Re-sync the core's idea of the endpoint's power state before touching
+	 * the MSI capability.  A crash caught while the CP had the link parked
+	 * leaves the endpoint D3hot *in software*: the park quiesced it to
+	 * D3hot and cleared bus-master, and s5300_relink_restore() -- the only
+	 * path back to D0 -- never ran because the relink itself failed on the
+	 * dying CP.  The reset above put the endpoint back in D0 in hardware
+	 * (PMCSR reads D0), but until the core agrees the MSI target write is
+	 * silently dropped: __pci_write_msi_msg() skips the hardware write for
+	 * any non-D0 state, so pci_restore_msi_state() below re-drives nothing
+	 * and the ROM boots with a zero boot-status DMA target.  Bus-master is
+	 * for the same DMA.  hw 2026-08-08: three "relink failed", CP crash,
+	 * then every recovery boot -- warm, dump and cold alike -- stuck at
+	 * boot_stage 0x0 for eleven minutes; forcing the target into the
+	 * endpoint's config space from userspace booted the CP to ONLINE.
+	 */
+	pci_set_power_state(pdev, PCI_D0);
+	pci_set_master(pdev);
+
 	/* The ROM reads these on the doorbell; make sure the writes stuck. */
 	s5300_verify_msi_target(sm);
 

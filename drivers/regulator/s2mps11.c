@@ -1279,8 +1279,16 @@ static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
 	.disable		= regulator_disable_regmap,
 };
 
-/* LxM_CTRL bits 7:6 select the operating mode; bit 7 alone is plain on/off. */
-#define regulator_desc_s2mpg14_ldo(_num)				\
+/*
+ * Where a rail's enable bit lives does not follow from its number.  Most sit in
+ * the rail's own LxM_CTRL -- some as plain on/off in bit 7, some as an
+ * operating mode in bits 7:6 -- but several are packed into the shared
+ * LDO_CTRL1/LDO_CTRL2 registers instead, up to four rails to a register.
+ * Take the register and mask as parameters so each rail states its own,
+ * rather than inheriting an assumption that happens to hold for the rail
+ * next to it.
+ */
+#define regulator_desc_s2mpg14_ldo_cmn(_num, _en_reg, _en_mask)		\
 	[S2MPG14_LDO##_num] = {						\
 		.name		= "ldo" #_num "m",			\
 		.of_match	= of_match_ptr("ldo" #_num "m"),	\
@@ -1289,10 +1297,18 @@ static const struct regulator_ops s2mpg14_reg_enable_only_ops = {
 		.ops		= &s2mpg14_reg_enable_only_ops,		\
 		.type		= REGULATOR_VOLTAGE,			\
 		.owner		= THIS_MODULE,				\
-		.enable_reg	= S2MPG14_PMIC_L##_num##M_CTRL,		\
-		.enable_mask	= BIT(7),				\
+		.enable_reg	= S2MPG14_PMIC_##_en_reg,		\
+		.enable_mask	= _en_mask,				\
 		.enable_time	= 130,					\
 	}
+
+/* enable is plain on/off in bit 7 of the rail's own CTRL register */
+#define regulator_desc_s2mpg14_ldo(_num)				\
+	regulator_desc_s2mpg14_ldo_cmn(_num, L##_num##M_CTRL, BIT(7))
+
+/* enable is the operating mode in bits 7:6 of the rail's own CTRL register */
+#define regulator_desc_s2mpg14_ldo_opmode(_num)				\
+	regulator_desc_s2mpg14_ldo_cmn(_num, L##_num##M_CTRL, GENMASK(7, 6))
 
 static const struct regulator_desc s2mpg14_regulators[] = {
 	regulator_desc_s2mpg14_ldo(4),
@@ -1313,8 +1329,8 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 	.disable		= regulator_disable_regmap,
 };
 
-/* LxS_CTRL bit 7 is the plain on/off enable. */
-#define regulator_desc_s2mpg15_ldo(_num)				\
+/* Same per-rail variation as S2MPG14 above; see the comment there. */
+#define regulator_desc_s2mpg15_ldo_cmn(_num, _en_reg, _en_mask)		\
 	[S2MPG15_LDO##_num] = {						\
 		.name		= "ldo" #_num "s",			\
 		.of_match	= of_match_ptr("ldo" #_num "s"),	\
@@ -1323,10 +1339,18 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 		.ops		= &s2mpg15_reg_enable_only_ops,		\
 		.type		= REGULATOR_VOLTAGE,			\
 		.owner		= THIS_MODULE,				\
-		.enable_reg	= S2MPG15_PMIC_L##_num##S_CTRL,		\
-		.enable_mask	= BIT(7),				\
+		.enable_reg	= S2MPG15_PMIC_##_en_reg,		\
+		.enable_mask	= _en_mask,				\
 		.enable_time	= 130,					\
 	}
+
+/* enable is plain on/off in bit 7 of the rail's own CTRL register */
+#define regulator_desc_s2mpg15_ldo(_num)				\
+	regulator_desc_s2mpg15_ldo_cmn(_num, L##_num##S_CTRL, BIT(7))
+
+/* enable is the operating mode in bits 7:6 of the rail's own CTRL register */
+#define regulator_desc_s2mpg15_ldo_opmode(_num)				\
+	regulator_desc_s2mpg15_ldo_cmn(_num, L##_num##S_CTRL, GENMASK(7, 6))
 
 static const struct regulator_desc s2mpg15_regulators[] = {
 	regulator_desc_s2mpg15_ldo(5),

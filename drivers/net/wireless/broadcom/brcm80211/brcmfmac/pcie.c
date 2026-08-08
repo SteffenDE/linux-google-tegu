@@ -389,6 +389,28 @@ module_param_named(fw_console, brcmf_pcie_fw_console, bool, 0444);
 MODULE_PARM_DESC(fw_console,
 		 "Expose the fw_console sysfs node to dump the firmware log; default off");
 
+/*
+ * Ask the firmware to validate the H2D ring phase (msgbuf_common_hdr.flags).
+ * The host always stamps the phase; this only decides whether the device looks
+ * at it.  When it does, pciedev_check_valid_phase() compares the phase of every
+ * TX_POST against the lap it believes the ring is on and complains on the
+ * firmware console when they disagree -- which is a direct report of the device
+ * consuming a flow-ring slot the host never wrote, the condition behind the
+ * "EL: 30 a164" trap (a zero TX request_id read back out of such a slot).
+ *
+ * Off by default because the expected first-lap polarity is not confirmed:
+ * BRCMF_COMMONRING_PHASE_INIT follows the firmware's own flow-ring seed, while
+ * bcmdhd seeds its H2D rings the other way.  If that choice is wrong, *every*
+ * TX post mismatches and the firmware logs one line per packet, which floods
+ * the console and, per past experience on this part, makes timing-sensitive
+ * failures markedly more likely.  Enable deliberately, on a boot where the
+ * console is being watched.
+ */
+static bool brcmf_pcie_h2d_phase;
+module_param_named(h2d_phase, brcmf_pcie_h2d_phase, bool, 0444);
+MODULE_PARM_DESC(h2d_phase,
+		 "Have the firmware validate the H2D ring phase and report stale slots; default off");
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -2680,6 +2702,14 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	host_cap |= BRCMF_HOSTCAP_DS_NO_OOB_DW;
 	if (brcmf_pcie_inband_ds(devinfo))
 		host_cap |= BRCMF_HOSTCAP_DS_INBAND_DW;
+
+	/*
+	 * Not BRCMF_HOSTCAP_H2D_ENABLE_TRAP_ON_BADPHASE: a stale slot should be
+	 * reported, not answered with the firmware halting itself, which is the
+	 * failure this is meant to diagnose.
+	 */
+	if (brcmf_pcie_h2d_phase)
+		host_cap |= BRCMF_HOSTCAP_H2D_VALID_PHASE;
 
 	brcmf_pcie_write_tcm32(devinfo, sharedram_addr +
 			       BRCMF_SHARED_HOST_CAP_OFFSET, host_cap);

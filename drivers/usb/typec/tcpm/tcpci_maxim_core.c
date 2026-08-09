@@ -15,6 +15,8 @@
 #include <linux/usb/tcpci.h>
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec.h>
+#include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_mux.h>
 
 #include "tcpci_maxim.h"
 
@@ -307,6 +309,39 @@ static void max_tcpci_set_partner_usb_comm_capable(struct tcpci *tcpci, struct t
 		dev_err(chip->dev, "Failed to enable USB switches");
 }
 
+/*
+ * The same USB switches as a connector state, for ports that never learn the
+ * partner's USB_COMM bit.  That bit only arrives with a PD contract, so on a
+ * pd-disable port the switches would be turned off at port reset and never
+ * turned back on.  TCPM drives TYPEC_STATE_USB from tcpm_set_roles() on every
+ * attach and TYPEC_STATE_SAFE from tcpm_reset_port() on every detach,
+ * independently of PD, which is the signal a non-PD port does get.
+ */
+static int max_tcpci_mux_set(struct typec_mux_dev *mux,
+			     struct typec_mux_state *state)
+{
+	struct max_tcpci_chip *chip = typec_mux_get_drvdata(mux);
+	int ret;
+
+	/*
+	 * Leave alternate and accessory modes alone: they arrive only through
+	 * PD, where set_partner_usb_comm_capable() above already owns the
+	 * switches, and DP pin assignments may keep USB data connected.
+	 */
+	if (state->mode != TYPEC_STATE_USB && state->mode != TYPEC_STATE_SAFE)
+		return 0;
+
+	ret = max_tcpci_write8(chip, TCPC_VENDOR_USBSW_CTRL,
+			       state->mode == TYPEC_STATE_USB ?
+			       TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA :
+			       TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA);
+	if (ret < 0)
+		dev_err(chip->dev, "Failed to set USB switches for mode %lu\n",
+			state->mode);
+
+	return ret;
+}
+
 static irqreturn_t _max_tcpci_irq(struct max_tcpci_chip *chip, u16 status)
 {
 	u16 mask;
@@ -487,6 +522,40 @@ static void max_tcpci_unregister_tcpci_port(void *tcpci)
 	tcpci_unregister_port(tcpci);
 }
 
+static void max_tcpci_unregister_mux(void *mux)
+{
+	typec_mux_unregister(mux);
+}
+
+static int max_tcpci_register_mux(struct max_tcpci_chip *chip)
+{
+	struct typec_mux_desc mux_desc;
+
+	/*
+	 * Only boards that link the connector back to this device expect the
+	 * switches to follow the connector state; leave the rest on the
+	 * USB_COMM path alone.  Register before the port, or its mode-switch
+	 * lookup defers on a mux this same probe has not created yet.
+	 */
+	if (!device_property_present(chip->dev, "mode-switch"))
+		return 0;
+
+	mux_desc = (struct typec_mux_desc){
+		.fwnode = dev_fwnode(chip->dev),
+		.set = max_tcpci_mux_set,
+		.drvdata = chip,
+		.name = dev_name(chip->dev),
+	};
+
+	chip->mux = typec_mux_register(chip->dev, &mux_desc);
+	if (IS_ERR(chip->mux))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->mux),
+				     "USB switch mode-switch registration failed\n");
+
+	return devm_add_action_or_reset(chip->dev, max_tcpci_unregister_mux,
+					chip->mux);
+}
+
 static int max_tcpci_probe(struct i2c_client *client)
 {
 	int ret;
@@ -525,6 +594,11 @@ static int max_tcpci_probe(struct i2c_client *client)
 	chip->data.attempt_vconn_swap_discovery = max_tcpci_attempt_vconn_swap_discovery;
 
 	max_tcpci_init_regs(chip);
+
+	ret = max_tcpci_register_mux(chip);
+	if (ret)
+		return ret;
+
 	chip->tcpci = tcpci_register_port(chip->dev, &chip->data);
 	if (IS_ERR(chip->tcpci))
 		return dev_err_probe(&client->dev, PTR_ERR(chip->tcpci),

@@ -13,6 +13,7 @@
 #include <linux/reset.h>
 
 #define EXYNOS_USB_PHY_HS_PHY_CTRL_RST	(0x0)
+#define PHY_RESET			BIT(0)
 #define USB_PHY_RST_MASK		GENMASK(1, 0)
 #define UTMI_PORT_RST_MASK		GENMASK(5, 4)
 
@@ -24,6 +25,7 @@
 #define FSEL_48_MHZ_VAL			(0x2)
 
 #define EXYNOS_USB_PHY_CFG_PLLCFG0	(0x8)
+#define EXYNOS_PHY_CFG_PLL_CPBIAS_CNTRL_MASK	GENMASK(6, 0)
 #define PHY_CFG_PLL_FB_DIV_19_8_MASK	GENMASK(19, 8)
 #define DIV_19_8_19_2_MHZ_VAL		(0x170)
 #define DIV_19_8_20_MHZ_VAL		(0x160)
@@ -153,11 +155,14 @@ static const char * const eusb2_hsphy_vreg_names[] = {
 
 #define EUSB2_NUM_VREGS		ARRAY_SIZE(eusb2_hsphy_vreg_names)
 
+#define SNPS_EUSB2_EXYNOS_701_INIT	BIT(0)
+
 struct snps_eusb2_phy_drvdata {
 	int (*phy_init)(struct phy *p);
 	int (*phy_exit)(struct phy *p);
 	const char * const *clk_names;
 	int num_clks;
+	u32 flags;
 };
 
 struct snps_eusb2_hsphy {
@@ -333,6 +338,12 @@ static int exynos_snps_eusb2_hsphy_init(struct phy *p)
 	if (ret)
 		return ret;
 
+	if (phy->data->flags & SNPS_EUSB2_EXYNOS_701_INIT)
+		snps_eusb2_hsphy_write_mask(phy->base,
+					    EXYNOS_USB_PHY_CFG_PLLCFG0,
+					    EXYNOS_PHY_CFG_PLL_CPBIAS_CNTRL_MASK,
+					    0);
+
 	/* default parameter: tx fsls-vref */
 	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_PHY_CFG_TX,
 				    EXYNOS_PHY_CFG_TX_FSLS_VREF_TUNE_MASK,
@@ -340,6 +351,39 @@ static int exynos_snps_eusb2_hsphy_init(struct phy *p)
 
 	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_USB_PHY_UTMI_TESTSE,
 				    TEST_IDDQ, 0);
+
+	if (phy->data->flags & SNPS_EUSB2_EXYNOS_701_INIT) {
+		/* Keep the PHY disabled throughout the controlled reset release. */
+		snps_eusb2_hsphy_write_mask(phy->base,
+					    EXYNOS_USB_PHY_HS_PHY_CTRL_COMMON,
+					    PHY_ENABLE, 0);
+
+		/* Keep PHY_RESET asserted for 10 us after leaving IDDQ. */
+		fsleep(10);
+
+		/* Release PHY_RESET while retaining its override. */
+		snps_eusb2_hsphy_write_mask(phy->base,
+					    EXYNOS_USB_PHY_HS_PHY_CTRL_RST,
+					    PHY_RESET, 0);
+
+		/* Allow REXT calibration to complete before enabling the PHY. */
+		fsleep(10);
+
+		snps_eusb2_hsphy_write_mask(phy->base,
+					    EXYNOS_USB_PHY_HS_PHY_CTRL_COMMON,
+					    PHY_ENABLE, PHY_ENABLE);
+
+		fsleep(1000);
+		fsleep(28); /* T4: analog and digital power-up */
+		fsleep(2500); /* T5: eUSB Port Reset/ESE1 completion */
+
+		snps_eusb2_hsphy_write_mask(phy->base,
+					    EXYNOS_USB_PHY_HS_PHY_CTRL_RST,
+					    UTMI_PORT_RST_MASK, 0);
+
+		return 0;
+	}
+
 	fsleep(10); /* required after releasing test_iddq */
 
 	snps_eusb2_hsphy_write_mask(phy->base, EXYNOS_USB_PHY_HS_PHY_CTRL_RST,
@@ -389,6 +433,14 @@ static const struct snps_eusb2_phy_drvdata exynos2200_snps_eusb2_phy = {
 	.phy_exit	= exynos_snps_eusb2_hsphy_exit,
 	.clk_names	= exynos_eusb2_hsphy_clock_names,
 	.num_clks	= ARRAY_SIZE(exynos_eusb2_hsphy_clock_names),
+};
+
+static const struct snps_eusb2_phy_drvdata zumapro_snps_eusb2_phy = {
+	.phy_init	= exynos_snps_eusb2_hsphy_init,
+	.phy_exit	= exynos_snps_eusb2_hsphy_exit,
+	.clk_names	= exynos_eusb2_hsphy_clock_names,
+	.num_clks	= ARRAY_SIZE(exynos_eusb2_hsphy_clock_names),
+	.flags		= SNPS_EUSB2_EXYNOS_701_INIT,
 };
 
 static int qcom_snps_eusb2_hsphy_init(struct phy *p)
@@ -648,12 +700,11 @@ static const struct of_device_id snps_eusb2_hsphy_of_match_table[] = {
 	}, {
 		/*
 		 * Tensor G4 (zumapro) uses the same 4nm Synopsys eUSB2 HS PHY as
-		 * Exynos 2200: identical register layout, init sequence and 19.2
-		 * MHz 4nm PLL config (phy_eusb_version 0x701).  Reuse the
-		 * exynos2200 driver data verbatim.
+		 * Exynos 2200, but its version 0x701 PHY needs the minor-version 1
+		 * cold initialization sequence.
 		 */
 		.compatible = "google,zumapro-eusb2-phy",
-		.data = &exynos2200_snps_eusb2_phy,
+		.data = &zumapro_snps_eusb2_phy,
 	}, {
 		/* sentinel */
 	}

@@ -856,6 +856,14 @@
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
 
+	/* MAX77759 USB Type-C interrupt (downstream usb-pd-irq). */
+	usb_pd_irq: usb-pd-irq-pins {
+		samsung,pins = "gpa8-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
 	/* Right speaker amp IRQ, XEINT_16 (downstream tas2572_2_irq). */
 	spk_amp_r_irq: spk-amp-r-irq-pins {
 		samsung,pins = "gpa7-2";
@@ -1001,10 +1009,100 @@
 &hsi2c_6 {
 	status = "okay";
 
+	/*
+	 * MAX77759 TCPC at the downstream address and gpa8-3 interrupt.  Keep
+	 * this first event-path port sink/device-only with PD disabled: source,
+	 * charging and regulator control remain deliberately out of scope.
+	 */
+	usb_typec: usb-typec@25 {
+		compatible = "maxim,max77759-tcpci", "maxim,max33359";
+		reg = <0x25>;
+		interrupts-extended = <&gpa8 3 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-0 = <&usb_pd_irq>;
+		pinctrl-names = "default";
+
+		/*
+		 * The vendor D+/D- switch is inside this TCPC, so the connector
+		 * links its mode switch back to the parent node.
+		 */
+		mode-switch;
+
+		port {
+			usbc0_mode_sw_in: endpoint {
+				remote-endpoint = <&usbc0_mode_sw>;
+			};
+		};
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C";
+			data-role = "device";
+			power-role = "sink";
+			self-powered;
+			pd-disable;
+			typec-power-opmode = "default";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* High speed: the DWC3 data role, and the */
+				/* vendor D+/D- switch inside this TCPC.  */
+				port@0 {
+					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					usbc0_role_sw: endpoint@0 {
+						reg = <0>;
+						remote-endpoint = <&usb_dwc3_role_sw>;
+					};
+
+					usbc0_mode_sw: endpoint@1 {
+						reg = <1>;
+						remote-endpoint = <&usbc0_mode_sw_in>;
+					};
+				};
+
+				/* Super speed: the USB32DRD combo PHY, which */
+				/* takes the connector orientation.           */
+				port@1 {
+					reg = <1>;
+
+					usbc0_orien_sw: endpoint {
+						remote-endpoint = <&usb32drd_orien_sw>;
+					};
+				};
+			};
+		};
+	};
+
 	fuel-gauge@36 {
 		compatible = "maxim,max77779fg";
 		reg = <0x36>;
 		shunt-resistor-micro-ohms = <2000>;
+	};
+};
+
+&usb32drd {
+	orientation-switch;
+
+	port {
+		usb32drd_orien_sw: endpoint {
+			remote-endpoint = <&usbc0_orien_sw>;
+		};
+	};
+};
+
+&usb_dwc3 {
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+
+	port {
+		usb_dwc3_role_sw: endpoint {
+			remote-endpoint = <&usbc0_role_sw>;
+		};
 	};
 };
 

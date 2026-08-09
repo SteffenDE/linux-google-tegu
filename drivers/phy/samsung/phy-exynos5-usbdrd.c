@@ -203,6 +203,10 @@
 #define LINKCTRL_FORCE_RXELECIDLE		BIT(18)
 #define LINKCTRL_FORCE_PHYSTATUS		BIT(17)
 #define LINKCTRL_FORCE_PIPE_EN			BIT(16)
+#define LINKCTRL_DIS_LINKGATE_QACT		BIT(12)
+#define LINKCTRL_DIS_ID0_QACT			BIT(11)
+#define LINKCTRL_DIS_VBUSVALID_QACT		BIT(10)
+#define LINKCTRL_DIS_BVALID_QACT		BIT(9)
 #define LINKCTRL_FORCE_QACT			BIT(8)
 #define LINKCTRL_BUS_FILTER_BYPASS		GENMASK(7, 4)
 
@@ -489,7 +493,10 @@ struct exynos5_usbdrd_phy_drvdata {
 	u32 pmu_offset_usbdrd0_phy;
 	u32 pmu_offset_usbdrd0_phy_ss;
 	u32 pmu_offset_usbdrd1_phy;
+	u32 flags;
 };
+
+#define EXYNOS5_DRD_PHY_FULL_LINK_INIT		BIT(0)
 
 /**
  * struct exynos5_usbdrd_phy - driver data for USB 3.0 PHY
@@ -1367,17 +1374,31 @@ static void exynos2200_usbdrd_link_init(struct exynos5_usbdrd_phy *phy_drd)
 	void __iomem *regs_base = phy_drd->reg_phy;
 	u32 reg;
 
-	/*
-	 * Disable HWACG (hardware auto clock gating control). This will force
-	 * QACTIVE signal in Q-Channel interface to HIGH level, to make sure
-	 * the PHY clock is not gated by the hardware.
-	 */
 	reg = readl(regs_base + EXYNOS850_DRD_LINKCTRL);
-	reg |= LINKCTRL_FORCE_QACT;
+	if (phy_drd->drv_data->flags & EXYNOS5_DRD_PHY_FULL_LINK_INIT) {
+		/* Disable all link Q-channel conditions before forcing QACTIVE. */
+		reg |= LINKCTRL_DIS_ID0_QACT | LINKCTRL_DIS_BVALID_QACT |
+		       LINKCTRL_DIS_VBUSVALID_QACT | LINKCTRL_DIS_LINKGATE_QACT;
+		reg &= ~LINKCTRL_FORCE_QACT;
+		fsleep(500);
+		writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
+		fsleep(500);
+
+		reg |= LINKCTRL_FORCE_QACT |
+		       FIELD_PREP(LINKCTRL_BUS_FILTER_BYPASS, 0xf);
+	} else {
+		/* Keep the PHY clock from being gated by hardware. */
+		reg |= LINKCTRL_FORCE_QACT;
+	}
 	writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
 
-	/* De-assert link reset */
 	reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
+	if (phy_drd->drv_data->flags & EXYNOS5_DRD_PHY_FULL_LINK_INIT) {
+		reg |= CLKRST_LINK_SW_RST;
+		writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
+		fsleep(10);
+	}
+
 	reg &= ~CLKRST_LINK_SW_RST;
 	writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
 
@@ -2040,18 +2061,15 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
 };
 
 /*
- * Google Tensor G4 (zumapro). Same 4nm USB32DRD combo PHY shape as Exynos 2200:
- * the combo "phy" reg holds the DRD link-control registers (LINKCTRL 0x04,
- * CLKRST 0x0c, UTMI 0x10, HSP_MISC 0x114) and HS is delegated to an external
- * Synopsys eUSB2 "hs" phy (phy-snps-eusb2), so the exynos2200 ops/phy_cfg are
- * reused verbatim (hardware trace confirmed these DRD offsets at 0x11100000 —
- * docs/archive/usb/needs-hardware-2026-05.md H2, docs/decisions/0002).
+ * Google Tensor G4 (zumapro) uses the same 4nm USB32DRD register layout and
+ * external Synopsys eUSB2 PHY shape as Exynos 2200. Its downstream link init
+ * additionally disables all Q-channel conditions, bypasses the bus filters and
+ * pulses link reset, so keep that sequence Zumapro-specific. Hardware tracing
+ * confirmed LINKCTRL 0x04, CLKRST 0x0c, UTMI 0x10 and HSP_MISC 0x114.
  *
- * The only delta is the PMU USB2.0 isolation/enable offset: zumapro uses the
- * same offset as gs101 (0x3eb0), NOT exynos2200's 0x72c (hardware trace +
- * dumped.dts pmu_offset = 0x3eb0). On this device the bootloader leaves the PMU
- * bit enabled (USB is live at fastboot handoff), so the isol "ungate" here is a
- * harmless re-assert and we program no other PMU/regulator state.
+ * Zumapro also uses the gs101 PMU USB2.0 isolation offset 0x3eb0 rather than
+ * Exynos 2200's 0x72c. The bootloader leaves that bit enabled, so the isolation
+ * "ungate" is a harmless re-assertion.
  */
 static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
 	.phy_cfg		= phy_cfg_exynos2200,
@@ -2064,6 +2082,7 @@ static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
 	.n_core_clks		= 0,
 	.regulator_names	= NULL,
 	.n_regulators		= 0,
+	.flags			= EXYNOS5_DRD_PHY_FULL_LINK_INIT,
 };
 
 static const struct exynos5_usbdrd_phy_drvdata exynos5420_usbdrd_phy = {

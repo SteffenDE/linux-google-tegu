@@ -183,6 +183,20 @@ allOf:
       properties:
         compatible:
           contains:
+            const: google,zumapro-usb32drd-phy
+    then:
+      allOf:
+        - $ref: /schemas/usb/usb-switch.yaml#
+        - $ref: /schemas/usb/usb-switch-ports.yaml#
+
+      required:
+        - orientation-switch
+        - port
+
+  - if:
+      properties:
+        compatible:
+          contains:
             enum:
               - google,zumapro-usb32drd-phy
               - samsung,exynos2200-usb32drd-phy

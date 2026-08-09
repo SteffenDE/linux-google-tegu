@@ -497,6 +497,7 @@ struct exynos5_usbdrd_phy_drvdata {
 };
 
 #define EXYNOS5_DRD_PHY_FULL_LINK_INIT		BIT(0)
+#define EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID	BIT(1)
 
 /**
  * struct exynos5_usbdrd_phy - driver data for USB 3.0 PHY
@@ -1369,9 +1370,27 @@ static void exynos2200_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
 	phy_init(phy_drd->hs_phy);
 }
 
+static void
+exynos2200_usbdrd_set_session_valid(struct exynos5_usbdrd_phy *phy_drd,
+				    bool valid)
+{
+	void __iomem *regs_base = phy_drd->reg_phy;
+	u32 reg;
+
+	reg = readl(regs_base + EXYNOS2200_DRD_UTMI);
+	if (valid)
+		reg |= EXYNOS2200_UTMI_FORCE_BVALID |
+		       EXYNOS2200_UTMI_FORCE_VBUSVALID;
+	else
+		reg &= ~(EXYNOS2200_UTMI_FORCE_BVALID |
+			 EXYNOS2200_UTMI_FORCE_VBUSVALID);
+	writel(reg, regs_base + EXYNOS2200_DRD_UTMI);
+}
+
 static void exynos2200_usbdrd_link_init(struct exynos5_usbdrd_phy *phy_drd)
 {
 	void __iomem *regs_base = phy_drd->reg_phy;
+	bool session_valid;
 	u32 reg;
 
 	reg = readl(regs_base + EXYNOS850_DRD_LINKCTRL);
@@ -1402,10 +1421,12 @@ static void exynos2200_usbdrd_link_init(struct exynos5_usbdrd_phy *phy_drd)
 	reg &= ~CLKRST_LINK_SW_RST;
 	writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
 
-	/* Set link VBUS Valid */
-	reg = readl(regs_base + EXYNOS2200_DRD_UTMI);
-	reg |= EXYNOS2200_UTMI_FORCE_BVALID | EXYNOS2200_UTMI_FORCE_VBUSVALID;
-	writel(reg, regs_base + EXYNOS2200_DRD_UTMI);
+	/* Restore the Type-C cable state after link reset. */
+	session_valid = !(phy_drd->drv_data->flags &
+			  EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID) ||
+			!phy_drd->sw ||
+			phy_drd->orientation != TYPEC_ORIENTATION_NONE;
+	exynos2200_usbdrd_set_session_valid(phy_drd, session_valid);
 }
 
 static void
@@ -1473,14 +1494,16 @@ static int exynos2200_usbdrd_phy_init(struct phy *phy)
 	if (ret)
 		return ret;
 
-	/* Set up the link controller */
-	exynos2200_usbdrd_link_init(phy_drd);
+	scoped_guard(mutex, &phy_drd->phy_mutex) {
+		/* Set up the link controller */
+		exynos2200_usbdrd_link_init(phy_drd);
 
-	/* UTMI or PIPE3 link preparation */
-	exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
+		/* UTMI or PIPE3 link preparation */
+		exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
 
-	/* UTMI or PIPE3 specific init */
-	inst->phy_cfg->phy_init(phy_drd);
+		/* UTMI or PIPE3 specific init */
+		inst->phy_cfg->phy_init(phy_drd);
+	}
 
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
 
@@ -1501,9 +1524,11 @@ static int exynos2200_usbdrd_phy_resume_prepare(struct exynos5_usbdrd_phy *phy_d
 	if (ret)
 		return ret;
 
-	exynos5_usbdrd_phy_isol(inst, false);
-	exynos2200_usbdrd_link_init(phy_drd);
-	exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
+	scoped_guard(mutex, &phy_drd->phy_mutex) {
+		exynos5_usbdrd_phy_isol(inst, false);
+		exynos2200_usbdrd_link_init(phy_drd);
+		exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
+	}
 
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
 
@@ -1533,13 +1558,13 @@ static int exynos2200_usbdrd_phy_exit(struct phy *phy)
 	if (ret)
 		return ret;
 
-	reg = readl(regs_base + EXYNOS2200_DRD_UTMI);
-	reg &= ~(EXYNOS2200_UTMI_FORCE_BVALID | EXYNOS2200_UTMI_FORCE_VBUSVALID);
-	writel(reg, regs_base + EXYNOS2200_DRD_UTMI);
+	scoped_guard(mutex, &phy_drd->phy_mutex) {
+		exynos2200_usbdrd_set_session_valid(phy_drd, false);
 
-	reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
-	reg |= CLKRST_LINK_SW_RST;
-	writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
+		reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
+		reg |= CLKRST_LINK_SW_RST;
+		writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
+	}
 
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
 
@@ -1909,8 +1934,13 @@ static int exynos5_usbdrd_orien_sw_set(struct typec_switch_dev *sw,
 	scoped_guard(mutex, &phy_drd->phy_mutex) {
 		void __iomem * const regs_base = phy_drd->reg_phy;
 		unsigned int reg;
+		bool session_valid;
 
-		if (orientation == TYPEC_ORIENTATION_NONE) {
+		if (phy_drd->drv_data->flags &
+		    EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID) {
+			session_valid = orientation != TYPEC_ORIENTATION_NONE;
+			exynos2200_usbdrd_set_session_valid(phy_drd, session_valid);
+		} else if (orientation == TYPEC_ORIENTATION_NONE) {
 			reg = readl(regs_base + EXYNOS850_DRD_UTMI);
 			reg &= ~(UTMI_FORCE_VBUSVALID | UTMI_FORCE_BVALID);
 			writel(reg, regs_base +  EXYNOS850_DRD_UTMI);
@@ -2082,7 +2112,8 @@ static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
 	.n_core_clks		= 0,
 	.regulator_names	= NULL,
 	.n_regulators		= 0,
-	.flags			= EXYNOS5_DRD_PHY_FULL_LINK_INIT,
+	.flags			= EXYNOS5_DRD_PHY_FULL_LINK_INIT |
+				  EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID,
 };
 
 static const struct exynos5_usbdrd_phy_drvdata exynos5420_usbdrd_phy = {

@@ -988,6 +988,20 @@
 	status = "okay";
 };
 
+/*
+ * USI3_HSI0 in SPI mode: the bus the KEPLER GNSS receiver hangs off.  Enabled
+ * ahead of the receiver itself so the controller can be proven on its own --
+ * the device node and its two-wire handshake GPIOs follow with the driver.
+ */
+&usi3_hsi0 {
+	samsung,mode = <USI_MODE_SPI>;
+	status = "okay";
+};
+
+&spi_21 {
+	status = "okay";
+};
+
 &spi_20 {
 	status = "okay";
 

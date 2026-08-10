@@ -441,6 +441,39 @@
 			no-map;
 		};
 	};
+
+	/*
+	 * The reboot mode the bootloader reads after a *cold* reset, which
+	 * clears the PMU SYSIP_DAT0 copy that serves the warm case (see the
+	 * syscon-reboot-mode node in zumapro.dtsi).  Both are needed: neither
+	 * store covers both reset types [HW 2026-08-10].
+	 *
+	 * Values are the enum pon_reboot_mode of the downstream
+	 * pixel-zuma-reboot.c or'd with its BMS_RSBM_VALID (BIT(31)) -- the
+	 * same encoding mainline already uses for gs101 in
+	 * gs101-pixel-common.dtsi.  The valid bit earns its keep here and not
+	 * on the PMU side, because battery-backed RAM comes up holding whatever
+	 * it last held, so the bootloader needs to be told the field means
+	 * something.  It clears the field once it has acted on it.
+	 *
+	 * Note this is the bootloader's notion of a reboot mode, not the
+	 * kernel's warm/cold reset type: that one is reboot_mode in the PSCI
+	 * sense, set from the reboot= cmdline parameter.
+	 */
+	reboot-mode {
+		compatible = "nvmem-reboot-mode";
+		nvmem-cells = <&max77779_reboot_mode>;
+		nvmem-cell-names = "reboot-mode";
+		mode-bootloader = <0x800000fc>;
+		mode-charge = <0x8000000a>;
+		mode-dm-verity-device-corrupted = <0x80000050>;
+		mode-fastboot = <0x800000fa>;
+		mode-reboot-ab-update = <0x80000052>;
+		mode-recovery = <0x800000ff>;
+		mode-rescue = <0x800000f9>;
+		mode-shutdown-thermal = <0x80000051>;
+		mode-shutdown-thermal-battery = <0x80000051>;
+	};
 };
 
 &watchdog_cl0 {
@@ -1094,6 +1127,29 @@
 		compatible = "maxim,max77779fg";
 		reg = <0x36>;
 		shunt-resistor-micro-ohms = <2000>;
+	};
+
+	/*
+	 * Source: research/dumped.dts:6249 (max77779sp@60).  The scratchpad is
+	 * battery-backed, so unlike the DRAM-resident post-mortem buffers its
+	 * contents outlive a cold reset -- which is what makes it the place the
+	 * bootloader looks for the reboot mode.  Offset 0 is RSBM_ADDR in the
+	 * downstream max77779_sp driver, and 4 bytes wide because
+	 * nvmem-reboot-mode writes an unsigned int.
+	 */
+	nvmem@60 {
+		compatible = "maxim,max77779sp";
+		reg = <0x60>;
+
+		nvmem-layout {
+			compatible = "fixed-layout";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			max77779_reboot_mode: reboot-mode@0 {
+				reg = <0x0 0x4>;
+			};
+		};
 	};
 };
 

@@ -415,11 +415,24 @@
 #endif
 
 		ramoops_reserved: ramoops@fd3ff000 {
-			/* Source: research/dumped.dts:1397-1401. */
+			/*
+			 * Source: research/dumped.dts:1397-1401, with the pmsg
+			 * zone traded for dmesg records.  Downstream splits the
+			 * 4 MiB into 2 MiB console + 2 MiB pmsg and carves no
+			 * record zone at all, because the pmsg consumer is
+			 * Android's logd and its panic post-mortems come from
+			 * debug-snapshot; neither exists here, so pmsg would be
+			 * 2 MiB that nothing ever reads.  The dmesg zones take
+			 * whatever console and pmsg leave (ram.c: dump_mem_sz =
+			 * size - console - ftrace - pmsg), hence 8 records here.
+			 * Console gets the larger share: a lockup that stops
+			 * printing never reaches kmsg_dump, so the console ring
+			 * is the only thing that will hold its last moments.
+			 */
 			compatible = "ramoops";
 			reg = <0x0 0xfd3ff000 0x400000>;
-			console-size = <0x200000>;
-			pmsg-size = <0x200000>;
+			console-size = <0x300000>;
+			record-size = <0x20000>;
 		};
 
 		bldr_log_reserved: bldr-log@fd800000 {

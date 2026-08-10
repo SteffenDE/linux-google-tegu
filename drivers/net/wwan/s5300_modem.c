@@ -179,6 +179,20 @@
 
 #define S5300_IPC_SRINFO_OFFSET		0x400000
 #define S5300_IPC_SRINFO_SIZE		0x300000
+
+/*
+ * The GNSS receiver's firmware staging window, the last 4 MiB of the ipc
+ * region.  Source: the downstream cp_shmem region table (research/dumped.dts),
+ * region "GNSS_FW" at index 0x0d with region,rmem 0 -- i.e. an offset into
+ * cp_rmem, above SRINFO rather than a carveout of its own.
+ *
+ * The receiver's firmware is staged here, and the codeload command train that
+ * makes the CP start it from here runs over the gnss_boot channel.  Both are
+ * driven from user space through /dev/gnss_boot0, the same way cbd drives
+ * /dev/umts_boot0: the image goes in by ioctl, the command train by write().
+ */
+#define S5300_GNSS_FW_OFFSET		0x800000
+#define S5300_GNSS_FW_SIZE		0x400000
 #define S5300_IPC_MAGIC_ONLINE		0xaa	/* SHM_IPC_MAGIC (running) */
 #define S5300_IPC_MAGIC_BOOT		0xbdbd	/* SHM_BOOT_MAGIC (download) */
 
@@ -249,6 +263,8 @@
  * ring post-ONLINE.  Frames are single-fragment; the biggest the corpus shows
  * is a ~2 KB READ_RESP/WRITE chunk (downstream rfsd reads 0x840 at a time).
  */
+#define S5300_GNSS_CH			0xf0	/* gnss_boot (GNSS codeload) */
+#define S5300_GNSS_MAX			SZ_1K
 #define S5300_RFS_CH			0x29	/* EXYNOS_CH_ID_RFS_0 */
 #define S5300_RFS_MAX			SZ_4K
 
@@ -472,7 +488,20 @@ struct s5300_boot_mode {
 #define IOCTL_START_CP_BOOTLOADER	_IOW('o', 0x22, struct s5300_boot_mode)
 #define IOCTL_COMPLETE_NORMAL_BOOTUP	_IO('o', 0x23)
 #define IOCTL_GET_CP_STATUS		_IO('o', 0x27)
+/*
+ * Staging for the GNSS receiver's firmware.  Like the CP image above, the
+ * pointer is a __u64 rather than a userspace pointer so the layout does not
+ * change between 32- and 64-bit callers; downstream's equivalent puts a
+ * "char *" in a packed struct and cannot be used from both.
+ */
+struct s5300_gnss_image {
+	__u64	binary;
+	__u32	size;
+	__u32	offset;
+} __packed;
+
 #define IOCTL_LOAD_CP_IMAGE		_IOW('o', 0x40, struct s5300_cp_image)
+#define IOCTL_LOAD_GNSS_IMAGE		_IOW('o', 0x41, struct s5300_gnss_image)
 #define IOCTL_GET_SRINFO		_IOWR('o', 0x45, struct s5300_srinfo)
 #define IOCTL_HANDOVER_BLOCK_INFO	_IO('o', 0x57)
 
@@ -580,6 +609,7 @@ struct s5300_modem {
 	 * carrier-config file requests (post-ONLINE).
 	 */
 	struct s5300_chardev	rfs;
+	struct s5300_chardev	gnss;
 
 	/* Vendor AT/router channel on the NORM_RAW ring (post-ONLINE). */
 	struct wwan_port	*at_port;
@@ -1658,6 +1688,12 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			 * (the chardev enqueues + wakes a reader). */
 			if (payload && payload <= S5300_RFS_MAX)
 				s5300_chardev_rx(&sm->rfs, buff,
+						 S5300_RAW_RXQ_SIZE, out, payload,
+						 S5300_HDR_CFG_SINGLE);
+		} else if (hdr[8] == S5300_GNSS_CH) {
+			/* Codeload replies; bound a corrupt CP length. */
+			if (payload && payload <= S5300_GNSS_MAX)
+				s5300_chardev_rx(&sm->gnss, buff,
 						 S5300_RAW_RXQ_SIZE, out, payload,
 						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
@@ -3014,6 +3050,70 @@ static __poll_t s5300_chardev_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+/*
+ * Stage a chunk of the GNSS receiver's firmware into the shared window.  The
+ * CP reads it from there when the codeload command train on this channel tells
+ * it to, so this only has to place bytes; @offset lets the caller load in
+ * pieces, as cbd does for the CP's own image.
+ */
+static int s5300_load_gnss_image(struct s5300_modem *sm, void __user *arg)
+{
+	struct s5300_gnss_image img;
+	void *buf;
+	int ret = 0;
+
+	if (copy_from_user(&img, arg, sizeof(img)))
+		return -EFAULT;
+
+	if (!img.size || img.size > S5300_GNSS_FW_SIZE ||
+	    img.offset > S5300_GNSS_FW_SIZE - img.size) {
+		dev_err(sm->dev, "GNSS chunk out of range (off %#x len %u)\n",
+			img.offset, img.size);
+		return -EINVAL;
+	}
+
+	buf = kvmalloc(img.size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (copy_from_user(buf, u64_to_user_ptr(img.binary), img.size)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	memcpy_toio(sm->ipc + S5300_GNSS_FW_OFFSET + img.offset, buf, img.size);
+out:
+	kvfree(buf);
+	return ret;
+}
+
+static long s5300_gnss_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct s5300_chardev *cd = file->private_data;
+
+	switch (cmd) {
+	case IOCTL_LOAD_GNSS_IMAGE:
+		return s5300_load_gnss_image(cd->sm, (void __user *)arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
+/*
+ * /dev/gnss_boot0 -- the GNSS codeload, shaped like /dev/umts_boot0.  The
+ * channel carries the command train that starts the receiver, and the ioctl
+ * stages the image the train refers to.
+ */
+static const struct file_operations s5300_gnss_fops = {
+	.owner		= THIS_MODULE,
+	.open		= s5300_chardev_open,
+	.read		= s5300_chardev_read,
+	.write		= s5300_chardev_write,
+	.poll		= s5300_chardev_poll,
+	.unlocked_ioctl	= s5300_gnss_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
 static const struct file_operations s5300_chardev_fops = {
 	.owner		= THIS_MODULE,
 	.open		= s5300_chardev_open,
@@ -3783,6 +3883,13 @@ static int s5300_probe(struct platform_device *pdev)
 	skb_queue_head_init(&sm->rfs.rxq);
 	mutex_init(&sm->rfs.tx_msg_lock);
 	init_waitqueue_head(&sm->rfs.read_wq);
+	sm->gnss.sm = sm;
+	sm->gnss.channel = S5300_GNSS_CH;
+	sm->gnss.tx_max = S5300_GNSS_MAX;
+	sm->gnss.raw_ring = true;
+	skb_queue_head_init(&sm->gnss.rxq);
+	mutex_init(&sm->gnss.tx_msg_lock);
+	init_waitqueue_head(&sm->gnss.read_wq);
 	sm->cp_status = S5300_STATE_OFFLINE;
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
@@ -3797,6 +3904,10 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->rfs.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_RFS_MAX + 8,
 				      GFP_KERNEL);
 	if (!sm->rfs.tx_buf)
+		return -ENOMEM;
+	sm->gnss.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_GNSS_MAX + 8,
+				       GFP_KERNEL);
+	if (!sm->gnss.tx_buf)
 		return -ENOMEM;
 	sm->at_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_AT_MAX + 8,
 				     GFP_KERNEL);
@@ -4091,10 +4202,33 @@ static int s5300_probe(struct platform_device *pdev)
 	 * that arrives before the CP is ONLINE (netdev not yet registered) is
 	 * a no-op -- it is safe to arm them here.
 	 */
+	/*
+	 * The GNSS codeload, exposed as /dev/gnss_boot0 -- channel 0xf0 for the
+	 * command train that starts the receiver, plus IOCTL_LOAD_GNSS_IMAGE to
+	 * stage the image it refers to.  Same division of labour as
+	 * /dev/umts_boot0 and cbd.  Created up front; the channel only carries
+	 * traffic once the CP is up.
+	 */
+	if (sm->ipc_size < S5300_GNSS_FW_OFFSET + S5300_GNSS_FW_SIZE) {
+		dev_err(dev, "ipc region too small for the GNSS window\n");
+		ret = -EINVAL;
+		goto err_oem;
+	}
+
+	sm->gnss.miscdev.minor = MISC_DYNAMIC_MINOR;
+	sm->gnss.miscdev.name = "gnss_boot0";
+	sm->gnss.miscdev.fops = &s5300_gnss_fops;
+	sm->gnss.miscdev.parent = dev;
+	ret = misc_register(&sm->gnss.miscdev);
+	if (ret) {
+		dev_err(dev, "misc_register(gnss_boot0): %d\n", ret);
+		goto err_oem;
+	}
+
 	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
 	if (ret) {
 		dev_err(dev, "register DL ISR: %d\n", ret);
-		goto err_oem;
+		goto err_gnss;
 	}
 
 	/*
@@ -4110,6 +4244,8 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_gnss:
+	misc_deregister(&sm->gnss.miscdev);
 err_oem:
 	misc_deregister(&sm->oem.miscdev);
 err_rfs:
@@ -4194,6 +4330,8 @@ static void s5300_remove(struct platform_device *pdev)
 	cancel_work_sync(&sm->ports_work);
 	if (sm->ports_up)
 		s5300_unregister_modem_ports(sm);
+	misc_deregister(&sm->gnss.miscdev);
+	skb_queue_purge(&sm->gnss.rxq);
 	misc_deregister(&sm->oem.miscdev);
 	skb_queue_purge(&sm->oem.rxq);
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)

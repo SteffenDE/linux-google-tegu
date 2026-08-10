@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/nvmem/maxim,max77779sp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Maxim MAX77779 battery-backed scratchpad
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  The MAX77779 PMIC integrates a battery-backed scratchpad that is reachable as
+  an independent I2C device (default address 0x60). Its contents survive a
+  reset, and a power cut, for as long as the battery stays connected, and the
+  bootloader uses the start of it to exchange the reboot mode and reason with
+  the kernel. This binding describes the scratchpad function only. Four
+  256-byte pages exist; the first, which is the one shared with the bootloader,
+  is what the driver exposes.
+
+allOf:
+  - $ref: nvmem.yaml#
+
+properties:
+  compatible:
+    const: maxim,max77779sp
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        nvmem@60 {
+            compatible = "maxim,max77779sp";
+            reg = <0x60>;
+
+            nvmem-layout {
+                compatible = "fixed-layout";
+                #address-cells = <1>;
+                #size-cells = <1>;
+
+                reboot-mode@0 {
+                    reg = <0x0 0x4>;
+                };
+            };
+        };
+    };

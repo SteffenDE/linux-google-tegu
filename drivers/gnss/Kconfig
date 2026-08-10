@@ -54,6 +54,21 @@ config GNSS_UBX_SERIAL
 
 	  If unsure, say N.
 
+config GNSS_KEPLER
+	tristate "Samsung KEPLER GNSS receiver support"
+	depends on SPI
+	depends on OF || COMPILE_TEST
+	help
+	  Say Y here if you have a Samsung KEPLER GNSS receiver, as integrated
+	  alongside the Exynos baseband on Google Tensor SoCs. Its firmware is
+	  started by the baseband; this driver is only the SPI transport that
+	  carries the receiver's stream to user space.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called gnss-kepler.
+
+	  If unsure, say N.
+
 config GNSS_USB
 	tristate "USB GNSS receiver support"
 	depends on USB

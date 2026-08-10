@@ -988,11 +988,7 @@
 	status = "okay";
 };
 
-/*
- * USI3_HSI0 in SPI mode: the bus the KEPLER GNSS receiver hangs off.  Enabled
- * ahead of the receiver itself so the controller can be proven on its own --
- * the device node and its two-wire handshake GPIOs follow with the driver.
- */
+/* USI3_HSI0 in SPI mode: the bus the KEPLER GNSS receiver hangs off. */
 &usi3_hsi0 {
 	samsung,mode = <USI_MODE_SPI>;
 	status = "okay";
@@ -1000,6 +996,28 @@
 
 &spi_21 {
 	status = "okay";
+
+	/*
+	 * Source: research/dumped.dts -- gnss@0 under spi@111E0000
+	 * (spi-max-frequency 0x2faf08), with the handshake lines from the
+	 * gnssif node (gpio_gnss2ap_spi gpa5-4, gpio_ap2gnss_spi gpp2-3) and
+	 * their pin configuration from the gnss_spi_irq and gnss_spi_int
+	 * pinctrl groups.
+	 *
+	 * Both lines are active high here even though the downstream cells set
+	 * the active-low flag: downstream never consults it, reading the line
+	 * with raw gpio_get_value() and requesting IRQF_TRIGGER_HIGH, so
+	 * active high is what reproduces the behaviour the hardware has.
+	 * gnss2ap idles low, which the downstream pinctrl agrees with -- it
+	 * gives that pin a pull-down.
+	 */
+	gnss@0 {
+		compatible = "samsung,kepler";
+		reg = <0>;
+		spi-max-frequency = <3125000>;
+		gnss2ap-gpios = <&gpa5 4 GPIO_ACTIVE_HIGH>;
+		ap2gnss-gpios = <&gpp2 3 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &spi_20 {

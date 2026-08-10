@@ -189,6 +189,21 @@ config NVMEM_MAX77759
 	  This driver can also be built as a module. If so, the module
 	  will be called nvmem-max77759.
 
+config NVMEM_MAX77779
+	tristate "Maxim Integrated MAX77779 scratchpad NVMEM Support"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y here to include support for the battery-backed scratchpad in
+	  Maxim Integrated MAX77779 charging PMICs, as found on the Google
+	  Pixel 9 series. It provides 256 bytes of storage that survives a
+	  reset, and a power cut, while the battery stays connected, and the
+	  bootloader uses the start of it to exchange the reboot mode and
+	  reason with the kernel.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called nvmem-max77779.
+
 config NVMEM_MESON_EFUSE
 	tristate "Amlogic Meson GX eFuse Support"
 	depends on (ARCH_MESON || COMPILE_TEST) && MESON_SM

@@ -238,6 +238,15 @@
 #define CLK_GOUT_HSI0_USI4_USI_CLK		13
 #define CLK_GOUT_HSI0_USI4_USI_PCLK		14
 
+/*
+ * CMU_HSI0 USI3 clocks (the KEPLER GNSS receiver's SPI bus, spi_21).  Same
+ * chain shape as USI2 and USI4.
+ */
+#define CLK_MOUT_HSI0_USI3			15
+#define CLK_DOUT_HSI0_USI3			16
+#define CLK_GOUT_HSI0_USI3_USI_CLK		17
+#define CLK_GOUT_HSI0_USI3_USI_PCLK		18
+
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1
 #define CLK_MOUT_DPUB_NOC_USER			2

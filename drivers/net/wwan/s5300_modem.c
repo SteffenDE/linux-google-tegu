@@ -249,7 +249,7 @@
  */
 #define S5300_OEM_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
 #define S5300_OEM_MAX			(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
-#define S5300_OEM_RXQ_MAX		64	/* bound the un-drained rx backlog */
+#define S5300_CHARDEV_RXQ_MAX		64	/* bound an un-drained rx backlog */
 #define S5300_OEM_MULTI_IDS		64
 /* The fragment countdown is one byte: at most 256 2036-byte payloads. */
 #define S5300_OEM_MSG_MAX		(256 * S5300_FMT_FRAME_PAYLOAD)
@@ -265,6 +265,23 @@
  */
 #define S5300_GNSS_CH			0xf0	/* gnss_boot (GNSS codeload) */
 #define S5300_GNSS_MAX			SZ_1K
+/*
+ * The GNSS receiver's own diagnostic stream, which it emits unprompted once
+ * running: BETP-framed (A0 A3 ... B0 B3), OSP-encoded binary diagnostics with
+ * embedded text -- chip calibration tables, state transitions, and its account
+ * of the configuration it has been given.  Without an io-device for it the CP
+ * still delivers every frame and the raw demux drops the lot, which is a lot of
+ * the receiver's side of the conversation thrown away unread.
+ */
+#define S5300_GNSS_DUMP_CH		0xef	/* gnss_dump */
+#define S5300_GNSS_DUMP_MAX		SZ_4K
+/*
+ * Tegu's downstream DT exempts gnss_dump from CPIF's normal 2048-skb limit. Keep
+ * a mainline safety bound, but use that normal limit to absorb hardware-observed
+ * bursts which overflow the generic 64-skb chardev queue despite an active
+ * userspace reader.
+ */
+#define S5300_GNSS_DUMP_RXQ_MAX		2048
 #define S5300_RFS_CH			0x29	/* EXYNOS_CH_ID_RFS_0 */
 #define S5300_RFS_MAX			SZ_4K
 
@@ -552,6 +569,7 @@ struct s5300_chardev {
 	u16			frame_seq;	/* per-channel link-header frame seq */
 	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
 	u32			tx_max;		/* max app message per write */
+	u32			rxq_max;	/* max queued app messages */
 	u8			*tx_buf;	/* header + one transport frame + pad */
 	struct sk_buff_head	rxq;		/* one skb per received app message */
 	struct sk_buff_head	rx_frag[S5300_OEM_MULTI_IDS];
@@ -610,6 +628,7 @@ struct s5300_modem {
 	 */
 	struct s5300_chardev	rfs;
 	struct s5300_chardev	gnss;
+	struct s5300_chardev	gnss_dump;
 
 	/* Vendor AT/router channel on the NORM_RAW ring (post-ONLINE). */
 	struct wwan_port	*at_port;
@@ -1606,6 +1625,8 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 		sm->oem.rx_frag_drop[i] = false;
 	}
 	sm->rfs.ch_seq = 0;
+	sm->gnss.ch_seq = 0;
+	sm->gnss_dump.ch_seq = 0;
 	sm->at_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
@@ -1694,6 +1715,12 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			/* Codeload replies; bound a corrupt CP length. */
 			if (payload && payload <= S5300_GNSS_MAX)
 				s5300_chardev_rx(&sm->gnss, buff,
+						 S5300_RAW_RXQ_SIZE, out, payload,
+						 S5300_HDR_CFG_SINGLE);
+		} else if (hdr[8] == S5300_GNSS_DUMP_CH) {
+			/* Receiver diagnostics; bound a corrupt CP length. */
+			if (payload && payload <= S5300_GNSS_DUMP_MAX)
+				s5300_chardev_rx(&sm->gnss_dump, buff,
 						 S5300_RAW_RXQ_SIZE, out, payload,
 						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
@@ -1802,7 +1829,7 @@ static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
 	u32 id, total;
 
 	if ((cfg & S5300_HDR_CFG_SINGLE) == S5300_HDR_CFG_SINGLE) {
-		if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+		if (skb_queue_len(&cd->rxq) >= cd->rxq_max) {
 			dev_warn_ratelimited(cd->sm->dev,
 					     "%s rxq full, dropping %u\n",
 					     cd->miscdev.name, payload);
@@ -1864,7 +1891,7 @@ static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
 	if (!last)
 		return;
 
-	if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+	if (skb_queue_len(&cd->rxq) >= cd->rxq_max) {
 		dev_warn_ratelimited(cd->sm->dev,
 				     "%s rxq full, dropping packet %u\n",
 				     cd->miscdev.name, id);
@@ -3871,6 +3898,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->oem.sm = sm;
 	sm->oem.channel = S5300_OEM_CH;
 	sm->oem.tx_max = S5300_OEM_MSG_MAX;
+	sm->oem.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	skb_queue_head_init(&sm->oem.rxq);
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
 		skb_queue_head_init(&sm->oem.rx_frag[i]);
@@ -3879,6 +3907,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->rfs.sm = sm;
 	sm->rfs.channel = S5300_RFS_CH;
 	sm->rfs.tx_max = S5300_RFS_MAX;
+	sm->rfs.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	sm->rfs.raw_ring = true;
 	skb_queue_head_init(&sm->rfs.rxq);
 	mutex_init(&sm->rfs.tx_msg_lock);
@@ -3886,10 +3915,19 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->gnss.sm = sm;
 	sm->gnss.channel = S5300_GNSS_CH;
 	sm->gnss.tx_max = S5300_GNSS_MAX;
+	sm->gnss.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	sm->gnss.raw_ring = true;
 	skb_queue_head_init(&sm->gnss.rxq);
 	mutex_init(&sm->gnss.tx_msg_lock);
 	init_waitqueue_head(&sm->gnss.read_wq);
+	sm->gnss_dump.sm = sm;
+	sm->gnss_dump.channel = S5300_GNSS_DUMP_CH;
+	sm->gnss_dump.tx_max = S5300_GNSS_DUMP_MAX;
+	sm->gnss_dump.rxq_max = S5300_GNSS_DUMP_RXQ_MAX;
+	sm->gnss_dump.raw_ring = true;
+	skb_queue_head_init(&sm->gnss_dump.rxq);
+	mutex_init(&sm->gnss_dump.tx_msg_lock);
+	init_waitqueue_head(&sm->gnss_dump.read_wq);
 	sm->cp_status = S5300_STATE_OFFLINE;
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
@@ -3908,6 +3946,11 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->gnss.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_GNSS_MAX + 8,
 				       GFP_KERNEL);
 	if (!sm->gnss.tx_buf)
+		return -ENOMEM;
+	sm->gnss_dump.tx_buf = devm_kmalloc(dev,
+					    S5300_HDR_SIZE + S5300_GNSS_DUMP_MAX + 8,
+					    GFP_KERNEL);
+	if (!sm->gnss_dump.tx_buf)
 		return -ENOMEM;
 	sm->at_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_AT_MAX + 8,
 				     GFP_KERNEL);
@@ -4225,10 +4268,27 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_oem;
 	}
 
+	/*
+	 * The receiver's diagnostic stream, exposed as /dev/gnss_dump0.  Plain
+	 * chardev: unlike gnss_boot0 there is no image to stage, so it needs no
+	 * ioctl.  Read-mostly in practice -- the receiver talks and the host
+	 * listens -- though the stock stack does write to it, so the channel is
+	 * left bidirectional like the others.
+	 */
+	sm->gnss_dump.miscdev.minor = MISC_DYNAMIC_MINOR;
+	sm->gnss_dump.miscdev.name = "gnss_dump0";
+	sm->gnss_dump.miscdev.fops = &s5300_chardev_fops;
+	sm->gnss_dump.miscdev.parent = dev;
+	ret = misc_register(&sm->gnss_dump.miscdev);
+	if (ret) {
+		dev_err(dev, "misc_register(gnss_dump0): %d\n", ret);
+		goto err_gnss;
+	}
+
 	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
 	if (ret) {
 		dev_err(dev, "register DL ISR: %d\n", ret);
-		goto err_gnss;
+		goto err_gnss_dump;
 	}
 
 	/*
@@ -4244,6 +4304,8 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_gnss_dump:
+	misc_deregister(&sm->gnss_dump.miscdev);
 err_gnss:
 	misc_deregister(&sm->gnss.miscdev);
 err_oem:
@@ -4330,6 +4392,8 @@ static void s5300_remove(struct platform_device *pdev)
 	cancel_work_sync(&sm->ports_work);
 	if (sm->ports_up)
 		s5300_unregister_modem_ports(sm);
+	misc_deregister(&sm->gnss_dump.miscdev);
+	skb_queue_purge(&sm->gnss_dump.rxq);
 	misc_deregister(&sm->gnss.miscdev);
 	skb_queue_purge(&sm->gnss.rxq);
 	misc_deregister(&sm->oem.miscdev);

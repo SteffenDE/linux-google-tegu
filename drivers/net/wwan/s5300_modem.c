@@ -265,6 +265,16 @@
  */
 #define S5300_GNSS_CH			0xf0	/* gnss_boot (GNSS codeload) */
 #define S5300_GNSS_MAX			SZ_1K
+/*
+ * The GNSS receiver's own diagnostic stream, which it emits unprompted once
+ * running: OSP-framed (A0 A3 ... B0 B3) and, inside that, plain text -- chip
+ * calibration tables, state transitions, and its account of the configuration
+ * it has been given.  Without an io-device for it the CP still delivers every
+ * frame and the raw demux drops the lot, which is a lot of the receiver's
+ * side of the conversation thrown away unread.
+ */
+#define S5300_GNSS_DUMP_CH		0xef	/* gnss_dump */
+#define S5300_GNSS_DUMP_MAX		SZ_4K
 #define S5300_RFS_CH			0x29	/* EXYNOS_CH_ID_RFS_0 */
 #define S5300_RFS_MAX			SZ_4K
 
@@ -610,6 +620,7 @@ struct s5300_modem {
 	 */
 	struct s5300_chardev	rfs;
 	struct s5300_chardev	gnss;
+	struct s5300_chardev	gnss_dump;
 
 	/* Vendor AT/router channel on the NORM_RAW ring (post-ONLINE). */
 	struct wwan_port	*at_port;
@@ -1694,6 +1705,12 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 			/* Codeload replies; bound a corrupt CP length. */
 			if (payload && payload <= S5300_GNSS_MAX)
 				s5300_chardev_rx(&sm->gnss, buff,
+						 S5300_RAW_RXQ_SIZE, out, payload,
+						 S5300_HDR_CFG_SINGLE);
+		} else if (hdr[8] == S5300_GNSS_DUMP_CH) {
+			/* Receiver diagnostics; bound a corrupt CP length. */
+			if (payload && payload <= S5300_GNSS_DUMP_MAX)
+				s5300_chardev_rx(&sm->gnss_dump, buff,
 						 S5300_RAW_RXQ_SIZE, out, payload,
 						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
@@ -3890,6 +3907,13 @@ static int s5300_probe(struct platform_device *pdev)
 	skb_queue_head_init(&sm->gnss.rxq);
 	mutex_init(&sm->gnss.tx_msg_lock);
 	init_waitqueue_head(&sm->gnss.read_wq);
+	sm->gnss_dump.sm = sm;
+	sm->gnss_dump.channel = S5300_GNSS_DUMP_CH;
+	sm->gnss_dump.tx_max = S5300_GNSS_DUMP_MAX;
+	sm->gnss_dump.raw_ring = true;
+	skb_queue_head_init(&sm->gnss_dump.rxq);
+	mutex_init(&sm->gnss_dump.tx_msg_lock);
+	init_waitqueue_head(&sm->gnss_dump.read_wq);
 	sm->cp_status = S5300_STATE_OFFLINE;
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
@@ -4225,10 +4249,27 @@ static int s5300_probe(struct platform_device *pdev)
 		goto err_oem;
 	}
 
+	/*
+	 * The receiver's diagnostic stream, exposed as /dev/gnss_dump0.  Plain
+	 * chardev: unlike gnss_boot0 there is no image to stage, so it needs no
+	 * ioctl.  Read-mostly in practice -- the receiver talks and the host
+	 * listens -- though the stock stack does write to it, so the channel is
+	 * left bidirectional like the others.
+	 */
+	sm->gnss_dump.miscdev.minor = MISC_DYNAMIC_MINOR;
+	sm->gnss_dump.miscdev.name = "gnss_dump0";
+	sm->gnss_dump.miscdev.fops = &s5300_chardev_fops;
+	sm->gnss_dump.miscdev.parent = dev;
+	ret = misc_register(&sm->gnss_dump.miscdev);
+	if (ret) {
+		dev_err(dev, "misc_register(gnss_dump0): %d\n", ret);
+		goto err_gnss;
+	}
+
 	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
 	if (ret) {
 		dev_err(dev, "register DL ISR: %d\n", ret);
-		goto err_gnss;
+		goto err_gnss_dump;
 	}
 
 	/*
@@ -4244,6 +4285,8 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
+err_gnss_dump:
+	misc_deregister(&sm->gnss_dump.miscdev);
 err_gnss:
 	misc_deregister(&sm->gnss.miscdev);
 err_oem:
@@ -4330,6 +4373,8 @@ static void s5300_remove(struct platform_device *pdev)
 	cancel_work_sync(&sm->ports_work);
 	if (sm->ports_up)
 		s5300_unregister_modem_ports(sm);
+	misc_deregister(&sm->gnss_dump.miscdev);
+	skb_queue_purge(&sm->gnss_dump.rxq);
 	misc_deregister(&sm->gnss.miscdev);
 	skb_queue_purge(&sm->gnss.rxq);
 	misc_deregister(&sm->oem.miscdev);

@@ -249,7 +249,7 @@
  */
 #define S5300_OEM_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
 #define S5300_OEM_MAX			(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
-#define S5300_OEM_RXQ_MAX		64	/* bound the un-drained rx backlog */
+#define S5300_CHARDEV_RXQ_MAX		64	/* bound an un-drained rx backlog */
 #define S5300_OEM_MULTI_IDS		64
 /* The fragment countdown is one byte: at most 256 2036-byte payloads. */
 #define S5300_OEM_MSG_MAX		(256 * S5300_FMT_FRAME_PAYLOAD)
@@ -267,14 +267,21 @@
 #define S5300_GNSS_MAX			SZ_1K
 /*
  * The GNSS receiver's own diagnostic stream, which it emits unprompted once
- * running: OSP-framed (A0 A3 ... B0 B3) and, inside that, plain text -- chip
- * calibration tables, state transitions, and its account of the configuration
- * it has been given.  Without an io-device for it the CP still delivers every
- * frame and the raw demux drops the lot, which is a lot of the receiver's
- * side of the conversation thrown away unread.
+ * running: BETP-framed (A0 A3 ... B0 B3), OSP-encoded binary diagnostics with
+ * embedded text -- chip calibration tables, state transitions, and its account
+ * of the configuration it has been given.  Without an io-device for it the CP
+ * still delivers every frame and the raw demux drops the lot, which is a lot of
+ * the receiver's side of the conversation thrown away unread.
  */
 #define S5300_GNSS_DUMP_CH		0xef	/* gnss_dump */
 #define S5300_GNSS_DUMP_MAX		SZ_4K
+/*
+ * Tegu's downstream DT exempts gnss_dump from CPIF's normal 2048-skb limit. Keep
+ * a mainline safety bound, but use that normal limit to absorb hardware-observed
+ * bursts which overflow the generic 64-skb chardev queue despite an active
+ * userspace reader.
+ */
+#define S5300_GNSS_DUMP_RXQ_MAX		2048
 #define S5300_RFS_CH			0x29	/* EXYNOS_CH_ID_RFS_0 */
 #define S5300_RFS_MAX			SZ_4K
 
@@ -562,6 +569,7 @@ struct s5300_chardev {
 	u16			frame_seq;	/* per-channel link-header frame seq */
 	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
 	u32			tx_max;		/* max app message per write */
+	u32			rxq_max;	/* max queued app messages */
 	u8			*tx_buf;	/* header + one transport frame + pad */
 	struct sk_buff_head	rxq;		/* one skb per received app message */
 	struct sk_buff_head	rx_frag[S5300_OEM_MULTI_IDS];
@@ -1821,7 +1829,7 @@ static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
 	u32 id, total;
 
 	if ((cfg & S5300_HDR_CFG_SINGLE) == S5300_HDR_CFG_SINGLE) {
-		if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+		if (skb_queue_len(&cd->rxq) >= cd->rxq_max) {
 			dev_warn_ratelimited(cd->sm->dev,
 					     "%s rxq full, dropping %u\n",
 					     cd->miscdev.name, payload);
@@ -1883,7 +1891,7 @@ static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
 	if (!last)
 		return;
 
-	if (skb_queue_len(&cd->rxq) >= S5300_OEM_RXQ_MAX) {
+	if (skb_queue_len(&cd->rxq) >= cd->rxq_max) {
 		dev_warn_ratelimited(cd->sm->dev,
 				     "%s rxq full, dropping packet %u\n",
 				     cd->miscdev.name, id);
@@ -3890,6 +3898,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->oem.sm = sm;
 	sm->oem.channel = S5300_OEM_CH;
 	sm->oem.tx_max = S5300_OEM_MSG_MAX;
+	sm->oem.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	skb_queue_head_init(&sm->oem.rxq);
 	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
 		skb_queue_head_init(&sm->oem.rx_frag[i]);
@@ -3898,6 +3907,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->rfs.sm = sm;
 	sm->rfs.channel = S5300_RFS_CH;
 	sm->rfs.tx_max = S5300_RFS_MAX;
+	sm->rfs.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	sm->rfs.raw_ring = true;
 	skb_queue_head_init(&sm->rfs.rxq);
 	mutex_init(&sm->rfs.tx_msg_lock);
@@ -3905,6 +3915,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->gnss.sm = sm;
 	sm->gnss.channel = S5300_GNSS_CH;
 	sm->gnss.tx_max = S5300_GNSS_MAX;
+	sm->gnss.rxq_max = S5300_CHARDEV_RXQ_MAX;
 	sm->gnss.raw_ring = true;
 	skb_queue_head_init(&sm->gnss.rxq);
 	mutex_init(&sm->gnss.tx_msg_lock);
@@ -3912,6 +3923,7 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->gnss_dump.sm = sm;
 	sm->gnss_dump.channel = S5300_GNSS_DUMP_CH;
 	sm->gnss_dump.tx_max = S5300_GNSS_DUMP_MAX;
+	sm->gnss_dump.rxq_max = S5300_GNSS_DUMP_RXQ_MAX;
 	sm->gnss_dump.raw_ring = true;
 	skb_queue_head_init(&sm->gnss_dump.rxq);
 	mutex_init(&sm->gnss_dump.tx_msg_lock);

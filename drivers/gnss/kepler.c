@@ -121,6 +121,23 @@ static void kepler_irq_disable_sync(struct kepler_gnss *kp)
 		disable_irq(kp->irq);
 }
 
+/*
+ * Drop the request line unless a write is parked on it.  The write path
+ * publishes its claim by setting tx_active and raising the line as one step
+ * under the same lock, so this cannot land between the two: otherwise a write
+ * starting here has its assertion undone and then waits out its whole timeout
+ * for an answer the receiver was never asked for.
+ */
+static void kepler_ap2gnss_idle(struct kepler_gnss *kp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kp->irq_lock, flags);
+	if (!atomic_read(&kp->tx_active))
+		gpiod_set_value(kp->ap2gnss, 0);
+	spin_unlock_irqrestore(&kp->irq_lock, flags);
+}
+
 static int kepler_spi_recv(struct kepler_gnss *kp, void *rx, unsigned int len)
 {
 	struct spi_transfer xfer = {
@@ -192,7 +209,7 @@ static irqreturn_t kepler_irq_thread(int irq, void *data)
 				 * scheduler stretch it defeats the point.
 				 */
 				udelay(100);
-				gpiod_set_value(kp->ap2gnss, 0);
+				kepler_ap2gnss_idle(kp);
 			}
 		}
 
@@ -229,8 +246,7 @@ static irqreturn_t kepler_irq_thread(int irq, void *data)
 		gnss_insert_raw(kp->gdev, kp->rx_buf, filled);
 
 	atomic_set(&kp->rx_active, 0);
-	if (!atomic_read(&kp->tx_active))
-		gpiod_set_value(kp->ap2gnss, 0);
+	kepler_ap2gnss_idle(kp);
 
 	kepler_irq_enable(kp);
 
@@ -272,18 +288,28 @@ static int kepler_write_raw(struct gnss_device *gdev,
 	}
 	memcpy(tx, buf, count);
 
-	atomic_set(&kp->tx_active, 1);
 	reinit_completion(&kp->ready);
 	atomic_set(&kp->wait_ready, 1);
 
 	pm_wakeup_dev_event(&kp->spi->dev, KEPLER_WAKE_MS, false);
 	kepler_irq_enable(kp);
 
-	/* Ask for the bus, then wait for the receiver to say it can take it. */
+	/*
+	 * Ask for the bus, then wait for the receiver to say it can take it.
+	 * Claiming the line and announcing the claim are one step, so the read
+	 * thread cannot drop it underneath us -- see kepler_ap2gnss_idle().
+	 */
+	spin_lock_irq(&kp->irq_lock);
+	atomic_set(&kp->tx_active, 1);
 	gpiod_set_value(kp->ap2gnss, 1);
+	spin_unlock_irq(&kp->irq_lock);
+
 	if (!wait_for_completion_timeout(&kp->ready,
 					 msecs_to_jiffies(KEPLER_RDY_TIMEOUT_MS))) {
-		dev_err(&kp->spi->dev, "timed out waiting for receiver ready\n");
+		dev_err(&kp->spi->dev,
+			"timed out waiting for receiver ready (ap2gnss %d, gnss2ap %d)\n",
+			gpiod_get_value(kp->ap2gnss),
+			gpiod_get_value(kp->gnss2ap));
 		ret = -ETIMEDOUT;
 		goto out_deassert;
 	}

@@ -1089,10 +1089,18 @@ static const struct samsung_mux_clock hsi0_mux_clks[] __initconst = {
 	    mout_hsi0_noc_user_p, PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER, 4, 1),
 	MUX(CLK_MOUT_HSI0_PERI_USER, "mout_hsi0_peri_user",
 	    mout_hsi0_peri_user_p, PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER, 4, 1),
-	MUX(CLK_MOUT_HSI0_USI2, "mout_hsi0_usi2",
-	    mout_hsi0_usi2_p, CLK_CON_MUX_MUX_CLK_HSI0_USI2, 0, 1),
-	MUX(CLK_MOUT_HSI0_USI4, "mout_hsi0_usi4",
-	    mout_hsi0_usi4_p, CLK_CON_MUX_MUX_CLK_HSI0_USI4, 0, 1),
+	/*
+	 * A USI mux picks between the 400 MHz peri clock and oscclk, and which
+	 * one serves depends on the rate the peripheral asks for, so these have
+	 * to be reparentable -- as their gs101 counterparts already are. The
+	 * divider below is only four bits, so off the peri parent it bottoms
+	 * out at 25 MHz, and the slow end of the range is reachable through
+	 * oscclk alone.
+	 */
+	nMUX(CLK_MOUT_HSI0_USI2, "mout_hsi0_usi2",
+	     mout_hsi0_usi2_p, CLK_CON_MUX_MUX_CLK_HSI0_USI2, 0, 1),
+	nMUX(CLK_MOUT_HSI0_USI4, "mout_hsi0_usi4",
+	     mout_hsi0_usi4_p, CLK_CON_MUX_MUX_CLK_HSI0_USI4, 0, 1),
 };
 
 static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
@@ -1101,10 +1109,17 @@ static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
 	    CLK_CON_DIV_DIV_CLK_HSI0_USB, 0, 6),
 	DIV(CLK_DOUT_HSI0_EUSB, "dout_hsi0_eusb", "mout_hsi0_noc_user",
 	    CLK_CON_DIV_DIV_CLK_HSI0_EUSB, 0, 2),
-	DIV(CLK_DOUT_HSI0_USI2, "dout_hsi0_usi2", "mout_hsi0_usi2",
-	    CLK_CON_DIV_DIV_CLK_HSI0_USI2, 0, 4),
-	DIV(CLK_DOUT_HSI0_USI4, "dout_hsi0_usi4", "mout_hsi0_usi4",
-	    CLK_CON_DIV_DIV_CLK_HSI0_USI4, 0, 4),
+	/*
+	 * The USI dividers are four bits, so from the 400 MHz peri parent they
+	 * bottom out at 25 MHz -- above what a slow peripheral can ask for, and
+	 * the SPI controller divides by only four on top. The mux beneath each
+	 * of them also offers oscclk, which reaches the low rates, so let a rate
+	 * request travel up and pick the parent that can serve it.
+	 */
+	DIV_F(CLK_DOUT_HSI0_USI2, "dout_hsi0_usi2", "mout_hsi0_usi2",
+	      CLK_CON_DIV_DIV_CLK_HSI0_USI2, 0, 4, CLK_SET_RATE_PARENT, 0),
+	DIV_F(CLK_DOUT_HSI0_USI4, "dout_hsi0_usi4", "mout_hsi0_usi4",
+	      CLK_CON_DIV_DIV_CLK_HSI0_USI4, 0, 4, CLK_SET_RATE_PARENT, 0),
 };
 
 static const struct samsung_gate_clock hsi0_gate_clks[] __initconst = {

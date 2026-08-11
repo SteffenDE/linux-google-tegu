@@ -1617,6 +1617,8 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 		sm->oem.rx_frag_drop[i] = false;
 	}
 	sm->rfs.ch_seq = 0;
+	sm->gnss.ch_seq = 0;
+	sm->gnss_dump.ch_seq = 0;
 	sm->at_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
@@ -3932,6 +3934,11 @@ static int s5300_probe(struct platform_device *pdev)
 	sm->gnss.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_GNSS_MAX + 8,
 				       GFP_KERNEL);
 	if (!sm->gnss.tx_buf)
+		return -ENOMEM;
+	sm->gnss_dump.tx_buf = devm_kmalloc(dev,
+					    S5300_HDR_SIZE + S5300_GNSS_DUMP_MAX + 8,
+					    GFP_KERNEL);
+	if (!sm->gnss_dump.tx_buf)
 		return -ENOMEM;
 	sm->at_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_AT_MAX + 8,
 				     GFP_KERNEL);

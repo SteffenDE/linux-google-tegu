@@ -569,6 +569,7 @@ struct s5300_chardev {
 	u16			frame_seq;	/* per-channel link-header frame seq */
 	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
 	u32			tx_max;		/* max app message per write */
+	u32			rx_max;		/* max accepted RX payload, 0 = ring-bounded */
 	u32			rxq_max;	/* max queued app messages */
 	u8			*tx_buf;	/* header + one transport frame + pad */
 	struct sk_buff_head	rxq;		/* one skb per received app message */
@@ -577,6 +578,32 @@ struct s5300_chardev {
 	bool			rx_frag_drop[S5300_OEM_MULTI_IDS];
 	struct mutex		tx_msg_lock;	/* serialise one app message's fragments */
 	wait_queue_head_t	read_wq;
+};
+
+/*
+ * The chardev-backed channels, in registration order.  One entry each in
+ * s5300_chardev_descs[] (defined with the fops it names) and in
+ * s5300_modem.cd[]; nothing else is per-channel, so exposing a new cpif channel
+ * is one table entry.  The ids exist only for the few call sites that mean a
+ * specific channel -- the ring drains find theirs by channel byte.
+ */
+enum s5300_chardev_id {
+	S5300_CD_RFS,
+	S5300_CD_OEM,
+	S5300_CD_GNSS,
+	S5300_CD_GNSS_DUMP,
+	S5300_CD_COUNT,
+};
+
+struct s5300_chardev_desc {
+	const char		*name;		/* /dev node, downstream's iod name */
+	u8			channel;	/* EXYNOS channel id */
+	bool			raw_ring;	/* true: NORM_RAW ring, false: FMT */
+	u32			tx_max;		/* max app message per write */
+	u32			frame_max;	/* max single link frame -> tx_buf size */
+	u32			rx_max;		/* max accepted RX payload, 0 = ring-bounded */
+	u32			rxq_max;	/* max queued app messages */
+	const struct file_operations *fops;
 };
 
 struct s5300_modem {
@@ -611,24 +638,20 @@ struct s5300_modem {
 	bool			ports_up;	/* ports registered (ports_work only) */
 
 	/*
-	 * OEM/GEMS channel (ch 0x82) on the FMT ring, exposed as /dev/umts_oem1.
-	 * fmt_tx_lock serialises the FMT txq's two post-ONLINE writers (SIT +
-	 * oem: their WWAN ops_lock / chardev writes are independent) and the
-	 * shared FMT ring; fmt_tx_wq wakes a blocked oem writer when the CP drains
-	 * the txq and frees ring space.
+	 * The chardev-backed channels, one per s5300_chardev_descs[] entry and
+	 * indexed by the same enum: the OEM/GEMS channel on the FMT ring, and
+	 * the RFS file channel plus the two GNSS channels on NORM_RAW.
 	 */
-	struct s5300_chardev	oem;
-	struct mutex		fmt_tx_lock;
-	wait_queue_head_t	fmt_tx_wq;
+	struct s5300_chardev	cd[S5300_CD_COUNT];
 
 	/*
-	 * RFS file channel (ch 0x29 on the NORM_RAW ring), exposed as
-	 * /dev/umts_rfs0 for the userspace server that answers the CP's NV and
-	 * carrier-config file requests (post-ONLINE).
+	 * fmt_tx_lock serialises the FMT txq's post-ONLINE writers (the SIT
+	 * ports and every FMT chardev: their WWAN ops_lock / chardev writes are
+	 * independent) and the shared FMT ring; fmt_tx_wq wakes a blocked
+	 * chardev writer when the CP drains the txq and frees ring space.
 	 */
-	struct s5300_chardev	rfs;
-	struct s5300_chardev	gnss;
-	struct s5300_chardev	gnss_dump;
+	struct mutex		fmt_tx_lock;
+	wait_queue_head_t	fmt_tx_wq;
 
 	/* Vendor AT/router channel on the NORM_RAW ring (post-ONLINE). */
 	struct wwan_port	*at_port;
@@ -1605,28 +1628,52 @@ static void s5300_init_boot_ring(struct s5300_modem *sm)
 }
 
 /*
+ * The chardev carrying channel @ch on @raw_ring, or NULL if that channel is not
+ * one of ours.  Called per received frame from the ring drains; the table is a
+ * handful of entries, so a scan beats keeping a channel-indexed map in step.
+ */
+static struct s5300_chardev *s5300_chardev_for(struct s5300_modem *sm, u8 ch,
+					       bool raw_ring)
+{
+	int i;
+
+	for (i = 0; i < S5300_CD_COUNT; i++) {
+		if (sm->cd[i].channel == ch && sm->cd[i].raw_ring == raw_ring)
+			return &sm->cd[i];
+	}
+	return NULL;
+}
+
+/*
  * Downstream init_legacy_link() from the PHONE_START handler: swap the boot
  * magic for the running magic once the CP asks to start IPC.
  */
 static void s5300_init_ipc_queues(struct s5300_modem *sm)
 {
 	u32 magic, access;
-	int i;
+	int i, j;
 
 	for (i = 0; i < S5300_SIT_PORT_COUNT; i++) {
 		sm->sit[i].ch_seq = 0;
 		sm->sit[i].frame_seq = 0;
 	}
-	sm->oem.frame_seq = 0;
-	sm->oem.tx_packet_id = 0;
-	for (i = 0; i < S5300_OEM_MULTI_IDS; i++) {
-		skb_queue_purge(&sm->oem.rx_frag[i]);
-		sm->oem.rx_frag_len[i] = 0;
-		sm->oem.rx_frag_drop[i] = false;
+	/*
+	 * The CP restarts its own link-header counters and drops any partial
+	 * multi-frame assembly, so every chardev starts from zero here.  (Before
+	 * the channels were table-driven this reset was per-channel and uneven:
+	 * the OEM channel kept a stale ch_seq across a CP restart and the others
+	 * kept a stale frame_seq.)
+	 */
+	for (i = 0; i < S5300_CD_COUNT; i++) {
+		sm->cd[i].ch_seq = 0;
+		sm->cd[i].frame_seq = 0;
+		sm->cd[i].tx_packet_id = 0;
+		for (j = 0; j < S5300_OEM_MULTI_IDS; j++) {
+			skb_queue_purge(&sm->cd[i].rx_frag[j]);
+			sm->cd[i].rx_frag_len[j] = 0;
+			sm->cd[i].rx_frag_drop[j] = false;
+		}
 	}
-	sm->rfs.ch_seq = 0;
-	sm->gnss.ch_seq = 0;
-	sm->gnss_dump.ch_seq = 0;
 	sm->at_ch_seq = 0;
 
 	writel(0, sm->ipc + S5300_IPC_MAGIC);
@@ -1678,6 +1725,7 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 		u8 frame[S5300_HDR_SIZE + 64];
 		u32 rest = s5300_circ_usage(S5300_RAW_RXQ_SIZE, in, out);
 		u32 flen, total, payload, body;
+		struct s5300_chardev *cd;
 		u8 hdr[S5300_HDR_SIZE];
 
 		if (rest < S5300_HDR_SIZE)
@@ -1704,23 +1752,16 @@ static void s5300_drain_rxq(struct s5300_modem *sm)
 		payload = flen - S5300_HDR_SIZE;
 		body = s5300_circ_new(S5300_RAW_RXQ_SIZE, out, S5300_HDR_SIZE);
 
-		if (hdr[8] == S5300_RFS_CH) {
-			/* Single-frame RE'd protocol; bound a corrupt CP length
-			 * (the chardev enqueues + wakes a reader). */
-			if (payload && payload <= S5300_RFS_MAX)
-				s5300_chardev_rx(&sm->rfs, buff,
-						 S5300_RAW_RXQ_SIZE, out, payload,
-						 S5300_HDR_CFG_SINGLE);
-		} else if (hdr[8] == S5300_GNSS_CH) {
-			/* Codeload replies; bound a corrupt CP length. */
-			if (payload && payload <= S5300_GNSS_MAX)
-				s5300_chardev_rx(&sm->gnss, buff,
-						 S5300_RAW_RXQ_SIZE, out, payload,
-						 S5300_HDR_CFG_SINGLE);
-		} else if (hdr[8] == S5300_GNSS_DUMP_CH) {
-			/* Receiver diagnostics; bound a corrupt CP length. */
-			if (payload && payload <= S5300_GNSS_DUMP_MAX)
-				s5300_chardev_rx(&sm->gnss_dump, buff,
+		cd = s5300_chardev_for(sm, hdr[8], true);
+		if (cd) {
+			/*
+			 * Every NORM_RAW chardev protocol is single-frame (RFS
+			 * request/response, GNSS codeload replies, receiver
+			 * diagnostics).  Bound a corrupt CP length against the
+			 * channel's own maximum, then enqueue + wake a reader.
+			 */
+			if (payload && payload <= cd->rx_max)
+				s5300_chardev_rx(cd, buff,
 						 S5300_RAW_RXQ_SIZE, out, payload,
 						 S5300_HDR_CFG_SINGLE);
 		} else if (hdr[8] == S5300_AT_CH) {
@@ -1954,6 +1995,7 @@ static void s5300_drain_fmt_rxq(struct s5300_modem *sm)
 	while (in != out) {
 		u32 rest = s5300_circ_usage(S5300_FMT_RXQ_SIZE, in, out);
 		u32 flen, total, payload;
+		struct s5300_chardev *cd;
 		u8 hdr[S5300_HDR_SIZE];
 		struct sk_buff *skb;
 
@@ -1979,12 +2021,18 @@ static void s5300_drain_fmt_rxq(struct s5300_modem *sm)
 		}
 		payload = flen - S5300_HDR_SIZE;
 
-		if (hdr[8] == S5300_OEM_CH) {
+		cd = s5300_chardev_for(sm, hdr[8], false);
+		if (cd) {
+			/*
+			 * FMT chardev traffic can be fragmented, so the frame's
+			 * config word goes to the reassembler; a corrupt length
+			 * is bounded there against the assembled maximum.
+			 */
 			if (payload)
-				s5300_chardev_rx(&sm->oem, buff,
+				s5300_chardev_rx(cd, buff,
 						 S5300_FMT_RXQ_SIZE, out, payload,
 						 hdr[4] | (hdr[5] << 8));
-			/* The CP opened an oem transaction and expects a (multi-frame)
+			/* The CP opened a transaction and expects a (multi-frame)
 			 * reply; keep the link up so it drains at L0. */
 			s5300_fmt_mark_busy(sm);
 		} else if (hdr[8] < S5300_SIT_CH_BASE ||
@@ -3149,6 +3197,118 @@ static const struct file_operations s5300_chardev_fops = {
 	.poll		= s5300_chardev_poll,
 };
 
+/*
+ * The cpif channels we expose as misc chardevs, named as downstream names its
+ * io-devices.  probe() walks this table to allocate, register and (on failure)
+ * unwind them, the ring drains match incoming frames against it, and nothing
+ * else is per-channel -- so a new channel is one entry here.
+ *
+ * @rx_max bounds a corrupt CP length on the single-frame NORM_RAW channels; the
+ * FMT ones reassemble instead and are bounded by S5300_OEM_MSG_MAX there.
+ * @frame_max sizes the TX staging buffer, and equals @tx_max except where the
+ * channel fragments a larger message across frames.
+ *
+ * The GNSS boot channel takes the richer fops: same read/write/poll, plus the
+ * ioctl that stages the receiver image the codeload train refers to.
+ */
+static const struct s5300_chardev_desc s5300_chardev_descs[S5300_CD_COUNT] = {
+	[S5300_CD_RFS] = {
+		.name		= "umts_rfs0",
+		.channel	= S5300_RFS_CH,
+		.raw_ring	= true,
+		.tx_max		= S5300_RFS_MAX,
+		.frame_max	= S5300_RFS_MAX,
+		.rx_max		= S5300_RFS_MAX,
+		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
+		.fops		= &s5300_chardev_fops,
+	},
+	[S5300_CD_OEM] = {
+		.name		= "umts_oem1",
+		.channel	= S5300_OEM_CH,
+		.tx_max		= S5300_OEM_MSG_MAX,
+		.frame_max	= S5300_OEM_MAX,
+		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
+		.fops		= &s5300_chardev_fops,
+	},
+	[S5300_CD_GNSS] = {
+		.name		= "gnss_boot0",
+		.channel	= S5300_GNSS_CH,
+		.raw_ring	= true,
+		.tx_max		= S5300_GNSS_MAX,
+		.frame_max	= S5300_GNSS_MAX,
+		.rx_max		= S5300_GNSS_MAX,
+		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
+		.fops		= &s5300_gnss_fops,
+	},
+	[S5300_CD_GNSS_DUMP] = {
+		.name		= "gnss_dump0",
+		.channel	= S5300_GNSS_DUMP_CH,
+		.raw_ring	= true,
+		.tx_max		= S5300_GNSS_DUMP_MAX,
+		.frame_max	= S5300_GNSS_DUMP_MAX,
+		.rx_max		= S5300_GNSS_DUMP_MAX,
+		.rxq_max	= S5300_GNSS_DUMP_RXQ_MAX,
+		.fops		= &s5300_chardev_fops,
+	},
+};
+
+/*
+ * Bring one table entry up: copy its description, init the RX/TX state and
+ * allocate the staging buffer.  Registration is separate (see probe): the
+ * chardev must be fully initialised before its node appears in /dev.
+ */
+static int s5300_chardev_init(struct s5300_modem *sm, enum s5300_chardev_id id)
+{
+	const struct s5300_chardev_desc *desc = &s5300_chardev_descs[id];
+	struct s5300_chardev *cd = &sm->cd[id];
+	int i;
+
+	/*
+	 * A NORM_RAW channel is bounded by its own @rx_max in the drain, so an
+	 * entry that leaves it zero would silently discard every frame.  Refuse
+	 * to probe instead of debugging that later.
+	 */
+	if (desc->raw_ring && !desc->rx_max) {
+		dev_err(sm->dev, "%s: raw channel without rx_max\n", desc->name);
+		return -EINVAL;
+	}
+
+	cd->sm = sm;
+	cd->channel = desc->channel;
+	cd->raw_ring = desc->raw_ring;
+	cd->tx_max = desc->tx_max;
+	cd->rx_max = desc->rx_max;
+	cd->rxq_max = desc->rxq_max;
+
+	skb_queue_head_init(&cd->rxq);
+	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+		skb_queue_head_init(&cd->rx_frag[i]);
+	mutex_init(&cd->tx_msg_lock);
+	init_waitqueue_head(&cd->read_wq);
+
+	cd->tx_buf = devm_kmalloc(sm->dev,
+				  S5300_HDR_SIZE + desc->frame_max + 8,
+				  GFP_KERNEL);
+	if (!cd->tx_buf)
+		return -ENOMEM;
+
+	cd->miscdev.minor = MISC_DYNAMIC_MINOR;
+	cd->miscdev.name = desc->name;
+	cd->miscdev.fops = desc->fops;
+	cd->miscdev.parent = sm->dev;
+	return 0;
+}
+
+/* Drop everything s5300_chardev_init() queued; the node is already gone. */
+static void s5300_chardev_purge(struct s5300_chardev *cd)
+{
+	int i;
+
+	skb_queue_purge(&cd->rxq);
+	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+		skb_queue_purge(&cd->rx_frag[i]);
+}
+
 /* --- shared NORM_RAW ring TX (RFS + AT + DM, post-ONLINE) ---------------- */
 
 /*
@@ -3895,39 +4055,11 @@ static int s5300_probe(struct platform_device *pdev)
 		sm->sit[i].sm = sm;
 		sm->sit[i].channel = S5300_SIT_CH_BASE + i;
 	}
-	sm->oem.sm = sm;
-	sm->oem.channel = S5300_OEM_CH;
-	sm->oem.tx_max = S5300_OEM_MSG_MAX;
-	sm->oem.rxq_max = S5300_CHARDEV_RXQ_MAX;
-	skb_queue_head_init(&sm->oem.rxq);
-	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
-		skb_queue_head_init(&sm->oem.rx_frag[i]);
-	mutex_init(&sm->oem.tx_msg_lock);
-	init_waitqueue_head(&sm->oem.read_wq);
-	sm->rfs.sm = sm;
-	sm->rfs.channel = S5300_RFS_CH;
-	sm->rfs.tx_max = S5300_RFS_MAX;
-	sm->rfs.rxq_max = S5300_CHARDEV_RXQ_MAX;
-	sm->rfs.raw_ring = true;
-	skb_queue_head_init(&sm->rfs.rxq);
-	mutex_init(&sm->rfs.tx_msg_lock);
-	init_waitqueue_head(&sm->rfs.read_wq);
-	sm->gnss.sm = sm;
-	sm->gnss.channel = S5300_GNSS_CH;
-	sm->gnss.tx_max = S5300_GNSS_MAX;
-	sm->gnss.rxq_max = S5300_CHARDEV_RXQ_MAX;
-	sm->gnss.raw_ring = true;
-	skb_queue_head_init(&sm->gnss.rxq);
-	mutex_init(&sm->gnss.tx_msg_lock);
-	init_waitqueue_head(&sm->gnss.read_wq);
-	sm->gnss_dump.sm = sm;
-	sm->gnss_dump.channel = S5300_GNSS_DUMP_CH;
-	sm->gnss_dump.tx_max = S5300_GNSS_DUMP_MAX;
-	sm->gnss_dump.rxq_max = S5300_GNSS_DUMP_RXQ_MAX;
-	sm->gnss_dump.raw_ring = true;
-	skb_queue_head_init(&sm->gnss_dump.rxq);
-	mutex_init(&sm->gnss_dump.tx_msg_lock);
-	init_waitqueue_head(&sm->gnss_dump.read_wq);
+	for (i = 0; i < S5300_CD_COUNT; i++) {
+		ret = s5300_chardev_init(sm, i);
+		if (ret)
+			return ret;
+	}
 	sm->cp_status = S5300_STATE_OFFLINE;
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
@@ -3939,27 +4071,9 @@ static int s5300_probe(struct platform_device *pdev)
 				      GFP_KERNEL);
 	if (!sm->fmt_tx_buf)
 		return -ENOMEM;
-	sm->rfs.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_RFS_MAX + 8,
-				      GFP_KERNEL);
-	if (!sm->rfs.tx_buf)
-		return -ENOMEM;
-	sm->gnss.tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_GNSS_MAX + 8,
-				       GFP_KERNEL);
-	if (!sm->gnss.tx_buf)
-		return -ENOMEM;
-	sm->gnss_dump.tx_buf = devm_kmalloc(dev,
-					    S5300_HDR_SIZE + S5300_GNSS_DUMP_MAX + 8,
-					    GFP_KERNEL);
-	if (!sm->gnss_dump.tx_buf)
-		return -ENOMEM;
 	sm->at_tx_buf = devm_kmalloc(dev, S5300_HDR_SIZE + S5300_AT_MAX + 8,
 				     GFP_KERNEL);
 	if (!sm->at_tx_buf)
-		return -ENOMEM;
-	sm->oem.tx_buf = devm_kmalloc(dev,
-				      S5300_HDR_SIZE + S5300_OEM_MAX + 8,
-				      GFP_KERNEL);
-	if (!sm->oem.tx_buf)
 		return -ENOMEM;
 	ret = kfifo_alloc(&sm->rx_fifo, S5300_RX_FIFO_SIZE, GFP_KERNEL);
 	if (ret)
@@ -4209,34 +4323,25 @@ static int s5300_probe(struct platform_device *pdev)
 	 * removes them when it leaves (crash/reset), so userspace only ever
 	 * sees ports that can carry traffic.
 	 *
-	 * The RFS file channel (ch 0x29 on the NORM_RAW ring), exposed as
-	 * /dev/umts_rfs0 for the userspace server that answers the CP's NV and
-	 * carrier-config file requests.  Created up front; only carries traffic
-	 * once ONLINE.
+	 * The chardev channels are the other way round: created up front so a
+	 * server can hold its node open and be draining before the CP reaches
+	 * ONLINE -- the CP's first request is lost if the reader arrives late.
+	 * They simply carry no traffic until then.  gnss_boot0 stages the
+	 * receiver image into the IPC window, so it needs that window whole.
 	 */
-	sm->rfs.miscdev.minor = MISC_DYNAMIC_MINOR;
-	sm->rfs.miscdev.name = "umts_rfs0";
-	sm->rfs.miscdev.fops = &s5300_chardev_fops;
-	sm->rfs.miscdev.parent = dev;
-	ret = misc_register(&sm->rfs.miscdev);
-	if (ret) {
-		dev_err(dev, "misc_register(rfs): %d\n", ret);
+	if (sm->ipc_size < S5300_GNSS_FW_OFFSET + S5300_GNSS_FW_SIZE) {
+		dev_err(dev, "ipc region too small for the GNSS window\n");
+		ret = -EINVAL;
 		goto err_boot0;
 	}
 
-	/*
-	 * The oem/GEMS channel (ch 0x82 on the FMT ring), exposed as /dev/umts_oem1
-	 * for the userspace daemon that answers the CP's UE-capability-config file
-	 * requests.  Created up front; only carries traffic once ONLINE.
-	 */
-	sm->oem.miscdev.minor = MISC_DYNAMIC_MINOR;
-	sm->oem.miscdev.name = "umts_oem1";
-	sm->oem.miscdev.fops = &s5300_chardev_fops;
-	sm->oem.miscdev.parent = dev;
-	ret = misc_register(&sm->oem.miscdev);
-	if (ret) {
-		dev_err(dev, "misc_register(oem): %d\n", ret);
-		goto err_rfs;
+	for (i = 0; i < S5300_CD_COUNT; i++) {
+		ret = misc_register(&sm->cd[i].miscdev);
+		if (ret) {
+			dev_err(dev, "misc_register(%s): %d\n",
+				sm->cd[i].miscdev.name, ret);
+			goto err_chardev;
+		}
 	}
 
 	/*
@@ -4245,50 +4350,10 @@ static int s5300_probe(struct platform_device *pdev)
 	 * that arrives before the CP is ONLINE (netdev not yet registered) is
 	 * a no-op -- it is safe to arm them here.
 	 */
-	/*
-	 * The GNSS codeload, exposed as /dev/gnss_boot0 -- channel 0xf0 for the
-	 * command train that starts the receiver, plus IOCTL_LOAD_GNSS_IMAGE to
-	 * stage the image it refers to.  Same division of labour as
-	 * /dev/umts_boot0 and cbd.  Created up front; the channel only carries
-	 * traffic once the CP is up.
-	 */
-	if (sm->ipc_size < S5300_GNSS_FW_OFFSET + S5300_GNSS_FW_SIZE) {
-		dev_err(dev, "ipc region too small for the GNSS window\n");
-		ret = -EINVAL;
-		goto err_oem;
-	}
-
-	sm->gnss.miscdev.minor = MISC_DYNAMIC_MINOR;
-	sm->gnss.miscdev.name = "gnss_boot0";
-	sm->gnss.miscdev.fops = &s5300_gnss_fops;
-	sm->gnss.miscdev.parent = dev;
-	ret = misc_register(&sm->gnss.miscdev);
-	if (ret) {
-		dev_err(dev, "misc_register(gnss_boot0): %d\n", ret);
-		goto err_oem;
-	}
-
-	/*
-	 * The receiver's diagnostic stream, exposed as /dev/gnss_dump0.  Plain
-	 * chardev: unlike gnss_boot0 there is no image to stage, so it needs no
-	 * ioctl.  Read-mostly in practice -- the receiver talks and the host
-	 * listens -- though the stock stack does write to it, so the channel is
-	 * left bidirectional like the others.
-	 */
-	sm->gnss_dump.miscdev.minor = MISC_DYNAMIC_MINOR;
-	sm->gnss_dump.miscdev.name = "gnss_dump0";
-	sm->gnss_dump.miscdev.fops = &s5300_chardev_fops;
-	sm->gnss_dump.miscdev.parent = dev;
-	ret = misc_register(&sm->gnss_dump.miscdev);
-	if (ret) {
-		dev_err(dev, "misc_register(gnss_dump0): %d\n", ret);
-		goto err_gnss;
-	}
-
 	ret = zumapro_pcie_register_dl_isr(sm->rc_dev, s5300_dl_isr, sm);
 	if (ret) {
 		dev_err(dev, "register DL ISR: %d\n", ret);
-		goto err_gnss_dump;
+		goto err_chardev;
 	}
 
 	/*
@@ -4304,14 +4369,9 @@ static int s5300_probe(struct platform_device *pdev)
 	dev_info(dev, "ready: /dev/%s awaiting CP boot\n", sm->miscdev.name);
 	return 0;
 
-err_gnss_dump:
-	misc_deregister(&sm->gnss_dump.miscdev);
-err_gnss:
-	misc_deregister(&sm->gnss.miscdev);
-err_oem:
-	misc_deregister(&sm->oem.miscdev);
-err_rfs:
-	misc_deregister(&sm->rfs.miscdev);
+err_chardev:
+	while (--i >= 0)
+		misc_deregister(&sm->cd[i].miscdev);
 err_boot0:
 	misc_deregister(&sm->miscdev);
 err_cp2ap:
@@ -4392,16 +4452,10 @@ static void s5300_remove(struct platform_device *pdev)
 	cancel_work_sync(&sm->ports_work);
 	if (sm->ports_up)
 		s5300_unregister_modem_ports(sm);
-	misc_deregister(&sm->gnss_dump.miscdev);
-	skb_queue_purge(&sm->gnss_dump.rxq);
-	misc_deregister(&sm->gnss.miscdev);
-	skb_queue_purge(&sm->gnss.rxq);
-	misc_deregister(&sm->oem.miscdev);
-	skb_queue_purge(&sm->oem.rxq);
-	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
-		skb_queue_purge(&sm->oem.rx_frag[i]);
-	misc_deregister(&sm->rfs.miscdev);
-	skb_queue_purge(&sm->rfs.rxq);
+	for (i = S5300_CD_COUNT - 1; i >= 0; i--) {
+		misc_deregister(&sm->cd[i].miscdev);
+		s5300_chardev_purge(&sm->cd[i]);
+	}
 	pci_free_irq_vectors(sm->pdev);
 	pci_disable_device(sm->pdev);
 	pci_dev_put(sm->pdev);

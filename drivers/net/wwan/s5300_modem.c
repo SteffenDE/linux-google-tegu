@@ -247,12 +247,30 @@
  * large for the ring fall back to the downstream packet-ID/countdown format,
  * whose AP->CP acceptance is unproven (TRACE NEEDED: stock GEMS write sizes).
  */
-#define S5300_OEM_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
-#define S5300_OEM_MAX			(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
+#define S5300_OEM1_CH			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
+
+/*
+ * The two sibling OEM channels the CP also talks on, same transport and frame
+ * shape, different owners and payload schemas (downstream opens each from a
+ * different process):
+ *
+ *  - oem_ipc0 (0x81), downstream's vendor.google.radioext HAL: RF-coexistence
+ *    indications, e.g. the Bluetooth adaptive-frequency-hopping channel mask
+ *    the CP derives from what it is transmitting.  Observed traffic is
+ *    type-3 indications, which owe no reply -- exposed so the AP can act on
+ *    them, not because the CP is waiting.
+ *  - oem_ipc3 (0x84), downstream's shared_modem_platform: the GEMS "GIPC"
+ *    services, which carry the CP's own temperature sensors and its modem
+ *    statistics.  These ARE requests: downstream acks every one, and left
+ *    unacked the CP stops reporting after the first.
+ */
+#define S5300_OEM0_CH			0x81	/* EXYNOS_CH_ID_OEM_0 (oem_ipc0) */
+#define S5300_OEM3_CH			0x84	/* EXYNOS_CH_ID_OEM_0 + 3 (oem_ipc3) */
+#define S5300_FMT_SINGLE_MAX		(S5300_FMT_TXQ_SIZE - S5300_HDR_SIZE - 8)
 #define S5300_CHARDEV_RXQ_MAX		64	/* bound an un-drained rx backlog */
-#define S5300_OEM_MULTI_IDS		64
+#define S5300_CHARDEV_MULTI_IDS		64
 /* The fragment countdown is one byte: at most 256 2036-byte payloads. */
-#define S5300_OEM_MSG_MAX		(256 * S5300_FMT_FRAME_PAYLOAD)
+#define S5300_FMT_MSG_MAX		(256 * S5300_FMT_FRAME_PAYLOAD)
 /* FMT chardev backpressure: a full-ring send re-nudges the CP every poll tick
  * and blocks (per frame) up to the timeout before giving up. */
 #define S5300_FMT_TX_POLL_MS		20
@@ -573,9 +591,9 @@ struct s5300_chardev {
 	u32			rxq_max;	/* max queued app messages */
 	u8			*tx_buf;	/* header + one transport frame + pad */
 	struct sk_buff_head	rxq;		/* one skb per received app message */
-	struct sk_buff_head	rx_frag[S5300_OEM_MULTI_IDS];
-	u32			rx_frag_len[S5300_OEM_MULTI_IDS];
-	bool			rx_frag_drop[S5300_OEM_MULTI_IDS];
+	struct sk_buff_head	rx_frag[S5300_CHARDEV_MULTI_IDS];
+	u32			rx_frag_len[S5300_CHARDEV_MULTI_IDS];
+	bool			rx_frag_drop[S5300_CHARDEV_MULTI_IDS];
 	struct mutex		tx_msg_lock;	/* serialise one app message's fragments */
 	wait_queue_head_t	read_wq;
 };
@@ -589,7 +607,9 @@ struct s5300_chardev {
  */
 enum s5300_chardev_id {
 	S5300_CD_RFS,
-	S5300_CD_OEM,
+	S5300_CD_OEM0,
+	S5300_CD_OEM1,
+	S5300_CD_OEM3,
 	S5300_CD_GNSS,
 	S5300_CD_GNSS_DUMP,
 	S5300_CD_COUNT,
@@ -1668,7 +1688,7 @@ static void s5300_init_ipc_queues(struct s5300_modem *sm)
 		sm->cd[i].ch_seq = 0;
 		sm->cd[i].frame_seq = 0;
 		sm->cd[i].tx_packet_id = 0;
-		for (j = 0; j < S5300_OEM_MULTI_IDS; j++) {
+		for (j = 0; j < S5300_CHARDEV_MULTI_IDS; j++) {
 			skb_queue_purge(&sm->cd[i].rx_frag[j]);
 			sm->cd[i].rx_frag_len[j] = 0;
 			sm->cd[i].rx_frag_drop[j] = false;
@@ -1916,7 +1936,7 @@ static void s5300_chardev_rx(struct s5300_chardev *cd, void __iomem *buff,
 			s5300_circ_new(ringsize, out, S5300_HDR_SIZE), payload);
 
 	if (check_add_overflow(cd->rx_frag_len[id], payload, &total) ||
-	    total > S5300_OEM_MSG_MAX) {
+	    total > S5300_FMT_MSG_MAX) {
 		dev_warn_ratelimited(cd->sm->dev,
 				     "%s multi-frame message too large, dropping\n",
 				     cd->miscdev.name);
@@ -2987,7 +3007,7 @@ static int s5300_fmt_chardev_frame_tx(struct file *file, const u8 *data,
 	for (;;) {
 		ret = s5300_fmt_ring_tx(sm, cd->tx_buf, cd->channel,
 					&cd->frame_seq, &cd->ch_seq, cfg,
-					S5300_OEM_MAX, data, len);
+					S5300_FMT_SINGLE_MAX, data, len);
 		if (ret != -EBUSY)
 			return ret;
 		if (file->f_flags & O_NONBLOCK)
@@ -3014,8 +3034,8 @@ static int s5300_fmt_chardev_frame_tx(struct file *file, const u8 *data,
 
 /*
  * One write() is one app message.  NORM_RAW messages are one link frame; FMT
- * OEM messages go out as one oversized single frame while they fit the ring
- * (see the S5300_OEM_MAX comment) and fall back to downstream-compatible
+ * messages go out as one oversized single frame while they fit the ring
+ * (see the S5300_OEM1_CH comment) and fall back to downstream-compatible
  * 2036-byte fragments beyond that.  Ring backpressure blocks until the CP
  * drains each frame.  For multi-frame messages, a signal after the first
  * fragment cannot safely abort the syscall: userspace retry would resend from
@@ -3043,7 +3063,7 @@ static ssize_t s5300_chardev_write(struct file *file, const char __user *buf,
 		/* Prefer one oversized single frame: the CP demonstrably parses
 		 * those (hw-validated uecap replies), while its acceptance of
 		 * AP->CP multi-frame is unproven. */
-		fragment_count = count <= S5300_OEM_MAX ? 1 :
+		fragment_count = count <= S5300_FMT_SINGLE_MAX ? 1 :
 				 DIV_ROUND_UP(count, S5300_FMT_FRAME_PAYLOAD);
 		if (fragment_count > 1 && (file->f_flags & O_NONBLOCK))
 			return -EINVAL;
@@ -3204,7 +3224,7 @@ static const struct file_operations s5300_chardev_fops = {
  * else is per-channel -- so a new channel is one entry here.
  *
  * @rx_max bounds a corrupt CP length on the single-frame NORM_RAW channels; the
- * FMT ones reassemble instead and are bounded by S5300_OEM_MSG_MAX there.
+ * FMT ones reassemble instead and are bounded by S5300_FMT_MSG_MAX there.
  * @frame_max sizes the TX staging buffer, and equals @tx_max except where the
  * channel fragments a larger message across frames.
  *
@@ -3222,11 +3242,27 @@ static const struct s5300_chardev_desc s5300_chardev_descs[S5300_CD_COUNT] = {
 		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
 		.fops		= &s5300_chardev_fops,
 	},
-	[S5300_CD_OEM] = {
+	[S5300_CD_OEM0] = {
+		.name		= "umts_oem0",
+		.channel	= S5300_OEM0_CH,
+		.tx_max		= S5300_FMT_MSG_MAX,
+		.frame_max	= S5300_FMT_SINGLE_MAX,
+		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
+		.fops		= &s5300_chardev_fops,
+	},
+	[S5300_CD_OEM1] = {
 		.name		= "umts_oem1",
-		.channel	= S5300_OEM_CH,
-		.tx_max		= S5300_OEM_MSG_MAX,
-		.frame_max	= S5300_OEM_MAX,
+		.channel	= S5300_OEM1_CH,
+		.tx_max		= S5300_FMT_MSG_MAX,
+		.frame_max	= S5300_FMT_SINGLE_MAX,
+		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
+		.fops		= &s5300_chardev_fops,
+	},
+	[S5300_CD_OEM3] = {
+		.name		= "umts_oem3",
+		.channel	= S5300_OEM3_CH,
+		.tx_max		= S5300_FMT_MSG_MAX,
+		.frame_max	= S5300_FMT_SINGLE_MAX,
 		.rxq_max	= S5300_CHARDEV_RXQ_MAX,
 		.fops		= &s5300_chardev_fops,
 	},
@@ -3281,7 +3317,7 @@ static int s5300_chardev_init(struct s5300_modem *sm, enum s5300_chardev_id id)
 	cd->rxq_max = desc->rxq_max;
 
 	skb_queue_head_init(&cd->rxq);
-	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+	for (i = 0; i < S5300_CHARDEV_MULTI_IDS; i++)
 		skb_queue_head_init(&cd->rx_frag[i]);
 	mutex_init(&cd->tx_msg_lock);
 	init_waitqueue_head(&cd->read_wq);
@@ -3305,7 +3341,7 @@ static void s5300_chardev_purge(struct s5300_chardev *cd)
 	int i;
 
 	skb_queue_purge(&cd->rxq);
-	for (i = 0; i < S5300_OEM_MULTI_IDS; i++)
+	for (i = 0; i < S5300_CHARDEV_MULTI_IDS; i++)
 		skb_queue_purge(&cd->rx_frag[i]);
 }
 

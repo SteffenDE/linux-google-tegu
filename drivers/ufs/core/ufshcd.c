@@ -9775,7 +9775,16 @@ static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on)
 	if (ret)
 		return ret;
 
-	if (!ufshcd_is_clkscaling_supported(hba))
+	/*
+	 * The CPU latency vote is a 0 us system-wide constraint, so it must be
+	 * paired with something that takes it back down again.  Clock scaling
+	 * does that from ufshcd_devfreq_scale(); without it, the "clocks on"
+	 * vote below is only released when the clocks go off, i.e. by clock
+	 * gating.  With neither capability the vote would be taken at the first
+	 * resume and never released, pinning every CPU to its shallowest idle
+	 * state for as long as the system is awake.  Skip it in that case.
+	 */
+	if (!ufshcd_is_clkscaling_supported(hba) && ufshcd_is_clkgating_allowed(hba))
 		ufshcd_pm_qos_update(hba, on);
 out:
 	if (ret) {

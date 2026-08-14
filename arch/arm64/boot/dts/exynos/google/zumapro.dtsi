@@ -1453,31 +1453,30 @@
 
 		/*
 		 * GPU: Mali-G715 (Valhall CSF, arch 11.2, product tTUx), driven by
-		 * mainline panthor.  Source: downstream research/dumped_uart.dts:5592
-		 * (mali@1F000000) and docs/subsystems/gpu/reference/gpu.md.  Disabled here; enabled per
+		 * mainline panthor.  Register base, interrupts and power domains are
+		 * the downstream mali@1F000000 node.  Disabled here; enabled per
 		 * board in zumapro-tegu.dts once the CSF firmware blob is staged.
 		 *
-		 * Clocks are ACPM-backed (Route B).  The two GPU DVFS domains are
-		 * G3DL2 (ACPM id 8, downstream gpu0 = TOP_LEVEL) and G3D (id 7,
-		 * downstream gpu1 = SHADERS).  panthor's clk #0 ("core") is the
-		 * top-level clock, so core = G3DL2 (8) and stacks = G3D (7).
+		 * Clocks are ACPM-backed.  The GPU has two independent ACPM DVFS
+		 * domains, each with its own PLL and its own S2MPG15 rail: G3D
+		 * (ACPM id 7, PLL_G3D, the shader stacks) and G3DL2 (id 8,
+		 * PLL_G3D_L2, the top-level/L2 block).  Downstream drives them as a
+		 * paired ladder, and only the G3D column is unique per operating
+		 * point -- the G3DL2 column repeats (four shader points share L2
+		 * 900 MHz).  The OPP core keys on clock index 0, so index 0 must be
+		 * G3D; G3DL2 rides along as "coregroup".
 		 *
-		 * panthor requires an operating-points-v2 table to probe
-		 * (panthor_devfreq_init -> devm_pm_opp_of_add_table returns -ENODEV
-		 * without one), so gpu_opp_table below pins the core/G3DL2 clock at
-		 * its ACPM idle rate (160 MHz) for first light; the full DVFS ladder
-		 * and thermal come in a later phase.  No mali-supply: the S2MPG15 GPU
-		 * bucks are regulator-always-on and GPU voltage scales through ACPM
-		 * (gpu.md §9), so each OPP is frequency-only and ACPM applies the
-		 * matching voltage in firmware.  The s2mpu_s0_g3d bypass is handled
-		 * separately on the G3D power-on path (gpu.md §8).
+		 * No mali-supply: the S2MPG15 GPU bucks are regulator-always-on and
+		 * ACPM applies the ASV/ECT voltage for the frequency it is asked
+		 * for, so every OPP is frequency-only and the AP never programs a
+		 * GPU rail.
 		 */
 		gpu: gpu@1f000000 {
 			compatible = "google,zumapro-mali", "arm,mali-valhall-csf";
 			reg = <0x1f000000 0x480000>;
 			#cooling-cells = <2>;
-			clocks = <&acpm_ipc 8>, <&acpm_ipc 7>;
-			clock-names = "core", "stacks";
+			clocks = <&acpm_ipc 7>, <&acpm_ipc 8>;
+			clock-names = "core", "coregroup";
 			interrupts = <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 346 IRQ_TYPE_LEVEL_HIGH 0>;
@@ -1487,12 +1486,24 @@
 			power-domain-names = "top", "cores";
 			status = "disabled";
 
+			/*
+			 * The bottom two rows of the downstream 14-row DVFS
+			 * table (the part declares a 940 MHz shader maximum).
+			 * Deliberately two points, not the full ladder: panthor
+			 * scales clock index 0 only, so whether G3DL2 tracks the
+			 * G3D request is a property of the ACPM firmware and is
+			 * unproven.  TRACE NEEDED -- step to 302 MHz and read the
+			 * g3dl2 rate: 386 MHz means ACPM pairs the domains and
+			 * the rest of the ladder is safe to add; 160 MHz means it
+			 * does not, and the top-level block would be starved at
+			 * the upper rungs.  Both rows here are low enough to be
+			 * harmless either way.
+			 */
 			gpu_opp_table: opp-table {
 				compatible = "operating-points-v2";
 
-				opp-160000000 {
-					opp-hz = /bits/ 64 <160000000>;
-				};
+				opp-150000000 { opp-hz = /bits/ 64 <150000000>; }; /* L2 160 MHz */
+				opp-302000000 { opp-hz = /bits/ 64 <302000000>; }; /* L2 386 MHz */
 			};
 		};
 

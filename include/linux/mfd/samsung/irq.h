@@ -271,6 +271,28 @@ enum s2mpg11_irq {
 	S2MPG11_IRQ_NR,
 };
 
+/*
+ * The s2mpg14 signals its interrupts in band over I3C rather than on a wire.
+ * The APM reflects that into the vGPIO2AP combiner, which is what raises the
+ * AP interrupt; the source bits below say which block inside the PMIC asked.
+ * Only the sources mainline consumes are listed, as elsewhere for this chip.
+ */
+enum s2mpg14_common_irq {
+	/* Top-level (common) block, IBI0 */
+	S2MPG14_COMMON_IRQ_PMIC,
+};
+
+#define S2MPG14_COMMON_IRQ_PMIC_MASK	BIT(0)
+
+enum s2mpg14_irq {
+	/* PMIC INT2 */
+	S2MPG14_IRQ_RTCA0,
+
+	S2MPG14_IRQ_NR,
+};
+
+#define S2MPG14_IRQ_RTCA0_MASK		BIT(2)
+
 enum s2mps11_irq {
 	S2MPS11_IRQ_PWRONF,
 	S2MPS11_IRQ_PWRONR,

@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/mfd/samsung/core.h>
 #include <linux/mfd/samsung/rtc.h>
+#include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mps14.h>
 
 /*
@@ -254,6 +255,10 @@ static int s5m_check_pending_alarm_interrupt(struct s5m_rtc_info *info,
 		val &= S5M_ALARM0_STATUS;
 		break;
 	case S2MPG10:
+		ret = regmap_read(info->s5m87xx->regmap_pmic,
+				  S2MPG10_PMIC_STATUS2, &val);
+		val &= S2MPS_ALARM0_STATUS;
+		break;
 	case S2MPS15X:
 	case S2MPS14X:
 	case S2MPS13X:

@@ -6,19 +6,24 @@
 #include <linux/array_size.h>
 #include <linux/build_bug.h>
 #include <linux/dev_printk.h>
+#include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/mfd/samsung/core.h>
 #include <linux/mfd/samsung/irq.h>
 #include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mpg11.h>
+#include <linux/mfd/samsung/s2mpg14.h>
 #include <linux/mfd/samsung/s2mps11.h>
 #include <linux/mfd/samsung/s2mps14.h>
 #include <linux/mfd/samsung/s2mpu02.h>
 #include <linux/mfd/samsung/s2mpu05.h>
 #include <linux/mfd/samsung/s2mu005.h>
 #include <linux/mfd/samsung/s5m8767.h>
+#include <linux/mfd/syscon.h>
+#include <linux/of.h>
 #include <linux/regmap.h>
+#include <linux/slab.h>
 #include "sec-core.h"
 
 static const struct regmap_irq s2mpg10_irqs[] = {
@@ -417,6 +422,80 @@ static const struct regmap_irq_chip s5m8767_irq_chip = {
 	.ack_base = S5M8767_REG_INT1,
 };
 
+static const struct regmap_irq s2mpg14_irqs[] = {
+	REGMAP_IRQ_REG(S2MPG14_COMMON_IRQ_PMIC, 0, S2MPG14_COMMON_IRQ_PMIC_MASK),
+};
+
+static const struct regmap_irq s2mpg14_pmic_irqs[] = {
+	REGMAP_IRQ_REG(S2MPG14_IRQ_RTCA0, 1, S2MPG14_IRQ_RTCA0_MASK),
+};
+
+/*
+ * The s2mpg14 has no interrupt wire. It raises an I3C in-band interrupt, the
+ * APM latches that in its vGPIO-to-AP combiner, and the combiner drives the
+ * GIC SPI. That latch is level triggered and write-1-to-clear, so it has to be
+ * acknowledged before anything reads status, or the parent interrupt never
+ * deasserts.
+ *
+ * The combiner also mirrors the PMIC's IBI source byte into a monitor
+ * register, which is how the vendor driver decides who interrupted. We do not
+ * need it: the same source bits are in the PMIC's own IBI0 register, which the
+ * top-level regmap-irq chip below reads over ACPM anyway.
+ */
+#define S2MPG14_VGPIO2AP_INTC0_IPEND	0x290
+
+struct s2mpg14_irq_ack {
+	struct regmap *vgpio2ap;
+};
+
+static int s2mpg14_vgpio_ack(void *data)
+{
+	struct s2mpg14_irq_ack *ack = data;
+	unsigned int pend;
+
+	if (regmap_read(ack->vgpio2ap, S2MPG14_VGPIO2AP_INTC0_IPEND, &pend))
+		return 0;
+
+	if (pend)
+		regmap_write(ack->vgpio2ap, S2MPG14_VGPIO2AP_INTC0_IPEND, pend);
+
+	return 0;
+}
+
+/*
+ * Top-level chip. Only the main PMIC source is described: the neighbouring
+ * mask bit gates the power meter, and regmap-irq only ever touches the bits
+ * belonging to interrupts declared here, so leaving it out leaves the meter
+ * alone. Note the mask register does not mirror the status register on this
+ * chip -- IBIM1 bit 1 gates the meter, whose status bit lives in IBI1 -- so
+ * describing more sources here would need more than a bigger num_regs.
+ */
+static const struct regmap_irq_chip s2mpg14_irq_chip = {
+	.name = "s2mpg14",
+	.status_base = S2MPG14_COMMON_IBI0,
+	.mask_base = S2MPG14_COMMON_IBIM1,
+	.num_regs = 1,
+	.irqs = s2mpg14_irqs,
+	.num_irqs = ARRAY_SIZE(s2mpg14_irqs),
+};
+
+/*
+ * All five PMIC status registers are read even though only alarm 0 is
+ * described, because reading them is what clears them. A source this driver
+ * does not describe, left unmasked by the bootloader, would otherwise keep the
+ * PMIC asserting its IBI after the combiner latch was cleared, and the parent
+ * interrupt would never go quiet.
+ */
+static const struct regmap_irq_chip s2mpg14_irq_chip_pmic = {
+	.name = "s2mpg14-pmic",
+	.domain_suffix = "pmic",
+	.status_base = S2MPG14_PMIC_INT1,
+	.mask_base = S2MPG14_PMIC_INT1M,
+	.num_regs = 5,
+	.irqs = s2mpg14_pmic_irqs,
+	.num_irqs = ARRAY_SIZE(s2mpg14_pmic_irqs),
+};
+
 static struct regmap_irq_chip_data *
 s2mpg1x_add_chained_pmic(struct sec_pmic_dev *sec_pmic, int pirq,
 			 struct regmap_irq_chip_data *parent, const struct regmap_irq_chip *chip)
@@ -476,6 +555,53 @@ static struct regmap_irq_chip_data *sec_irq_init_s2mpg1x(struct sec_pmic_dev *se
 	return s2mpg1x_add_chained_pmic(sec_pmic, chained_pirq, irq_data, chained_irq_chip);
 }
 
+static struct regmap_irq_chip_data *sec_irq_init_s2mpg14(struct sec_pmic_dev *sec_pmic)
+{
+	struct device *dev = sec_pmic->dev;
+	struct regmap_irq_chip_data *irq_data;
+	struct regmap_irq_chip *irq_chip;
+	struct s2mpg14_irq_ack *ack;
+	struct regmap *regmap_common;
+	int ret;
+
+	ack = devm_kzalloc(dev, sizeof(*ack), GFP_KERNEL);
+	if (!ack)
+		return ERR_PTR(-ENOMEM);
+
+	ack->vgpio2ap = syscon_regmap_lookup_by_phandle(dev->of_node,
+						       "samsung,vgpio2ap-syscon");
+	if (IS_ERR(ack->vgpio2ap)) {
+		/*
+		 * Without the combiner there is no way to acknowledge the
+		 * interrupt, so run without one rather than wedge the parent.
+		 * Regulator and meter operation does not need it.
+		 */
+		dev_dbg(dev, "No vGPIO-to-AP combiner, interrupts unavailable\n");
+		return NULL;
+	}
+
+	regmap_common = dev_get_regmap(dev, "common");
+	if (!regmap_common)
+		return dev_err_ptr_probe(dev, -EINVAL, "No 'common' regmap %d\n",
+					 sec_pmic->device_type);
+
+	irq_chip = devm_kmemdup(dev, &s2mpg14_irq_chip, sizeof(*irq_chip), GFP_KERNEL);
+	if (!irq_chip)
+		return ERR_PTR(-ENOMEM);
+
+	irq_chip->handle_pre_irq = s2mpg14_vgpio_ack;
+	irq_chip->irq_drv_data = ack;
+
+	ret = devm_regmap_add_irq_chip(dev, regmap_common, sec_pmic->irq, IRQF_ONESHOT, 0,
+				       irq_chip, &irq_data);
+	if (ret)
+		return dev_err_ptr_probe(dev, ret, "Failed to add %s IRQ chip\n",
+					 irq_chip->name);
+
+	return s2mpg1x_add_chained_pmic(sec_pmic, S2MPG14_COMMON_IRQ_PMIC, irq_data,
+					&s2mpg14_irq_chip_pmic);
+}
+
 struct regmap_irq_chip_data *sec_irq_init(struct sec_pmic_dev *sec_pmic)
 {
 	struct regmap_irq_chip_data *sec_irq_chip_data;
@@ -495,11 +621,11 @@ struct regmap_irq_chip_data *sec_irq_init(struct sec_pmic_dev *sec_pmic)
 	case S2MPG11:
 		return sec_irq_init_s2mpg1x(sec_pmic);
 	case S2MPG14:
+		return sec_irq_init_s2mpg14(sec_pmic);
 	case S2MPG15:
 		/*
-		 * The s2mpg14/s2mpg15 interrupt arrives through the APM vGPIO
-		 * interrupt combiner, which has no mainline driver yet.
-		 * Regulator/meter-only operation does not need it.
+		 * The sub PMIC signals through the same combiner, on its own
+		 * source bit, but nothing mainline consumes its interrupts.
 		 */
 		return NULL;
 	case S2MPS11X:

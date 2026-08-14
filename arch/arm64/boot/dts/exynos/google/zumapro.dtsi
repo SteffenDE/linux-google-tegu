@@ -414,14 +414,26 @@
 		 * live at all times because pd_g3d is samsung,always-on, so
 		 * there is no collapsed-domain reading to guard against.
 		 *
-		 * No sustainable-power yet: unlike the CPU zones it has not been
-		 * measured.  Until it is, power_allocator estimates one from the
-		 * Energy Model, which only matters once the zone is at its trip.
+		 * sustainable-power is the measured full-tilt figure, matching
+		 * the top of the OPP table's own measured power (glmark2 pinned
+		 * at 940 MHz reached only 63 C, so the part sustains this
+		 * without approaching the trip -- like MID and LITTLE, this is a
+		 * feed-forward safety net rather than something that actuates).
+		 *
+		 * It has to be set explicitly, and not just for accuracy: with a
+		 * single passive trip the IPA gains come from
+		 * estimate_pid_constants() as sustainable_power over the control
+		 * temperature, so a small value truncates k_po and k_pu to ZERO
+		 * and the budget collapses to sustainable_power alone.  Letting
+		 * the kernel estimate it here produced 28 mW, which pinned the
+		 * GPU at cooling state 7 -- capped at 521 MHz -- while idling at
+		 * 48 C, 40 C below the trip.
 		 */
 		g3d-thermal {
 			polling-delay = <1000>;
 			polling-delay-passive = <25>;
 			thermal-sensors = <&tmu_sub 0>;
+			sustainable-power = <740>;
 
 			trips {
 				/* Always-on IPA, single passive trip; see big-thermal. */
@@ -1509,13 +1521,6 @@
 			#cooling-cells = <2>;
 			clocks = <&acpm_ipc 7>, <&acpm_ipc 8>;
 			clock-names = "core", "coregroup";
-			/*
-			 * Downstream gpu_power_coeff.  Feeds the Energy Model
-			 * that makes the devfreq cooling device a power actor,
-			 * which power_allocator requires before it will bind to
-			 * the GPU thermal zone at all.
-			 */
-			dynamic-power-coefficient = <625>;
 			interrupts = <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 346 IRQ_TYPE_LEVEL_HIGH 0>;
@@ -1534,14 +1539,23 @@
 			 * 160 MHz idle setting, so the pairing has to come from
 			 * here.
 			 *
-			 * opp-microvolt is NOT actuated: there is no mali-supply,
-			 * so the OPP core never programs a rail and ACPM keeps
-			 * owning GPU voltage.  It exists only so the Energy Model
-			 * can be built (P = C*V^2*f).  These are ESTIMATED, as the
-			 * real ASV-calibrated ladder lives in the ACPM fvmap; IPA's
-			 * feedback tolerates the approximation.  Replace with
-			 * measured opp-microwatt, which the EM prefers, once the
-			 * GPU rail has been sampled per operating point.
+			 * opp-microwatt is what the Energy Model is built from,
+			 * and these are MEASURED: mean ODPM S2S_VDD_G3D over a
+			 * 10 s glmark2 terrain run pinned at each rung, rounded
+			 * to 10 mW, about the noise floor of the reading.  Three
+			 * points came back 2-4% below the rung beneath them --
+			 * inside that noise -- and were raised one step to keep
+			 * the table increasing.
+			 *
+			 * Two known biases, both understating, which is the safe
+			 * direction for a thermal budget: ODPM does not meter the
+			 * L2 rail (S8S_VDD_G3D_L2 is not one of the 12 muxed
+			 * channels), and the figures include whatever the
+			 * compositor was doing at the time.
+			 *
+			 * This replaces a dynamic-power-coefficient plus invented
+			 * per-OPP voltages, which underestimated the bottom rung
+			 * by 4.7x -- 28 mW modelled against 135 mW measured.
 			 */
 			gpu_opp_table: opp-table {
 				compatible = "operating-points-v2";
@@ -1549,85 +1563,85 @@
 				opp-150000000 {
 					opp-hz = /bits/ 64 <150000000>,
 						 /bits/ 64 <160000000>;
-					opp-microvolt = <550000>;
+					opp-microwatt = <140000>;
 				};
 
 				opp-302000000 {
 					opp-hz = /bits/ 64 <302000000>,
 						 /bits/ 64 <386000000>;
-					opp-microvolt = <575000>;
+					opp-microwatt = <210000>;
 				};
 
 				opp-337000000 {
 					opp-hz = /bits/ 64 <337000000>,
 						 /bits/ 64 <430000000>;
-					opp-microvolt = <590000>;
+					opp-microwatt = <240000>;
 				};
 
 				opp-376000000 {
 					opp-hz = /bits/ 64 <376000000>,
 						 /bits/ 64 <531000000>;
-					opp-microvolt = <605000>;
+					opp-microwatt = <250000>;
 				};
 
 				opp-419000000 {
 					opp-hz = /bits/ 64 <419000000>,
 						 /bits/ 64 <531000000>;
-					opp-microvolt = <620000>;
+					opp-microwatt = <270000>;
 				};
 
 				opp-467000000 {
 					opp-hz = /bits/ 64 <467000000>,
 						 /bits/ 64 <659000000>;
-					opp-microvolt = <640000>;
+					opp-microwatt = <320000>;
 				};
 
 				opp-521000000 {
 					opp-hz = /bits/ 64 <521000000>,
 						 /bits/ 64 <659000000>;
-					opp-microvolt = <660000>;
+					opp-microwatt = <350000>;
 				};
 
 				opp-580000000 {
 					opp-hz = /bits/ 64 <580000000>,
 						 /bits/ 64 <749000000>;
-					opp-microvolt = <685000>;
+					opp-microwatt = <420000>;
 				};
 
 				opp-649000000 {
 					opp-hz = /bits/ 64 <649000000>,
 						 /bits/ 64 <749000000>;
-					opp-microvolt = <715000>;
+					opp-microwatt = <430000>;
 				};
 
 				opp-723000000 {
 					opp-hz = /bits/ 64 <723000000>,
 						 /bits/ 64 <900000000>;
-					opp-microvolt = <750000>;
+					opp-microwatt = <500000>;
 				};
 
 				opp-807000000 {
 					opp-hz = /bits/ 64 <807000000>,
 						 /bits/ 64 <900000000>;
-					opp-microvolt = <790000>;
+					opp-microwatt = <550000>;
 				};
 
 				opp-850000000 {
 					opp-hz = /bits/ 64 <850000000>,
 						 /bits/ 64 <900000000>;
-					opp-microvolt = <830000>;
+					opp-microwatt = <600000>;
 				};
 
 				opp-890000000 {
 					opp-hz = /bits/ 64 <890000000>,
 						 /bits/ 64 <900000000>;
-					opp-microvolt = <870000>;
+					opp-microwatt = <610000>;
 				};
 
 				opp-940000000 {
 					opp-hz = /bits/ 64 <940000000>,
 						 /bits/ 64 <950000000>;
-					opp-microvolt = <920000>;
+					opp-microwatt = <740000>;
 				};
 			};
 		};

@@ -1489,21 +1489,25 @@
 			/*
 			 * The bottom two rows of the downstream 14-row DVFS
 			 * table (the part declares a 940 MHz shader maximum).
-			 * Deliberately two points, not the full ladder: panthor
-			 * scales clock index 0 only, so whether G3DL2 tracks the
-			 * G3D request is a property of the ACPM firmware and is
-			 * unproven.  TRACE NEEDED -- step to 302 MHz and read the
-			 * g3dl2 rate: 386 MHz means ACPM pairs the domains and
-			 * the rest of the ladder is safe to add; 160 MHz means it
-			 * does not, and the top-level block would be starved at
-			 * the upper rungs.  Both rows here are low enough to be
-			 * harmless either way.
+			 * Each row carries both rates, G3D first and G3DL2
+			 * second, because ACPM moves only the domain it is asked
+			 * for: requesting 302 MHz on G3D leaves PLL_G3D_L2 at its
+			 * 160 MHz idle setting, so the pairing has to come from
+			 * here.  Deliberately two points rather than the whole
+			 * ladder until the pair has been seen to move together.
 			 */
 			gpu_opp_table: opp-table {
 				compatible = "operating-points-v2";
 
-				opp-150000000 { opp-hz = /bits/ 64 <150000000>; }; /* L2 160 MHz */
-				opp-302000000 { opp-hz = /bits/ 64 <302000000>; }; /* L2 386 MHz */
+				opp-150000000 {
+					opp-hz = /bits/ 64 <150000000>,
+						 /bits/ 64 <160000000>;
+				};
+
+				opp-302000000 {
+					opp-hz = /bits/ 64 <302000000>,
+						 /bits/ 64 <386000000>;
+				};
 			};
 		};
 

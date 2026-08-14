@@ -592,7 +592,14 @@
 &acpm_ipc {
 	pmic {
 		compatible = "samsung,s2mpg14-pmic";
+		/*
+		 * The PMIC has no interrupt wire: it raises an in-band I3C
+		 * interrupt which the APM forwards through the vGPIO-to-AP
+		 * combiner, and the combiner drives this GIC line.
+		 */
 		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH 0>;
+		samsung,vgpio2ap-syscon = <&sysreg_vgpio2ap>;
+		wakeup-source;
 
 		regulators {
 			s2mpg14_ldo4: ldo4m {

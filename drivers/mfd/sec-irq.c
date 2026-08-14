@@ -516,6 +516,21 @@ static struct regmap_irq_chip_data *sec_irq_init_s2mpg14(struct sec_pmic_dev *se
 		return dev_err_ptr_probe(dev, -EINVAL, "No 'common' regmap %d\n",
 					 sec_pmic->device_type);
 
+	/*
+	 * The meter raises an in-band interrupt of its own, gated by the bit
+	 * next to the PMIC's in IBIM1 -- but its status lives in IBI1, which
+	 * the chip below does not read. An interrupt from it could therefore
+	 * never be acknowledged, and the level-triggered parent would never go
+	 * quiet again. Nothing here consumes meter interrupts (ODPM is polled),
+	 * so gate them off rather than depend on the bootloader having masked
+	 * every source inside the meter. Metering itself is unaffected.
+	 */
+	ret = regmap_update_bits(regmap_common, S2MPG14_COMMON_IBIM1,
+				 S2MPG14_COMMON_IRQ_METER_MASK,
+				 S2MPG14_COMMON_IRQ_METER_MASK);
+	if (ret)
+		return dev_err_ptr_probe(dev, ret, "Failed to gate the meter interrupt\n");
+
 	irq_chip = devm_kmemdup(dev, &s2mpg14_irq_chip, sizeof(*irq_chip), GFP_KERNEL);
 	if (!irq_chip)
 		return ERR_PTR(-ENOMEM);

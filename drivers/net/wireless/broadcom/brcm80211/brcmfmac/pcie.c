@@ -4047,14 +4047,27 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	/*
-	 * With in-band DS the device may have micro-slept; wake it, release
-	 * device-wake, and stop acking new sleep requests so the D3 handshake
-	 * below is serviced from a known-awake state.
+	 * With in-band DS the device may have micro-slept; wake it and stop
+	 * acking new sleep requests so the D3 handshake below is serviced from
+	 * a known-awake state.  Device-wake is then held asserted for the whole
+	 * handshake and released only once the firmware has acked.
+	 *
+	 * Releasing it before HOST_D3_INFORM leaves the firmware doing work that
+	 * needs host memory with the line already down.  Host-sleep entry runs
+	 * pciedev_ds_enter_host_sleep_pend -> pciedev_notify_devpwrstchg ->
+	 * wlc_devpwrstchg_change -> wlc_bmac_enable_rx_hostmem_access ->
+	 * wlc_bmac_cmplt_pending_rxdma, which drains outstanding RX DMA into
+	 * host memory.  That drain timed out on a *host* address (firmware
+	 * console "AXI timeout", core 0x18139000, id 0x220022, high word
+	 * 0x80000000 -- with no SMMU fault and no AER, so it never reached the
+	 * host at all) and the firmware then halted in
+	 * wlc_bmac_check_dma_idle_status: "BAD: DIE as DMA didn't become idle".
+	 * Three times in six hours before this change; 17171 host-sleep entries
+	 * clean afterwards.
 	 */
 	if (brcmf_pcie_inband_ds(devinfo)) {
 		brcmf_pcie_set_skip_ds_ack(devinfo, true);
 		brcmf_pcie_inband_device_wake(devinfo, true, true);
-		brcmf_pcie_inband_device_wake(devinfo, false, false);
 	}
 
 	devinfo->mbdata_completed = false;
@@ -4062,6 +4075,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev, bool runtime)
 
 	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
 			   BRCMF_PCIE_MBDATA_TIMEOUT);
+
+	if (brcmf_pcie_inband_ds(devinfo))
+		brcmf_pcie_inband_device_wake(devinfo, false, false);
+
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
 		if (!runtime) {

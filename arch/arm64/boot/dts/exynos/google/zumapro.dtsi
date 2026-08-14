@@ -1526,14 +1526,13 @@
 			status = "disabled";
 
 			/*
-			 * The bottom two rows of the downstream 14-row DVFS
-			 * table (the part declares a 940 MHz shader maximum).
+			 * The downstream 14-row DVFS table, whose top row is
+			 * this part's declared 940 MHz shader maximum.
 			 * Each row carries both rates, G3D first and G3DL2
 			 * second, because ACPM moves only the domain it is asked
 			 * for: requesting 302 MHz on G3D leaves PLL_G3D_L2 at its
 			 * 160 MHz idle setting, so the pairing has to come from
-			 * here.  Deliberately two points rather than the whole
-			 * ladder until the pair has been seen to move together.
+			 * here.
 			 *
 			 * opp-microvolt is NOT actuated: there is no mali-supply,
 			 * so the OPP core never programs a rail and ACPM keeps
@@ -1557,6 +1556,78 @@
 					opp-hz = /bits/ 64 <302000000>,
 						 /bits/ 64 <386000000>;
 					opp-microvolt = <575000>;
+				};
+
+				opp-337000000 {
+					opp-hz = /bits/ 64 <337000000>,
+						 /bits/ 64 <430000000>;
+					opp-microvolt = <590000>;
+				};
+
+				opp-376000000 {
+					opp-hz = /bits/ 64 <376000000>,
+						 /bits/ 64 <531000000>;
+					opp-microvolt = <605000>;
+				};
+
+				opp-419000000 {
+					opp-hz = /bits/ 64 <419000000>,
+						 /bits/ 64 <531000000>;
+					opp-microvolt = <620000>;
+				};
+
+				opp-467000000 {
+					opp-hz = /bits/ 64 <467000000>,
+						 /bits/ 64 <659000000>;
+					opp-microvolt = <640000>;
+				};
+
+				opp-521000000 {
+					opp-hz = /bits/ 64 <521000000>,
+						 /bits/ 64 <659000000>;
+					opp-microvolt = <660000>;
+				};
+
+				opp-580000000 {
+					opp-hz = /bits/ 64 <580000000>,
+						 /bits/ 64 <749000000>;
+					opp-microvolt = <685000>;
+				};
+
+				opp-649000000 {
+					opp-hz = /bits/ 64 <649000000>,
+						 /bits/ 64 <749000000>;
+					opp-microvolt = <715000>;
+				};
+
+				opp-723000000 {
+					opp-hz = /bits/ 64 <723000000>,
+						 /bits/ 64 <900000000>;
+					opp-microvolt = <750000>;
+				};
+
+				opp-807000000 {
+					opp-hz = /bits/ 64 <807000000>,
+						 /bits/ 64 <900000000>;
+					opp-microvolt = <790000>;
+				};
+
+				opp-850000000 {
+					opp-hz = /bits/ 64 <850000000>,
+						 /bits/ 64 <900000000>;
+					opp-microvolt = <830000>;
+				};
+
+				opp-890000000 {
+					opp-hz = /bits/ 64 <890000000>,
+						 /bits/ 64 <900000000>;
+					opp-microvolt = <870000>;
+				};
+
+				opp-940000000 {
+					opp-hz = /bits/ 64 <940000000>,
+						 /bits/ 64 <950000000>;
+					opp-microvolt = <920000>;
 				};
 			};
 		};

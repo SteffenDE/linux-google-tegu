@@ -57,14 +57,16 @@ static const struct mfd_cell s2mpg11_devs[] = {
 
 /*
  * Regulators, the power meter and the RTC; clk/gpio cells can be added once
- * their drivers grow s2mpg14 support.  The RTC cell carries no alarm
- * resource: alarm 0 reaches the AP through the APM vGPIO interrupt combiner,
- * which has no mainline support yet, so the RTC is time-only for now.
+ * their drivers grow s2mpg14 support.
  */
+static const struct resource s2mpg14_rtc_resources[] = {
+	DEFINE_RES_IRQ_NAMED(S2MPG14_IRQ_RTCA0, "alarm"),
+};
+
 static const struct mfd_cell s2mpg14_devs[] = {
 	MFD_CELL_NAME("s2mpg14-regulator"),
 	MFD_CELL_OF("s2mpg14-meter", NULL, NULL, 0, 0, "samsung,s2mpg14-meter"),
-	MFD_CELL_NAME("s2mpg14-rtc"),
+	MFD_CELL_RES("s2mpg14-rtc", s2mpg14_rtc_resources),
 };
 
 /* Regulators and the read-only power meter; clk/gpio can follow. */

@@ -103,6 +103,44 @@ enum s2mpg10_rtc_reg {
 	S2MPG10_RTC_OSC_CTRL,
 };
 
+/*
+ * The S2MPG14 RTC block is register-compatible with the S2MPG10 for
+ * everything up to the oscillator control register.  The hardware block
+ * continues past it with nonce (0x1c..0x2b) and scratch (0x2c..0x30)
+ * registers, which mainline has no use for: the nonce only tells the
+ * downstream driver whether it has initialised the clock itself.
+ */
+enum s2mpg14_rtc_reg {
+	S2MPG14_RTC_CTRL,
+	S2MPG14_RTC_UPDATE,
+	S2MPG14_RTC_SMPL,
+	S2MPG14_RTC_WTSR,
+	S2MPG14_RTC_CAP_SEL,
+	S2MPG14_RTC_MSEC,
+	S2MPG14_RTC_SEC,
+	S2MPG14_RTC_MIN,
+	S2MPG14_RTC_HOUR,
+	S2MPG14_RTC_WEEK,
+	S2MPG14_RTC_DAY,
+	S2MPG14_RTC_MON,
+	S2MPG14_RTC_YEAR,
+	S2MPG14_RTC_A0SEC,
+	S2MPG14_RTC_A0MIN,
+	S2MPG14_RTC_A0HOUR,
+	S2MPG14_RTC_A0WEEK,
+	S2MPG14_RTC_A0DAY,
+	S2MPG14_RTC_A0MON,
+	S2MPG14_RTC_A0YEAR,
+	S2MPG14_RTC_A1SEC,
+	S2MPG14_RTC_A1MIN,
+	S2MPG14_RTC_A1HOUR,
+	S2MPG14_RTC_A1WEEK,
+	S2MPG14_RTC_A1DAY,
+	S2MPG14_RTC_A1MON,
+	S2MPG14_RTC_A1YEAR,
+	S2MPG14_RTC_OSC_CTRL,
+};
+
 #define RTC_I2C_ADDR		(0x0C >> 1)
 
 #define HOUR_12			(1 << 7)

@@ -373,7 +373,7 @@ static const struct regmap_config s2mpg11_regmap_config_meter = {
  * no access tables and no register cache, so every access becomes a real
  * ACPM transaction.  That trades a few IPC round trips for not having to
  * transcribe the full downstream register map while the chip support is
- * still partial; tighten this up together with interrupt/RTC/meter support.
+ * still partial; tighten this up together with interrupt support.
  */
 static const struct regmap_config s2mpg14_regmap_config_common = {
 	.name = "common",
@@ -387,6 +387,29 @@ static const struct regmap_config s2mpg14_regmap_config_pmic = {
 	.reg_bits = ACPM_ADDR_BITS,
 	.val_bits = 8,
 	.max_register = S2MPG14_PMIC_SW_RESET,
+};
+
+/*
+ * The RTC block has a small, stable layout, so describe it properly.  Don't
+ * cache it: the counter registers advance in hardware, and reading them is a
+ * two-step protocol (request an update through RTC_UPDATE, then read the
+ * shadow registers), so a cached value is never the time.
+ */
+static const struct regmap_range s2mpg14_rtc_registers[] = {
+	regmap_reg_range(0x00, 0x1b), /* Control, time/date, alarms, osc */
+};
+
+static const struct regmap_access_table s2mpg14_rtc_rd_table = {
+	.yes_ranges = s2mpg14_rtc_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_rtc_registers),
+};
+
+static const struct regmap_config s2mpg14_regmap_config_rtc = {
+	.name = "rtc",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG14_RTC_OSC_CTRL,
+	.rd_table = &s2mpg14_rtc_rd_table,
 };
 
 /*
@@ -671,6 +694,7 @@ static const struct sec_pmic_acpm_platform_data s2mpg14_data = {
 	.speedy_channel = 0,
 	.regmap_cfg_common = &s2mpg14_regmap_config_common,
 	.regmap_cfg_pmic = &s2mpg14_regmap_config_pmic,
+	.regmap_cfg_rtc = &s2mpg14_regmap_config_rtc,
 	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
 };
 

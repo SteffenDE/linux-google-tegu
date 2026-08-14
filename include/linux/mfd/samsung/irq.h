@@ -283,6 +283,8 @@ enum s2mpg14_common_irq {
 };
 
 #define S2MPG14_COMMON_IRQ_PMIC_MASK	BIT(0)
+/* Gates the power meter's own in-band interrupt, in IBIM1 alongside the above */
+#define S2MPG14_COMMON_IRQ_METER_MASK	BIT(1)
 
 enum s2mpg14_irq {
 	/* PMIC INT2 */

@@ -568,17 +568,18 @@ static struct regmap_irq_chip_data *sec_irq_init_s2mpg14(struct sec_pmic_dev *se
 	if (!ack)
 		return ERR_PTR(-ENOMEM);
 
+	/*
+	 * Not optional. The RTC cell carries an alarm IRQ resource, so coming
+	 * back without a domain would hand it interrupt 0 and fail its probe,
+	 * and -EPROBE_DEFER has to propagate rather than become permanent
+	 * silence. A node declaring an interrupt but no combiner to
+	 * acknowledge it at is malformed.
+	 */
 	ack->vgpio2ap = syscon_regmap_lookup_by_phandle(dev->of_node,
 						       "samsung,vgpio2ap-syscon");
-	if (IS_ERR(ack->vgpio2ap)) {
-		/*
-		 * Without the combiner there is no way to acknowledge the
-		 * interrupt, so run without one rather than wedge the parent.
-		 * Regulator and meter operation does not need it.
-		 */
-		dev_dbg(dev, "No vGPIO-to-AP combiner, interrupts unavailable\n");
-		return NULL;
-	}
+	if (IS_ERR(ack->vgpio2ap))
+		return dev_err_ptr_probe(dev, PTR_ERR(ack->vgpio2ap),
+					 "Failed to find the vGPIO-to-AP combiner\n");
 
 	regmap_common = dev_get_regmap(dev, "common");
 	if (!regmap_common)

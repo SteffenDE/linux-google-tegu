@@ -208,6 +208,8 @@ static const struct regmap_config s2mps14_rtc_regmap_config = {
 static void s5m8767_data_to_tm(u8 *data, struct rtc_time *tm,
 			       int rtc_24hr_mode)
 {
+	unsigned int wday;
+
 	tm->tm_sec = data[RTC_SEC] & 0x7f;
 	tm->tm_min = data[RTC_MIN] & 0x7f;
 	if (rtc_24hr_mode) {
@@ -218,7 +220,13 @@ static void s5m8767_data_to_tm(u8 *data, struct rtc_time *tm,
 			tm->tm_hour += 12;
 	}
 
-	tm->tm_wday = ffs(data[RTC_WEEKDAY] & 0x7f);
+	/*
+	 * The weekday register holds one bit per day, bit 0 being Sunday --
+	 * which is the encoding s5m8767_tm_to_data() writes. ffs() numbers
+	 * bits from 1, so bring the position back down to a tm_wday.
+	 */
+	wday = ffs(data[RTC_WEEKDAY] & 0x7f);
+	tm->tm_wday = wday ? wday - 1 : 0;
 	tm->tm_mday = data[RTC_DATE] & 0x1f;
 	tm->tm_mon = (data[RTC_MONTH] & 0x0f) - 1;
 	tm->tm_year = (data[RTC_YEAR1] & 0x7f) + 100;

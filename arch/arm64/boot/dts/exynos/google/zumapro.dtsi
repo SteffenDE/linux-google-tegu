@@ -1477,6 +1477,13 @@
 			#cooling-cells = <2>;
 			clocks = <&acpm_ipc 7>, <&acpm_ipc 8>;
 			clock-names = "core", "coregroup";
+			/*
+			 * Downstream gpu_power_coeff.  Feeds the Energy Model
+			 * that makes the devfreq cooling device a power actor,
+			 * which power_allocator requires before it will bind to
+			 * the GPU thermal zone at all.
+			 */
+			dynamic-power-coefficient = <625>;
 			interrupts = <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 346 IRQ_TYPE_LEVEL_HIGH 0>;
@@ -1495,6 +1502,15 @@
 			 * 160 MHz idle setting, so the pairing has to come from
 			 * here.  Deliberately two points rather than the whole
 			 * ladder until the pair has been seen to move together.
+			 *
+			 * opp-microvolt is NOT actuated: there is no mali-supply,
+			 * so the OPP core never programs a rail and ACPM keeps
+			 * owning GPU voltage.  It exists only so the Energy Model
+			 * can be built (P = C*V^2*f).  These are ESTIMATED, as the
+			 * real ASV-calibrated ladder lives in the ACPM fvmap; IPA's
+			 * feedback tolerates the approximation.  Replace with
+			 * measured opp-microwatt, which the EM prefers, once the
+			 * GPU rail has been sampled per operating point.
 			 */
 			gpu_opp_table: opp-table {
 				compatible = "operating-points-v2";
@@ -1502,11 +1518,13 @@
 				opp-150000000 {
 					opp-hz = /bits/ 64 <150000000>,
 						 /bits/ 64 <160000000>;
+					opp-microvolt = <550000>;
 				};
 
 				opp-302000000 {
 					opp-hz = /bits/ 64 <302000000>,
 						 /bits/ 64 <386000000>;
+					opp-microvolt = <575000>;
 				};
 			};
 		};

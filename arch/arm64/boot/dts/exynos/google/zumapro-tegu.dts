@@ -728,6 +728,29 @@
 			s2mpg15_ldo7: ldo7s {
 				regulator-name = "L7S_SENSORS";
 			};
+
+			/*
+			 * The under-display fingerprint sensor's 3.3 V supply.
+			 *
+			 * The PMIC table calls it "SPARE" and nothing in the
+			 * device tree consumes it, downstream included -- the
+			 * only thing that claims it is the Goodix overlay
+			 * zumapro-tegu-udfps.dtsi, whose entire content is the
+			 * goodixfp node, its IRQ and reset pins, and forcing
+			 * this rail always-on at 3.3 V.  So always-on here too,
+			 * rather than a consumer reference: there is no
+			 * mainline driver to hang one off, and the sensor is
+			 * driven from userspace over the Trusty TA.
+			 *
+			 * Enable-only, like the two rails above: the selector
+			 * already reads 3300 mV with the rail disabled, so
+			 * claiming a voltage constraint would only invite the
+			 * core to program one.
+			 */
+			s2mpg15_ldo15: ldo15s {
+				regulator-name = "L15S_SPARE";
+				regulator-always-on;
+			};
 		};
 
 		meter {

@@ -16,10 +16,14 @@
 
 #include <linux/backlight.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/gpio/consumer.h>
+#include <linux/kstrtox.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
+#include <linux/sysfs.h>
 
 #include <video/mipi_display.h>
 
@@ -41,12 +45,38 @@
 #define TG4C_BRIGHTNESS_MAX	3628
 #define TG4C_BRIGHTNESS_DEFAULT	1829
 
+/*
+ * LHBM (local high-brightness mode): the panel drives a fixed circular region
+ * -- 100 px radius, centred 540 px below the centre of the active area, i.e.
+ * about (540, 1752) -- at elevated brightness, so an under-display fingerprint
+ * sensor can see the finger.
+ *
+ * The region is driven white regardless of what is in the framebuffer beneath
+ * it: enabling LHBM over an all-red screen produces a white disc, not a
+ * brighter red one. Nothing has to be drawn there for it to work.
+ *
+ * DBV thresholds selecting the LHBM gamma set, from downstream
+ * tg4c_set_local_hbm_gamma() (LHBM_GAMMASET1..3).
+ */
+#define TG4C_LHBM_GAMMA_SET1	3628
+#define TG4C_LHBM_GAMMA_SET2	2774
+#define TG4C_LHBM_GAMMA_SET3	2186
+
 struct google_tg4c {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
 	struct drm_dsc_config dsc;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
+	/*
+	 * Serialises LHBM against the panel's own power transitions.
+	 * @lhbm_usable tracks display-on precisely: drm_panel's ->enabled is
+	 * cleared by the core only *after* ->disable returns, so it would still
+	 * read true while the display-off sequence is running.
+	 */
+	struct mutex lhbm_lock;
+	bool lhbm_usable;
+	bool lhbm_on;
 };
 
 enum google_tg4c_supply {
@@ -298,6 +328,11 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	if (ret < 0)
 		goto err;
 
+	/* Display is on: LHBM writes are safe from here until ->disable. */
+	mutex_lock(&ctx->lhbm_lock);
+	ctx->lhbm_usable = true;
+	mutex_unlock(&ctx->lhbm_lock);
+
 	return 0;
 err:
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
@@ -308,6 +343,17 @@ err:
 static int google_tg4c_disable(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
+
+	/*
+	 * Close the window before the display-off sequence starts, not after:
+	 * a DCS write to a panel on its way down gets no reply and stalls every
+	 * command-mode frame behind it. The panel forgets 0x87 along with the
+	 * rest of its state, so the cached flag goes too.
+	 */
+	mutex_lock(&ctx->lhbm_lock);
+	ctx->lhbm_usable = false;
+	ctx->lhbm_on = false;
+	mutex_unlock(&ctx->lhbm_lock);
 
 	return google_tg4c_off(ctx);
 }
@@ -407,6 +453,107 @@ static const struct drm_panel_funcs google_tg4c_panel_funcs = {
 	.disable = google_tg4c_disable,
 	.get_modes = google_tg4c_get_modes,
 };
+
+/*
+ * LHBM, transcribed from downstream tg4c_set_local_hbm_mode() and
+ * tg4c_set_local_hbm_gamma().
+ *
+ * Downstream also reprograms the per-channel LHBM brightness (0xD1) on every
+ * transition, picking an overdrive table from the current DBV and the reported
+ * grey level of the surrounding content. That is deliberately not done here:
+ * the values it starts from are the panel's own factory calibration, which
+ * downstream *reads back* with a DCS read of 0xD1 at init
+ * (tg4c_lhbm_brightness_init) before deriving the overdrive tables. Leaving
+ * 0xD1 alone therefore leaves the panel at its calibrated brightness, which is
+ * correct -- just not adaptive to the surround.
+ *
+ * Downstream force-disables LHBM whenever the refresh rate leaves 120 Hz
+ * (tg4c_change_frequency). This driver advertises 60 Hz as preferred and does
+ * no runtime switching, so a caller that wants LHBM has to have selected the
+ * 120 Hz mode. Nothing here enforces that -- drm_panel is not told the current
+ * mode -- so it is the caller's problem, and it is untested at 60 Hz.
+ */
+static int google_tg4c_set_lhbm(struct google_tg4c *ctx, bool on)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	u8 gamma_cmd[] = { 0x87, 0x00 };
+	u16 br;
+
+	/* CMD2 page 2, where 0x87 lives (as does the 0xD1 above). */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xF0, 0x55, 0xAA, 0x52, 0x08, 0x02);
+
+	if (!on) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x87, 0x00);
+		return dsi_ctx.accum_err;
+	}
+
+	br = backlight_get_brightness(ctx->panel.backlight);
+	if (br > TG4C_LHBM_GAMMA_SET1)
+		gamma_cmd[1] = 0x01;
+	else if (br > TG4C_LHBM_GAMMA_SET2)
+		gamma_cmd[1] = 0x02;
+	else if (br > TG4C_LHBM_GAMMA_SET3)
+		gamma_cmd[1] = 0x03;
+	else
+		gamma_cmd[1] = 0x04;
+
+	/*
+	 * 0x6F sets the byte offset for the *next* write only, so this pair
+	 * writes byte 7 of 0x87 (the gamma set) and the write after it writes
+	 * byte 0 (the enable). The gamma value is not a compile-time constant,
+	 * hence write_buffer rather than write_seq.
+	 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6F, 0x07);
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, gamma_cmd, sizeof(gamma_cmd));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x87, 0x05);
+
+	return dsi_ctx.accum_err;
+}
+
+static ssize_t local_hbm_mode_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct google_tg4c *ctx = dev_get_drvdata(dev);
+	bool on;
+
+	mutex_lock(&ctx->lhbm_lock);
+	on = ctx->lhbm_on;
+	mutex_unlock(&ctx->lhbm_lock);
+
+	return sysfs_emit(buf, "%d\n", on);
+}
+
+static ssize_t local_hbm_mode_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct google_tg4c *ctx = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ctx->lhbm_lock);
+	if (!ctx->lhbm_usable) {
+		ret = -ENODEV;
+	} else if (on != ctx->lhbm_on) {
+		ret = google_tg4c_set_lhbm(ctx, on);
+		if (!ret)
+			ctx->lhbm_on = on;
+	}
+	mutex_unlock(&ctx->lhbm_lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(local_hbm_mode);
+
+static struct attribute *google_tg4c_attrs[] = {
+	&dev_attr_local_hbm_mode.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(google_tg4c);
 
 /*
  * Brightness is a plain DCS set_display_brightness (0x51) write, transcribed
@@ -537,6 +684,10 @@ static int google_tg4c_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
+	ret = devm_mutex_init(dev, &ctx->lhbm_lock);
+	if (ret)
+		return ret;
+
 	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(google_tg4c_supplies),
 					    google_tg4c_supplies, &ctx->supplies);
 	if (ret < 0)
@@ -571,8 +722,9 @@ static int google_tg4c_probe(struct mipi_dsi_device *dsi)
 				     "Failed to create backlight\n");
 
 	/*
-	 * TODO: the downstream driver also implements LHBM/local HBM overdrive
-	 * (tg4c_set_local_hbm_*), HBM (tg4c_set_hbm_mode), AOD/low-power modes
+	 * TODO: the downstream driver also implements LHBM *overdrive* (the
+	 * 0xD1 reprogramming in tg4c_set_local_hbm_brightness; plain LHBM is
+	 * implemented here), HBM (tg4c_set_hbm_mode), AOD/low-power modes
 	 * (tg4c_lp_cmds, set_lp_mode), dynamic 60/120Hz switching
 	 * (tg4c_change_frequency), TE2, FFC retuning and DDIC id/panel-rev
 	 * read-back (tg4c_read_id / tg4c_get_panel_rev). None of that is
@@ -609,6 +761,13 @@ static struct mipi_dsi_driver google_tg4c_driver = {
 	.driver = {
 		.name = "panel-google-tg4c",
 		.of_match_table = google_tg4c_of_match,
+		/*
+		 * Exposes local_hbm_mode. A DRM connector property would be the
+		 * upstream shape for this; sysfs is a local interface until
+		 * there is one, and it keeps the name downstream userspace and
+		 * the fingerprint daemon already expect.
+		 */
+		.dev_groups = google_tg4c_groups,
 	},
 };
 module_mipi_dsi_driver(google_tg4c_driver);

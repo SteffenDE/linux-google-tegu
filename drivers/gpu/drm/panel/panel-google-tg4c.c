@@ -77,6 +77,7 @@ struct google_tg4c {
 	struct mutex lhbm_lock;
 	bool lhbm_usable;
 	bool lhbm_on;
+	unsigned int refresh_rate;
 };
 
 enum google_tg4c_supply {
@@ -257,7 +258,7 @@ static int google_tg4c_on(struct google_tg4c *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x91, 0x89, 0xA8, 0x00, 0x18, 0xC2, 0x00,
 				     0x02, 0x0E, 0x02, 0x4C, 0x00, 0x07, 0x04, 0x2D, 0x04, 0x3D,
 				     0x10, 0xF0);
-	/* 60Hz */
+	/* 60Hz -- see google_tg4c_set_refresh_rate() for the other value */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2F, 0x02);
 
 	/* FFC off, then FFC setting for MIPI 1102 Mbps */
@@ -331,6 +332,8 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	/* Display is on: LHBM writes are safe from here until ->disable. */
 	mutex_lock(&ctx->lhbm_lock);
 	ctx->lhbm_usable = true;
+	/* google_tg4c_on() ends with 0x2F 0x02, and this tracks it. */
+	ctx->refresh_rate = 60;
 	mutex_unlock(&ctx->lhbm_lock);
 
 	return 0;
@@ -353,6 +356,7 @@ static int google_tg4c_disable(struct drm_panel *panel)
 	mutex_lock(&ctx->lhbm_lock);
 	ctx->lhbm_usable = false;
 	ctx->lhbm_on = false;
+	ctx->refresh_rate = 0;
 	mutex_unlock(&ctx->lhbm_lock);
 
 	return google_tg4c_off(ctx);
@@ -510,6 +514,86 @@ static int google_tg4c_set_lhbm(struct google_tg4c *ctx, bool on)
 	return dsi_ctx.accum_err;
 }
 
+/*
+ * The DDIC's own refresh rate, which is not the same thing as the mode DECON
+ * drives. Downstream's tg4c_change_frequency() writes exactly this: 0x2F 0x00
+ * for 120Hz and 0x2F 0x02 for 60Hz, and it force-disables LHBM on any switch
+ * away from 120Hz -- so on this panel the two are coupled inside the DDIC.
+ *
+ * Our init sequence writes 0x2F 0x02, which pins the panel at 60Hz whatever
+ * mode is selected, and there is no mode_set-driven switching here yet. This
+ * attribute exists so that the coupling can be measured rather than assumed:
+ * the fingerprint sensor's anti-spoof stage rejects every capture taken at
+ * 60Hz, and whether that is because of this gate is exactly the open question.
+ *
+ * A DRM property driven from the mode is the right shape once the answer is
+ * known. Until then this is a bring-up knob and is documented as one.
+ */
+static int google_tg4c_set_refresh_rate(struct google_tg4c *ctx, unsigned int hz)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	u8 cmd[] = { 0x2F, 0x02 };
+
+	if (hz != 60 && hz != 120)
+		return -EINVAL;
+
+	/*
+	 * write_buffer rather than write_seq: the payload is not a compile-time
+	 * constant, and write_seq builds a static array from its arguments.
+	 */
+	if (hz == 120)
+		cmd[1] = 0x00;
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, cmd, sizeof(cmd));
+	if (dsi_ctx.accum_err)
+		return dsi_ctx.accum_err;
+
+	ctx->refresh_rate = hz;
+	return 0;
+}
+
+static ssize_t refresh_rate_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct google_tg4c *ctx = dev_get_drvdata(dev);
+	unsigned int hz;
+
+	mutex_lock(&ctx->lhbm_lock);
+	hz = ctx->refresh_rate;
+	mutex_unlock(&ctx->lhbm_lock);
+
+	return sysfs_emit(buf, "%u\n", hz);
+}
+
+static ssize_t refresh_rate_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct google_tg4c *ctx = dev_get_drvdata(dev);
+	unsigned int hz;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &hz);
+	if (ret)
+		return ret;
+
+	/*
+	 * Shares lhbm_lock rather than taking one of its own: the DDIC couples
+	 * the two, and downstream drops LHBM before leaving 120Hz. Serialising
+	 * them here keeps that invariant expressible.
+	 */
+	mutex_lock(&ctx->lhbm_lock);
+	if (!ctx->lhbm_usable)
+		ret = -ENODEV;
+	else if (ctx->lhbm_on && hz != 120)
+		ret = -EBUSY;
+	else
+		ret = google_tg4c_set_refresh_rate(ctx, hz);
+	mutex_unlock(&ctx->lhbm_lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(refresh_rate);
+
 static ssize_t local_hbm_mode_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
@@ -551,6 +635,7 @@ static DEVICE_ATTR_RW(local_hbm_mode);
 
 static struct attribute *google_tg4c_attrs[] = {
 	&dev_attr_local_hbm_mode.attr,
+	&dev_attr_refresh_rate.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(google_tg4c);

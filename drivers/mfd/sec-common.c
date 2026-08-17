@@ -57,8 +57,8 @@ static const struct mfd_cell s2mpg11_devs[] = {
 };
 
 /*
- * Regulators, the power meter and the RTC; clk/gpio cells can be added once
- * their drivers grow s2mpg14 support.
+ * Regulators, the power meter, the RTC and the GPIO controller; a clk cell can
+ * be added once that driver grows s2mpg14 support.
  */
 static const struct resource s2mpg14_rtc_resources[] = {
 	DEFINE_RES_IRQ_NAMED(S2MPG14_IRQ_RTCA0, "alarm"),
@@ -68,12 +68,14 @@ static const struct mfd_cell s2mpg14_devs[] = {
 	MFD_CELL_NAME("s2mpg14-regulator"),
 	MFD_CELL_OF("s2mpg14-meter", NULL, NULL, 0, 0, "samsung,s2mpg14-meter"),
 	MFD_CELL_RES("s2mpg14-rtc", s2mpg14_rtc_resources),
+	MFD_CELL_OF("s2mpg14-gpio", NULL, NULL, 0, 0, "samsung,s2mpg14-gpio"),
 };
 
-/* Regulators and the read-only power meter; clk/gpio can follow. */
+/* Regulators, the read-only power meter and the GPIO controller. */
 static const struct mfd_cell s2mpg15_devs[] = {
 	MFD_CELL_NAME("s2mpg15-regulator"),
 	MFD_CELL_OF("s2mpg15-meter", NULL, NULL, 0, 0, "samsung,s2mpg15-meter"),
+	MFD_CELL_OF("s2mpg15-gpio", NULL, NULL, 0, 0, "samsung,s2mpg15-gpio"),
 };
 
 static const struct resource s2mps11_rtc_resources[] = {

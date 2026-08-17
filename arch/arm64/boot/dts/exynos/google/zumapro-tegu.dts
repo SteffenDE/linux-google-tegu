@@ -2015,12 +2015,17 @@
 	};
 
 	/*
-	 * Sensor master clock outputs.  Function 2 is the CIS_CLK function;
-	 * downstream also carries an "off" state that drives the pin low
-	 * instead, which is how it stops the clock.  Source:
-	 * research/dumped.dts sensor-mclk1-fn (ultrawide, CIS_CLK0),
-	 * sensor-mclk2-fn (front, CIS_CLK1) and sensor-mclk4-fn (main,
-	 * CIS_CLK3).
+	 * Sensor master clock outputs, in both states: function 2 is the
+	 * CIS_CLK function, and the "off" state drives the pin low instead,
+	 * which is how the clock is stopped at the pad.  Source:
+	 * research/dumped.dts sensor-mclk1-fn/-out (ultrawide, CIS_CLK0),
+	 * sensor-mclk2-fn/-out (front, CIS_CLK1) and sensor-mclk4-fn/-out
+	 * (main, CIS_CLK3).
+	 *
+	 * Nothing references these yet -- there is no sensor node to hang
+	 * them off -- so no camera pin is muxed at boot.  The phase 1 script
+	 * selects them through pinctrl's debugfs; a sensor driver will carry
+	 * them as its "mclk_on"/"mclk_off" pinctrl states.
 	 */
 	cam_main_mclk: cam-main-mclk-pins {
 		samsung,pins = "gpp9-0";
@@ -2040,6 +2045,27 @@
 		samsung,pins = "gpp3-0";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	cam_main_mclk_off: cam-main-mclk-off-pins {
+		samsung,pins = "gpp9-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	cam_front_mclk_off: cam-front-mclk-off-pins {
+		samsung,pins = "gpp5-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	cam_uw_mclk_off: cam-uw-mclk-off-pins {
+		samsung,pins = "gpp3-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
 	};
 };

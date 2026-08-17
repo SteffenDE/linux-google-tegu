@@ -116,6 +116,35 @@ enum s2mpg15_pmic_reg {
 	S2MPG15_PMIC_BB_USONIC = 0xea,
 };
 
+/*
+ * GPIO registers (type 0x00c).  The S2MPG14's layout widened for ten pins:
+ * one more interrupt register, a second status register for pins 8 and 9, and
+ * ten control registers.
+ */
+enum s2mpg15_gpio_reg {
+	S2MPG15_GPIO_INT1 = 0x00,
+	S2MPG15_GPIO_INT2 = 0x01,
+	S2MPG15_GPIO_INT3 = 0x02,
+	S2MPG15_GPIO_INT1M = 0x03,
+	S2MPG15_GPIO_INT2M = 0x04,
+	S2MPG15_GPIO_INT3M = 0x05,
+	S2MPG15_GPIO_STATUS1 = 0x06,
+	S2MPG15_GPIO_STATUS2 = 0x07,
+	S2MPG15_GPIO0_SET = 0x08,
+	S2MPG15_GPIO0_MONSEL = 0x12,
+	S2MPG15_GPIO9_MONSEL = 0x1b,
+};
+
+#define S2MPG15_GPIO_NR		10
+
+/* Bits in a GPIOn_SET register; the same on both parts. */
+#define S2MPG1X_GPIO_SET_MODE		GENMASK(1, 0)
+#define S2MPG1X_GPIO_SET_DRV_STR	BIT(2)
+#define S2MPG1X_GPIO_SET_PULL_DOWN	BIT(3)
+#define S2MPG1X_GPIO_SET_PULL_UP	BIT(4)
+#define S2MPG1X_GPIO_SET_OUT		BIT(5)
+#define S2MPG1X_GPIO_SET_OEN		BIT(6)
+
 /* Regulator ids -- every rail; see the s2mpg14.h counterpart. */
 enum s2mpg15_regulators {
 	S2MPG15_LDO1,

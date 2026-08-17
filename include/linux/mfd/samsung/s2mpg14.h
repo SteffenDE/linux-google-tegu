@@ -137,6 +137,24 @@ enum s2mpg14_meter_reg {
 };
 
 /*
+ * GPIO registers (type 0x00c).  Six general-purpose pins with one control
+ * register each, a status register holding all six input levels, and an
+ * interrupt block.
+ */
+enum s2mpg14_gpio_reg {
+	S2MPG14_GPIO_INT1 = 0x00,
+	S2MPG14_GPIO_INT2 = 0x01,
+	S2MPG14_GPIO_INT1M = 0x02,
+	S2MPG14_GPIO_INT2M = 0x03,
+	S2MPG14_GPIO_STATUS = 0x04,
+	S2MPG14_GPIO0_SET = 0x05,
+	S2MPG14_GPIO0_MONSEL = 0x0b,
+	S2MPG14_GPIO5_MONSEL = 0x10,
+};
+
+#define S2MPG14_GPIO_NR		6
+
+/*
  * The S2MPG14 and S2MPG15 share an identical meter block; these
  * S2MPG14_METER_* definitions describe both and are used by the common
  * s2mpg1x meter driver for either PMIC.

@@ -58,17 +58,19 @@ struct slg51000_evt_sta {
  * @ldo12_vrange: LDO1 and LDO2 are dual-range and pick 1.2 V or 2.4 V as
  *	their base from a bit in MISC1 (SLG51000 only; on the SLG51002 that
  *	address is LDO1_CONF1 and both are plain 1.2 V-based high-voltage LDOs)
- * @ldo56_bypass: LDO5 and LDO6 can be strapped into bypass, in which case
- *	they are switches rather than regulators (SLG51000 only)
+ * @trim2_regs: per-LDO TRIM2 register, or 0 for an LDO that cannot be
+ *	strapped into bypass.  Bypass turns an LDO into a pass-through of its
+ *	input, so a driver that missed the strap would report a regulated
+ *	voltage the rail does not have.
  */
 struct slg51000_chip_info {
 	const struct regmap_config *regmap_cfg;
 	const struct regulator_desc *rdesc;
 	const struct slg51000_evt_sta *evt_sta;
 	const unsigned int *min_regs;
+	const unsigned int *trim2_regs;
 	unsigned int n_regulators;
 	bool ldo12_vrange;
-	bool ldo56_bypass;
 };
 
 struct slg51000 {
@@ -108,6 +110,21 @@ static const unsigned int slg51000_min_regs[] = {
 	SLG51000_LDO1_MINV, SLG51000_LDO2_MINV, SLG51000_LDO3_MINV,
 	SLG51000_LDO4_MINV, SLG51000_LDO5_MINV, SLG51000_LDO6_MINV,
 	SLG51000_LDO7_MINV,
+};
+
+/*
+ * The low-voltage LDOs are the bypass-capable ones: LDO5 and LDO6 on the
+ * SLG51000, LDO6 through LDO8 on the SLG51002.
+ */
+static const unsigned int slg51000_trim2_regs[SLG51000_MAX_REGULATORS] = {
+	[SLG51000_REGULATOR_LDO5] = SLG51000_LDO5_TRIM2,
+	[SLG51000_REGULATOR_LDO6] = SLG51000_LDO6_TRIM2,
+};
+
+static const unsigned int slg51002_trim2_regs[SLG51002_MAX_REGULATORS] = {
+	[SLG51000_REGULATOR_LDO6] = SLG51002_LDO6_TRIM2,
+	[SLG51000_REGULATOR_LDO7] = SLG51002_LDO7_TRIM2,
+	[SLG51000_REGULATOR_LDO8] = SLG51002_LDO8_TRIM2,
 };
 
 static const unsigned int slg51002_min_regs[] = {
@@ -453,9 +470,9 @@ static const struct slg51000_chip_info slg51000_chip_info = {
 	.rdesc		= slg51000_regls_desc,
 	.evt_sta	= slg51000_es_reg,
 	.min_regs	= slg51000_min_regs,
+	.trim2_regs	= slg51000_trim2_regs,
 	.n_regulators	= SLG51000_MAX_REGULATORS,
 	.ldo12_vrange	= true,
-	.ldo56_bypass	= true,
 };
 
 static const struct slg51000_chip_info slg51002_chip_info = {
@@ -463,6 +480,7 @@ static const struct slg51000_chip_info slg51002_chip_info = {
 	.rdesc		= slg51002_regls_desc,
 	.evt_sta	= slg51002_es_reg,
 	.min_regs	= slg51002_min_regs,
+	.trim2_regs	= slg51002_trim2_regs,
 	.n_regulators	= SLG51002_MAX_REGULATORS,
 };
 
@@ -489,12 +507,12 @@ static int slg51000_regulator_init(struct slg51000 *chip)
 			return ret;
 		}
 
-		switch (id) {
-		case SLG51000_REGULATOR_LDO1:
-		case SLG51000_REGULATOR_LDO2:
-			if (!info->ldo12_vrange)
-				goto plain;
-
+		/*
+		 * LDO1 and LDO2 are dual-range on some variants and pick
+		 * their base from a bit in MISC1.
+		 */
+		if (info->ldo12_vrange && (id == SLG51000_REGULATOR_LDO1 ||
+					   id == SLG51000_REGULATOR_LDO2)) {
 			if (id == SLG51000_REGULATOR_LDO1)
 				reg = SLG51000_LDO1_MISC1;
 			else
@@ -518,19 +536,17 @@ static int slg51000_regulator_init(struct slg51000 *chip)
 				rdesc->min_uV = SLG51000_LDOHP_LV_MIN
 						+ (vsel_range[0]
 						   * rdesc->uV_step);
-			break;
+			goto register_it;
+		}
 
-		case SLG51000_REGULATOR_LDO5:
-		case SLG51000_REGULATOR_LDO6:
-			if (!info->ldo56_bypass)
-				goto plain;
-
-			if (id == SLG51000_REGULATOR_LDO5)
-				reg = SLG51000_LDO5_TRIM2;
-			else
-				reg = SLG51000_LDO6_TRIM2;
-
-			ret = regmap_read(chip->regmap, reg, &val);
+		/*
+		 * A low-voltage LDO can be strapped into bypass, in which case
+		 * it passes its input through and is a switch, not a
+		 * regulator.  Which LDOs those are moves with the part.
+		 */
+		if (info->trim2_regs[id]) {
+			ret = regmap_read(chip->regmap, info->trim2_regs[id],
+					  &val);
 			if (ret < 0) {
 				dev_err(chip->dev,
 					"Failed to read LDO mode register\n");
@@ -543,19 +559,15 @@ static int slg51000_regulator_init(struct slg51000 *chip)
 				rdesc->min_uV = 0;
 				rdesc->uV_step = 0;
 				rdesc->linear_min_sel = 0;
-				break;
+				goto register_it;
 			}
-			fallthrough;	/* to the check below */
-
-		default:
-plain:
-			rdesc->linear_min_sel = vsel_range[0];
-			rdesc->n_voltages = vsel_range[1] + 1;
-			rdesc->min_uV = rdesc->min_uV
-					+ (vsel_range[0] * rdesc->uV_step);
-			break;
 		}
 
+		rdesc->linear_min_sel = vsel_range[0];
+		rdesc->n_voltages = vsel_range[1] + 1;
+		rdesc->min_uV = rdesc->min_uV + (vsel_range[0] * rdesc->uV_step);
+
+register_it:
 		chip->rdev[id] = devm_regulator_register(chip->dev, rdesc,
 							 &config);
 		if (IS_ERR(chip->rdev[id])) {

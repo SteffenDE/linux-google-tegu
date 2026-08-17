@@ -1781,9 +1781,19 @@
 		 * Source: research/dumped.dts hsi2c@10890000, hsi2c@108A0000,
 		 * hsi2c@108B0000 and hsi2c@108C0000 for the addresses, IRQs,
 		 * bus rates and USI mode offsets, and zumapro-pinctrl.dtsi for
-		 * the pinmux.  The USI mode register offsets continue the +0x4
-		 * stride USI6 sits at the end of (0x1004..0x1010 against its
-		 * 0x1014).  Devices live in the board file.
+		 * the pinmux.  The USI mode register offsets follow the same
+		 * +0x4 stride as USI6's 0x1014.  Devices live in the board
+		 * file.
+		 *
+		 * Each USI's serial-engine clock is pinned to the 200 MHz the
+		 * vendor kernel asks for, off the PERIC0 IP feed.  Nothing
+		 * else selects that mux, so without this each bus would
+		 * inherit whatever the bootloader left -- possibly oscclk at
+		 * 24.576 MHz -- and i2c-exynos5 derives its bus timing from
+		 * that rate with no lower bound check.  The rate request stops
+		 * at the mux, which carries CLK_SET_RATE_NO_REPARENT and does
+		 * not propagate, so it cannot disturb the PERIC0 IP feed the
+		 * debug UART shares.
 		 */
 		usi2: usi@108900c0 {
 			compatible = "google,gs101-usi", "samsung,exynos850-usi";
@@ -1794,6 +1804,10 @@
 			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI2_USI_PCLK>,
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI2_USI>;
 			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI2_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI2_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
 			samsung,sysreg = <&sysreg_peric0 0x1004>;
 			status = "disabled";
 
@@ -1823,6 +1837,10 @@
 			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI3_USI_PCLK>,
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI3_USI>;
 			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI3_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI3_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
 			samsung,sysreg = <&sysreg_peric0 0x1008>;
 			status = "disabled";
 
@@ -1852,6 +1870,10 @@
 			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI4_USI_PCLK>,
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI4_USI>;
 			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI4_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI4_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
 			samsung,sysreg = <&sysreg_peric0 0x100c>;
 			status = "disabled";
 
@@ -1882,6 +1904,10 @@
 			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI5_USI_PCLK>,
 				 <&cmu_peric0 CLK_DOUT_PERIC0_USI5_USI>;
 			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI5_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI5_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
 			samsung,sysreg = <&sysreg_peric0 0x1010>;
 			status = "disabled";
 

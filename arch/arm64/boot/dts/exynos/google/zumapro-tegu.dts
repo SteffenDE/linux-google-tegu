@@ -474,6 +474,21 @@
 		mode-shutdown-thermal = <0x80000051>;
 		mode-shutdown-thermal-battery = <0x80000051>;
 	};
+
+	/*
+	 * PP1350_CAM, the 1.35 V board rail feeding the camera PMIC's two
+	 * low-voltage LDO inputs.  A discrete regulator whose enable is an
+	 * S2MPG15 GPIO.  Source: research/dumped.dts cam_supply@0.
+	 */
+	pp1350_cam: regulator-pp1350-cam {
+		compatible = "regulator-fixed";
+		regulator-name = "PP1350_CAM";
+		regulator-min-microvolt = <1350000>;
+		regulator-max-microvolt = <1350000>;
+		regulator-enable-ramp-delay = <2000>;
+		gpio = <&s2mpg15_gpio 2 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 &watchdog_cl0 {
@@ -609,6 +624,20 @@
 			s2mpg14_ldo25: ldo25m {
 				regulator-name = "L25M_TS1_DVDD";
 			};
+		};
+
+		/*
+		 * Six general-purpose pins.  Only pin 0 is used on this board:
+		 * it is the main camera module's vdig_enable, which gates the
+		 * sensor's digital supply -- that module has no 1.2 V rail of
+		 * its own on the camera PMIC.  Source: research/dumped.dts
+		 * s2mpg14_gpio and the sensor-barghest vdig_enable-gpios.
+		 */
+		s2mpg14_gpio: gpio {
+			compatible = "samsung,s2mpg14-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <6>;
 		};
 
 		/*
@@ -751,6 +780,32 @@
 				regulator-name = "L15S_SPARE";
 				regulator-always-on;
 			};
+
+			/*
+			 * The camera modules' shared 1.8 V I/O rail, and the
+			 * only camera supply that does not come from the
+			 * camera PMIC.  Every module's power sequence brings
+			 * it up before any of its own rails.  Enable-only,
+			 * like the rails above.
+			 */
+			s2mpg15_ldo12: ldo12s {
+				regulator-name = "L12S_CAMIO";
+			};
+		};
+
+		/*
+		 * Ten general-purpose pins.  Three are the camera board's:
+		 * pin 0 selects the camera PMIC on its i2c bus, pin 1 enables
+		 * the PP3200_CAM_BB buck-boost and pin 2 the PP1350_CAM rail.
+		 * Source: research/dumped.dts s2mpg15_gpio, and the
+		 * dlg,cs-gpios, enable-gpios and gpio properties that
+		 * reference it.
+		 */
+		s2mpg15_gpio: gpio {
+			compatible = "samsung,s2mpg15-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <10>;
 		};
 
 		meter {
@@ -1833,4 +1888,222 @@
 			pinctrl-0 = <&wlan_host_wake>;
 		};
 	};
+};
+
+/*
+ * Camera.
+ *
+ * Three sensors -- a Samsung ISOCELL GN8 as the main camera and two Sony
+ * IMX712 as the ultrawide and the front camera -- plus their EEPROMs, the
+ * main module's combined AF/OIS/EEPROM part, a TI LM3644 flash driver, and
+ * the analog supplies all three run on.
+ *
+ * There are no sensor drivers yet.  What is described here is the power tree,
+ * the buses and the pins, so that the rails can be brought up in the recorded
+ * order and the sensors answer on i2c.
+ *
+ * The supply topology, from the board rails inward:
+ *
+ *   L12S_CAMIO (1.8 V) ------------------------> every module's I/O
+ *   PP3200_CAM_BB (3.2 V) -> SLG51002 vin1_2/3/4/5 -> ldo1..ldo5 (analog)
+ *   PP1350_CAM    (1.35 V) -> SLG51002 vin6/vin7   -> ldo6, ldo7  (digital)
+ *
+ * and per module:
+ *
+ *   main       ldo5 (2.9 V), ldo4 (2.9 V), ldo1 (2.25 V), then vdig_enable
+ *   ultrawide  ldo3 (2.8 V), ldo6 (1.2 V)
+ *   front      ldo2 (2.8 V), ldo7 (1.2 V)
+ *
+ * then reset, then MCLK.  That order is the downstream power sequence and is
+ * confirmed against hardware by an i2c capture of the vendor stack ramping the
+ * camera PMIC's rail-enable mask one bit at a time.
+ */
+&pinctrl_peric0 {
+	/*
+	 * Sensor reset lines, one per module, on the same pin of the same bank
+	 * as that module's i2c bus.  Source: research/dumped.dts
+	 * sensor-barghest, sensor-leshen and sensor-leshen-uw reset-gpios.
+	 */
+	cam_main_reset: cam-main-reset-pins {
+		samsung,pins = "gpp10-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	cam_front_reset: cam-front-reset-pins {
+		samsung,pins = "gpp6-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	cam_uw_reset: cam-uw-reset-pins {
+		samsung,pins = "gpp4-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	/*
+	 * Sensor master clock outputs.  Function 2 is the CIS_CLK function;
+	 * downstream also carries an "off" state that drives the pin low
+	 * instead, which is how it stops the clock.  Source:
+	 * research/dumped.dts sensor-mclk1-fn (ultrawide, CIS_CLK0),
+	 * sensor-mclk2-fn (front, CIS_CLK1) and sensor-mclk4-fn (main,
+	 * CIS_CLK3).
+	 */
+	cam_main_mclk: cam-main-mclk-pins {
+		samsung,pins = "gpp9-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	cam_front_mclk: cam-front-mclk-pins {
+		samsung,pins = "gpp5-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+
+	cam_uw_mclk: cam-uw-mclk-pins {
+		samsung,pins = "gpp3-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+	};
+};
+
+/* Ultrawide camera: sensor at 0x1a, module EEPROM at 0x50. */
+&usi2 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_2 {
+	status = "okay";
+};
+
+/* Front camera: sensor at 0x1a, module EEPROM at 0x50. */
+&usi3 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_3 {
+	status = "okay";
+};
+
+/*
+ * The camera's auxiliary bus: the SLG51002 camera PMIC at 0x75, the RT6160
+ * buck-boost at 0x77 and the LM3644 flash LED driver at 0x63.  The flash has
+ * no mainline driver and is left unclaimed.
+ */
+&usi4 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_4 {
+	status = "okay";
+
+	/*
+	 * PP3200_CAM_BB.  Every analog camera rail is derived from this, and
+	 * the SLG51002 itself is fed from it.  The vendor stack programs 3.2 V
+	 * through the same mainline driver: it writes VSELH = 0x2f, which with
+	 * the driver's 2025 mV base and 25 mV step is exactly 3.2 V.
+	 *
+	 * Mode 1 is the driver's forced-PWM mode, which is what the vendor
+	 * asks for and what its 0x08 write to the control register sets.  It
+	 * costs quiescent current and buys ripple, which is the right trade
+	 * for a rail feeding analog sensor supplies.
+	 *
+	 * Note the driver asserts the enable line and talks to the chip during
+	 * probe, so this rail comes up early and stays up until the regulator
+	 * core disables unused rails.
+	 */
+	cam_bb: regulator@77 {
+		compatible = "richtek,rt6160";
+		reg = <0x77>;
+		regulator-name = "PP3200_CAM_BB";
+		regulator-min-microvolt = <3200000>;
+		regulator-max-microvolt = <3200000>;
+		regulator-enable-ramp-delay = <2000>;
+		regulator-initial-mode = <1>;
+		enable-gpios = <&s2mpg15_gpio 1 GPIO_ACTIVE_HIGH>;
+	};
+
+	/*
+	 * The camera PMIC.  Its chip-select pin has to be asserted before it
+	 * answers on this bus, which is what dlg,cs-gpios drives.
+	 *
+	 * Voltages are the downstream constraints, each pinned to a single
+	 * value.  ldo8 exists on this part but is not wired on this board.
+	 */
+	cam_pmic: pmic@75 {
+		compatible = "dlg,slg51002";
+		reg = <0x75>;
+		dlg,cs-gpios = <&s2mpg15_gpio 0 GPIO_ACTIVE_HIGH>;
+		vin1_2-supply = <&cam_bb>;
+		vin3-supply = <&cam_bb>;
+		vin4-supply = <&cam_bb>;
+		vin5-supply = <&cam_bb>;
+		vin6-supply = <&pp1350_cam>;
+		vin7-supply = <&pp1350_cam>;
+
+		regulators {
+			cam_ldo1: ldo1 {
+				regulator-name = "CAM_MAIN_2V25";
+				regulator-min-microvolt = <2250000>;
+				regulator-max-microvolt = <2250000>;
+			};
+
+			cam_ldo2: ldo2 {
+				regulator-name = "CAM_FRONT_2V8";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			cam_ldo3: ldo3 {
+				regulator-name = "CAM_UW_2V8";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			cam_ldo4: ldo4 {
+				regulator-name = "CAM_MAIN_2V9_A";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo5: ldo5 {
+				regulator-name = "CAM_MAIN_2V9_B";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo6: ldo6 {
+				regulator-name = "CAM_UW_1V2";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+
+			cam_ldo7: ldo7 {
+				regulator-name = "CAM_FRONT_1V2";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+		};
+	};
+};
+
+/*
+ * Main camera: sensor at 0x56, and the combined AF/OIS/EEPROM part at 0x24.
+ * Neither has a driver yet.
+ */
+&usi5 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_5 {
+	status = "okay";
 };

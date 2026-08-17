@@ -813,10 +813,12 @@
 		compatible = "samsung,s2mpg15-pmic";
 
 		/*
-		 * The two sensor rails the AoC powers.  Enable-only (bit 7 of
-		 * LxS_CTRL); the bootloader leaves the voltage selectors at the
-		 * downstream values so no voltage constraint is claimed -- see
-		 * s2mps11.c s2mpg15_regulators.  Consumed by the aoc node's
+		 * The two sensor rails the AoC powers.  No voltage constraint
+		 * is claimed for these two: the bootloader leaves their
+		 * selectors at the downstream values, so only the enable bit
+		 * is wanted -- see s2mps11.c s2mpg15_regulators.  That is not
+		 * a property of the PMIC, though, only of these rails; L12S
+		 * below is one the bootloader gets wrong.  Consumed by the aoc node's
 		 * sensor_power_list below.
 		 */
 		regulators {
@@ -855,11 +857,18 @@
 			 * The camera modules' shared 1.8 V I/O rail, and the
 			 * only camera supply that does not come from the
 			 * camera PMIC.  Every module's power sequence brings
-			 * it up before any of its own rails.  Enable-only,
-			 * like the rails above.
+			 * it up before any of its own rails.
+			 *
+			 * Unlike the rails above this one is constrained,
+			 * because the bootloader gets it wrong: it leaves the
+			 * selector at 1.85 V, and the vendor kernel corrects
+			 * it to 1.8 V when it applies this same constraint.
+			 * Sensor I/O would otherwise run off spec.
 			 */
 			s2mpg15_ldo12: ldo12s {
 				regulator-name = "L12S_CAMIO";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
 			};
 		};
 

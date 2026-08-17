@@ -253,8 +253,9 @@ static const struct regmap_config slg51000_regmap_config = {
 
 /*
  * The SLG51002 tables differ from the SLG51000 ones above only in the per-LDO
- * tail registers, which all follow the same TRIM/CONF/VSEL_ACTUAL layout here,
- * and in the eighth LDO.
+ * tail registers -- which move because the two parts split their LDOs into
+ * high- and low-voltage groups differently, see the header -- and in the
+ * eighth LDO.
  */
 static const struct regmap_range slg51002_writeable_ranges[] = {
 	regmap_reg_range(SLG51000_SYSCTL_MATRIX_CONF_A,

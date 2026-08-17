@@ -936,6 +936,46 @@
 	};
 
 	/*
+	 * BLK_ISPFE is the camera receive complex: the CSIS link/PHY block, the
+	 * ISPFE front end and its PDMA.  Source: downstream
+	 * research/dumped.dts:2892-2901 (pd-ispfe@15462480: need_smc
+	 * 0x1c010204, cmu_id 0x1c000000).
+	 *
+	 * Unlike the display and G3D domains this one is neither always-on nor
+	 * disabled: the driver powers it up when it opens the block, and
+	 * exynos_pd_probe() reads the live PMU state before pm_genpd_init(), so
+	 * a domain found off is registered off.  Whether it *is* off when the
+	 * kernel takes over has not been measured, and it matters: if the
+	 * bootloader leaves it powered (as it does for DPU and G3D),
+	 * genpd_power_off_unused() will run the off-sequence against it at
+	 * late_initcall_sync, which no zumapro domain has yet done on real
+	 * silicon.  The sequence matches downstream's ispfe_off[] exactly --
+	 * CMU CONTROLLER_OPTION bit 24 clear, then PMU 0x2480 bit 0 clear --
+	 * so it should be safe, but it is not proven.
+	 *
+	 * Powering the domain does NOT bring CMU_ISPFE up.  Downstream's
+	 * ispfe_on[] is two PMU accesses; the CMU is programmed separately by
+	 * pmucal_rae_restore_seq() replaying 51 saved registers into
+	 * 0x1c000000 -- the NOC mux user at +0x600, two dividers at
+	 * +0x1800/+0x1804, and a QCH_CON run from +0x301c that includes the
+	 * block's own Q-channel and one per CSIS link.  exynos_pd_power() only
+	 * writes the CONTROLLER_OPTION at +0x800, so the rest is the ISPFE
+	 * driver's job.  (The downstream LWIS node's UMUX_CLKCMU_ISPFE is not a
+	 * CMU_TOP gate to add: in an unfiltered capture of a whole camera
+	 * session the only CMU_TOP writes are the CIS_CLK Q-channels, which are
+	 * the sensor master clocks.)
+	 */
+	pd_ispfe: power-domain@15462480 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462480 0x20>,
+		      <0x0 0x1c000800 0x4>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x1c010204>;
+		#power-domain-cells = <0>;
+		label = "ISPFE";
+	};
+
+	/*
 	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
 	 * Downstream leaves its exynos-pd node disabled (the domain is never
 	 * kernel-managed there, and ACPM has a dedicated SYS_SLEEP_HSI1ON

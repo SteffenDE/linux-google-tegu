@@ -47,6 +47,10 @@
 		pinctrl10 = &pinctrl_hsi2;
 		pinctrl11 = &pinctrl_peric0;
 		pinctrl12 = &pinctrl_peric1;
+		i2c2 = &hsi2c_2;
+		i2c3 = &hsi2c_3;
+		i2c4 = &hsi2c_4;
+		i2c5 = &hsi2c_5;
 		i2c6 = &hsi2c_6;
 		i2c9 = &hsi2c_9;
 		i2c10 = &hsi2c_10;
@@ -1864,6 +1868,163 @@
 		};
 
 		/*
+		 * The four camera buses.  USI2..USI5 in I2C mode carry,
+		 * respectively, the ultrawide sensor and its EEPROM, the front
+		 * sensor and its EEPROM, the auxiliary devices (camera PMIC,
+		 * PP3200_CAM_BB buck-boost, flash LED driver), and the main
+		 * sensor with its combined AF/OIS/EEPROM part.
+		 *
+		 * Source: research/dumped.dts hsi2c@10890000, hsi2c@108A0000,
+		 * hsi2c@108B0000 and hsi2c@108C0000 for the addresses, IRQs,
+		 * bus rates and USI mode offsets, and zumapro-pinctrl.dtsi for
+		 * the pinmux.  The USI mode register offsets follow the same
+		 * +0x4 stride as USI6's 0x1014.  Devices live in the board
+		 * file.
+		 *
+		 * Each USI's serial-engine clock is pinned to the 200 MHz the
+		 * vendor kernel asks for, off the PERIC0 IP feed.  Nothing
+		 * else selects that mux, so without this each bus would
+		 * inherit whatever the bootloader left -- possibly oscclk at
+		 * 24.576 MHz -- and i2c-exynos5 derives its bus timing from
+		 * that rate with no lower bound check.  The rate request stops
+		 * at the mux, which carries CLK_SET_RATE_NO_REPARENT and does
+		 * not propagate, so it cannot disturb the PERIC0 IP feed the
+		 * debug UART shares.
+		 */
+		usi2: usi@108900c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x108900c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI2_USI_PCLK>,
+				 <&cmu_peric0 CLK_DOUT_PERIC0_USI2_USI>;
+			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI2_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI2_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
+			samsung,sysreg = <&sysreg_peric0 0x1004>;
+			status = "disabled";
+
+			hsi2c_2: i2c@10890000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x10890000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric0 CLK_DOUT_PERIC0_USI2_USI>,
+					 <&cmu_peric0 CLK_GOUT_PERIC0_USI2_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 643 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c2_bus>;
+				clock-frequency = <400000>;
+				status = "disabled";
+			};
+		};
+
+		usi3: usi@108a00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x108a00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI3_USI_PCLK>,
+				 <&cmu_peric0 CLK_DOUT_PERIC0_USI3_USI>;
+			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI3_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI3_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
+			samsung,sysreg = <&sysreg_peric0 0x1008>;
+			status = "disabled";
+
+			hsi2c_3: i2c@108a0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x108a0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric0 CLK_DOUT_PERIC0_USI3_USI>,
+					 <&cmu_peric0 CLK_GOUT_PERIC0_USI3_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 644 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c3_bus>;
+				clock-frequency = <400000>;
+				status = "disabled";
+			};
+		};
+
+		usi4: usi@108b00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x108b00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI4_USI_PCLK>,
+				 <&cmu_peric0 CLK_DOUT_PERIC0_USI4_USI>;
+			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI4_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI4_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
+			samsung,sysreg = <&sysreg_peric0 0x100c>;
+			status = "disabled";
+
+			hsi2c_4: i2c@108b0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x108b0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric0 CLK_DOUT_PERIC0_USI4_USI>,
+					 <&cmu_peric0 CLK_GOUT_PERIC0_USI4_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 645 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c4_bus>;
+				/* The rate the vendor kernel runs this bus at. */
+				clock-frequency = <390000>;
+				status = "disabled";
+			};
+		};
+
+		usi5: usi@108c00c0 {
+			compatible = "google,gs101-usi", "samsung,exynos850-usi";
+			reg = <0x108c00c0 0x20>;
+			ranges;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			clocks = <&cmu_peric0 CLK_GOUT_PERIC0_USI5_USI_PCLK>,
+				 <&cmu_peric0 CLK_DOUT_PERIC0_USI5_USI>;
+			clock-names = "pclk", "ipclk";
+			assigned-clocks = <&cmu_peric0 CLK_MOUT_PERIC0_USI5_USI_USER>,
+					  <&cmu_peric0 CLK_DOUT_PERIC0_USI5_USI>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_PERIC0_IP>;
+			assigned-clock-rates = <0>, <200000000>;
+			samsung,sysreg = <&sysreg_peric0 0x1010>;
+			status = "disabled";
+
+			hsi2c_5: i2c@108c0000 {
+				compatible = "google,gs101-hsi2c",
+					     "samsung,exynosautov9-hsi2c";
+				reg = <0x108c0000 0xc0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				clocks = <&cmu_peric0 CLK_DOUT_PERIC0_USI5_USI>,
+					 <&cmu_peric0 CLK_GOUT_PERIC0_USI5_USI_PCLK>;
+				clock-names = "hsi2c", "hsi2c_pclk";
+				interrupts = <GIC_SPI 646 IRQ_TYPE_LEVEL_HIGH 0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&hsi2c5_bus>;
+				clock-frequency = <400000>;
+				status = "disabled";
+			};
+		};
+
+		/*
 		 * Source: downstream hsi2c_6 and USI6 pinmux data are from
 		 * zumapro-usi.dtsi and zumapro-pinctrl.dtsi.  Only the bare
 		 * controller is enabled for now; consumers stay out until the
@@ -2654,6 +2815,50 @@
 
 			hsi2c6_bus: hsi2c6-bus-pins {
 				samsung,pins = "gpp12-0", "gpp12-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			/*
+			 * The four camera buses.  Source:
+			 * research/dumped.dts hsi2c2-bus, hsi2c3-bus,
+			 * hsi2c4-bus and hsi2c5-bus.  The auxiliary bus is the
+			 * odd one out, selecting no internal pull, which is
+			 * what a bus with board pull-ups looks like.
+			 *
+			 * Downstream parks the three sensor buses as plain
+			 * inputs while the camera is off (its "off_i2c" state)
+			 * and only selects the I2C function on power-up, to
+			 * avoid feeding an unpowered sensor through the pull.
+			 * Mainline's i2c core has only a "default" state, so
+			 * these stay in I2C function; the leakage is one
+			 * internal pull-up per line into the sensor's I/O
+			 * clamp.
+			 */
+			hsi2c2_bus: hsi2c2-bus-pins {
+				samsung,pins = "gpp4-0", "gpp4-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			hsi2c3_bus: hsi2c3-bus-pins {
+				samsung,pins = "gpp6-0", "gpp6-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			hsi2c4_bus: hsi2c4-bus-pins {
+				samsung,pins = "gpp8-0", "gpp8-1";
+				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
+				samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+			};
+
+			hsi2c5_bus: hsi2c5-bus-pins {
+				samsung,pins = "gpp10-0", "gpp10-1";
 				samsung,pin-function = <ZUMAPRO_PIN_FUNC_3>;
 				samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 				samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;

@@ -14,7 +14,9 @@
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/notifier.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 
 /*
@@ -104,6 +106,7 @@ static const char * const ispfe_window_names[ISPFE_NUM_WINDOWS] = {
 
 struct ispfe_device {
 	struct device *dev;
+	struct notifier_block genpd_nb;
 	void __iomem *base[ISPFE_NUM_WINDOWS];
 };
 
@@ -139,11 +142,17 @@ static void __iomem *ispfe_map(struct platform_device *pdev, const char *name)
  * the block on CLKCMU while both dividers were still at their reset ratio of
  * one, briefly overclocking the NoC and the D/C-PHY.
  *
- * This has to run on every resume, not once at probe.  A power cycle resets
+ * This has to run on every power-on, not once at probe.  A power cycle resets
  * CMU_ISPFE, and a domain brought back up without it has no clocks for its
  * Q-channels to hand back -- the next power-down handshake then never
  * completes, and on this SoC that does not fail quietly: the PMU write times
  * out, ACPM stops answering, and the APM watchdog resets the phone.
+ *
+ * The values are the ones the *bootloader* leaves in CMU_ISPFE.  Nothing in
+ * the vendor stack programs this CMU either: its power-domain code saves the
+ * live registers on the way down and writes them back on the way up, so the
+ * configuration every later power cycle restores is still the bootloader's,
+ * and a first power-on after reset restores nothing at all.
  */
 static void ispfe_cmu_restore(struct ispfe_device *ispfe)
 {
@@ -184,6 +193,36 @@ static void ispfe_cmu_restore(struct ispfe_device *ispfe)
 	readl(cmu + CMU_CONTROLLER_OPTION);
 }
 
+/*
+ * BLK_ISPFE holds more than this device: the three ISPFE SysMMUs sit in it
+ * too, and because they are this device's IOMMUs they are also its runtime-PM
+ * suppliers -- so they resume, and touch their own registers, *before* our
+ * ->runtime_resume would get a chance to bring the CMU up.  Hang the restore
+ * off the domain instead, where genpd runs it after the PMU has powered the
+ * block and before any device in it is resumed.  That is also where the vendor
+ * stack does it: its power-domain enable path is the PMU sequence, the TZPC
+ * restore, and then the CMU restore, in that order.
+ */
+static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
+			      void *unused)
+{
+	struct ispfe_device *ispfe = container_of(nb, struct ispfe_device,
+						  genpd_nb);
+
+	if (action == GENPD_NOTIFY_ON)
+		ispfe_cmu_restore(ispfe);
+
+	return NOTIFY_OK;
+}
+
+/*
+ * Still needed alongside the notifier: genpd only powers a domain on that is
+ * off, and the bootloader hands BLK_ISPFE over powered.  The first resume
+ * after boot therefore fires no notification at all -- harmlessly, because
+ * that is exactly the state the restore reproduces, but the block is then
+ * running on a configuration nothing in this kernel has written.  Writing it
+ * once from here makes that case indistinguishable from every later one.
+ */
 static int ispfe_runtime_resume(struct device *dev)
 {
 	ispfe_cmu_restore(dev_get_drvdata(dev));
@@ -194,6 +233,11 @@ static int ispfe_runtime_resume(struct device *dev)
 static const struct dev_pm_ops ispfe_pm_ops = {
 	RUNTIME_PM_OPS(NULL, ispfe_runtime_resume, NULL)
 };
+
+static void ispfe_genpd_notifier_remove(void *dev)
+{
+	dev_pm_genpd_remove_notifier(dev);
+}
 
 static void ispfe_report(struct ispfe_device *ispfe)
 {
@@ -239,6 +283,19 @@ static int ispfe_probe(struct platform_device *pdev)
 					     "cannot map %s\n",
 					     ispfe_window_names[i]);
 	}
+
+	/*
+	 * Before runtime PM is enabled, so that nothing can power the domain
+	 * on between the two.
+	 */
+	ispfe->genpd_nb.notifier_call = ispfe_genpd_notify;
+	ret = dev_pm_genpd_add_notifier(dev, &ispfe->genpd_nb);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot watch the power domain\n");
+
+	ret = devm_add_action_or_reset(dev, ispfe_genpd_notifier_remove, dev);
+	if (ret)
+		return ret;
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)

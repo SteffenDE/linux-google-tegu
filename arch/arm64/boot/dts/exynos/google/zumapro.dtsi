@@ -3611,8 +3611,22 @@
 		 * the 4-byte "cmu" window in pd_ispfe, which is fine because both
 		 * sides use devm_ioremap() rather than an exclusive request.
 		 *
-		 * No interrupts yet: the first milestone is a register read with
-		 * nothing programmed and nothing streaming.
+		 * Downstream names 202 interrupts on this block; they land on 17
+		 * GIC lines, and all 17 are here.  Each "csis<n>" is one CSIS
+		 * link bank's four sources -- int0, int1, frame start and frame
+		 * end -- sharing SPI 467 + n.  "csis-core" carries 120 named
+		 * sources for the CSIS core and its logical channels.  "fc" is
+		 * every frame-controller context, bayer and phase-detect alike;
+		 * "lmp-bayer" is the five bayer line-memory instances plus a
+		 * debug source, "lmp-pdaf" the four phase-detect ones, and
+		 * "pdma" all five PDMA contexts with their error and reset
+		 * sources.
+		 *
+		 * Which link a sensor arrives on is a board property, so the SoC
+		 * file names all twelve and the driver asks for the one it is
+		 * configured to use.  The same reasoning names the phase-detect
+		 * line-memory pool even though a raw Bayer path does not use it:
+		 * this describes the block, not one driver's needs.
 		 */
 		ispfe: camera@1c300000 {
 			compatible = "google,zumapro-ispfe";
@@ -3624,6 +3638,28 @@
 			      <0x1c000000 0x8000>;
 			reg-names = "isp-fe", "csis-link-phy", "isp-fe-sysreg",
 				    "pdma", "pdma-wrap", "cmu";
+			interrupts = <GIC_SPI 467 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 468 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 469 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 470 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 471 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 472 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 473 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 474 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 475 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 476 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 477 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 478 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 479 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 480 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 481 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 482 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 483 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "csis0", "csis1", "csis2", "csis3",
+					  "csis4", "csis5", "csis6", "csis7",
+					  "csis8", "csis9", "csis10", "csis11",
+					  "csis-core", "fc", "lmp-bayer",
+					  "lmp-pdaf", "pdma";
 			power-domains = <&pd_ispfe>;
 			iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>,
 				 <&sysmmu_ispfe_s2>;

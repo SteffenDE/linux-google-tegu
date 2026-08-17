@@ -3490,6 +3490,45 @@
 			timeout-sec = <30>;
 			status = "disabled";
 		};
+
+		/*
+		 * BLK_ISPFE, the camera receive complex: twelve CSIS links with
+		 * nine combo D/C-PHYs behind them, the ISPFE front end, and the
+		 * PDMA that carries per-frame descriptors.  Windows are the
+		 * reg/reg-names of downstream's lwis_isp_fe@1C000000
+		 * (research/dumped.dts:13000-13005).
+		 *
+		 * Two of those windows nest inside the first: "pdma" and
+		 * "pdma-wrap" fall within the 1 MB "isp-fe" range, and downstream
+		 * maps them separately because they are separately named blocks.
+		 * Keep that split -- a PDMA register is reachable either way, and
+		 * treating the whole 1 MB as one opaque window is what made PDMA
+		 * traffic look like it did not exist.
+		 *
+		 * The "cmu" window is a bring-up shortcut and should not outlive
+		 * it.  CMU_ISPFE loses its mux, dividers and Q-channel requests
+		 * across a power cycle and mainline models no clock controller for
+		 * it, so the driver restores them itself; the right home is a
+		 * clock-controller node once CMU_ISPFE is described.  It overlaps
+		 * the 4-byte "cmu" window in pd_ispfe, which is fine because both
+		 * sides use devm_ioremap() rather than an exclusive request.
+		 *
+		 * No interrupts yet: the first milestone is a register read with
+		 * nothing programmed and nothing streaming.
+		 */
+		ispfe: camera@1c300000 {
+			compatible = "google,zumapro-ispfe";
+			reg = <0x1c300000 0x100000>,
+			      <0x1c040000 0xd0000>,
+			      <0x1c020000 0x10000>,
+			      <0x1c390000 0x5000>,
+			      <0x1c395000 0x1000>,
+			      <0x1c000000 0x8000>;
+			reg-names = "isp-fe", "csis-link-phy", "isp-fe-sysreg",
+				    "pdma", "pdma-wrap", "cmu";
+			power-domains = <&pd_ispfe>;
+			status = "disabled";
+		};
 	};
 
 	/*

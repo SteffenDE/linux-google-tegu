@@ -345,18 +345,21 @@ void __init samsung_clk_register_gate(struct samsung_clk_provider *ctx,
 	void __iomem *reg_offs;
 
 	for (idx = 0; idx < nr_clk; idx++, list++) {
+		bool manual = list->gate_flags & CLK_GATE_SAMSUNG_MANUAL;
+		u8 gate_flags = list->gate_flags & ~CLK_GATE_SAMSUNG_MANUAL;
+
 		reg_offs = ctx->reg_base + list->offset;
 
-		if (ctx->auto_clock_gate && ctx->gate_dbg_offset)
+		if (ctx->auto_clock_gate && ctx->gate_dbg_offset && !manual)
 			clk_hw = samsung_register_auto_gate(ctx->dev, NULL,
 				list->name, list->parent_name, NULL, NULL,
 				list->flags, reg_offs + ctx->gate_dbg_offset,
-				list->bit_idx, list->gate_flags, &ctx->lock);
+				list->bit_idx, gate_flags, &ctx->lock);
 		else
 			clk_hw = clk_hw_register_gate(ctx->dev, list->name,
 				list->parent_name, list->flags,
 				ctx->reg_base + list->offset, list->bit_idx,
-				list->gate_flags, &ctx->lock);
+				gate_flags, &ctx->lock);
 		if (IS_ERR(clk_hw)) {
 			pr_err("%s: failed to register clock %s: %pe\n", __func__,
 			       list->name, clk_hw);

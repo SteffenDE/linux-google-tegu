@@ -42,11 +42,28 @@ properties:
   power-domains:
     maxItems: 1
 
+  samsung,iommu-group:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The shared IOMMU group object. Required by the System MMU v9 driver,
+      which cannot attach a device whose group it did not create.
+
+  iommus:
+    items:
+      - description: ISPFE System MMU S0
+      - description: ISPFE System MMU S1
+      - description: ISPFE System MMU S2
+    description:
+      All three instances, because they share one translation context - a frame
+      buffer's address is invalidated in every one of them.
+
 required:
   - compatible
   - reg
   - reg-names
   - power-domains
+  - iommus
+  - samsung,iommu-group
 
 additionalProperties: false
 
@@ -63,4 +80,6 @@ examples:
         reg-names = "isp-fe", "csis-link-phy", "isp-fe-sysreg",
                     "pdma", "pdma-wrap", "cmu";
         power-domains = <&pd_ispfe>;
+        iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>, <&sysmmu_ispfe_s2>;
+        samsung,iommu-group = <&iommu_group_isp>;
     };

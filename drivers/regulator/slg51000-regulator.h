@@ -205,13 +205,18 @@
  * every LDO's VSEL/MINV/MAXV and EVENT/STATUS/IRQ_MASK are at the same
  * addresses, with the same bit fields.
  *
- * What moves is the per-LDO tail between MAXV and EVENT.  On the SLG51002
- * every LDO carries the same TRIM/CONF1/CONF2/VSEL_ACTUAL/CONF3 layout,
- * whereas on the SLG51000 it varies per LDO; the visible effect is that
- * VSEL_ACTUAL sits one register later on LDO1, LDO2 and LDO7 and one earlier
- * on LDO5.  Only the endpoints the driver describes are defined here; the
- * CONF3/CONF4 registers past VSEL_ACTUAL are configuration the driver does
- * not touch.
+ * What moves is the per-LDO tail between MAXV and EVENT, because the tail
+ * follows the high/low-voltage grouping and the two parts group their LDOs
+ * differently.  The SLG51000's low-voltage LDOs are LDO5 and LDO6; the
+ * SLG51002's are LDO6 through LDO8.  A low-voltage LDO carries an extra TRIM3,
+ * which pushes its VSEL_ACTUAL to base+0x67 against base+0x66 for a
+ * high-voltage one -- so VSEL_ACTUAL moves one register later on LDO1, LDO2
+ * and LDO7, which became high-voltage, and one earlier on LDO5, which stopped
+ * being low-voltage.
+ *
+ * Only the endpoints the driver describes are defined here.  The CONF3 past
+ * VSEL_ACTUAL on every LDO, and the CONF4 past that on LDO4 and LDO5, are
+ * configuration the driver does not touch.
  *
  * The SLG51002 also has an eighth LDO and a second global lock register.
  */

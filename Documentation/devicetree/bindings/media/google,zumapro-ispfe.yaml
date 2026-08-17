@@ -42,6 +42,31 @@ properties:
   power-domains:
     maxItems: 1
 
+  interrupts:
+    description:
+      Downstream names 202 interrupts on this block; they share 17 GIC lines,
+      and all 17 are described here.
+    maxItems: 17
+
+  interrupt-names:
+    items:
+      - const: csis0
+      - const: csis1
+      - const: csis2
+      - const: csis3
+      - const: csis4
+      - const: csis5
+      - const: csis6
+      - const: csis7
+      - const: csis8
+      - const: csis9
+      - const: csis10
+      - const: csis11
+      - const: csis-core
+      - const: fc
+      - const: lmp-bayer
+      - const: lmp-pdaf
+      - const: pdma
   samsung,iommu-group:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -61,6 +86,8 @@ required:
   - compatible
   - reg
   - reg-names
+  - interrupts
+  - interrupt-names
   - power-domains
   - iommus
   - samsung,iommu-group
@@ -69,6 +96,8 @@ additionalProperties: false
 
 examples:
   - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
     camera@1c300000 {
         compatible = "google,zumapro-ispfe";
         reg = <0x1c300000 0x100000>,
@@ -81,5 +110,27 @@ examples:
                     "pdma", "pdma-wrap", "cmu";
         power-domains = <&pd_ispfe>;
         iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>, <&sysmmu_ispfe_s2>;
+        interrupts = <GIC_SPI 467 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 468 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 469 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 470 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 471 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 472 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 473 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 474 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 475 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 476 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 477 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 478 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 479 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 480 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 481 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 482 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 483 IRQ_TYPE_LEVEL_HIGH 0>;
+        interrupt-names = "csis0", "csis1", "csis2", "csis3",
+                          "csis4", "csis5", "csis6", "csis7",
+                          "csis8", "csis9", "csis10", "csis11",
+                          "csis-core", "fc", "lmp-bayer",
+                          "lmp-pdaf", "pdma";
         samsung,iommu-group = <&iommu_group_isp>;
     };

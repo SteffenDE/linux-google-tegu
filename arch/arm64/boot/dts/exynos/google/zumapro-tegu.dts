@@ -515,8 +515,12 @@
 	 *
 	 * The two board rails are not here.  PP3200_CAM_BB comes up on its own
 	 * as the camera PMIC's input whenever one of these LDOs is enabled,
-	 * which is the order the recording has anyway, and PP1350_CAM is
-	 * always-on above.
+	 * and PP1350_CAM is always-on above.  So both are up before any rail
+	 * that depends on them, but not in the recording's order -- it brings
+	 * both board rails up ahead of the I/O rail, where this brings
+	 * PP3200_CAM_BB up after it.  I/O before analog is the safer
+	 * direction, and the main module's digital supply stays gated behind
+	 * vdig_enable either way.
 	 *
 	 * Delete this block together with scripts/camera-power-up.sh when the
 	 * sensor drivers land.

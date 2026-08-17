@@ -4,21 +4,24 @@
  *
  * BLK_ISPFE is twelve CSIS links with nine combo D/C-PHYs behind them, the
  * ISPFE front end, and a PDMA that carries per-frame descriptors.  This is the
- * bring-up stage: it powers the block, restores its CMU, and can bring one
- * CSIS link and its PHY up so that a sensor's frames reach the receiver.
- * Nothing lands in memory yet and there is no V4L2.
+ * bring-up stage: it powers the block, restores the CMU state the power domain
+ * does not, and can put one CSIS link, its PHY, a frame controller context and
+ * PDMA into a raw Bayer capture aimed at its own DMA buffer.  Driven from
+ * debugfs; there is no V4L2 yet.
  *
  * Copyright 2026 Steffen Deusch
  */
 
 #include <linux/bits.h>
 #include <linux/debugfs.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -130,6 +133,198 @@
 #define SYSREG_CSIS_PHY_RESET		0x0500
 
 /*
+ * The ISPFE frame controller.  Global registers first; the per-context bits in
+ * the interrupt, start and stop words run bayer context c at BIT(c) and
+ * phase-detect context c at BIT(7 + c), which is how a main-camera session --
+ * one of each -- shows up as 0x81 and an ultrawide one on the second context
+ * as 0x2.
+ */
+#define FC_INIT_ENABLE			0x20008
+#define FC_INIT_ENABLE_VAL		0x0000000f
+#define FC_INIT_START			0x20010
+#define FC_INIT_START_VAL		0x00000001
+#define FC_INT_SRC			0x2008c
+#define FC_INT_MSK			0x200a0
+#define FC_CTX_STOP			0x200a4
+#define FC_CTX_START			0x200b0
+#define FC_INIT_MASK			0x20094
+#define FC_INIT_MASK_VAL		0x3fffffff
+#define FC_INIT_GO			0x2011c
+#define FC_INIT_GO_VAL			0x00000001
+#define FC_INT_ACK			0x20110
+
+#define FC_NUM_BAYER_CTX		5
+#define FC_BAYER_CTX(c)			(0x20400 + (c) * 0x400)
+
+/* Offsets within one context. */
+#define FC_CTX_INT0			0x04
+#define FC_CTX_ENABLE			0x10
+#define FC_CTX_ENABLE_VAL		0x00000007
+#define FC_CTX_ARM			0x18
+#define FC_CTX_INT1			0x24
+#define FC_CTX_MODE2			0x2c
+#define FC_CTX_MODE2_VAL		0x0000001b
+#define FC_CTX_MODE			0x30
+#define FC_CTX_MODE_CONFIGURE		0x00000012
+#define FC_CTX_MODE_RUN_RAW		0x0000001b
+#define FC_CTX_MODE_DRAIN		0x00000009
+#define FC_CTX_INT2			0x38
+#define FC_CTX_LIMIT			0x44
+#define FC_CTX_LIMIT_VAL		0x00003fff
+#define FC_CTX_LIMIT_DRAIN		0x00000010
+#define FC_CTX_INT3			0x4c
+#define FC_CTX_DEPTH			0x58
+#define FC_CTX_DEPTH_VAL		0x00000003
+#define FC_CTX_RESOL			0x74
+/*
+ * Two words that travel with the sensor mode and are not decoded.  They are
+ * the same for a raw and a YUV stream on the same sensor, so they are not
+ * about the output, and they differ between the two IMX712s -- which have the
+ * same width and 48 lines of height between them -- so they are not a
+ * per-sensor constant either.  Carried as measured values for one mode.
+ */
+#define FC_CTX_MODE_WORD0		0x78
+#define FC_CTX_MODE_WORD1		0x7c
+#define FC_CTX_ZERO			0x88
+/*
+ * Where a context is told which CSIS link and virtual channel feed it.  Three
+ * sensors settle the layout: the main camera on link 0 writes 0x00000200, the
+ * ultrawide on link 1 writes 0x01000200, and the front camera -- which is on
+ * link 6 but on bayer context 0, so nothing here follows from the context
+ * number -- writes 0x06000200.  The channel field is the same sensor's
+ * phase-detect stream writing 0x1200 against its image stream's 0x200.
+ */
+#define FC_CTX_SOURCE			0x8c
+#define FC_CTX_SOURCE_LINK(n)		((n) << 24)
+#define FC_CTX_SOURCE_CHANNEL(n)	((n) << 12)
+#define FC_CTX_SOURCE_COMMON		0x00000200
+/* All four written with one, meaning unknown; there are three buffers. */
+static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
+
+/*
+ * The line-memory pool.  Nine instances -- five bayer and four phase-detect --
+ * and each one appears in three places at three different strides, which is
+ * what ties them together: a control block that binds the instance to a frame
+ * controller context, an interrupt group, and an interrupt bank.  The main
+ * camera's raw stream uses bayer instance 4 and phase-detect instance 0; the
+ * ultrawide's preview used bayer instance 2 while the main camera held 3.
+ * Which instance a stream gets is an allocation, not a property of the link or
+ * the context, so it is a debugfs control here.
+ */
+#define LMP_CTRL			0x5000c
+#define LMP_CTRL_RESET			0x00000000
+#define LMP_CTRL_CONFIGURE		0x00000c10
+#define LMP_CTRL_RUN			0x00000c11
+#define LMP_SIGNATURE			0x50010
+#define LMP_SIGNATURE_VAL		0x00dddead
+
+#define LMP_NUM_BAYER			5
+#define LMP_BAYER_BIND(n)		(0x27c00 + (n) * 0x400)
+#define LMP_BAYER_INT(n)		(0x50058 + (n) * 0x30)
+#define LMP_BAYER_BANK(n)		(0x31000 + (n) * 0x2000)
+#define LMP_NUM_PDAF			4
+#define LMP_PDAF_INT(m)			(0x50148 + (m) * 0x18)
+
+#define LMP_BIND_ENABLE			0x00
+#define LMP_BIND_CONTEXT		0x04
+#define LMP_INT_SRC			0x00
+#define LMP_INT_ARM			0x08
+#define LMP_INT_ARM_VAL			0x103ffffe
+#define LMP_INT_MSK			0x0c
+#define LMP_INT_MSK_BAYER_VAL		0x3fffffff
+#define LMP_INT_MSK_PDAF_VAL		0x000003ff
+#define LMP_INT_DEBUG			0x501ac
+#define LMP_BANK_SRC			0x300
+#define LMP_BANK_MSK0			0x308
+#define LMP_BANK_MSK0_VAL		0x000007fc
+#define LMP_BANK_MSK1			0x30c
+#define LMP_BANK_MSK1_ARM		0x000007f8
+#define LMP_BANK_MSK1_RUN		0x000007fc
+
+/*
+ * A pair of blocks with a slot per stream, eight bytes each from +0x30, both
+ * written with the same values, and a control word at +0x08 that changes with
+ * the sensor: 0x6c for the main camera, 0x1a for either IMX712, 0x2 with
+ * nothing streaming.  It reads like an allocator for a shared resource and it
+ * is not decoded; these are the values measured for one IMX712 alone.
+ */
+#define LMP_ALLOC_A			0x30c00
+#define LMP_ALLOC_B			0x30d00
+#define LMP_ALLOC_INIT0			0x00
+#define LMP_ALLOC_INIT1			0x04
+#define LMP_ALLOC_INIT2			0x0c
+#define LMP_ALLOC_CTRL			0x08
+#define LMP_ALLOC_CTRL_IMX712		0x0000001a
+#define LMP_ALLOC_CTRL_B		0x00000002
+#define LMP_ALLOC_SLOT(s)		(0x30 + (s) * 8)
+#define LMP_ALLOC_NUM_SLOTS		((LMP_ALLOC_B - LMP_ALLOC_A - 0x30) / 8)
+#define LMP_ALLOC_SLOT_VAL0		0x00000040
+#define LMP_ALLOC_SLOT_VAL1		0x00000020
+#define LMP_ALLOC_GATE			0x30f00
+#define LMP_ALLOC_GATE_VAL		0x00000001
+#define LMP_ALLOC_MODE			0x30100
+#define LMP_ALLOC_MODE_VAL		0x00000053
+
+/*
+ * PDMA: five contexts of a small DRAM control ring, and the only path by which
+ * a frame buffer address reaches this hardware -- no register write anywhere in
+ * the system carries one.  The ring is 1000 bytes whatever the sensor,
+ * resolution or frame rate, and its head advances exactly one 16-byte record
+ * per frame.  A PDMA context is used with the frame controller context of the
+ * same index in every session captured.
+ */
+#define PDMA_CTX(c)			((c) * 0x1000)
+#define PDMA_ENABLE			0x00
+#define PDMA_BASE_LO			0x04
+#define PDMA_BASE_HI			0x08
+#define PDMA_SIZE			0x0c
+#define PDMA_SIZE_VAL			0x3e8
+#define PDMA_HEAD			0x10
+#define PDMA_INT0_SRC			0x20
+#define PDMA_INT0_MSK			0x2c
+#define PDMA_INT0_ARM			0x28
+#define PDMA_INT1_SRC			0x34
+#define PDMA_INT1_MSK			0x40
+#define PDMA_INT0_MSK_VAL		0x00000001
+#define PDMA_INT1_MSK_VAL		0x0000001f
+
+#define PDMA_WRAP_CTX(c)		(0x100 + (c) * 0x100)
+#define PDMA_WRAP_INIT0			0x08
+#define PDMA_WRAP_INIT0_VAL		0x00000007
+#define PDMA_WRAP_INIT1			0x10
+#define PDMA_WRAP_INIT1_VAL		0x00000001
+#define PDMA_WRAP_SRC			0x80
+#define PDMA_WRAP_MSK			0x8c
+#define PDMA_WRAP_MSK_VAL		0x0000001f
+
+/*
+ * One PDMA record.  The command word and the trailing word are byte-identical
+ * between a 4000x3000 and a 2000x1500 capture of the same sensor, so neither
+ * is geometry, stride or size; only the address varies, and it varied three
+ * ways round with one record written per frame.  Replayed as measured.
+ */
+struct ispfe_pdma_desc {
+	__le32 cmd;
+	__le32 addr_lo;
+	__le32 addr_hi;
+	__le32 tail;
+} __packed;
+
+#define PDMA_DESC_CMD			0x0000c003
+#define PDMA_DESC_TAIL			0x000019c8
+#define PDMA_NUM_RECORDS \
+	(PDMA_SIZE_VAL / sizeof(struct ispfe_pdma_desc))
+
+/*
+ * The vendor stack's own saved frame is width * 2 * height with no padding, so
+ * the receiver writes 10-bit samples into 16-bit containers at the natural
+ * stride.  Allocating exactly that is deliberate: if the hardware writes past
+ * it the System MMU faults, which says more than a silent overrun would.
+ */
+#define ISPFE_BYTES_PER_PIXEL		2
+#define ISPFE_FRAME_POISON		0xa5
+
+/*
  * The ISPFE front end proper.  +0x50000 reads 0x1003aa in every capture taken
  * of the vendor stack, before anything writes it.
  */
@@ -218,6 +413,21 @@ struct ispfe_source {
 	u32 width;
 	u32 height;
 	bool cphy;
+
+	/*
+	 * Which of the receiver's own resources the stream is put on.  A frame
+	 * controller context and a PDMA context of the same index went
+	 * together in every session captured, so they are one control; the
+	 * line-memory instance is separate because the vendor stack allocates
+	 * it independently, and the slot is separate again.
+	 */
+	u32 ctx;
+	u32 lmp;
+	u32 slot;
+
+	/* Not derived from anything: measured for one sensor mode. */
+	u32 mode_word0;
+	u32 mode_word1;
 };
 
 struct ispfe_device {
@@ -242,6 +452,9 @@ struct ispfe_device {
 	struct ispfe_source active;
 	bool streaming;
 	int link_irq;
+	int fc_irq;
+	int lmp_irq;
+	int pdma_irq;
 	/*
 	 * request_irq() keeps the name it is given rather than copying it, so
 	 * this cannot be a local: /proc/interrupts would print whatever took
@@ -249,11 +462,23 @@ struct ispfe_device {
 	 */
 	char link_name[8];
 
-	/* Everything below is written from the link interrupt. */
+	/* The frame buffer, and the descriptor ring that points the ISP at it. */
+	void *frame;
+	dma_addr_t frame_dma;
+	size_t frame_size;
+	struct ispfe_pdma_desc *ring;
+	dma_addr_t ring_dma;
+	u32 head;
+
+	/* Everything below is written from an interrupt. */
 	atomic_t frame_start;
 	atomic_t frame_end;
+	atomic_t fc_events;
+	atomic_t lmp_events;
+	atomic_t pdma_events;
 	u32 int0_seen;
 	u32 int1_seen;
+	u32 fc_seen;
 };
 
 /*
@@ -624,8 +849,22 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 
 	if (fs)
 		atomic_inc(&ispfe->frame_start);
-	if (fe)
+	if (fe) {
 		atomic_inc(&ispfe->frame_end);
+
+		/*
+		 * Advance the descriptor head one record per frame, which is
+		 * what the vendor stack does from its own frame interrupt.
+		 * Every record names the same buffer, so this is belt and
+		 * braces rather than the thing that makes a frame land.
+		 */
+		ispfe->head += sizeof(*ispfe->ring);
+		if (ispfe->head >= PDMA_NUM_RECORDS * sizeof(*ispfe->ring))
+			ispfe->head = 0;
+		writel_relaxed(ispfe->head,
+			       ispfe->base[ISPFE_WIN_PDMA] +
+			       PDMA_CTX(ispfe->active.ctx) + PDMA_HEAD);
+	}
 
 	/*
 	 * Sticky rather than counted: what a bring-up wants to know is which
@@ -640,6 +879,461 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 	return (int0 | int1 | fs | fe) ? IRQ_HANDLED : IRQ_NONE;
 }
 
+/*
+ * Everything the front end wants before a stream: the
+ * frame controller, the line-memory pool and its allocator, and PDMA's
+ * per-context enables.  Ordered as the vendor stack does it, including the
+ * signature word at LMP_SIGNATURE, which is not configuration.
+ *
+ * The twelve-link reset that opens it is the same pulse the vendor stack
+ * issues across every CSIS bank at device enable, and it is why a link can be
+ * configured without knowing what the last session left in it.
+ */
+static void ispfe_device_init(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *csis = ispfe->base[ISPFE_WIN_CSIS];
+	unsigned int i;
+
+	for (i = 0; i < CSIS_NUM_LINKS; i++)
+		writel_relaxed(CSIS_CMN_CTRL_RESET_ALL,
+			       csis + i * CSIS_LINK_STRIDE + CSIS_CMN_CTRL);
+
+	writel_relaxed(FC_INIT_ENABLE_VAL, core + FC_INIT_ENABLE);
+	writel_relaxed(FC_INIT_START_VAL, core + FC_INIT_START);
+
+	writel_relaxed(LMP_CTRL_RESET, core + LMP_CTRL);
+	/*
+	 * Note that the first of these is ISPFE_VERSION, which reads 0x1003aa
+	 * before anything writes it and is what ispfe_report() prints.  The
+	 * vendor stack writes zero to it here, so a report taken after a
+	 * stream has run is not the same measurement as one taken at probe.
+	 */
+	writel_relaxed(0, core + ISPFE_VERSION);
+	writel_relaxed(0, core + 0x50004);
+	writel_relaxed(0, core + 0x50008);
+	writel_relaxed(LMP_CTRL_CONFIGURE, core + LMP_CTRL);
+	writel_relaxed(LMP_SIGNATURE_VAL, core + LMP_SIGNATURE);
+	for (i = 0x50014; i <= 0x50054; i += 4)
+		writel_relaxed(i == 0x50020 ? 0x00020002 : 0, core + i);
+
+	/* A block of thresholds, written once and never varying. */
+	writel_relaxed(0x00000006, core + 0x50294);
+	writel_relaxed(0x00000064, core + 0x50298);
+	writel_relaxed(0x000001f4, core + 0x5029c);
+	writel_relaxed(0x00001388, core + 0x502a0);
+	writel_relaxed(0x00000000, core + 0x502a4);
+	writel_relaxed(0x0000005a, core + 0x502a8);
+	writel_relaxed(0x00000190, core + 0x502ac);
+	writel_relaxed(LMP_CTRL_RUN, core + LMP_CTRL);
+
+	for (i = 0; i < LMP_NUM_BAYER; i++) {
+		void __iomem *lmp = core + LMP_BAYER_INT(i);
+
+		writel_relaxed(0, lmp + LMP_INT_SRC);
+		writel_relaxed(0, lmp + 0x04);
+		writel_relaxed(0, lmp + LMP_INT_ARM);
+		writel_relaxed(LMP_INT_MSK_BAYER_VAL, lmp + LMP_INT_MSK);
+		writel_relaxed(0, lmp + 0x10);
+	}
+	for (i = 0; i < LMP_NUM_PDAF; i++) {
+		void __iomem *lmp = core + LMP_PDAF_INT(i);
+
+		writel_relaxed(0, lmp + LMP_INT_SRC);
+		writel_relaxed(0, lmp + 0x04);
+		writel_relaxed(0, lmp + LMP_INT_ARM);
+		writel_relaxed(LMP_INT_MSK_PDAF_VAL, lmp + LMP_INT_MSK);
+		writel_relaxed(0, lmp + 0x10);
+	}
+
+	writel_relaxed(LMP_ALLOC_GATE_VAL, core + LMP_ALLOC_GATE);
+	writel_relaxed(1, core + LMP_ALLOC_A + LMP_ALLOC_INIT0);
+	writel_relaxed(1, core + LMP_ALLOC_A + LMP_ALLOC_INIT1);
+	writel_relaxed(0, core + LMP_ALLOC_A + LMP_ALLOC_INIT2);
+	writel_relaxed(1, core + LMP_ALLOC_B + LMP_ALLOC_INIT0);
+	writel_relaxed(1, core + LMP_ALLOC_B + LMP_ALLOC_INIT1);
+	writel_relaxed(0, core + LMP_ALLOC_B + LMP_ALLOC_INIT2);
+	writel_relaxed(LMP_ALLOC_MODE_VAL, core + LMP_ALLOC_MODE);
+
+	writel_relaxed(FC_INIT_MASK_VAL, core + FC_INIT_MASK);
+	writel_relaxed(FC_INIT_GO_VAL, core + FC_INIT_GO);
+
+	for (i = 0; i < FC_NUM_BAYER_CTX; i++) {
+		void __iomem *wrap = ispfe->base[ISPFE_WIN_PDMA_WRAP] +
+				     PDMA_WRAP_CTX(i);
+
+		writel_relaxed(PDMA_WRAP_INIT0_VAL, wrap + PDMA_WRAP_INIT0);
+		writel_relaxed(PDMA_WRAP_INIT1_VAL, wrap + PDMA_WRAP_INIT1);
+	}
+}
+
+/*
+ * Fill every record with the same descriptor rather than staging one per
+ * frame, so a missed head advance costs a repeated frame rather than a lost
+ * one.  That is the one place this deliberately diverges from the vendor
+ * stack, and the reason is arithmetic.
+ *
+ * The ring is 1000 bytes and a record is 16, so a lap is 62 records and 8
+ * bytes left over: the vendor's head reaches 0x3e0, whose record keeps its
+ * first half there and its second half at offset 0, and the next lap then
+ * starts at offset 8.  No static fill can serve that, because offset 0 would
+ * have to be both the tail of the wrapped record and the head of the first
+ * one.  The vendor can use it only because it rewrites each record before
+ * advancing.
+ *
+ * So this fills the 62 records that fit whole and never lets the head reach
+ * the split one.  The last eight bytes are left alone.
+ */
+static void ispfe_ring_fill(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	for (i = 0; i < PDMA_NUM_RECORDS; i++) {
+		ispfe->ring[i].cmd = cpu_to_le32(PDMA_DESC_CMD);
+		ispfe->ring[i].addr_lo =
+			cpu_to_le32(lower_32_bits(ispfe->frame_dma));
+		ispfe->ring[i].addr_hi =
+			cpu_to_le32(upper_32_bits(ispfe->frame_dma));
+		ispfe->ring[i].tail = cpu_to_le32(PDMA_DESC_TAIL);
+	}
+}
+
+static void ispfe_pdma_start(struct ispfe_device *ispfe)
+{
+	void __iomem *pdma = ispfe->base[ISPFE_WIN_PDMA] +
+			     PDMA_CTX(ispfe->active.ctx);
+	void __iomem *wrap = ispfe->base[ISPFE_WIN_PDMA_WRAP] +
+			     PDMA_WRAP_CTX(ispfe->active.ctx);
+
+	ispfe->head = 0;
+
+	writel_relaxed(PDMA_INT0_MSK_VAL, pdma + PDMA_INT0_MSK);
+	writel_relaxed(PDMA_INT1_MSK_VAL, pdma + PDMA_INT1_MSK);
+	writel_relaxed(PDMA_WRAP_MSK_VAL, wrap + PDMA_WRAP_MSK);
+
+	writel_relaxed(lower_32_bits(ispfe->ring_dma), pdma + PDMA_BASE_LO);
+	writel_relaxed(upper_32_bits(ispfe->ring_dma), pdma + PDMA_BASE_HI);
+	writel_relaxed(PDMA_SIZE_VAL, pdma + PDMA_SIZE);
+	writel_relaxed(0, pdma + PDMA_HEAD);
+	dma_wmb();
+	writel_relaxed(1, pdma + PDMA_ENABLE);
+	writel_relaxed(1, pdma + PDMA_INT0_ARM);
+}
+
+static void ispfe_pdma_stop(struct ispfe_device *ispfe)
+{
+	void __iomem *pdma = ispfe->base[ISPFE_WIN_PDMA] +
+			     PDMA_CTX(ispfe->active.ctx);
+	void __iomem *wrap = ispfe->base[ISPFE_WIN_PDMA_WRAP] +
+			     PDMA_WRAP_CTX(ispfe->active.ctx);
+
+	writel_relaxed(0, pdma + PDMA_ENABLE);
+	writel_relaxed(0, pdma + PDMA_INT0_MSK);
+	writel_relaxed(0, pdma + PDMA_INT1_MSK);
+	writel_relaxed(0, wrap + PDMA_WRAP_MSK);
+}
+
+/*
+ * The frame controller context, in the order the vendor stack writes it for a
+ * raw stream: the four configuration words, the line-memory instance bound to
+ * this context, the context started, then everything the mode describes, and
+ * last of all the mode word that puts it in raw rather than configure.  That
+ * last write is what makes the context run, so it is deliberately after the
+ * link and its interrupts are up.
+ */
+static void ispfe_fc_start(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *ctx = core + FC_BAYER_CTX(ispfe->active.ctx);
+	void __iomem *bind = core + LMP_BAYER_BIND(ispfe->active.lmp);
+	void __iomem *bank = core + LMP_BAYER_BANK(ispfe->active.lmp);
+	void __iomem *alloc = core + LMP_ALLOC_A;
+	unsigned int i;
+
+	writel_relaxed(LMP_BANK_MSK0_VAL, bank + LMP_BANK_MSK0);
+	writel_relaxed(LMP_BANK_MSK1_ARM, bank + LMP_BANK_MSK1);
+
+	writel_relaxed(LMP_ALLOC_SLOT_VAL0,
+		       alloc + LMP_ALLOC_SLOT(ispfe->active.slot));
+	writel_relaxed(LMP_ALLOC_SLOT_VAL1,
+		       alloc + LMP_ALLOC_SLOT(ispfe->active.slot) + 4);
+	writel_relaxed(LMP_ALLOC_SLOT_VAL0,
+		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot));
+	writel_relaxed(LMP_ALLOC_SLOT_VAL1,
+		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot) + 4);
+	writel_relaxed(LMP_ALLOC_CTRL_IMX712, alloc + LMP_ALLOC_CTRL);
+	writel_relaxed(LMP_ALLOC_CTRL_B, core + LMP_ALLOC_B + LMP_ALLOC_CTRL);
+
+	writel_relaxed(LMP_INT_ARM_VAL,
+		       core + LMP_BAYER_INT(ispfe->active.lmp) + LMP_INT_ARM);
+
+	writel_relaxed(FC_CTX_ENABLE_VAL, ctx + FC_CTX_ENABLE);
+	writel_relaxed(FC_CTX_MODE_CONFIGURE, ctx + FC_CTX_MODE);
+	writel_relaxed(FC_CTX_LIMIT_VAL, ctx + FC_CTX_LIMIT);
+	writel_relaxed(FC_CTX_DEPTH_VAL, ctx + FC_CTX_DEPTH);
+
+	writel_relaxed(1, ctx + FC_CTX_ARM);
+	writel_relaxed(BIT(ispfe->active.ctx), core + FC_CTX_START);
+
+	writel_relaxed(ispfe->active.mode_word0, ctx + FC_CTX_MODE_WORD0);
+	writel_relaxed(ispfe->active.mode_word1, ctx + FC_CTX_MODE_WORD1);
+	for (i = 0; i < ARRAY_SIZE(fc_ctx_ones); i++)
+		writel_relaxed(1, ctx + fc_ctx_ones[i]);
+	writel_relaxed(FC_CTX_SOURCE_LINK(ispfe->active.link) |
+		       FC_CTX_SOURCE_CHANNEL(0) | FC_CTX_SOURCE_COMMON,
+		       ctx + FC_CTX_SOURCE);
+	writel_relaxed(0, ctx + FC_CTX_ZERO);
+	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, ispfe->active.height),
+		       ctx + FC_CTX_RESOL);
+	writel_relaxed(FC_CTX_MODE2_VAL, ctx + FC_CTX_MODE2);
+
+	writel_relaxed(ispfe->active.ctx, bind + LMP_BIND_CONTEXT);
+	writel_relaxed(1, bind + LMP_BIND_ENABLE);
+
+	writel_relaxed(BIT(ispfe->active.ctx), core + FC_INT_MSK);
+}
+
+static void ispfe_fc_run(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+
+	writel_relaxed(LMP_BANK_MSK1_RUN,
+		       core + LMP_BAYER_BANK(ispfe->active.lmp) + LMP_BANK_MSK1);
+	writel_relaxed(FC_CTX_MODE_RUN_RAW,
+		       core + FC_BAYER_CTX(ispfe->active.ctx) + FC_CTX_MODE);
+}
+
+static void ispfe_fc_stop(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *ctx = core + FC_BAYER_CTX(ispfe->active.ctx);
+
+	writel_relaxed(0, core + FC_INT_MSK);
+	writel_relaxed(BIT(ispfe->active.ctx), core + FC_CTX_STOP);
+	writel_relaxed(0, ctx + FC_CTX_ARM);
+	writel_relaxed(0, ctx + FC_CTX_ENABLE);
+	writel_relaxed(0, ctx + FC_CTX_MODE);
+	writel_relaxed(0, ctx + FC_CTX_LIMIT);
+	writel_relaxed(0, ctx + FC_CTX_DEPTH);
+	writel_relaxed(0, core + LMP_BAYER_BIND(ispfe->active.lmp) +
+			  LMP_BIND_ENABLE);
+	writel_relaxed(0, core + LMP_BAYER_BANK(ispfe->active.lmp) +
+			  LMP_BANK_MSK1);
+	writel_relaxed(0, core + LMP_BAYER_BANK(ispfe->active.lmp) +
+			  LMP_BANK_MSK0);
+}
+
+static irqreturn_t ispfe_fc_isr(int irq, void *data)
+{
+	struct ispfe_device *ispfe = data;
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *ctx = core + FC_BAYER_CTX(ispfe->active.ctx);
+	u32 src, int1;
+
+	src = readl_relaxed(core + FC_INT_SRC);
+	if (!src)
+		return IRQ_NONE;
+
+	int1 = readl_relaxed(ctx + FC_CTX_INT1);
+	WRITE_ONCE(ispfe->fc_seen, READ_ONCE(ispfe->fc_seen) | int1);
+	writel_relaxed(readl_relaxed(ctx + FC_CTX_INT0), ctx + FC_CTX_INT0);
+	writel_relaxed(int1, ctx + FC_CTX_INT1);
+	writel_relaxed(readl_relaxed(ctx + FC_CTX_INT2), ctx + FC_CTX_INT2);
+	writel_relaxed(readl_relaxed(ctx + FC_CTX_INT3), ctx + FC_CTX_INT3);
+	writel_relaxed(0, core + FC_INT_ACK);
+	writel_relaxed(src, core + FC_INT_SRC);
+
+	atomic_inc(&ispfe->fc_events);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * All five bayer line-memory instances share one GIC line, and device init
+ * unmasks every one of them, so acknowledging only the configured instance
+ * would leave a level-triggered line asserted for ever.  That is an interrupt
+ * storm the kernel's spurious detector cannot see, because the handler keeps
+ * returning IRQ_HANDLED for it.  Acknowledge all of them, which is what the
+ * vendor stack's handler does.
+ */
+static irqreturn_t ispfe_lmp_isr(int irq, void *data)
+{
+	struct ispfe_device *ispfe = data;
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	unsigned int i;
+	u32 seen;
+
+	seen = readl_relaxed(core + LMP_INT_DEBUG);
+	writel_relaxed(seen, core + LMP_INT_DEBUG);
+
+	for (i = 0; i < LMP_NUM_BAYER; i++) {
+		void __iomem *lmp = core + LMP_BAYER_INT(i);
+		void __iomem *bank = core + LMP_BAYER_BANK(i);
+		u32 src = readl_relaxed(lmp + LMP_INT_SRC);
+		u32 bsrc = readl_relaxed(bank + LMP_BANK_SRC);
+
+		seen |= src | bsrc;
+		writel_relaxed(src, lmp + LMP_INT_SRC);
+		writel_relaxed(bsrc, bank + LMP_BANK_SRC);
+	}
+
+	if (!seen)
+		return IRQ_NONE;
+
+	atomic_inc(&ispfe->lmp_events);
+
+	return IRQ_HANDLED;
+}
+
+/* All five PDMA contexts share one line too, for the same reason. */
+static irqreturn_t ispfe_pdma_isr(int irq, void *data)
+{
+	struct ispfe_device *ispfe = data;
+	unsigned int i;
+	u32 seen = 0;
+
+	for (i = 0; i < FC_NUM_BAYER_CTX; i++) {
+		void __iomem *pdma = ispfe->base[ISPFE_WIN_PDMA] + PDMA_CTX(i);
+		void __iomem *wrap = ispfe->base[ISPFE_WIN_PDMA_WRAP] +
+				     PDMA_WRAP_CTX(i);
+		u32 int0 = readl_relaxed(pdma + PDMA_INT0_SRC);
+		u32 int1 = readl_relaxed(pdma + PDMA_INT1_SRC);
+		u32 wr = readl_relaxed(wrap + PDMA_WRAP_SRC);
+
+		seen |= int0 | int1 | wr;
+		writel_relaxed(int0, pdma + PDMA_INT0_SRC);
+		writel_relaxed(int1, pdma + PDMA_INT1_SRC);
+		writel_relaxed(wr, wrap + PDMA_WRAP_SRC);
+	}
+
+	if (!seen)
+		return IRQ_NONE;
+
+	atomic_inc(&ispfe->pdma_events);
+
+	return IRQ_HANDLED;
+}
+
+static void ispfe_buffers_free(struct ispfe_device *ispfe)
+{
+	if (ispfe->ring) {
+		dma_free_coherent(ispfe->dev, PAGE_SIZE, ispfe->ring,
+				  ispfe->ring_dma);
+		ispfe->ring = NULL;
+	}
+	if (ispfe->frame) {
+		dma_free_coherent(ispfe->dev, ispfe->frame_size, ispfe->frame,
+				  ispfe->frame_dma);
+		ispfe->frame = NULL;
+		ispfe->frame_size = 0;
+	}
+}
+
+/*
+ * The frame buffer outlives the stream: a capture is read out after it has
+ * been stopped, so freeing it on stop would throw away the only thing the
+ * whole exercise produces.  It is reallocated when the geometry changes and
+ * released when the driver goes away.
+ */
+static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
+{
+	size_t size = array3_size(ispfe->active.width, ispfe->active.height,
+				  ISPFE_BYTES_PER_PIXEL);
+
+
+	if (size == SIZE_MAX)
+		return -EOVERFLOW;
+
+	if (ispfe->frame && ispfe->frame_size == size) {
+		memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+		ispfe_ring_fill(ispfe);
+		return 0;
+	}
+
+	ispfe_buffers_free(ispfe);
+
+	ispfe->frame = dma_alloc_coherent(ispfe->dev, size, &ispfe->frame_dma,
+					  GFP_KERNEL);
+	if (!ispfe->frame)
+		return -ENOMEM;
+	ispfe->frame_size = size;
+
+	ispfe->ring = dma_alloc_coherent(ispfe->dev, PAGE_SIZE,
+					 &ispfe->ring_dma, GFP_KERNEL);
+	if (!ispfe->ring) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Poisoned rather than zeroed, so that a frame that never arrived is
+	 * distinguishable from one that arrived black.
+	 */
+	memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+	ispfe_ring_fill(ispfe);
+
+	return 0;
+}
+
+static int ispfe_request_irqs(struct ispfe_device *ispfe)
+{
+	struct platform_device *pdev = to_platform_device(ispfe->dev);
+	int ret;
+
+	ret = request_irq(ispfe->link_irq, ispfe_link_isr, 0, ispfe->link_name,
+			  ispfe);
+	if (ret)
+		return ret;
+
+	ispfe->fc_irq = platform_get_irq_byname(pdev, "fc");
+	ispfe->lmp_irq = platform_get_irq_byname(pdev, "lmp-bayer");
+	ispfe->pdma_irq = platform_get_irq_byname(pdev, "pdma");
+	if (ispfe->fc_irq < 0 || ispfe->lmp_irq < 0 || ispfe->pdma_irq < 0) {
+		ret = -ENODEV;
+		goto err_link;
+	}
+
+	ret = request_irq(ispfe->fc_irq, ispfe_fc_isr, 0, "ispfe-fc", ispfe);
+	if (ret)
+		goto err_link;
+
+	ret = request_irq(ispfe->lmp_irq, ispfe_lmp_isr, 0, "ispfe-lmp", ispfe);
+	if (ret)
+		goto err_fc;
+
+	ret = request_irq(ispfe->pdma_irq, ispfe_pdma_isr, 0, "ispfe-pdma",
+			  ispfe);
+	if (ret)
+		goto err_lmp;
+
+	return 0;
+
+err_lmp:
+	free_irq(ispfe->lmp_irq, ispfe);
+err_fc:
+	free_irq(ispfe->fc_irq, ispfe);
+err_link:
+	free_irq(ispfe->link_irq, ispfe);
+	return ret;
+}
+
+static void ispfe_free_irqs(struct ispfe_device *ispfe)
+{
+	free_irq(ispfe->pdma_irq, ispfe);
+	free_irq(ispfe->lmp_irq, ispfe);
+	free_irq(ispfe->fc_irq, ispfe);
+	free_irq(ispfe->link_irq, ispfe);
+}
+
+/*
+ * Bring one raw stream up, in the order the vendor stack does: the block, the
+ * line-memory pool, PDMA, the frame controller context, the PHY, the link, the
+ * link's interrupts, and only then the mode word that makes the context run.
+ *
+ * The sensor is not started here.  Nothing in this driver knows how to, and
+ * the vendor stack has the same ordering -- the receiver is configured and
+ * armed, and the sensor's own stream-on comes last.
+ */
 static int ispfe_start(struct ispfe_device *ispfe)
 {
 	struct platform_device *pdev = to_platform_device(ispfe->dev);
@@ -655,6 +1349,9 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	    ispfe->src.phy >= PHY_NUM_INSTANCES ||
 	    ispfe->src.lanes < 1 ||
 	    ispfe->src.lanes > ispfe_phy_lanes(ispfe->src.phy) ||
+	    ispfe->src.ctx >= FC_NUM_BAYER_CTX ||
+	    ispfe->src.lmp >= LMP_NUM_BAYER ||
+	    ispfe->src.slot >= LMP_ALLOC_NUM_SLOTS ||
 	    ispfe->src.width - 1 >= U16_MAX || ispfe->src.height - 1 >= U16_MAX)
 		return -EINVAL;
 
@@ -667,10 +1364,18 @@ static int ispfe_start(struct ispfe_device *ispfe)
 		return ret;
 	ispfe->link_irq = ret;
 
+	ret = ispfe_buffers_alloc(ispfe);
+	if (ret)
+		return ret;
+
 	atomic_set(&ispfe->frame_start, 0);
 	atomic_set(&ispfe->frame_end, 0);
+	atomic_set(&ispfe->fc_events, 0);
+	atomic_set(&ispfe->lmp_events, 0);
+	atomic_set(&ispfe->pdma_events, 0);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
+	ispfe->fc_seen = 0;
 
 	ret = pm_runtime_resume_and_get(ispfe->dev);
 	if (ret)
@@ -678,16 +1383,20 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	/*
 	 * Requested before anything is unmasked, and after the domain is up:
-	 * the handler touches the link's registers.
+	 * the handlers touch the block's registers.
 	 */
-	ret = request_irq(ispfe->link_irq, ispfe_link_isr, 0, ispfe->link_name,
-			  ispfe);
+	ret = ispfe_request_irqs(ispfe);
 	if (ret)
 		goto err_put;
 
+	ispfe_device_init(ispfe);
+	ispfe_pdma_start(ispfe);
+	ispfe_fc_start(ispfe);
 	ispfe_phy_start(ispfe);
 	ispfe_link_start(ispfe);
 	ispfe_link_unmask(ispfe);
+	ispfe_fc_run(ispfe);
+
 	ispfe->streaming = true;
 
 	return 0;
@@ -701,7 +1410,9 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 {
 	ispfe_link_stop(ispfe);
 	ispfe_phy_stop(ispfe);
-	free_irq(ispfe->link_irq, ispfe);
+	ispfe_fc_stop(ispfe);
+	ispfe_pdma_stop(ispfe);
+	ispfe_free_irqs(ispfe);
 	ispfe->streaming = false;
 	pm_runtime_put(ispfe->dev);
 }
@@ -745,15 +1456,80 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
 	seq_printf(s, "frame_start  %u\n", atomic_read(&ispfe->frame_start));
 	seq_printf(s, "frame_end    %u\n", atomic_read(&ispfe->frame_end));
+	seq_printf(s, "fc_events    %u\n", atomic_read(&ispfe->fc_events));
+	seq_printf(s, "lmp_events   %u\n", atomic_read(&ispfe->lmp_events));
+	seq_printf(s, "pdma_events  %u\n", atomic_read(&ispfe->pdma_events));
 	seq_printf(s, "int0_seen    %#010x\n", READ_ONCE(ispfe->int0_seen));
 	seq_printf(s, "int1_seen    %#010x\n", READ_ONCE(ispfe->int1_seen));
+	seq_printf(s, "fc_seen      %#010x\n", READ_ONCE(ispfe->fc_seen));
+	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
+	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);
+	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
+	seq_printf(s, "ring_head    %#x\n", ispfe->head);
 
-	if (ispfe->streaming)
+	if (ispfe->streaming) {
+		void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+
 		seq_printf(s, "cmn_ctrl     %#010x\n",
 			   readl_relaxed(ispfe_link(ispfe) + CSIS_CMN_CTRL));
+		seq_printf(s, "fc_mode      %#010x\n",
+			   readl_relaxed(core + FC_BAYER_CTX(ispfe->active.ctx) +
+					 FC_CTX_MODE));
+		seq_printf(s, "pdma_head    %#010x\n",
+			   readl_relaxed(ispfe->base[ISPFE_WIN_PDMA] +
+					 PDMA_CTX(ispfe->active.ctx) + PDMA_HEAD));
+	}
+
+	/*
+	 * How much of the buffer is still poison, sampled rather than counted
+	 * in full: the question a bring-up asks of an untouched 25 MB buffer is
+	 * only "did anything at all write to it", and where.
+	 */
+	if (ispfe->frame) {
+		const u8 *p = ispfe->frame;
+		size_t i, step = max_t(size_t, ispfe->frame_size / 4096, 1);
+		size_t touched = 0, samples = 0;
+		ssize_t first = -1;
+
+		for (i = 0; i < ispfe->frame_size; i += step, samples++) {
+			if (p[i] == ISPFE_FRAME_POISON)
+				continue;
+			if (first < 0)
+				first = i;
+			touched++;
+		}
+		seq_printf(s, "frame_dirty  %zu of %zu samples, first %zd\n",
+			   touched, samples, first);
+	}
 
 	return 0;
 }
+
+/*
+ * The captured frame, straight out of the buffer the hardware was pointed at.
+ * There is no V4L2 device yet, so this is how a frame leaves the phone; it is
+ * raw Bayer at the configured geometry, ten bits in a sixteen-bit container.
+ */
+static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	struct ispfe_device *ispfe = file->private_data;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (!ispfe->frame)
+		return -ENODATA;
+
+	return simple_read_from_buffer(buf, count, ppos, ispfe->frame,
+				       ispfe->frame_size);
+}
+
+static const struct file_operations ispfe_frame_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_frame_read,
+	.llseek = default_llseek,
+};
 DEFINE_SHOW_ATTRIBUTE(ispfe_status);
 
 static void ispfe_debugfs_init(struct ispfe_device *ispfe)
@@ -769,8 +1545,14 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("width", 0644, d, &ispfe->src.width);
 	debugfs_create_u32("height", 0644, d, &ispfe->src.height);
 	debugfs_create_bool("cphy", 0644, d, &ispfe->src.cphy);
+	debugfs_create_u32("ctx", 0644, d, &ispfe->src.ctx);
+	debugfs_create_u32("lmp", 0644, d, &ispfe->src.lmp);
+	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);
+	debugfs_create_u32("mode_word0", 0644, d, &ispfe->src.mode_word0);
+	debugfs_create_u32("mode_word1", 0644, d, &ispfe->src.mode_word1);
 	debugfs_create_file("enable", 0644, d, ispfe, &ispfe_enable_fops);
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
+	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 }
 
 static void ispfe_report(struct ispfe_device *ispfe)
@@ -815,12 +1597,34 @@ static int ispfe_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
+	 * Stated rather than inherited.  A platform device defaults to a
+	 * 32-bit coherent mask and the System MMU aperture is wider, so
+	 * widening this would start putting a non-zero high word in the PDMA
+	 * descriptor -- and every ring base the vendor stack was ever seen to
+	 * write is 32-bit with that word zero.
+	 */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
+
+	/*
 	 * tegu's ultrawide IMX712 as the default source, because it is the
 	 * simplest of the three: one recovered mode at full readout and an
 	 * ordinary four-lane D-PHY, where the main camera is three-lane C-PHY.
 	 */
 	ispfe->src = (struct ispfe_source){
 		.link = 1, .phy = 1, .lanes = 4, .width = 4208, .height = 3120,
+		/*
+		 * The exact configuration the vendor stack put this sensor in,
+		 * rather than a plausible mixture of several.  Nothing in the
+		 * captures separates "per sensor mode" from "per context" for
+		 * the two mode words, and they were only ever measured in
+		 * context 1's register block -- so use context 1, the PDMA
+		 * context beside it, and the line-memory instance and slot that
+		 * went with them.
+		 */
+		.ctx = 1, .lmp = 2, .slot = 0,
+		.mode_word0 = 0x000c44a0, .mode_word1 = 0x000014f8,
 	};
 
 	for (i = 0; i < ISPFE_NUM_WINDOWS; i++) {
@@ -881,9 +1685,11 @@ static void ispfe_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(ispfe->debugfs);
 
-	scoped_guard(mutex, &ispfe->lock)
+	scoped_guard(mutex, &ispfe->lock) {
 		if (ispfe->streaming)
 			ispfe_stop(ispfe);
+		ispfe_buffers_free(ispfe);
+	}
 }
 
 static const struct of_device_id ispfe_of_match[] = {

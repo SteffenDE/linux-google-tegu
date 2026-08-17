@@ -199,6 +199,55 @@
 #define SLG51000_OTP_LOCK_CTRL                  0x78ff
 #define SLG51000_LOCK_GLOBAL_LOCK_CTRL1         0x8000
 
+/*
+ * SLG51002 deltas.  The two parts share a register map: the system
+ * controller, the GPIO, LUT, mux and power-sequencer arrays, the OTP block and
+ * every LDO's VSEL/MINV/MAXV and EVENT/STATUS/IRQ_MASK are at the same
+ * addresses, with the same bit fields.
+ *
+ * What moves is the per-LDO tail between MAXV and EVENT.  A low-voltage LDO
+ * carries an extra TRIM3, which puts its VSEL_ACTUAL at base+0x67 against
+ * base+0x66 for a high-voltage one -- and the two parts split their LDOs
+ * differently, the SLG51000's low-voltage pair being LDO5 and LDO6 and the
+ * SLG51002's low-voltage trio LDO6 through LDO8.  So LDO7 became low-voltage
+ * and gained the TRIM3, moving one register later; LDO5 went the other way and
+ * moved one earlier.
+ *
+ * LDO1 and LDO2 are a third case, and not the grouping rule at all: on the
+ * SLG51000 they are dual-range, with a MISC1 tail and no CONF1/CONF2, which
+ * puts VSEL_ACTUAL at base+0x65.  On the SLG51002 they are ordinary
+ * high-voltage LDOs and land at base+0x66.
+ *
+ * Only the endpoints the driver describes are defined here.  The CONF3 past
+ * VSEL_ACTUAL on every LDO, and the CONF4 past that on LDO4 and LDO5, are
+ * configuration the driver does not touch.
+ *
+ * The SLG51002 also has an eighth LDO and a second global lock register.
+ */
+#define SLG51002_LDO1_TRIM2                     0x2063
+#define SLG51002_LDO1_VSEL_ACTUAL               0x2066
+#define SLG51002_LDO2_TRIM2                     0x2263
+#define SLG51002_LDO2_VSEL_ACTUAL               0x2266
+#define SLG51002_LDO3_TRIM2                     0x2363
+#define SLG51002_LDO3_VSEL_ACTUAL               0x2366
+#define SLG51002_LDO4_TRIM2                     0x2563
+#define SLG51002_LDO4_VSEL_ACTUAL               0x2566
+#define SLG51002_LDO5_TRIM2                     0x2763
+#define SLG51002_LDO5_VSEL_ACTUAL               0x2766
+#define SLG51002_LDO6_TRIM2                     0x2963
+#define SLG51002_LDO6_VSEL_ACTUAL               0x2967
+#define SLG51002_LDO7_TRIM2                     0x3163
+#define SLG51002_LDO7_VSEL_ACTUAL               0x3167
+#define SLG51002_LDO8_VSEL                      0x3200
+#define SLG51002_LDO8_MINV                      0x3260
+#define SLG51002_LDO8_MAXV                      0x3261
+#define SLG51002_LDO8_TRIM2                     0x3263
+#define SLG51002_LDO8_VSEL_ACTUAL               0x3267
+#define SLG51002_LDO8_EVENT                     0x32c0
+#define SLG51002_LDO8_STATUS                    0x32c1
+#define SLG51002_LDO8_IRQ_MASK                  0x32c2
+#define SLG51002_LOCK_GLOBAL_LOCK_CTRL2         0x8001
+
 /* Register Bit Fields */
 
 /* SLG51000_SYSCTL_PATTERN_ID_BYTE0 = 0x1105 */

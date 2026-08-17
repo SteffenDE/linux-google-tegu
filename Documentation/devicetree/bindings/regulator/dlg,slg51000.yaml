@@ -4,15 +4,21 @@
 $id: http://devicetree.org/schemas/regulator/dlg,slg51000.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Dialog Semiconductor SLG51000 Voltage Regulator
+title: Dialog Semiconductor SLG51000/SLG51002 Voltage Regulator
 
 maintainers:
   - Eric Jeong <eric.jeong.opensource@diasemi.com>
   - Support Opensource <support.opensource@diasemi.com>
 
+description: |
+  The SLG51000 has seven LDOs; the SLG51002 has eight, and pairs LDO1 and LDO2
+  on a shared input pin.
+
 properties:
   compatible:
-    const: dlg,slg51000
+    enum:
+      - dlg,slg51000
+      - dlg,slg51002
 
   reg:
     maxItems: 1
@@ -24,6 +30,10 @@ properties:
     maxItems: 1
     description:
       GPIO for chip select
+
+  vin1_2-supply:
+    description:
+      Input supply shared by ldo1 and ldo2, required if either is enabled
 
   vin3-supply:
     description:
@@ -45,12 +55,16 @@ properties:
     description:
       Input supply for ldo7, required if regulator is enabled
 
+  vin8-supply:
+    description:
+      Input supply for ldo8, required if regulator is enabled
+
   regulators:
     type: object
     additionalProperties: false
 
     patternProperties:
-      "^ldo[1-7]$":
+      "^ldo[1-8]$":
         type: object
         $ref: /schemas/regulator/regulator.yaml#
         unevaluatedProperties: false
@@ -66,6 +80,19 @@ required:
   - compatible
   - reg
   - regulators
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: dlg,slg51000
+    then:
+      properties:
+        vin1_2-supply: false
+        vin8-supply: false
+        regulators:
+          properties:
+            ldo8: false
 
 additionalProperties: false
 

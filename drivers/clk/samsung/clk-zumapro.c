@@ -19,7 +19,7 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_MFC_MFC + 1)
+#define CLKS_NR_TOP		(CLK_GOUT_CMU_DFTMUX_CIS_CLK3 + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI5_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI9_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
@@ -105,6 +105,28 @@
 #define CLK_CON_MUX_MUX_CLKCMU_MFC_MFC	0x10c4
 #define CLK_CON_DIV_CLKCMU_MFC_MFC		0x18bc
 #define CLK_CON_GAT_GATE_CLKCMU_MFC_MFC	0x20ec
+#define CLK_CON_MUX_MUX_CLKCMU_CIS_CLK0		0x1010
+#define CLK_CON_MUX_MUX_CLKCMU_CIS_CLK1		0x1014
+#define CLK_CON_MUX_MUX_CLKCMU_CIS_CLK3		0x101c
+#define CLK_CON_DIV_CLKCMU_CIS_CLK0		0x1810
+#define CLK_CON_DIV_CLKCMU_CIS_CLK1		0x1814
+#define CLK_CON_DIV_CLKCMU_CIS_CLK3		0x181c
+#define CLK_CON_GAT_GATE_CLKCMU_CIS_CLK0	0x2038
+#define CLK_CON_GAT_GATE_CLKCMU_CIS_CLK1	0x203c
+#define CLK_CON_GAT_GATE_CLKCMU_CIS_CLK3	0x2044
+#define DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK0	0x3004
+#define DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK1	0x3008
+#define DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK3	0x3010
+
+/*
+ * DMYQCH_CON_* bit 0 is the Q-Channel's own enable, bit 1 the clock request
+ * and bit 2 an ignore-force-PM override.  Bit 0 clear means software owns the
+ * request, and clear is what it is in practice: the vendor driver clears it
+ * when it registers the clock, and a register trace of a live camera session
+ * shows these registers only ever holding 0x0 or 0x2.  So asserting bit 1 is
+ * what makes the CMU let the clock out on the pad.
+ */
+#define DMYQCH_CON_CLOCK_REQ_BIT		1
 
 static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_MFC_MFC,
@@ -162,6 +184,18 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_MUX_MUX_CLKCMU_MISC_NOC,
 	CLK_CON_DIV_CLKCMU_MISC_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_MISC_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_CIS_CLK0,
+	CLK_CON_MUX_MUX_CLKCMU_CIS_CLK1,
+	CLK_CON_MUX_MUX_CLKCMU_CIS_CLK3,
+	CLK_CON_DIV_CLKCMU_CIS_CLK0,
+	CLK_CON_DIV_CLKCMU_CIS_CLK1,
+	CLK_CON_DIV_CLKCMU_CIS_CLK3,
+	CLK_CON_GAT_GATE_CLKCMU_CIS_CLK0,
+	CLK_CON_GAT_GATE_CLKCMU_CIS_CLK1,
+	CLK_CON_GAT_GATE_CLKCMU_CIS_CLK3,
+	DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK0,
+	DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK1,
+	DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK3,
 };
 
 /*
@@ -231,6 +265,14 @@ PNAME(mout_cmu_mfc_mfc_p) = {
 	"fout_spare_pll", "oscclk",
 };
 
+/* Selectors 6 and 7 tie back to oscclk, as they do on gs101. */
+PNAME(mout_cmu_cis_clk_p) = {
+	"oscclk", "fout_shared0_d3",
+	"fout_shared1_d3", "fout_shared2_d2",
+	"fout_shared3_d2", "fout_spare_pll",
+	"oscclk", "oscclk",
+};
+
 static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	MUX(CLK_MOUT_CMU_MFC_MFC, "mout_cmu_mfc_mfc", mout_cmu_mfc_mfc_p,
 	    CLK_CON_MUX_MUX_CLKCMU_MFC_MFC, 0, 3),
@@ -270,6 +312,12 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_hsi0_peri_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI, 0, 2),
 	MUX(CLK_MOUT_CMU_MISC_NOC, "mout_cmu_misc_noc",
 	    mout_cmu_misc_noc_p, CLK_CON_MUX_MUX_CLKCMU_MISC_NOC, 0, 2),
+	MUX(CLK_MOUT_CMU_CIS_CLK0, "mout_cmu_cis_clk0",
+	    mout_cmu_cis_clk_p, CLK_CON_MUX_MUX_CLKCMU_CIS_CLK0, 0, 3),
+	MUX(CLK_MOUT_CMU_CIS_CLK1, "mout_cmu_cis_clk1",
+	    mout_cmu_cis_clk_p, CLK_CON_MUX_MUX_CLKCMU_CIS_CLK1, 0, 3),
+	MUX(CLK_MOUT_CMU_CIS_CLK3, "mout_cmu_cis_clk3",
+	    mout_cmu_cis_clk_p, CLK_CON_MUX_MUX_CLKCMU_CIS_CLK3, 0, 3),
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
@@ -343,6 +391,33 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_CMU_MISC_NOC, "gout_cmu_misc_noc",
 	     "mout_cmu_misc_noc", CLK_CON_GAT_GATE_CLKCMU_MISC_NOC,
 	     21, 0, 0),
+	/*
+	 * Camera sensor master clocks.  The CLKCMU gate is an ordinary
+	 * automatic one; the DFTMUX Q-Channel request behind it is not, and
+	 * carries CLK_GATE_SAMSUNG_MANUAL so it is actually written -- there
+	 * is no consumer block on the far side of a pad to handshake with.
+	 */
+	GATE(CLK_GOUT_CMU_CIS_CLK0, "gout_cmu_cis_clk0",
+	     "mout_cmu_cis_clk0", CLK_CON_GAT_GATE_CLKCMU_CIS_CLK0,
+	     21, 0, 0),
+	GATE(CLK_GOUT_CMU_CIS_CLK1, "gout_cmu_cis_clk1",
+	     "mout_cmu_cis_clk1", CLK_CON_GAT_GATE_CLKCMU_CIS_CLK1,
+	     21, 0, 0),
+	GATE(CLK_GOUT_CMU_CIS_CLK3, "gout_cmu_cis_clk3",
+	     "mout_cmu_cis_clk3", CLK_CON_GAT_GATE_CLKCMU_CIS_CLK3,
+	     21, 0, 0),
+	GATE(CLK_GOUT_CMU_DFTMUX_CIS_CLK0, "gout_cmu_dftmux_cis_clk0",
+	     "dout_cmu_cis_clk0", DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK0,
+	     DMYQCH_CON_CLOCK_REQ_BIT, CLK_SET_RATE_PARENT,
+	     CLK_GATE_SAMSUNG_MANUAL),
+	GATE(CLK_GOUT_CMU_DFTMUX_CIS_CLK1, "gout_cmu_dftmux_cis_clk1",
+	     "dout_cmu_cis_clk1", DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK1,
+	     DMYQCH_CON_CLOCK_REQ_BIT, CLK_SET_RATE_PARENT,
+	     CLK_GATE_SAMSUNG_MANUAL),
+	GATE(CLK_GOUT_CMU_DFTMUX_CIS_CLK3, "gout_cmu_dftmux_cis_clk3",
+	     "dout_cmu_cis_clk3", DMYQCH_CON_DFTMUX_CMU_QCH_CIS_CLK3,
+	     DMYQCH_CON_CLOCK_REQ_BIT, CLK_SET_RATE_PARENT,
+	     CLK_GATE_SAMSUNG_MANUAL),
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
@@ -384,6 +459,12 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_hsi0_peri", CLK_CON_DIV_CLKCMU_HSI0_PERI, 0, 4),
 	DIV(CLK_DOUT_CMU_MISC_NOC, "dout_cmu_misc_noc",
 	    "gout_cmu_misc_noc", CLK_CON_DIV_CLKCMU_MISC_NOC, 0, 4),
+	DIV(CLK_DOUT_CMU_CIS_CLK0, "dout_cmu_cis_clk0",
+	    "gout_cmu_cis_clk0", CLK_CON_DIV_CLKCMU_CIS_CLK0, 0, 5),
+	DIV(CLK_DOUT_CMU_CIS_CLK1, "dout_cmu_cis_clk1",
+	    "gout_cmu_cis_clk1", CLK_CON_DIV_CLKCMU_CIS_CLK1, 0, 5),
+	DIV(CLK_DOUT_CMU_CIS_CLK3, "dout_cmu_cis_clk3",
+	    "gout_cmu_cis_clk3", CLK_CON_DIV_CLKCMU_CIS_CLK3, 0, 5),
 };
 
 static const struct samsung_cmu_info top_cmu_info __initconst = {

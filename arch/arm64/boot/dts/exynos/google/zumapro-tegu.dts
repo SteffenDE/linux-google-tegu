@@ -2172,14 +2172,15 @@
 	 * through the same mainline driver: it writes VSELH = 0x2f, which with
 	 * the driver's 2025 mV base and 25 mV step is exactly 3.2 V.
 	 *
-	 * Mode 1 is the driver's forced-PWM mode, which is what the vendor
-	 * asks for and what its 0x08 write to the control register sets.  It
-	 * costs quiescent current and buys ripple, which is the right trade
-	 * for a rail feeding analog sensor supplies.
-	 *
-	 * Note the driver asserts the enable line and talks to the chip during
-	 * probe, so this rail comes up early and stays up until the regulator
-	 * core disables unused rails.
+	 * The vendor pins this to the driver's forced-PWM mode, which trades
+	 * quiescent current for ripple -- the right way round for a rail
+	 * feeding analog sensor supplies, but only while the camera is on,
+	 * which is the only time the vendor's rail is up.  Ours is up from
+	 * probe: the driver asserts the enable line to read the chip ID and
+	 * leaves it asserted, so the rail is idle far more than it is used,
+	 * and forced PWM into no load is the expensive case.  Allow both modes
+	 * and let it idle in auto; a sensor driver can ask for the fast mode
+	 * while it is streaming, which is when the ripple matters.
 	 */
 	cam_bb: regulator@77 {
 		compatible = "richtek,rt6160";
@@ -2188,7 +2189,7 @@
 		regulator-min-microvolt = <3200000>;
 		regulator-max-microvolt = <3200000>;
 		regulator-enable-ramp-delay = <2000>;
-		regulator-initial-mode = <1>;
+		regulator-allowed-modes = <0>, <1>;
 		enable-gpios = <&s2mpg15_gpio 1 GPIO_ACTIVE_HIGH>;
 	};
 

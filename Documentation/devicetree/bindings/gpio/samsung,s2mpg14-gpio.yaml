@@ -27,24 +27,10 @@ properties:
 
   gpio-line-names: true
 
-  ngpios:
-    minimum: 1
-    maximum: 10
-
 required:
   - compatible
   - gpio-controller
   - "#gpio-cells"
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          const: samsung,s2mpg14-gpio
-    then:
-      properties:
-        ngpios:
-          maximum: 6
 
 additionalProperties: false
 

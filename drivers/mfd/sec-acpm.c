@@ -458,17 +458,44 @@ static const struct regmap_config s2mpg14_regmap_config_meter = {
 };
 
 /*
- * The GPIO block: one control register per pin, the status register holding
- * their live input levels, and the pin interrupt registers.  Uncached and
- * permissive, like the common/pmic regmaps above: the status register follows
- * the pins, and the PMIC's own power sequencer can drive a pin without the
- * kernel knowing.
+ * The GPIO block: one control register per pin, a status register holding
+ * their live input levels, and per-pin interrupt registers.  Don't cache it:
+ * the status register follows the pins, and the PMIC's own power sequencer can
+ * drive a pin without the kernel knowing.
+ *
+ * The interrupt registers below the status one are left out, matching the
+ * downstream driver.  Some are write-1-to-clear, and nothing here services
+ * them -- the PMIC's interrupt has no mainline parent -- so the only thing
+ * exposing them would achieve is a debugfs register dump that acknowledges
+ * interrupts.  The status register is read-only.
  */
+static const struct regmap_range s2mpg14_gpio_registers[] = {
+	regmap_reg_range(S2MPG14_GPIO_STATUS, S2MPG14_GPIO5_MONSEL),
+};
+
+static const struct regmap_range s2mpg14_gpio_ro_registers[] = {
+	regmap_reg_range(S2MPG14_GPIO_STATUS, S2MPG14_GPIO_STATUS),
+};
+
+static const struct regmap_access_table s2mpg14_gpio_wr_table = {
+	.yes_ranges = s2mpg14_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_gpio_registers),
+	.no_ranges = s2mpg14_gpio_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg14_gpio_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg14_gpio_rd_table = {
+	.yes_ranges = s2mpg14_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_gpio_registers),
+};
+
 static const struct regmap_config s2mpg14_regmap_config_gpio = {
 	.name = "gpio",
 	.reg_bits = ACPM_ADDR_BITS,
 	.val_bits = 8,
 	.max_register = S2MPG14_GPIO5_MONSEL,
+	.wr_table = &s2mpg14_gpio_wr_table,
+	.rd_table = &s2mpg14_gpio_rd_table,
 };
 
 /*
@@ -491,11 +518,34 @@ static const struct regmap_config s2mpg15_regmap_config_pmic = {
 	.max_register = S2MPG15_PMIC_BB_USONIC,
 };
 
+/* Same shape as the S2MPG14's, with two status registers for its ten pins. */
+static const struct regmap_range s2mpg15_gpio_registers[] = {
+	regmap_reg_range(S2MPG15_GPIO_STATUS1, S2MPG15_GPIO9_MONSEL),
+};
+
+static const struct regmap_range s2mpg15_gpio_ro_registers[] = {
+	regmap_reg_range(S2MPG15_GPIO_STATUS1, S2MPG15_GPIO_STATUS2),
+};
+
+static const struct regmap_access_table s2mpg15_gpio_wr_table = {
+	.yes_ranges = s2mpg15_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_gpio_registers),
+	.no_ranges = s2mpg15_gpio_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg15_gpio_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg15_gpio_rd_table = {
+	.yes_ranges = s2mpg15_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_gpio_registers),
+};
+
 static const struct regmap_config s2mpg15_regmap_config_gpio = {
 	.name = "gpio",
 	.reg_bits = ACPM_ADDR_BITS,
 	.val_bits = 8,
 	.max_register = S2MPG15_GPIO9_MONSEL,
+	.wr_table = &s2mpg15_gpio_wr_table,
+	.rd_table = &s2mpg15_gpio_rd_table,
 };
 
 struct sec_pmic_acpm_shared_bus_context {

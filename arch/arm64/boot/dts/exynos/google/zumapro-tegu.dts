@@ -637,7 +637,6 @@
 			compatible = "samsung,s2mpg14-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			ngpios = <6>;
 		};
 
 		/*
@@ -797,15 +796,17 @@
 		 * Ten general-purpose pins.  Three are the camera board's:
 		 * pin 0 selects the camera PMIC on its i2c bus, pin 1 enables
 		 * the PP3200_CAM_BB buck-boost and pin 2 the PP1350_CAM rail.
+		 * Downstream also uses pin 5 to select the wireless charger
+		 * and pin 8 to enable the hearing-aid amplifier; neither has
+		 * a consumer here yet, so do not read the rest as free.
 		 * Source: research/dumped.dts s2mpg15_gpio, and the
-		 * dlg,cs-gpios, enable-gpios and gpio properties that
-		 * reference it.
+		 * dlg,cs-gpios, enable-gpios, gpio, idt,gpio_slct and
+		 * hac_amp_en-gpios properties that reference it.
 		 */
 		s2mpg15_gpio: gpio {
 			compatible = "samsung,s2mpg15-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			ngpios = <10>;
 		};
 
 		meter {

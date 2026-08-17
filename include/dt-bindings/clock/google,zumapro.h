@@ -118,6 +118,29 @@
 #define CLK_DOUT_CMU_DPUF0_NOC			49
 #define CLK_DOUT_CMU_DPUF1_NOC			50
 
+/*
+ * CMU_TOP camera sensor master clocks (MCLK).  Each CIS_CLK<n> leaves the SoC
+ * on a pad and drives one image sensor's external clock input.  CLK3 is the
+ * main (wide) camera, CLK1 the front camera and CLK0 the ultrawide; CLK2 is
+ * unused on this board.
+ *
+ * Each has the usual mux/gate/divider chain plus a DFTMUX gate: the dummy
+ * Q-Channel request that actually lets the clock out of the CMU, since a pad
+ * has no consumer block to handshake with.  Both have to be enabled.
+ */
+#define CLK_MOUT_CMU_CIS_CLK0			69
+#define CLK_GOUT_CMU_CIS_CLK0			70
+#define CLK_DOUT_CMU_CIS_CLK0			71
+#define CLK_GOUT_CMU_DFTMUX_CIS_CLK0		72
+#define CLK_MOUT_CMU_CIS_CLK1			73
+#define CLK_GOUT_CMU_CIS_CLK1			74
+#define CLK_DOUT_CMU_CIS_CLK1			75
+#define CLK_GOUT_CMU_DFTMUX_CIS_CLK1		76
+#define CLK_MOUT_CMU_CIS_CLK3			77
+#define CLK_GOUT_CMU_CIS_CLK3			78
+#define CLK_DOUT_CMU_CIS_CLK3			79
+#define CLK_GOUT_CMU_DFTMUX_CIS_CLK3		80
+
 /* CMU_PERIC0 muxes */
 #define CLK_MOUT_PERIC0_NOC_USER		1
 #define CLK_MOUT_PERIC0_USI0_UART_USER		2

@@ -2279,3 +2279,21 @@
 &ispfe {
 	status = "okay";
 };
+
+/*
+ * BLK_ISPFE's three System MMUs, enabled with it: they are the camera's
+ * IOMMUs, so they are also its runtime-PM suppliers and they resume first.
+ * That is why the CMU restore hangs off the power domain rather than off the
+ * camera's own resume -- see drivers/media/platform/samsung/exynos-ispfe.
+ */
+&sysmmu_ispfe_s0 {
+	status = "okay";
+};
+
+&sysmmu_ispfe_s1 {
+	status = "okay";
+};
+
+&sysmmu_ispfe_s2 {
+	status = "okay";
+};

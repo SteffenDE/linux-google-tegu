@@ -25,7 +25,9 @@
 #include <linux/mfd/samsung/s2mpg15.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/pinctrl/pinconf-generic.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 struct s2mpg1x_gpio_variant {
@@ -79,21 +81,21 @@ static int s2mpg1x_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	unsigned int reg, val;
 	int ret;
 
-	ret = s2mpg1x_gpio_get_direction(gc, offset);
-	if (ret < 0)
+	/*
+	 * The control register carries both the direction and, for an output,
+	 * the level being driven, so one read settles the common case.
+	 */
+	ret = regmap_read(chip->regmap, s2mpg1x_gpio_ctrl_reg(chip, offset),
+			  &val);
+	if (ret)
 		return ret;
 
-	if (ret == GPIO_LINE_DIRECTION_OUT) {
-		ret = regmap_read(chip->regmap,
-				  s2mpg1x_gpio_ctrl_reg(chip, offset), &val);
-		if (ret)
-			return ret;
-
+	if (val & S2MPG1X_GPIO_SET_OEN)
 		return !!(val & S2MPG1X_GPIO_SET_OUT);
-	}
 
 	/*
-	 * Input levels live in the status registers, eight pins to a register.
+	 * An input's level is only in the status registers, eight pins to a
+	 * register.
 	 */
 	reg = chip->variant->status_base + offset / 8;
 	ret = regmap_read(chip->regmap, reg, &val);

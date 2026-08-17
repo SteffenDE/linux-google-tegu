@@ -63,7 +63,7 @@ struct slg51000_evt_sta {
  */
 struct slg51000_chip_info {
 	const struct regmap_config *regmap_cfg;
-	struct regulator_desc *rdesc;
+	const struct regulator_desc *rdesc;
 	const struct slg51000_evt_sta *evt_sta;
 	const unsigned int *min_regs;
 	unsigned int n_regulators;
@@ -75,6 +75,7 @@ struct slg51000 {
 	struct device *dev;
 	struct regmap *regmap;
 	const struct slg51000_chip_info *info;
+	struct regulator_desc *rdesc;
 	struct regulator_dev *rdev[SLG51000_MAX_LDOS];
 	struct gpio_desc *cs_gpiod;
 	int chip_irq;
@@ -419,7 +420,7 @@ static int slg51000_of_parse_cb(struct device_node *np,
 	__SLG51000_REGL_DESC(_id, _name, _s_name, _min, _step, \
 			     SLG51000_##_id##_VSEL)
 
-static struct regulator_desc slg51000_regls_desc[SLG51000_MAX_REGULATORS] = {
+static const struct regulator_desc slg51000_regls_desc[SLG51000_MAX_REGULATORS] = {
 	SLG51000_REGL_DESC(LDO1, ldo1, NULL,   2400000,  5000),
 	SLG51000_REGL_DESC(LDO2, ldo2, NULL,   2400000,  5000),
 	SLG51000_REGL_DESC(LDO3, ldo3, "vin3", 1200000, 10000),
@@ -435,7 +436,7 @@ static struct regulator_desc slg51000_regls_desc[SLG51000_MAX_REGULATORS] = {
  * LDO6 are low-voltage and LDO7 high-voltage.  LDO1 and LDO2 share one input
  * pin here rather than having none named.
  */
-static struct regulator_desc slg51002_regls_desc[SLG51002_MAX_REGULATORS] = {
+static const struct regulator_desc slg51002_regls_desc[SLG51002_MAX_REGULATORS] = {
 	SLG51000_REGL_DESC(LDO1, ldo1, "vin1_2", 1200000, 10000),
 	SLG51000_REGL_DESC(LDO2, ldo2, "vin1_2", 1200000, 10000),
 	SLG51000_REGL_DESC(LDO3, ldo3, "vin3",   1200000, 10000),
@@ -475,7 +476,7 @@ static int slg51000_regulator_init(struct slg51000 *chip)
 	int id, ret = 0;
 
 	for (id = 0; id < info->n_regulators; id++) {
-		rdesc = &info->rdesc[id];
+		rdesc = &chip->rdesc[id];
 		config.regmap = chip->regmap;
 		config.dev = chip->dev;
 		config.driver_data = chip;
@@ -678,6 +679,17 @@ static int slg51000_i2c_probe(struct i2c_client *client)
 	chip->info = i2c_get_match_data(client);
 	if (!chip->info)
 		return -ENODEV;
+
+	/*
+	 * slg51000_regulator_init() patches each descriptor from the chip's
+	 * own trim registers, so it needs a copy per device rather than the
+	 * shared template.
+	 */
+	chip->rdesc = devm_kmemdup_array(dev, chip->info->rdesc,
+					 chip->info->n_regulators,
+					 sizeof(*chip->rdesc), GFP_KERNEL);
+	if (!chip->rdesc)
+		return -ENOMEM;
 
 	cs_gpiod = devm_gpiod_get_optional(dev, "dlg,cs",
 					   GPIOD_OUT_HIGH |

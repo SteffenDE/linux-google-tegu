@@ -2269,3 +2269,13 @@
 &hsi2c_5 {
 	status = "okay";
 };
+
+/*
+ * The camera receive complex.  Enabled for bring-up: the driver powers the
+ * block, restores the CMU state the power domain leaves behind, and reports
+ * its identification registers.  Nothing streams and no sensor is wired to a
+ * link yet.
+ */
+&ispfe {
+	status = "okay";
+};

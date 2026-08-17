@@ -1809,7 +1809,7 @@
 				interrupts = <GIC_SPI 643 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c2_bus>;
-				clock-frequency = <950000>;
+				clock-frequency = <400000>;
 				status = "disabled";
 			};
 		};
@@ -1838,7 +1838,7 @@
 				interrupts = <GIC_SPI 644 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c3_bus>;
-				clock-frequency = <950000>;
+				clock-frequency = <400000>;
 				status = "disabled";
 			};
 		};
@@ -1867,11 +1867,7 @@
 				interrupts = <GIC_SPI 645 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c4_bus>;
-				/*
-				 * 390 kHz, not the 950 kHz the sensor buses
-				 * run at: this bus is shared by the camera
-				 * PMIC, the buck-boost and the flash driver.
-				 */
+				/* The rate the vendor kernel runs this bus at. */
 				clock-frequency = <390000>;
 				status = "disabled";
 			};
@@ -1901,7 +1897,7 @@
 				interrupts = <GIC_SPI 646 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&hsi2c5_bus>;
-				clock-frequency = <950000>;
+				clock-frequency = <400000>;
 				status = "disabled";
 			};
 		};
@@ -2706,8 +2702,8 @@
 			 * The four camera buses.  Source:
 			 * research/dumped.dts hsi2c2-bus, hsi2c3-bus,
 			 * hsi2c4-bus and hsi2c5-bus.  The auxiliary bus is the
-			 * odd one out with no internal pull: it is the only one
-			 * of the four with pull-ups on the board.
+			 * odd one out, selecting no internal pull, which is
+			 * what a bus with board pull-ups looks like.
 			 *
 			 * Downstream parks the three sensor buses as plain
 			 * inputs while the camera is off (its "off_i2c" state)

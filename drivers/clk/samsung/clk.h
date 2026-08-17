@@ -213,6 +213,20 @@ struct samsung_div_clock {
 #define DIV_T(_id, cname, pname, o, s, w, t)			\
 	__DIV(_id, cname, pname, o, s, w, 0, 0, t)
 
+/*
+ * Samsung-private gate flag, occupying a bit the generic CLK_GATE_* flags do
+ * not use.  Keep this gate under software control even in a CMU registered
+ * with auto_clock_gate, instead of turning it into a read-only shadow of the
+ * gate debug register.
+ *
+ * A CMU in automatic mode gates each feed from its consumer's Q-Channel
+ * handshake, so its ordinary gates are nops.  But a clock that leaves the SoC
+ * on a pad has no consumer block to handshake with; the CMU gives it a dummy
+ * Q-Channel whose request bit is asserted by software instead.  That bit is a
+ * real gate and has to be written.
+ */
+#define CLK_GATE_SAMSUNG_MANUAL		BIT(7)
+
 /**
  * struct samsung_gate_clock - information about gate clock
  * @id: platform specific id of the clock
@@ -221,7 +235,7 @@ struct samsung_div_clock {
  * @flags: optional flags for basic clock
  * @offset: offset of the register for configuring the gate
  * @bit_idx: bit index of the gate control bit-field in @reg
- * @gate_flags: flags for gate-type clock
+ * @gate_flags: flags for gate-type clock, including CLK_GATE_SAMSUNG_MANUAL
  */
 struct samsung_gate_clock {
 	unsigned int		id;

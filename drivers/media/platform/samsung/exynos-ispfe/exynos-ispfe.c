@@ -4,10 +4,10 @@
  *
  * BLK_ISPFE is twelve CSIS links with nine combo D/C-PHYs behind them, the
  * ISPFE front end, and a PDMA that carries per-frame descriptors.  This is the
- * bring-up stage: it powers the block, restores the CMU state the power domain
- * does not, and can put one CSIS link, its PHY, a frame controller context and
- * PDMA into a raw Bayer capture aimed at its own DMA buffer.  Driven from
- * debugfs; there is no V4L2 yet.
+ * bring-up stage: it powers the block, restores the CMU and stage-2
+ * protection state the power domain does not, and can put one CSIS link, its
+ * PHY, a frame controller context and PDMA into a raw Bayer capture aimed at
+ * its own DMA buffer.  Driven from debugfs; there is no V4L2 yet.
  *
  * Copyright 2026 Steffen Deusch
  */
@@ -373,6 +373,19 @@ struct ispfe_pdma_desc {
 #define CMU_CONTROLLER_OPTION		0x0800
 #define CMU_CONTROLLER_OPTION_VAL	0xf01ff03f
 
+/*
+ * The stage-2 protection units in front of this block's System MMUs.  They
+ * reset with the power domain into a state that blocks all DMA -- that is a
+ * security property their own documentation states outright -- and the vendor
+ * driver reopens them from its resume path whenever the hypervisor that would
+ * otherwise program them is absent, by clearing protection for every VID.
+ * Mainline has no such hypervisor, so this driver does the same thing, for the
+ * same reason, at the same point in the power-on.
+ */
+#define S2MPU_PROT_EN_PER_VID_CLR	0x54
+#define S2MPU_PROT_EN_ALL_VIDS		0xff
+#define S2MPU_PROT_EN_PER_VID_SET	0x50
+
 /* Last two entries of the same list, in the sysreg window rather than the CMU. */
 #define SYSREG_BUS_COMPONENT_DRCG_EN	0x0104
 #define SYSREG_BUS_COMPONENT_DRCG_EN_VAL 0x03ffffff
@@ -386,8 +399,13 @@ enum ispfe_window {
 	ISPFE_WIN_PDMA,
 	ISPFE_WIN_PDMA_WRAP,
 	ISPFE_WIN_CMU,
+	ISPFE_WIN_S2MPU0,
+	ISPFE_WIN_S2MPU1,
+	ISPFE_WIN_S2MPU2,
 	ISPFE_NUM_WINDOWS,
 };
+
+#define ISPFE_NUM_S2MPU			3
 
 static const char * const ispfe_window_names[ISPFE_NUM_WINDOWS] = {
 	[ISPFE_WIN_CORE]      = "isp-fe",
@@ -396,6 +414,9 @@ static const char * const ispfe_window_names[ISPFE_NUM_WINDOWS] = {
 	[ISPFE_WIN_PDMA]      = "pdma",
 	[ISPFE_WIN_PDMA_WRAP] = "pdma-wrap",
 	[ISPFE_WIN_CMU]       = "cmu",
+	[ISPFE_WIN_S2MPU0]    = "s2mpu0",
+	[ISPFE_WIN_S2MPU1]    = "s2mpu1",
+	[ISPFE_WIN_S2MPU2]    = "s2mpu2",
 };
 
 /*
@@ -434,6 +455,7 @@ struct ispfe_device {
 	struct device *dev;
 	struct notifier_block genpd_nb;
 	struct dentry *debugfs;
+	bool s2mpu_reported;
 	void __iomem *base[ISPFE_NUM_WINDOWS];
 
 	/* Serialises the debugfs controls against the streaming state. */
@@ -635,14 +657,39 @@ static void ispfe_cmu_restore(struct ispfe_device *ispfe)
  * stack does it: its power-domain enable path is the PMU sequence, the TZPC
  * restore, and then the CMU restore, in that order.
  */
+static void ispfe_s2mpu_open(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	for (i = 0; i < ISPFE_NUM_S2MPU; i++) {
+		void __iomem *s2mpu = ispfe->base[ISPFE_WIN_S2MPU0 + i];
+
+		/*
+		 * Reported once, because what these read as immediately after a
+		 * power cycle is the thing this is assuming.  The GPU bring-up
+		 * found the bootloader leaves them open, but that only holds
+		 * until something power-cycles the domain, and this driver does.
+		 */
+		if (!ispfe->s2mpu_reported)
+			dev_info(ispfe->dev, "S2MPU%u protection %#010x\n", i,
+				 readl_relaxed(s2mpu + S2MPU_PROT_EN_PER_VID_SET));
+
+		writel_relaxed(S2MPU_PROT_EN_ALL_VIDS,
+			       s2mpu + S2MPU_PROT_EN_PER_VID_CLR);
+	}
+	ispfe->s2mpu_reported = true;
+}
+
 static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
 			      void *unused)
 {
 	struct ispfe_device *ispfe = container_of(nb, struct ispfe_device,
 						  genpd_nb);
 
-	if (action == GENPD_NOTIFY_ON)
+	if (action == GENPD_NOTIFY_ON) {
 		ispfe_cmu_restore(ispfe);
+		ispfe_s2mpu_open(ispfe);
+	}
 
 	return NOTIFY_OK;
 }
@@ -657,7 +704,10 @@ static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
  */
 static int ispfe_runtime_resume(struct device *dev)
 {
-	ispfe_cmu_restore(dev_get_drvdata(dev));
+	struct ispfe_device *ispfe = dev_get_drvdata(dev);
+
+	ispfe_cmu_restore(ispfe);
+	ispfe_s2mpu_open(ispfe);
 
 	return 0;
 }

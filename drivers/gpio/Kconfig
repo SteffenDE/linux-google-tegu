@@ -1628,6 +1628,18 @@ config GPIO_RC5T583
 	  This driver provides the support for driving/reading the GPIO pins
 	  of RC5T583 device through standard GPIO library.
 
+config GPIO_S2MPG1X
+	tristate "Samsung S2MPG14/S2MPG15 PMIC GPIO support"
+	depends on MFD_SEC_ACPM || COMPILE_TEST
+	help
+	  Say yes here to support the general-purpose pins of the Samsung
+	  S2MPG14 and S2MPG15 PMICs, which are the main and sub PMICs on
+	  Google Tensor SoC boards.  Boards use them for things the SoC's own
+	  pins cannot reach, such as gating a camera or sensor supply.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called gpio-s2mpg1x.
+
 config GPIO_SL28CPLD
 	tristate "Kontron sl28cpld GPIO support"
 	depends on MFD_SL28CPLD || COMPILE_TEST

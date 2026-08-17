@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/samsung,s2mpg14-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung S2MPG14/S2MPG15 PMIC GPIO controller
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  General-purpose pins on the Samsung S2MPG14 and S2MPG15 PMICs. This is a
+  child node of the PMIC, which is itself reached over the ACPM mailbox.
+  The S2MPG14 has six pins and the S2MPG15 ten.
+
+properties:
+  compatible:
+    enum:
+      - samsung,s2mpg14-gpio
+      - samsung,s2mpg15-gpio
+
+  gpio-controller: true
+
+  "#gpio-cells":
+    const: 2
+
+  gpio-line-names: true
+
+required:
+  - compatible
+  - gpio-controller
+  - "#gpio-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    pmic {
+        gpio {
+            compatible = "samsung,s2mpg14-gpio";
+            gpio-controller;
+            #gpio-cells = <2>;
+        };
+    };

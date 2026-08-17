@@ -3603,6 +3603,16 @@
 		 * treating the whole 1 MB as one opaque window is what made PDMA
 		 * traffic look like it did not exist.
 		 *
+		 * The three "s2mpu" windows are the stage-2 protection units in
+		 * front of this block's System MMUs.  They are here rather than
+		 * as their own nodes because nothing drives them: they reset
+		 * with the power domain into a state that blocks all DMA, and
+		 * the vendor's own driver reopens them from its resume path
+		 * whenever the hypervisor that would otherwise own them is
+		 * absent -- which on mainline is always.  The bootloader
+		 * leaving them open, as the GPU bring-up found, only holds
+		 * until something power-cycles the domain, and this driver does.
+		 *
 		 * The "cmu" window is a bring-up shortcut and should not outlive
 		 * it.  CMU_ISPFE loses its mux, dividers and Q-channel requests
 		 * across a power cycle and mainline models no clock controller for
@@ -3635,9 +3645,13 @@
 			      <0x1c020000 0x10000>,
 			      <0x1c390000 0x5000>,
 			      <0x1c395000 0x1000>,
-			      <0x1c000000 0x8000>;
+			      <0x1c000000 0x8000>,
+			      <0x1c140000 0x10000>,
+			      <0x1c180000 0x10000>,
+			      <0x1c1c0000 0x10000>;
 			reg-names = "isp-fe", "csis-link-phy", "isp-fe-sysreg",
-				    "pdma", "pdma-wrap", "cmu";
+				    "pdma", "pdma-wrap", "cmu",
+				    "s2mpu0", "s2mpu1", "s2mpu2";
 			interrupts = <GIC_SPI 467 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 468 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 469 IRQ_TYPE_LEVEL_HIGH 0>,

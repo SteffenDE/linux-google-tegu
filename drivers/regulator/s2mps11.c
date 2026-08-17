@@ -1396,17 +1396,15 @@ static const struct regulator_desc s2mpg14_regulators[] = {
 	regulator_desc_s2mpg14_buck_cmn(9, 9m, B9M_OUT1, 256, 1, B9M_CTRL, GENMASK(7, 6)),
 };
 
-/*
- * S2MPG15 (zumapro sub PMIC): enable-only descriptors for every rail.  Same
- * rationale as the S2MPG14 rails above: the bootloader leaves the voltage
- * selectors correct, so only the enable bit is wired.
- */
-static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
+/* S2MPG15 (zumapro sub PMIC) rails. */
+static const struct regulator_ops s2mpg15_reg_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
 	.enable			= regulator_enable_regmap,
 	.disable		= regulator_disable_regmap,
 	.list_voltage		= regulator_list_voltage_linear,
+	.map_voltage		= regulator_map_voltage_linear,
 	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
 };
 
 /* Same per-rail variation as S2MPG14 above; see the comment there. */
@@ -1417,7 +1415,7 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 		.of_match	= of_match_ptr("ldo" #_num "s"),	\
 		.regulators_node = of_match_ptr("regulators"),		\
 		.id		= S2MPG15_LDO##_num,			\
-		.ops		= &s2mpg15_reg_enable_only_ops,		\
+		.ops		= &s2mpg15_reg_ops,		\
 		.type		= REGULATOR_VOLTAGE,			\
 		.owner		= THIS_MODULE,				\
 		.n_voltages	= _n_volt,				\
@@ -1453,7 +1451,7 @@ static const struct regulator_ops s2mpg15_reg_enable_only_ops = {
 		.of_match	= of_match_ptr("buck" #_sfx),		\
 		.regulators_node = of_match_ptr("regulators"),		\
 		.id		= S2MPG15_BUCK##_id,			\
-		.ops		= &s2mpg15_reg_enable_only_ops,		\
+		.ops		= &s2mpg15_reg_ops,		\
 		.type		= REGULATOR_VOLTAGE,			\
 		.owner		= THIS_MODULE,				\
 		.n_voltages	= _n_volt,				\

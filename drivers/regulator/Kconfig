@@ -1504,13 +1504,14 @@ config REGULATOR_SKY81452
 	  will be called sky81452-regulator.
 
 config REGULATOR_SLG51000
-	tristate "Dialog Semiconductor SLG51000 regulators"
+	tristate "Dialog Semiconductor SLG51000/SLG51002 regulators"
 	depends on I2C
 	select REGMAP_I2C
 	help
-	  Say y here to support for the Dialog Semiconductor SLG51000.
-	  The SLG51000 is seven compact and customizable low dropout
-	  regulators.
+	  Say y here to support for the Dialog Semiconductor SLG51000 and
+	  SLG51002.  These are compact and customizable low dropout
+	  regulators, seven of them on the SLG51000 and eight on the
+	  SLG51002.
 
 config REGULATOR_SPACEMIT_P1
 	tristate "SpacemiT P1 regulators"

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_EXYNOS_ISPFE
+	tristate "Google zumapro ISPFE camera receive complex"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	depends on PM
+	help
+	  Bring-up driver for BLK_ISPFE on Google's zumapro (Tensor G4): the
+	  CSIS links and their combo D/C-PHYs, the ISPFE front end, and the
+	  PDMA that carries per-frame descriptors.
+
+	  At this stage the driver powers the block, restores the CMU state
+	  that the power domain does not, and reports the identification
+	  registers.  It does not stream and registers no V4L2 devices, so it
+	  is of no use outside camera bring-up.
+
+	  If unsure, say N.

@@ -29,6 +29,12 @@ properties:
           CMU_ISPFE. Present because the block loses its clock mux, dividers
           and Q-channel requests across a power cycle and no clock controller
           is described for it; this window goes away when one is.
+      - description: |
+          Stage-2 protection unit in front of System MMU S0. Present because
+          these reset with the power domain into a state that blocks all DMA
+          and nothing else reopens them.
+      - description: Stage-2 protection unit in front of System MMU S1
+      - description: Stage-2 protection unit in front of System MMU S2
 
   reg-names:
     items:
@@ -38,6 +44,9 @@ properties:
       - const: pdma
       - const: pdma-wrap
       - const: cmu
+      - const: s2mpu0
+      - const: s2mpu1
+      - const: s2mpu2
 
   power-domains:
     maxItems: 1
@@ -105,9 +114,13 @@ examples:
               <0x1c020000 0x10000>,
               <0x1c390000 0x5000>,
               <0x1c395000 0x1000>,
-              <0x1c000000 0x8000>;
+              <0x1c000000 0x8000>,
+              <0x1c140000 0x10000>,
+              <0x1c180000 0x10000>,
+              <0x1c1c0000 0x10000>;
         reg-names = "isp-fe", "csis-link-phy", "isp-fe-sysreg",
-                    "pdma", "pdma-wrap", "cmu";
+                    "pdma", "pdma-wrap", "cmu",
+                    "s2mpu0", "s2mpu1", "s2mpu2";
         power-domains = <&pd_ispfe>;
         iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>, <&sysmmu_ispfe_s2>;
         interrupts = <GIC_SPI 467 IRQ_TYPE_LEVEL_HIGH 0>,

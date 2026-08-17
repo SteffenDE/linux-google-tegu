@@ -521,6 +521,69 @@
 		gpio = <&s2mpg14_gpio 0 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 	};
+
+	/*
+	 * PHASE 1 SCAFFOLD.  There are no sensor drivers yet, so nothing claims
+	 * the camera rails and nothing can sequence them.  These expose each
+	 * rail's enable to userspace as a sysfs "state" file, so the recorded
+	 * power-up order can be replayed by hand -- which is how the sensors
+	 * get powered up at all until a driver does it.
+	 *
+	 * The two board rails are not here, because neither needs to be:
+	 * PP3200_CAM_BB comes up as the camera PMIC's input whenever one of
+	 * these LDOs is enabled, and PP1350_CAM as CAM_MAIN_VDIG's.  So both
+	 * arrive before anything that depends on them, though not in the
+	 * recording's order -- it brings both board rails up ahead of the I/O
+	 * rail, where this brings them up after it.  I/O before analog is the
+	 * safer direction.
+	 *
+	 * Delete this block together with scripts/camera-power-up.sh when the
+	 * sensor drivers land.
+	 */
+	cam-rail-camio {
+		compatible = "regulator-output";
+		vout-supply = <&s2mpg15_ldo12>;
+	};
+
+	cam-rail-vdig {
+		compatible = "regulator-output";
+		vout-supply = <&cam_main_vdig>;
+	};
+
+	cam-rail-ldo1 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo1>;
+	};
+
+	cam-rail-ldo2 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo2>;
+	};
+
+	cam-rail-ldo3 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo3>;
+	};
+
+	cam-rail-ldo4 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo4>;
+	};
+
+	cam-rail-ldo5 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo5>;
+	};
+
+	cam-rail-ldo6 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo6>;
+	};
+
+	cam-rail-ldo7 {
+		compatible = "regulator-output";
+		vout-supply = <&cam_ldo7>;
+	};
 };
 
 &watchdog_cl0 {

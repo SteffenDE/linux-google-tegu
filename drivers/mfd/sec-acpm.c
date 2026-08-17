@@ -37,6 +37,7 @@ struct sec_pmic_acpm_platform_data {
 	const struct regmap_config *regmap_cfg_pmic;
 	const struct regmap_config *regmap_cfg_rtc;
 	const struct regmap_config *regmap_cfg_meter;
+	const struct regmap_config *regmap_cfg_gpio;
 };
 
 static const struct regmap_range s2mpg10_common_registers[] = {
@@ -456,6 +457,47 @@ static const struct regmap_config s2mpg14_regmap_config_meter = {
 };
 
 /*
+ * The GPIO block: one control register per pin, a status register holding
+ * their live input levels, and per-pin interrupt registers.  Don't cache it:
+ * the status register follows the pins, and the PMIC's own power sequencer can
+ * drive a pin without the kernel knowing.
+ *
+ * The interrupt registers below the status one are left out, matching the
+ * downstream driver.  Some are write-1-to-clear, and nothing here services
+ * them -- the PMIC's interrupt has no mainline parent -- so the only thing
+ * exposing them would achieve is a debugfs register dump that acknowledges
+ * interrupts.  The status register is read-only.
+ */
+static const struct regmap_range s2mpg14_gpio_registers[] = {
+	regmap_reg_range(S2MPG14_GPIO_STATUS, S2MPG14_GPIO5_MONSEL),
+};
+
+static const struct regmap_range s2mpg14_gpio_ro_registers[] = {
+	regmap_reg_range(S2MPG14_GPIO_STATUS, S2MPG14_GPIO_STATUS),
+};
+
+static const struct regmap_access_table s2mpg14_gpio_wr_table = {
+	.yes_ranges = s2mpg14_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_gpio_registers),
+	.no_ranges = s2mpg14_gpio_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg14_gpio_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg14_gpio_rd_table = {
+	.yes_ranges = s2mpg14_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg14_gpio_registers),
+};
+
+static const struct regmap_config s2mpg14_regmap_config_gpio = {
+	.name = "gpio",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG14_GPIO5_MONSEL,
+	.wr_table = &s2mpg14_gpio_wr_table,
+	.rd_table = &s2mpg14_gpio_rd_table,
+};
+
+/*
  * s2mpg15 (zumapro sub PMIC): same uncached, permissive style as s2mpg14.
  * The meter block is register-identical to the s2mpg14, so it reuses that
  * regmap config (s2mpg14_regmap_config_meter) below; only the common/pmic
@@ -475,6 +517,36 @@ static const struct regmap_config s2mpg15_regmap_config_pmic = {
 	.max_register = S2MPG15_PMIC_BB_USONIC,
 };
 
+/* Same shape as the S2MPG14's, with two status registers for its ten pins. */
+static const struct regmap_range s2mpg15_gpio_registers[] = {
+	regmap_reg_range(S2MPG15_GPIO_STATUS1, S2MPG15_GPIO9_MONSEL),
+};
+
+static const struct regmap_range s2mpg15_gpio_ro_registers[] = {
+	regmap_reg_range(S2MPG15_GPIO_STATUS1, S2MPG15_GPIO_STATUS2),
+};
+
+static const struct regmap_access_table s2mpg15_gpio_wr_table = {
+	.yes_ranges = s2mpg15_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_gpio_registers),
+	.no_ranges = s2mpg15_gpio_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg15_gpio_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg15_gpio_rd_table = {
+	.yes_ranges = s2mpg15_gpio_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_gpio_registers),
+};
+
+static const struct regmap_config s2mpg15_regmap_config_gpio = {
+	.name = "gpio",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG15_GPIO9_MONSEL,
+	.wr_table = &s2mpg15_gpio_wr_table,
+	.rd_table = &s2mpg15_gpio_rd_table,
+};
+
 struct sec_pmic_acpm_shared_bus_context {
 	struct acpm_handle *acpm;
 	unsigned int acpm_chan_id;
@@ -487,6 +559,7 @@ enum sec_pmic_acpm_accesstype {
 	SEC_PMIC_ACPM_ACCESSTYPE_RTC = 0x02,
 	SEC_PMIC_ACPM_ACCESSTYPE_METER = 0x0a,
 	SEC_PMIC_ACPM_ACCESSTYPE_WLWP = 0x0b,
+	SEC_PMIC_ACPM_ACCESSTYPE_GPIO = 0x0c,
 	SEC_PMIC_ACPM_ACCESSTYPE_TRIM = 0x0f,
 };
 
@@ -648,6 +721,13 @@ static int sec_pmic_acpm_probe(struct platform_device *pdev)
 			return PTR_ERR(regmap);
 	}
 
+	if (pdata->regmap_cfg_gpio) {
+		regmap = sec_pmic_acpm_regmap_init(dev, shared_ctx, SEC_PMIC_ACPM_ACCESSTYPE_GPIO,
+						   pdata->regmap_cfg_gpio, true);
+		if (IS_ERR(regmap))
+			return PTR_ERR(regmap);
+	}
+
 	ret = sec_pmic_probe(dev, pdata->device_type, irq, regmap_pmic, NULL);
 	if (ret)
 		return ret;
@@ -695,6 +775,7 @@ static const struct sec_pmic_acpm_platform_data s2mpg14_data = {
 	.regmap_cfg_pmic = &s2mpg14_regmap_config_pmic,
 	.regmap_cfg_rtc = &s2mpg14_regmap_config_rtc,
 	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
+	.regmap_cfg_gpio = &s2mpg14_regmap_config_gpio,
 };
 
 /*
@@ -709,6 +790,7 @@ static const struct sec_pmic_acpm_platform_data s2mpg15_data = {
 	.regmap_cfg_pmic = &s2mpg15_regmap_config_pmic,
 	/* The s2mpg15 meter block is register-identical to the s2mpg14. */
 	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
+	.regmap_cfg_gpio = &s2mpg15_regmap_config_gpio,
 };
 
 static const struct of_device_id sec_pmic_acpm_of_match[] = {

@@ -395,8 +395,9 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 
 /*
  * One PDMA record. The address names an indirect command program and the final
- * word is its exact byte count. The first program is 0x20 bytes longer than the
- * steady-state one: it appends four register/value pairs to the same prefix.
+ * word is its exact byte count. The captured program is a structurally complete
+ * 0x19c8-byte stream; bytes after its final grouped-write command are stale
+ * contents from an earlier use of the rotating buffer.
  */
 struct ispfe_pdma_desc {
 	__le32 cmd;
@@ -406,7 +407,7 @@ struct ispfe_pdma_desc {
 } __packed;
 
 #define PDMA_DESC_CMD			0x0000c003
-#define PDMA_DESC_BYTES_FIRST		0x000019e8
+#define PDMA_DESC_BYTES_FIRST		0x000019c8
 #define PDMA_DESC_BYTES			0x000019c8
 #define PDMA_NUM_RECORDS \
 	(PDMA_SIZE_VAL / sizeof(struct ispfe_pdma_desc))
@@ -1537,11 +1538,7 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 			addr ? addr : lower_32_bits(ispfe->program_dma));
 		ispfe->ring[i].addr_hi = cpu_to_le32(
 			addr ? 0 : upper_32_bits(ispfe->program_dma));
-		/*
-		 * The initial program includes four final register/value pairs;
-		 * steady records end 0x20 bytes earlier. Both lengths address the
-		 * same captured prefix in this static diagnostic.
-		 */
+		/* Keep the separate first-record control for parser experiments. */
 		ispfe->ring[i].bytes =
 			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_bytes)
 				      : READ_ONCE(ispfe->pdma_bytes_first));

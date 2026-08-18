@@ -487,14 +487,22 @@ struct ispfe_device {
 	struct ispfe_source src;
 	struct ispfe_source active;
 	/*
-	 * Off by default, and that is a bug rather than a policy: with the
-	 * D/C-PHY isolation bypassed BLK_ISPFE will not power down again --
-	 * "Power domain ISPFE disable failed", then the APM watchdog -- even
-	 * though the block is re-isolated before genpd touches the PMU.  No
-	 * frame can arrive without it and no boot survives with it, so it is a
-	 * control until that is understood.
+	 * Off by default, and that is a bug rather than a policy: after the
+	 * D/C-PHY isolation has been bypassed BLK_ISPFE will not power down
+	 * again -- "Power domain ISPFE disable failed", then the APM watchdog --
+	 * even though the block is re-isolated before genpd touches the PMU.  No
+	 * frame can arrive without it, so it is a control until that conflict is
+	 * understood.
 	 */
 	bool phy_isolation_bypass;
+	/*
+	 * A deliberate runtime-PM reference for separating PHY isolation from
+	 * the domain power-down.  This is a bring-up control: downstream drops
+	 * the shared isolation bypass while its ISPFE reference is still held,
+	 * whereas GENPD_NOTIFY_PRE_OFF leaves no room to observe or settle the
+	 * transition before the PMU starts the domain handshake.
+	 */
+	bool power_hold;
 	bool streaming;
 	int link_irq;
 	int fc_irq;
@@ -677,17 +685,17 @@ static void ispfe_cmu_restore(struct ispfe_device *ispfe)
  * the link's own registers read back correctly, because they are on the other
  * side of it.
  *
- * It belongs to the power domain rather than to a stream.  Isolation is what
- * lets the domain be powered off at all, so leaving it bypassed when the
- * domain goes down means the power-down handshake never completes: "Power
- * domain ISPFE disable failed", then ACPM stops answering and the APM watchdog
- * resets the phone.  Hanging it off the genpd notifications makes that
- * impossible to get wrong -- PRE_OFF is delivered before genpd powers the
- * domain down, so the block is always isolated by then.
+ * Isolation has to be restored before the domain goes down.  Downstream does
+ * that from PHY power-off while the ISPFE runtime-PM reference is still held;
+ * GENPD_NOTIFY_PRE_OFF is the final backstop here, delivered before genpd
+ * touches the PMU.  Both placements have nevertheless failed the subsequent
+ * power-down on hardware, so power_hold below can separate and expose the two
+ * transitions instead of running straight into the watchdog.
  */
 static int ispfe_phy_isolation(struct ispfe_device *ispfe, bool bypass)
 {
 	unsigned int val;
+	int ret;
 
 	/*
 	 * Reported once, as found.  Whether the bootloader leaves the PHYs
@@ -700,9 +708,29 @@ static int ispfe_phy_isolation(struct ispfe_device *ispfe, bool bypass)
 		ispfe->state_reported = true;
 	}
 
-	return regmap_update_bits(ispfe->pmu, ispfe->pmu_iso_offset,
-				  PHY_PMU_ISO_BYPASS,
-				  bypass ? PHY_PMU_ISO_BYPASS : 0);
+	ret = regmap_update_bits(ispfe->pmu, ispfe->pmu_iso_offset,
+				 PHY_PMU_ISO_BYPASS,
+				 bypass ? PHY_PMU_ISO_BYPASS : 0);
+	if (ret)
+		return ret;
+
+	/*
+	 * The secure monitor accepting the update only says the request was
+	 * delivered.  Read the hardware state back: whether bit 0 actually
+	 * follows both edges is the cheapest open measurement, and a failed
+	 * bypass must stop the caller before it programs an isolated PHY.
+	 */
+	ret = regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &val);
+	if (ret)
+		return ret;
+
+	dev_info(ispfe->dev, "PHY isolation %s, readback %#010x\n",
+		 bypass ? "bypassed" : "enabled", val);
+
+	if (!!(val & PHY_PMU_ISO_BYPASS) != bypass)
+		return -EIO;
+
+	return 0;
 }
 
 /*
@@ -742,16 +770,23 @@ static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
 {
 	struct ispfe_device *ispfe = container_of(nb, struct ispfe_device,
 						  genpd_nb);
+	int ret;
 
 	switch (action) {
 	case GENPD_NOTIFY_ON:
 		ispfe_cmu_restore(ispfe);
 		ispfe_s2mpu_open(ispfe);
-		if (ispfe->phy_isolation_bypass)
-			ispfe_phy_isolation(ispfe, true);
+		if (ispfe->phy_isolation_bypass) {
+			ret = ispfe_phy_isolation(ispfe, true);
+			if (ret)
+				dev_err(ispfe->dev,
+					"cannot bypass PHY isolation: %d\n", ret);
+		}
 		break;
 	case GENPD_NOTIFY_PRE_OFF:
-		ispfe_phy_isolation(ispfe, false);
+		ret = ispfe_phy_isolation(ispfe, false);
+		if (ret)
+			return notifier_from_errno(ret);
 		break;
 	}
 
@@ -773,7 +808,7 @@ static int ispfe_runtime_resume(struct device *dev)
 	ispfe_cmu_restore(ispfe);
 	ispfe_s2mpu_open(ispfe);
 	if (ispfe->phy_isolation_bypass)
-		ispfe_phy_isolation(ispfe, true);
+		return ispfe_phy_isolation(ispfe, true);
 
 	return 0;
 }
@@ -1563,13 +1598,112 @@ static int ispfe_enable_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 			 "%llu\n");
 
+static int ispfe_phy_isolation_bypass_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+	bool bypass;
+	int ret;
+
+	if (val > 1)
+		return -EINVAL;
+	bypass = val;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (bypass == ispfe->phy_isolation_bypass)
+		return 0;
+	if (ispfe->streaming)
+		return -EBUSY;
+	if (bypass && !ispfe->power_hold)
+		return -EBUSY;
+
+	/*
+	 * The hold makes the domain known-live and separates this edge from its
+	 * power-down.  Require it before bypassing, then keep it until a
+	 * successful re-isolation has cleared the requested state; this makes
+	 * the known-fatal unheld sequence unrepresentable through debugfs.
+	 */
+	ret = ispfe_phy_isolation(ispfe, bypass);
+	if (ret)
+		return ret;
+
+	ispfe->phy_isolation_bypass = bypass;
+
+	return 0;
+}
+
+static int ispfe_phy_isolation_bypass_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = ispfe->phy_isolation_bypass;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_phy_isolation_bypass_fops,
+			 ispfe_phy_isolation_bypass_get,
+			 ispfe_phy_isolation_bypass_set, "%llu\n");
+
+static int ispfe_power_hold_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+	int ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (!!val == ispfe->power_hold)
+		return 0;
+	if (ispfe->streaming)
+		return -EBUSY;
+
+	if (val) {
+		ret = pm_runtime_resume_and_get(ispfe->dev);
+		if (ret)
+			return ret;
+		ispfe->power_hold = true;
+		return 0;
+	}
+
+	/* Never drop the diagnostic hold while the requested state is unsafe. */
+	if (ispfe->phy_isolation_bypass)
+		return -EBUSY;
+
+	ispfe->power_hold = false;
+	ret = pm_runtime_put_sync(ispfe->dev);
+
+	return ret < 0 ? ret : 0;
+}
+
+static int ispfe_power_hold_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = ispfe->power_hold;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_power_hold_fops, ispfe_power_hold_get,
+			 ispfe_power_hold_set, "%llu\n");
+
 static int ispfe_status_show(struct seq_file *s, void *unused)
 {
 	struct ispfe_device *ispfe = s->private;
+	unsigned int isolation;
 
 	guard(mutex)(&ispfe->lock);
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
+	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
+	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
+	if (!regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &isolation))
+		seq_printf(s, "phy_iso_pmu  %#010x\n", isolation);
 	seq_printf(s, "frame_start  %u\n", atomic_read(&ispfe->frame_start));
 	seq_printf(s, "frame_end    %u\n", atomic_read(&ispfe->frame_end));
 	seq_printf(s, "fc_events    %u\n", atomic_read(&ispfe->fc_events));
@@ -1661,8 +1795,10 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("width", 0644, d, &ispfe->src.width);
 	debugfs_create_u32("height", 0644, d, &ispfe->src.height);
 	debugfs_create_bool("cphy", 0644, d, &ispfe->src.cphy);
-	debugfs_create_bool("phy_isolation_bypass", 0644, d,
-			    &ispfe->phy_isolation_bypass);
+	debugfs_create_file("phy_isolation_bypass", 0644, d, ispfe,
+			    &ispfe_phy_isolation_bypass_fops);
+	debugfs_create_file("power_hold", 0644, d, ispfe,
+			    &ispfe_power_hold_fops);
 	debugfs_create_u32("ctx", 0644, d, &ispfe->src.ctx);
 	debugfs_create_u32("lmp", 0644, d, &ispfe->src.lmp);
 	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);
@@ -1817,12 +1953,25 @@ static int ispfe_probe(struct platform_device *pdev)
 static void ispfe_remove(struct platform_device *pdev)
 {
 	struct ispfe_device *ispfe = platform_get_drvdata(pdev);
+	int ret;
 
 	debugfs_remove_recursive(ispfe->debugfs);
 
 	scoped_guard(mutex, &ispfe->lock) {
 		if (ispfe->streaming)
 			ispfe_stop(ispfe);
+		if (ispfe->power_hold) {
+			ret = ispfe_phy_isolation(ispfe, false);
+			if (ret) {
+				dev_crit(ispfe->dev,
+					 "cannot re-isolate PHYs; retaining power hold\n");
+				ispfe_buffers_free(ispfe);
+				return;
+			}
+			ispfe->phy_isolation_bypass = false;
+			ispfe->power_hold = false;
+			pm_runtime_put_sync(ispfe->dev);
+		}
 		ispfe_buffers_free(ispfe);
 	}
 }
@@ -1840,6 +1989,13 @@ static struct platform_driver ispfe_driver = {
 		.name = "exynos-ispfe",
 		.of_match_table = ispfe_of_match,
 		.pm = pm_ptr(&ispfe_pm_ops),
+		/*
+		 * ->remove cannot veto driver-core's subsequent genpd detach and
+		 * power-down if re-isolation fails.  This bring-up driver is built
+		 * in, so hide the userspace unbind path rather than make that known
+		 * watchdog sequence reachable while a diagnostic hold exists.
+		 */
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(ispfe_driver);

@@ -3603,6 +3603,12 @@
 		 * treating the whole 1 MB as one opaque window is what made PDMA
 		 * traffic look like it did not exist.
 		 *
+		 * The PMU phandle carries the offset of the word that isolates
+		 * the nine D/C-PHYs, which every downstream dcphy node names as
+		 * "isolation = <0x3ebc>".  It is a second gate entirely separate
+		 * from the per-PHY reset in isp-fe-sysreg, and while it is set
+		 * the whole PHY register region reads zero and takes no writes.
+		 *
 		 * The three "s2mpu" windows are the stage-2 protection units in
 		 * front of this block's System MMUs.  They are here rather than
 		 * as their own nodes because nothing drives them: they reset
@@ -3678,6 +3684,7 @@
 			iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>,
 				 <&sysmmu_ispfe_s2>;
 			samsung,iommu-group = <&iommu_group_isp>;
+			samsung,pmu-syscon = <&pmu_system_controller 0x3ebc>;
 			status = "disabled";
 		};
 	};

@@ -212,12 +212,23 @@
 #define LOCH_ABORT_MSK			0x10
 #define LOCH_ABORT_MSK_VAL		0x00000007
 /*
- * Written as zero at teardown and never otherwise: across a whole vendor
- * session the only four accesses to this word in any of the five contexts are
- * writes of 0.  It is not an arm bit; the driver used to write 1 to it during
- * setup on the strength of the name alone.
+ * Written 1 in the microsecond before LOCH_START and 0 at teardown -- so it is
+ * an arm bit after all.  This carried the opposite claim, "the only accesses
+ * in a whole session are four writes of 0", and that reading came out of a
+ * pid-filtered capture: the setup burst runs on a `RunnerR:P+:A:N` thread the
+ * filter did not include, so every write of 1 was missing and only the
+ * teardown zeroes survived.  An unfiltered capture has, for a `barghest` RAW
+ * session (research/data/camera-reads-2026-08-18/):
+ *
+ *	615.372074  W  isp-fe +0x028c00 0x1        line memory enabled
+ *	615.372075  W  isp-fe +0x020418 0x1        <- this
+ *	615.372076  W  isp-fe +0x0200b0 0x1        LOCH_START
+ *
+ * and the same pair one microsecond apart for the phase-detect channel at
+ * +0x022018 / +0x200b0 = 0x80.
  */
-#define LOCH_QUIESCE			0x18
+#define LOCH_ARM			0x18
+#define LOCH_ARM_VAL			0x00000001
 #define LOCH_PROC_SRC			0x24
 #define LOCH_CFG2			0x2c
 #define LOCH_CFG2_VAL		0x0000001b
@@ -1472,6 +1483,12 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 	writel_relaxed(ispfe->active.loch, bind + FC_BIND_LOCH);
 	writel_relaxed(1, bind + FC_BIND_ENABLE);
 
+	/*
+	 * Arm the channel, then start it.  The vendor writes these one
+	 * microsecond apart and in this order, immediately after the line
+	 * memory it just bound is enabled; see LOCH_ARM.
+	 */
+	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
 	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_START);
 
 	writel_relaxed(ispfe->active.mode_word0, ctx + LOCH_WORD0);
@@ -1539,7 +1556,7 @@ static void ispfe_fc_stop(struct ispfe_device *ispfe)
 
 	writel_relaxed(0, core + LOCH_ENABLE);
 	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_STOP);
-	writel_relaxed(0, ctx + LOCH_QUIESCE);
+	writel_relaxed(0, ctx + LOCH_ARM);
 	writel_relaxed(0, ctx + LOCH_ABORT_MSK);
 	writel_relaxed(0, ctx + LOCH_PROC_MSK);
 	writel_relaxed(0, ctx + LOCH_ERR_MSK);

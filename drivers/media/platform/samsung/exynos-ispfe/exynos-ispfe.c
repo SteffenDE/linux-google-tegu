@@ -16,6 +16,7 @@
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/mfd/syscon.h>
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
@@ -25,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/regmap.h>
 #include <linux/seq_file.h>
 
 /*
@@ -131,6 +133,16 @@
  * PHY slots -- one common block each, but only the first one's lane blocks.
  */
 #define SYSREG_CSIS_PHY_RESET		0x0500
+
+/*
+ * And a second gate the sysreg reset says nothing about: the nine PHYs share
+ * one PMU isolation bit, and an isolated block reads back zero and swallows
+ * writes.  Every dcphy node downstream carries "isolation = <0x3ebc>" against
+ * the PMU syscon, and its driver bypasses isolation with bit 0 before
+ * releasing the reset.  This is the same shape as the UFS PHY's isolation at
+ * 0x3ec0, which is already described that way in this device tree.
+ */
+#define PHY_PMU_ISO_BYPASS		BIT(0)
 
 /*
  * The ISPFE frame controller.  Global registers first; the per-context bits in
@@ -455,7 +467,9 @@ struct ispfe_device {
 	struct device *dev;
 	struct notifier_block genpd_nb;
 	struct dentry *debugfs;
-	bool s2mpu_reported;
+	bool state_reported;
+	struct regmap *pmu;
+	u32 pmu_iso_offset;
 	void __iomem *base[ISPFE_NUM_WINDOWS];
 
 	/* Serialises the debugfs controls against the streaming state. */
@@ -648,6 +662,41 @@ static void ispfe_cmu_restore(struct ispfe_device *ispfe)
 }
 
 /*
+ * The PMU isolation shared by all nine PHYs.  While it is set the whole PHY
+ * region reads back zero and takes no writes, which looks exactly like a
+ * sensor streaming happily into a receiver that never sees a frame boundary --
+ * the link's own registers read back correctly, because they are on the other
+ * side of it.
+ *
+ * It belongs to the power domain rather than to a stream.  Isolation is what
+ * lets the domain be powered off at all, so leaving it bypassed when the
+ * domain goes down means the power-down handshake never completes: "Power
+ * domain ISPFE disable failed", then ACPM stops answering and the APM watchdog
+ * resets the phone.  Hanging it off the genpd notifications makes that
+ * impossible to get wrong -- PRE_OFF is delivered before genpd powers the
+ * domain down, so the block is always isolated by then.
+ */
+static int ispfe_phy_isolation(struct ispfe_device *ispfe, bool bypass)
+{
+	unsigned int val;
+
+	/*
+	 * Reported once, as found.  Whether the bootloader leaves the PHYs
+	 * isolated is the assumption underneath both this and the power-down
+	 * that follows it, and reading it costs one register.
+	 */
+	if (bypass && !ispfe->state_reported &&
+	    !regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &val)) {
+		dev_info(ispfe->dev, "PHY isolation %#010x\n", val);
+		ispfe->state_reported = true;
+	}
+
+	return regmap_update_bits(ispfe->pmu, ispfe->pmu_iso_offset,
+				  PHY_PMU_ISO_BYPASS,
+				  bypass ? PHY_PMU_ISO_BYPASS : 0);
+}
+
+/*
  * BLK_ISPFE holds more than this device: the three ISPFE SysMMUs sit in it
  * too, and because they are this device's IOMMUs they are also its runtime-PM
  * suppliers -- so they resume, and touch their own registers, *before* our
@@ -670,14 +719,13 @@ static void ispfe_s2mpu_open(struct ispfe_device *ispfe)
 		 * found the bootloader leaves them open, but that only holds
 		 * until something power-cycles the domain, and this driver does.
 		 */
-		if (!ispfe->s2mpu_reported)
+		if (!ispfe->state_reported)
 			dev_info(ispfe->dev, "S2MPU%u protection %#010x\n", i,
 				 readl_relaxed(s2mpu + S2MPU_PROT_EN_PER_VID_SET));
 
 		writel_relaxed(S2MPU_PROT_EN_ALL_VIDS,
 			       s2mpu + S2MPU_PROT_EN_PER_VID_CLR);
 	}
-	ispfe->s2mpu_reported = true;
 }
 
 static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
@@ -686,9 +734,15 @@ static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
 	struct ispfe_device *ispfe = container_of(nb, struct ispfe_device,
 						  genpd_nb);
 
-	if (action == GENPD_NOTIFY_ON) {
+	switch (action) {
+	case GENPD_NOTIFY_ON:
 		ispfe_cmu_restore(ispfe);
 		ispfe_s2mpu_open(ispfe);
+		ispfe_phy_isolation(ispfe, true);
+		break;
+	case GENPD_NOTIFY_PRE_OFF:
+		ispfe_phy_isolation(ispfe, false);
+		break;
 	}
 
 	return NOTIFY_OK;
@@ -708,6 +762,7 @@ static int ispfe_runtime_resume(struct device *dev)
 
 	ispfe_cmu_restore(ispfe);
 	ispfe_s2mpu_open(ispfe);
+	ispfe_phy_isolation(ispfe, true);
 
 	return 0;
 }
@@ -1701,6 +1756,23 @@ static int ispfe_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, ispfe_genpd_notifier_remove, dev);
 	if (ret)
 		return ret;
+
+	/*
+	 * The PMU register that isolates the D/C-PHYs, and the offset of the
+	 * isolation word within it -- both from the phandle, in the same shape
+	 * the UFS PHY already uses for its own isolation next door at 0x3ec0.
+	 */
+	ispfe->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
+						    "samsung,pmu-syscon");
+	if (IS_ERR(ispfe->pmu))
+		return dev_err_probe(dev, PTR_ERR(ispfe->pmu),
+				     "cannot reach the PMU\n");
+
+	ret = of_property_read_u32_index(dev->of_node, "samsung,pmu-syscon", 1,
+					 &ispfe->pmu_iso_offset);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "no PHY isolation offset\n");
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)

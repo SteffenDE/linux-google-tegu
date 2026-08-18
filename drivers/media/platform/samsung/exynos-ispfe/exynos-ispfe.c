@@ -486,6 +486,15 @@ struct ispfe_device {
 	 */
 	struct ispfe_source src;
 	struct ispfe_source active;
+	/*
+	 * Off by default, and that is a bug rather than a policy: with the
+	 * D/C-PHY isolation bypassed BLK_ISPFE will not power down again --
+	 * "Power domain ISPFE disable failed", then the APM watchdog -- even
+	 * though the block is re-isolated before genpd touches the PMU.  No
+	 * frame can arrive without it and no boot survives with it, so it is a
+	 * control until that is understood.
+	 */
+	bool phy_isolation_bypass;
 	bool streaming;
 	int link_irq;
 	int fc_irq;
@@ -685,7 +694,7 @@ static int ispfe_phy_isolation(struct ispfe_device *ispfe, bool bypass)
 	 * isolated is the assumption underneath both this and the power-down
 	 * that follows it, and reading it costs one register.
 	 */
-	if (bypass && !ispfe->state_reported &&
+	if (!ispfe->state_reported &&
 	    !regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &val)) {
 		dev_info(ispfe->dev, "PHY isolation %#010x\n", val);
 		ispfe->state_reported = true;
@@ -738,7 +747,8 @@ static int ispfe_genpd_notify(struct notifier_block *nb, unsigned long action,
 	case GENPD_NOTIFY_ON:
 		ispfe_cmu_restore(ispfe);
 		ispfe_s2mpu_open(ispfe);
-		ispfe_phy_isolation(ispfe, true);
+		if (ispfe->phy_isolation_bypass)
+			ispfe_phy_isolation(ispfe, true);
 		break;
 	case GENPD_NOTIFY_PRE_OFF:
 		ispfe_phy_isolation(ispfe, false);
@@ -762,7 +772,8 @@ static int ispfe_runtime_resume(struct device *dev)
 
 	ispfe_cmu_restore(ispfe);
 	ispfe_s2mpu_open(ispfe);
-	ispfe_phy_isolation(ispfe, true);
+	if (ispfe->phy_isolation_bypass)
+		ispfe_phy_isolation(ispfe, true);
 
 	return 0;
 }
@@ -1650,6 +1661,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("width", 0644, d, &ispfe->src.width);
 	debugfs_create_u32("height", 0644, d, &ispfe->src.height);
 	debugfs_create_bool("cphy", 0644, d, &ispfe->src.cphy);
+	debugfs_create_bool("phy_isolation_bypass", 0644, d,
+			    &ispfe->phy_isolation_bypass);
 	debugfs_create_u32("ctx", 0644, d, &ispfe->src.ctx);
 	debugfs_create_u32("lmp", 0644, d, &ispfe->src.lmp);
 	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);

@@ -185,6 +185,7 @@
  */
 #define FC_INIT_BUSY			0x2003c
 #define FC_INIT_TIMEOUT_US		5000
+#define FC_INIT_SETTLE_US		2000
 #define FC_INIT			0x20008
 #define FC_INIT_VAL		0x0000000f
 #define FC_INIT_MSK			0x20010
@@ -592,6 +593,41 @@ struct ispfe_device {
 	 * is what the vendor does and therefore the default.
 	 */
 	u32 predown_qch;
+	/*
+	 * How long to leave the block alone between the device init and the
+	 * stream start; a tenth of it again before the run masks.  Sweepable
+	 * because the vendor's intervals are what a HAL happened to take, not
+	 * a documented requirement.
+	 */
+	u32 settle_us;
+	/*
+	 * The line-memory allocator's control word.  0x1a is what one IMX712
+	 * alone was measured writing; the ultrawide with a phase-detect stream
+	 * beside it wrote 0x88 and the main camera 0x6c, and nothing decodes
+	 * the value, so it is a knob rather than a constant.
+	 */
+	u32 lmp_alloc_ctrl;
+	/*
+	 * The PDMA descriptor's two undecoded words and whether to push the
+	 * head at all.  Sweepable because the first descriptor fetch is where
+	 * this driver diverges: PDMA raises isp_fe_ctxN_pdma_err bit 4 -- an
+	 * error the vendor never sees in a whole session -- and stops with its
+	 * tail at one record.  Both words were measured on `barghest`, and the
+	 * only ring ever dumped is that sensor's; nothing says they are the
+	 * same for an IMX712.
+	 */
+	u32 pdma_cmd;
+	/*
+	 * Override the descriptor's address field.  Zero means the frame
+	 * buffer, which is what a driver would really put there; a deliberate
+	 * unmapped IOVA says whether PDMA issues the read at all, because a
+	 * SysMMU fault would then be logged and its absence would put the
+	 * error before the bus rather than on it.
+	 */
+	u32 pdma_addr;
+	u32 pdma_tail;
+	u32 pdma_tail_first;
+	bool pdma_no_kick;
 	bool streaming;
 	int link_irq;
 	int core_irq;
@@ -879,7 +915,7 @@ static void ispfe_links_reset(struct ispfe_device *ispfe)
 	void __iomem *csis = ispfe->base[ISPFE_WIN_CSIS];
 	ktime_t start = ktime_get();
 	unsigned int i;
-	u32 busy;
+	u32 busy, first;
 	int ret;
 
 	for (i = 0; i < CSIS_NUM_LINKS; i++)
@@ -889,13 +925,35 @@ static void ispfe_links_reset(struct ispfe_device *ispfe)
 	writel_relaxed(FC_INIT_VAL, core + FC_INIT);
 	writel_relaxed(FC_INIT_MSK_VAL, core + FC_INIT_MSK);
 
+	/*
+	 * Report the first sample separately from the poll.  The vendor reads
+	 * 0x1 here, one microsecond after the same two writes, and 0x0 about a
+	 * millisecond later; this driver has been returning from the poll in
+	 * 9-22 us, which is either a block that initialises two orders of
+	 * magnitude faster or a busy bit that never sets.  One read says which.
+	 */
+	first = readl(core + FC_INIT_BUSY);
+
 	ret = readl_poll_timeout(core + FC_INIT_BUSY, busy, !busy, 50,
 				 FC_INIT_TIMEOUT_US);
+	/*
+	 * Then wait anyway.  The poll is not load-bearing here and cannot be:
+	 * the busy bit reads 0x1 for the vendor one microsecond after these
+	 * same two writes and 0x0 a millisecond later, and reads 0x0
+	 * immediately for us -- so on this driver the poll returns at once and
+	 * the caller runs the LMP_CTRL transitions, the allocator, the PDMA
+	 * resets and the START pulse into a block that has had no settling
+	 * time at all.  Register contents survive that; pulses do not.  Sleep
+	 * the interval the vendor's own poll grants and leave the readback in
+	 * the log as the measurement it is.
+	 */
+	usleep_range(FC_INIT_SETTLE_US, FC_INIT_SETTLE_US + 500);
+
 	if (ret)
 		dev_warn(ispfe->dev, "front end still initialising: %#x\n", busy);
 	else
-		dev_info(ispfe->dev, "front end init took %lld us\n",
-			 ktime_us_delta(ktime_get(), start));
+		dev_info(ispfe->dev, "front end init: busy %#x, took %lld us\n",
+			 first, ktime_us_delta(ktime_get(), start));
 }
 
 /*
@@ -923,6 +981,7 @@ static void ispfe_links_reset(struct ispfe_device *ispfe)
 #define CMU_QCH_CON_PHY_WRAP_FIRST	0x3048
 #define CMU_QCH_CON_PHY_WRAP_LAST	0x3074
 #define ISPFE_PREDOWN_QCH_OFF		U32_MAX
+#define ISPFE_SETTLE_US_DEFAULT		20000
 
 static void ispfe_predown_quiesce(struct ispfe_device *ispfe)
 {
@@ -1358,11 +1417,13 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 	unsigned int i;
 
 	for (i = 0; i < PDMA_NUM_RECORDS; i++) {
-		ispfe->ring[i].cmd = cpu_to_le32(PDMA_DESC_CMD);
-		ispfe->ring[i].addr_lo =
-			cpu_to_le32(lower_32_bits(ispfe->frame_dma));
-		ispfe->ring[i].addr_hi =
-			cpu_to_le32(upper_32_bits(ispfe->frame_dma));
+		ispfe->ring[i].cmd = cpu_to_le32(READ_ONCE(ispfe->pdma_cmd));
+		u32 addr = READ_ONCE(ispfe->pdma_addr);
+
+		ispfe->ring[i].addr_lo = cpu_to_le32(
+			addr ? addr : lower_32_bits(ispfe->frame_dma));
+		ispfe->ring[i].addr_hi = cpu_to_le32(
+			addr ? 0 : upper_32_bits(ispfe->frame_dma));
 		/*
 		 * Record 0 carries a bit the rest do not: every record in the
 		 * vendor's ring has tail 0x19c8 except the first, which has
@@ -1371,8 +1432,9 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 		 * first-record flag is exactly the shape of a start-of-ring
 		 * marker.  research/data/camera-pdma-ring-2026-08-17.
 		 */
-		ispfe->ring[i].tail = cpu_to_le32(i ? PDMA_DESC_TAIL
-						    : PDMA_DESC_TAIL_FIRST);
+		ispfe->ring[i].tail =
+			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_tail)
+				      : READ_ONCE(ispfe->pdma_tail_first));
 	}
 }
 
@@ -1413,6 +1475,9 @@ static void ispfe_pdma_kick(struct ispfe_device *ispfe)
 {
 	void __iomem *pdma = ispfe->base[ISPFE_WIN_PDMA] +
 			     PDMA_CTX(ispfe->active.loch);
+
+	if (READ_ONCE(ispfe->pdma_no_kick))
+		return;
 
 	ispfe->head = sizeof(*ispfe->ring);
 	dma_wmb();
@@ -1461,7 +1526,8 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot));
 	writel_relaxed(LMP_ALLOC_SLOT_VAL1,
 		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot) + 4);
-	writel_relaxed(LMP_ALLOC_CTRL_IMX712, alloc + LMP_ALLOC_CTRL);
+	writel_relaxed(READ_ONCE(ispfe->lmp_alloc_ctrl),
+		       alloc + LMP_ALLOC_CTRL);
 	writel_relaxed(LMP_ALLOC_CTRL_B, core + LMP_ALLOC_B + LMP_ALLOC_CTRL);
 
 	writel_relaxed(LMP_INT_MSK_VAL,
@@ -1722,7 +1788,14 @@ static irqreturn_t ispfe_pdma_isr(int irq, void *data)
 		 * latched by stream start.  A descriptor fetch that faults and
 		 * one that completes both show up here as "an interrupt".
 		 */
-		if (i == ispfe->active.fcctx) {
+		/*
+		 * PDMA is indexed by the logical channel, not the frame
+		 * controller context -- ispfe_pdma_start() uses PDMA_CTX(loch)
+		 * -- so recording against fcctx reported a context this stream
+		 * never programmed.  That is why a run could show one PDMA
+		 * event with all three sticky words reading zero.
+		 */
+		if (i == ispfe->active.loch) {
 			WRITE_ONCE(ispfe->pdma_seen[0],
 				   READ_ONCE(ispfe->pdma_seen[0]) | int0);
 			WRITE_ONCE(ispfe->pdma_seen[1],
@@ -1932,11 +2005,23 @@ static int ispfe_start(struct ispfe_device *ispfe)
 		goto err_put;
 
 	ispfe_device_init(ispfe);
+
+	/*
+	 * The vendor leaves 110 ms between finishing the device init and
+	 * touching the frame controller, and 460 us to 2 ms between the START
+	 * pulse and the run masks.  This driver had neither: the whole
+	 * sequence ran in 1.1 ms with nothing between any two steps, which is
+	 * indistinguishable from correct in a register readback and is not
+	 * indistinguishable to a block that has to sequence something.  Both
+	 * intervals are one knob, because nothing yet separates them.
+	 */
+	fsleep(READ_ONCE(ispfe->settle_us));
 	ispfe_pdma_start(ispfe);
 	ispfe_fc_start(ispfe);
 	ispfe_phy_start(ispfe);
 	ispfe_link_start(ispfe);
 	ispfe_link_unmask(ispfe);
+	fsleep(READ_ONCE(ispfe->settle_us) / 10);
 	ispfe_fc_run(ispfe);
 	ispfe_pdma_kick(ispfe);
 	ispfe_fc_arm(ispfe);
@@ -2235,7 +2320,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "lmp_events   %u\n", atomic_read(&ispfe->lmp_events));
 	seq_printf(s, "pdma_events  %u\n", atomic_read(&ispfe->pdma_events));
 	seq_printf(s, "pdma_int0    %#010x\n", READ_ONCE(ispfe->pdma_seen[0]));
-	seq_printf(s, "pdma_int1    %#010x\n", READ_ONCE(ispfe->pdma_seen[1]));
+	seq_printf(s, "pdma_int1    %#010x  (isp_fe_ctx%u_pdma_err)\n",
+		   READ_ONCE(ispfe->pdma_seen[1]), ispfe->active.loch);
 	seq_printf(s, "pdma_wrap    %#010x\n", READ_ONCE(ispfe->pdma_seen[2]));
 	seq_printf(s, "int0_seen    %#010x\n", READ_ONCE(ispfe->int0_seen));
 	seq_printf(s, "int1_seen    %#010x\n", READ_ONCE(ispfe->int1_seen));
@@ -2333,6 +2419,13 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("loch", 0644, d, &ispfe->src.loch);
 	debugfs_create_u32("fcctx", 0644, d, &ispfe->src.fcctx);
 	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);
+	debugfs_create_u32("settle_us", 0644, d, &ispfe->settle_us);
+	debugfs_create_x32("lmp_alloc_ctrl", 0644, d, &ispfe->lmp_alloc_ctrl);
+	debugfs_create_x32("pdma_cmd", 0644, d, &ispfe->pdma_cmd);
+	debugfs_create_x32("pdma_addr", 0644, d, &ispfe->pdma_addr);
+	debugfs_create_x32("pdma_tail", 0644, d, &ispfe->pdma_tail);
+	debugfs_create_x32("pdma_tail_first", 0644, d, &ispfe->pdma_tail_first);
+	debugfs_create_bool("pdma_no_kick", 0644, d, &ispfe->pdma_no_kick);
 	debugfs_create_u32("mode_word0", 0644, d, &ispfe->src.mode_word0);
 	debugfs_create_u32("mode_word1", 0644, d, &ispfe->src.mode_word1);
 	debugfs_create_file("enable", 0644, d, ispfe, &ispfe_enable_fops);
@@ -2376,6 +2469,11 @@ static int ispfe_probe(struct platform_device *pdev)
 
 	ispfe->dev = dev;
 	ispfe->predown_qch = ISPFE_PREDOWN_QCH_OFF;
+	ispfe->settle_us = ISPFE_SETTLE_US_DEFAULT;
+	ispfe->lmp_alloc_ctrl = LMP_ALLOC_CTRL_IMX712;
+	ispfe->pdma_cmd = PDMA_DESC_CMD;
+	ispfe->pdma_tail = PDMA_DESC_TAIL;
+	ispfe->pdma_tail_first = PDMA_DESC_TAIL_FIRST;
 	platform_set_drvdata(pdev, ispfe);
 
 	ret = devm_mutex_init(dev, &ispfe->lock);

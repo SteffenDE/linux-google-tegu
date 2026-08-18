@@ -31,6 +31,8 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 
+#include "exynos-ispfe-pdma-program.h"
+
 /*
  * CSIS is licensed Samsung IP that mainline already drives as
  * drivers/media/platform/nxp/imx-mipi-csis.c, and zumapro's is a later version
@@ -346,12 +348,11 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define LMP_ALLOC_MODE_VAL		0x00000053
 
 /*
- * PDMA: five contexts of a small DRAM control ring, and the only path by which
- * a frame buffer address reaches this hardware -- no register write anywhere in
- * the system carries one.  The ring is 1000 bytes whatever the sensor,
- * resolution or frame rate, and its head advances exactly one 16-byte record
- * per frame.  A PDMA context is used with the frame controller context of the
- * same index in every session captured.
+ * PDMA: five contexts of a small DRAM control ring.  Each ring record points at
+ * an indirect program that applies register writes at the frame boundary; the
+ * image-context write to +0x205c0 inside that program carries the Bayer IOVA.
+ * The ring is 1000 bytes whatever the sensor, resolution or frame rate, and its
+ * head advances exactly one 16-byte record per frame.
  */
 /*
  * Indexed by logical channel, not by frame-controller context -- the two are
@@ -393,23 +394,78 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define PDMA_WRAP_MSK_VAL		0x0000001f
 
 /*
- * One PDMA record.  The command word and the trailing word are byte-identical
- * between a 4000x3000 and a 2000x1500 capture of the same sensor, so neither
- * is geometry, stride or size; only the address varies, and it varied three
- * ways round with one record written per frame.  Replayed as measured.
+ * One PDMA record. The address names an indirect command program and the final
+ * word is its exact byte count. The first program is 0x20 bytes longer than the
+ * steady-state one: it appends four register/value pairs to the same prefix.
  */
 struct ispfe_pdma_desc {
 	__le32 cmd;
 	__le32 addr_lo;
 	__le32 addr_hi;
-	__le32 tail;
+	__le32 bytes;
 } __packed;
 
 #define PDMA_DESC_CMD			0x0000c003
-#define PDMA_DESC_TAIL_FIRST		0x000019e8
-#define PDMA_DESC_TAIL			0x000019c8
+#define PDMA_DESC_BYTES_FIRST		0x000019e8
+#define PDMA_DESC_BYTES			0x000019c8
 #define PDMA_NUM_RECORDS \
 	(PDMA_SIZE_VAL / sizeof(struct ispfe_pdma_desc))
+
+/*
+ * One captured barghest program plus the eleven input-only buffers reached by
+ * its 0x00010009 indirect records. Each input starts on the same page boundary
+ * it had in the vendor session. Output and read/write working-buffer IOVAs are
+ * redirected to the large mainline frame allocation for this diagnostic.
+ */
+#define PDMA_PROGRAM_AREA_SIZE		0x0000e000
+
+struct ispfe_pdma_input {
+	u32 captured_iova;
+	u32 area_offset;
+	const u8 *data;
+	size_t size;
+};
+
+#define PDMA_INPUT(_iova, _offset, _data) { \
+	.captured_iova = (_iova), .area_offset = (_offset), \
+	.data = (_data), .size = sizeof(_data), \
+}
+
+static const struct ispfe_pdma_input ispfe_pdma_inputs[] = {
+	PDMA_INPUT(0x1ca64000, 0x2000, ispfe_pdma_input_1ca64000),
+	PDMA_INPUT(0x1ca6e000, 0x3000, ispfe_pdma_input_1ca6e000),
+	PDMA_INPUT(0x1ca5a000, 0x5000, ispfe_pdma_input_1ca5a000),
+	PDMA_INPUT(0x1ca59000, 0x6000, ispfe_pdma_input_1ca59000),
+	PDMA_INPUT(0x1ca58000, 0x7000, ispfe_pdma_input_1ca58000),
+	PDMA_INPUT(0x1ca5b000, 0x8000, ispfe_pdma_input_1ca5b000),
+	PDMA_INPUT(0x1ca6d000, 0x9000, ispfe_pdma_input_1ca6d000),
+	PDMA_INPUT(0x1c6d9000, 0xa000, ispfe_pdma_input_1c6d9000),
+	PDMA_INPUT(0x1c449000, 0xb000, ispfe_pdma_input_1c449000),
+	PDMA_INPUT(0x1ca5d000, 0xc000, ispfe_pdma_input_1ca5d000),
+	PDMA_INPUT(0x1ca53000, 0xd000, ispfe_pdma_input_1ca53000),
+};
+
+struct ispfe_pdma_output {
+	u32 captured_iova;
+	u8 refs;
+};
+
+#define PDMA_OUTPUT(_iova, _refs) { .captured_iova = (_iova), .refs = (_refs) }
+
+static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
+	PDMA_OUTPUT(0x17280000, 1), PDMA_OUTPUT(0x19200000, 1),
+	PDMA_OUTPUT(0x1a900000, 1), PDMA_OUTPUT(0x1c674000, 1),
+	PDMA_OUTPUT(0x1c6cd000, 1), PDMA_OUTPUT(0x1c6db000, 1),
+	PDMA_OUTPUT(0x1c758000, 1), PDMA_OUTPUT(0x1c760000, 2),
+	PDMA_OUTPUT(0x1c7e8000, 2), PDMA_OUTPUT(0x1c800000, 1),
+	PDMA_OUTPUT(0x1ca50000, 1), PDMA_OUTPUT(0x1cb00000, 1),
+	PDMA_OUTPUT(0x1cb72000, 1), PDMA_OUTPUT(0x1cd00000, 1),
+	PDMA_OUTPUT(0x1ce00000, 1), PDMA_OUTPUT(0x1ce80000, 1),
+	PDMA_OUTPUT(0x1cecc000, 1), PDMA_OUTPUT(0x1ced8000, 1),
+	PDMA_OUTPUT(0x1cf00000, 1), PDMA_OUTPUT(0x1cf80000, 1),
+};
+
+static_assert(sizeof(ispfe_pdma_program_barghest) == PDMA_DESC_BYTES_FIRST);
 
 /*
  * The vendor stack's own saved frame is width * 2 * height with no padding, so
@@ -607,26 +663,16 @@ struct ispfe_device {
 	 * the value, so it is a knob rather than a constant.
 	 */
 	u32 lmp_alloc_ctrl;
-	/*
-	 * The PDMA descriptor's two undecoded words and whether to push the
-	 * head at all.  Sweepable because the first descriptor fetch is where
-	 * this driver diverges: PDMA raises isp_fe_ctxN_pdma_err bit 4 -- an
-	 * error the vendor never sees in a whole session -- and stops with its
-	 * tail at one record.  Both words were measured on `barghest`, and the
-	 * only ring ever dumped is that sensor's; nothing says they are the
-	 * same for an IMX712.
-	 */
+	/* Bring-up overrides for the measured opcode/length and head push. */
 	u32 pdma_cmd;
 	/*
-	 * Override the descriptor's address field.  Zero means the frame
-	 * buffer, which is what a driver would really put there; a deliberate
-	 * unmapped IOVA says whether PDMA issues the read at all, because a
-	 * SysMMU fault would then be logged and its absence would put the
-	 * error before the bus rather than on it.
+	 * Override the descriptor's program address. Zero selects the relocated
+	 * captured program; a deliberate unmapped IOVA remains useful for proving
+	 * that PDMA issues the read and reaches the System MMU.
 	 */
 	u32 pdma_addr;
-	u32 pdma_tail;
-	u32 pdma_tail_first;
+	u32 pdma_bytes;
+	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
 	int link_irq;
@@ -641,10 +687,12 @@ struct ispfe_device {
 	 */
 	char link_name[8];
 
-	/* The frame buffer, and the descriptor ring that points the ISP at it. */
+	/* The frame, indirect program area and ring that points at the program. */
 	void *frame;
 	dma_addr_t frame_dma;
 	size_t frame_size;
+	void *program;
+	dma_addr_t program_dma;
 	struct ispfe_pdma_desc *ring;
 	dma_addr_t ring_dma;
 	u32 head;
@@ -1412,6 +1460,71 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
  * So this fills the 62 records that fit whole and never lets the head reach
  * the split one.  The last eight bytes are left alone.
  */
+static unsigned int
+ispfe_pdma_patch_iova(void *program, u32 captured, u32 replacement)
+{
+	__le32 *words = program;
+	unsigned int i, patched = 0;
+
+	for (i = 0; i < PDMA_DESC_BYTES_FIRST / sizeof(*words); i++) {
+		if (le32_to_cpu(words[i]) != captured)
+			continue;
+		words[i] = cpu_to_le32(replacement);
+		patched++;
+	}
+
+	return patched;
+}
+
+static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
+{
+	unsigned int i, patched;
+
+	if (upper_32_bits(ispfe->program_dma + PDMA_PROGRAM_AREA_SIZE - 1) ||
+	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1))
+		return -ERANGE;
+
+	memset(ispfe->program, 0, PDMA_PROGRAM_AREA_SIZE);
+	memcpy(ispfe->program, ispfe_pdma_program_barghest,
+	       sizeof(ispfe_pdma_program_barghest));
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_inputs); i++) {
+		const struct ispfe_pdma_input *input = &ispfe_pdma_inputs[i];
+		u32 replacement = lower_32_bits(ispfe->program_dma +
+						input->area_offset);
+
+		if (input->area_offset + input->size > PDMA_PROGRAM_AREA_SIZE)
+			return -EOVERFLOW;
+		memcpy((u8 *)ispfe->program + input->area_offset,
+		       input->data, input->size);
+		patched = ispfe_pdma_patch_iova(ispfe->program,
+						input->captured_iova,
+						replacement);
+		if (patched != 1) {
+			dev_err(ispfe->dev,
+				"program input %#x has %u references, expected 1\n",
+				input->captured_iova, patched);
+			return -EINVAL;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		const struct ispfe_pdma_output *output = &ispfe_pdma_outputs[i];
+
+		patched = ispfe_pdma_patch_iova(ispfe->program,
+						output->captured_iova,
+						lower_32_bits(ispfe->frame_dma));
+		if (patched != output->refs) {
+			dev_err(ispfe->dev,
+				"program output %#x has %u references, expected %u\n",
+				output->captured_iova, patched, output->refs);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static void ispfe_ring_fill(struct ispfe_device *ispfe)
 {
 	unsigned int i;
@@ -1421,20 +1534,17 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 		u32 addr = READ_ONCE(ispfe->pdma_addr);
 
 		ispfe->ring[i].addr_lo = cpu_to_le32(
-			addr ? addr : lower_32_bits(ispfe->frame_dma));
+			addr ? addr : lower_32_bits(ispfe->program_dma));
 		ispfe->ring[i].addr_hi = cpu_to_le32(
-			addr ? 0 : upper_32_bits(ispfe->frame_dma));
+			addr ? 0 : upper_32_bits(ispfe->program_dma));
 		/*
-		 * Record 0 carries a bit the rest do not: every record in the
-		 * vendor's ring has tail 0x19c8 except the first, which has
-		 * 0x19e8.  Nothing decodes bit 5, but the head is a producer
-		 * credit and the first record is the one consumed first, so a
-		 * first-record flag is exactly the shape of a start-of-ring
-		 * marker.  research/data/camera-pdma-ring-2026-08-17.
+		 * The initial program includes four final register/value pairs;
+		 * steady records end 0x20 bytes earlier. Both lengths address the
+		 * same captured prefix in this static diagnostic.
 		 */
-		ispfe->ring[i].tail =
-			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_tail)
-				      : READ_ONCE(ispfe->pdma_tail_first));
+		ispfe->ring[i].bytes =
+			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_bytes)
+				      : READ_ONCE(ispfe->pdma_bytes_first));
 	}
 }
 
@@ -1818,6 +1928,11 @@ static irqreturn_t ispfe_pdma_isr(int irq, void *data)
 
 static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
+	if (ispfe->program) {
+		dma_free_coherent(ispfe->dev, PDMA_PROGRAM_AREA_SIZE,
+				  ispfe->program, ispfe->program_dma);
+		ispfe->program = NULL;
+	}
 	if (ispfe->ring) {
 		dma_free_coherent(ispfe->dev, PAGE_SIZE, ispfe->ring,
 				  ispfe->ring_dma);
@@ -1841,13 +1956,17 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 {
 	size_t size = array3_size(ispfe->active.width, ispfe->active.height,
 				  ISPFE_BYTES_PER_PIXEL);
-
+	int ret;
 
 	if (size == SIZE_MAX)
 		return -EOVERFLOW;
 
-	if (ispfe->frame && ispfe->frame_size == size) {
+	if (ispfe->frame && ispfe->ring && ispfe->program &&
+	    ispfe->frame_size == size) {
 		memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+		ret = ispfe_pdma_program_prepare(ispfe);
+		if (ret)
+			return ret;
 		ispfe_ring_fill(ispfe);
 		return 0;
 	}
@@ -1866,12 +1985,24 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
+	ispfe->program = dma_alloc_coherent(ispfe->dev,
+					    PDMA_PROGRAM_AREA_SIZE,
+					    &ispfe->program_dma, GFP_KERNEL);
+	if (!ispfe->program) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
 
 	/*
 	 * Poisoned rather than zeroed, so that a frame that never arrived is
 	 * distinguishable from one that arrived black.
 	 */
 	memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+	ret = ispfe_pdma_program_prepare(ispfe);
+	if (ret) {
+		ispfe_buffers_free(ispfe);
+		return ret;
+	}
 	ispfe_ring_fill(ispfe);
 
 	return 0;
@@ -2328,6 +2459,7 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "fc_seen      %#010x\n", READ_ONCE(ispfe->fc_seen));
 	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);
+	seq_printf(s, "program_iova %pad\n", &ispfe->program_dma);
 	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
 	seq_printf(s, "ring_head    %#x\n", ispfe->head);
 
@@ -2423,8 +2555,9 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_x32("lmp_alloc_ctrl", 0644, d, &ispfe->lmp_alloc_ctrl);
 	debugfs_create_x32("pdma_cmd", 0644, d, &ispfe->pdma_cmd);
 	debugfs_create_x32("pdma_addr", 0644, d, &ispfe->pdma_addr);
-	debugfs_create_x32("pdma_tail", 0644, d, &ispfe->pdma_tail);
-	debugfs_create_x32("pdma_tail_first", 0644, d, &ispfe->pdma_tail_first);
+	debugfs_create_x32("pdma_bytes", 0644, d, &ispfe->pdma_bytes);
+	debugfs_create_x32("pdma_bytes_first", 0644, d,
+			   &ispfe->pdma_bytes_first);
 	debugfs_create_bool("pdma_no_kick", 0644, d, &ispfe->pdma_no_kick);
 	debugfs_create_u32("mode_word0", 0644, d, &ispfe->src.mode_word0);
 	debugfs_create_u32("mode_word1", 0644, d, &ispfe->src.mode_word1);
@@ -2472,8 +2605,8 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->settle_us = ISPFE_SETTLE_US_DEFAULT;
 	ispfe->lmp_alloc_ctrl = LMP_ALLOC_CTRL_IMX712;
 	ispfe->pdma_cmd = PDMA_DESC_CMD;
-	ispfe->pdma_tail = PDMA_DESC_TAIL;
-	ispfe->pdma_tail_first = PDMA_DESC_TAIL_FIRST;
+	ispfe->pdma_bytes = PDMA_DESC_BYTES;
+	ispfe->pdma_bytes_first = PDMA_DESC_BYTES_FIRST;
 	platform_set_drvdata(pdev, ispfe);
 
 	ret = devm_mutex_init(dev, &ispfe->lock);

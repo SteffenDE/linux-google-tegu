@@ -395,9 +395,9 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 
 /*
  * One PDMA record. The address names an indirect command program and the final
- * word is its exact byte count. The captured program is a structurally complete
- * 0x19c8-byte stream; bytes after its final grouped-write command are stale
- * contents from an earlier use of the rotating buffer.
+ * word is its exact byte count. The physical-ultrawide RAW capture's current
+ * program is a structurally complete 0x1800-byte stream; the first record's
+ * older 0x1824 length again outlived the generation caught by dmabuf-peek.
  */
 struct ispfe_pdma_desc {
 	__le32 cmd;
@@ -407,16 +407,17 @@ struct ispfe_pdma_desc {
 } __packed;
 
 #define PDMA_DESC_CMD			0x0000c003
-#define PDMA_DESC_BYTES_FIRST		0x000019c8
-#define PDMA_DESC_BYTES			0x000019c8
+#define PDMA_DESC_BYTES_FIRST		0x00001800
+#define PDMA_DESC_BYTES			0x00001800
 #define PDMA_NUM_RECORDS \
 	(PDMA_SIZE_VAL / sizeof(struct ispfe_pdma_desc))
 
 /*
- * One captured barghest program plus the eleven input-only buffers reached by
- * its 0x00010009 indirect records. Each input starts on the same page boundary
- * it had in the vendor session. Output and read/write working-buffer IOVAs are
- * redirected to the large mainline frame allocation for this diagnostic.
+ * One captured physical-ultrawide RAW program plus the eight input-only
+ * buffers reached by its 0x00010009 indirect records. Each input starts on a
+ * page boundary, as it did in the vendor session. Output and read/write
+ * working-buffer IOVAs are redirected to the large mainline frame allocation
+ * for this diagnostic.
  */
 #define PDMA_PROGRAM_AREA_SIZE		0x0000e000
 
@@ -433,17 +434,14 @@ struct ispfe_pdma_input {
 }
 
 static const struct ispfe_pdma_input ispfe_pdma_inputs[] = {
-	PDMA_INPUT(0x1ca64000, 0x2000, ispfe_pdma_input_1ca64000),
-	PDMA_INPUT(0x1ca6e000, 0x3000, ispfe_pdma_input_1ca6e000),
-	PDMA_INPUT(0x1ca5a000, 0x5000, ispfe_pdma_input_1ca5a000),
-	PDMA_INPUT(0x1ca59000, 0x6000, ispfe_pdma_input_1ca59000),
-	PDMA_INPUT(0x1ca58000, 0x7000, ispfe_pdma_input_1ca58000),
-	PDMA_INPUT(0x1ca5b000, 0x8000, ispfe_pdma_input_1ca5b000),
-	PDMA_INPUT(0x1ca6d000, 0x9000, ispfe_pdma_input_1ca6d000),
-	PDMA_INPUT(0x1c6d9000, 0xa000, ispfe_pdma_input_1c6d9000),
-	PDMA_INPUT(0x1c449000, 0xb000, ispfe_pdma_input_1c449000),
-	PDMA_INPUT(0x1ca5d000, 0xc000, ispfe_pdma_input_1ca5d000),
-	PDMA_INPUT(0x1ca53000, 0xd000, ispfe_pdma_input_1ca53000),
+	PDMA_INPUT(0x1d55e000, 0x2000, ispfe_pdma_input_1d55e000),
+	PDMA_INPUT(0x1d5f2000, 0x3000, ispfe_pdma_input_1d5f2000),
+	PDMA_INPUT(0x1d480000, 0x5000, ispfe_pdma_input_1d480000),
+	PDMA_INPUT(0x1ca7d000, 0x6000, ispfe_pdma_input_1ca7d000),
+	PDMA_INPUT(0x1d85c000, 0x7000, ispfe_pdma_input_1d85c000),
+	PDMA_INPUT(0x1d673000, 0x8000, ispfe_pdma_input_1d673000),
+	PDMA_INPUT(0x1d84b000, 0x9000, ispfe_pdma_input_1d84b000),
+	PDMA_INPUT(0x1d45c000, 0xa000, ispfe_pdma_input_1d45c000),
 };
 
 struct ispfe_pdma_output {
@@ -454,19 +452,16 @@ struct ispfe_pdma_output {
 #define PDMA_OUTPUT(_iova, _refs) { .captured_iova = (_iova), .refs = (_refs) }
 
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
-	PDMA_OUTPUT(0x17280000, 1), PDMA_OUTPUT(0x19200000, 1),
-	PDMA_OUTPUT(0x1a900000, 1), PDMA_OUTPUT(0x1c674000, 1),
-	PDMA_OUTPUT(0x1c6cd000, 1), PDMA_OUTPUT(0x1c6db000, 1),
-	PDMA_OUTPUT(0x1c758000, 1), PDMA_OUTPUT(0x1c760000, 2),
-	PDMA_OUTPUT(0x1c7e8000, 2), PDMA_OUTPUT(0x1c800000, 1),
-	PDMA_OUTPUT(0x1ca50000, 1), PDMA_OUTPUT(0x1cb00000, 1),
-	PDMA_OUTPUT(0x1cb72000, 1), PDMA_OUTPUT(0x1cd00000, 1),
-	PDMA_OUTPUT(0x1ce00000, 1), PDMA_OUTPUT(0x1ce80000, 1),
-	PDMA_OUTPUT(0x1cecc000, 1), PDMA_OUTPUT(0x1ced8000, 1),
-	PDMA_OUTPUT(0x1cf00000, 1), PDMA_OUTPUT(0x1cf80000, 1),
+	PDMA_OUTPUT(0x15d00000, 1), PDMA_OUTPUT(0x1d55b000, 1),
+	PDMA_OUTPUT(0x1d678000, 2), PDMA_OUTPUT(0x1c9e0000, 2),
+	PDMA_OUTPUT(0x1d55c000, 1), PDMA_OUTPUT(0x1cc00000, 1),
+	PDMA_OUTPUT(0x1d780000, 1), PDMA_OUTPUT(0x1d5fc000, 1),
+	PDMA_OUTPUT(0x1d674000, 1), PDMA_OUTPUT(0x1d454000, 1),
+	PDMA_OUTPUT(0x1d700000, 1), PDMA_OUTPUT(0x1cb80000, 1),
+	PDMA_OUTPUT(0x1cb00000, 1), PDMA_OUTPUT(0x1c980000, 1),
 };
 
-static_assert(sizeof(ispfe_pdma_program_barghest) == PDMA_DESC_BYTES_FIRST);
+static_assert(sizeof(ispfe_pdma_program_ultrawide) == PDMA_DESC_BYTES_FIRST);
 
 /*
  * The vendor stack's own saved frame is width * 2 * height with no padding, so
@@ -1486,8 +1481,8 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 		return -ERANGE;
 
 	memset(ispfe->program, 0, PDMA_PROGRAM_AREA_SIZE);
-	memcpy(ispfe->program, ispfe_pdma_program_barghest,
-	       sizeof(ispfe_pdma_program_barghest));
+	memcpy(ispfe->program, ispfe_pdma_program_ultrawide,
+	       sizeof(ispfe_pdma_program_ultrawide));
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_inputs); i++) {
 		const struct ispfe_pdma_input *input = &ispfe_pdma_inputs[i];
@@ -2629,15 +2624,13 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->src = (struct ispfe_source){
 		.link = 1, .phy = 1, .lanes = 4, .width = 4208, .height = 3120,
 		/*
-		 * The exact configuration the vendor stack put this sensor in,
-		 * rather than a plausible mixture of several.  Nothing in the
-		 * captures separates "per sensor mode" from "per context" for
-		 * the two mode words, and they were only ever measured in
-		 * context 1's register block -- so use context 1, the PDMA
-		 * context beside it, and the line-memory instance and slot that
-		 * went with them.
+		 * A standalone physical-output RAW capture allocated this sensor
+		 * on logical channel and frame-controller context 0.  The earlier
+		 * mixed preview's channel 1/context 2 were allocator choices, not
+		 * sensor properties.  Keep the measured sensor-mode words while
+		 * making the same allocation as the captured PDMA program.
 		 */
-		.loch = 1, .fcctx = 2, .slot = 0,
+		.loch = 0, .fcctx = 0, .slot = 0,
 		.mode_word0 = 0x000c44a0, .mode_word1 = 0x000014f8,
 	};
 

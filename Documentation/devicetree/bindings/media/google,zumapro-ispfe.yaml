@@ -82,6 +82,16 @@ properties:
       The shared IOMMU group object. Required by the System MMU v9 driver,
       which cannot attach a device whose group it did not create.
 
+  samsung,pmu-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: phandle to the PMU system controller
+          - description: offset of the D/C-PHY isolation word
+    description:
+      The nine D/C-PHYs share one PMU isolation bit, and while it is set their
+      register region reads zero and takes no writes.
+
   iommus:
     items:
       - description: ISPFE System MMU S0
@@ -100,6 +110,7 @@ required:
   - power-domains
   - iommus
   - samsung,iommu-group
+  - samsung,pmu-syscon
 
 additionalProperties: false
 
@@ -146,4 +157,5 @@ examples:
                           "csis-core", "fc", "lmp-bayer",
                           "lmp-pdaf", "pdma";
         samsung,iommu-group = <&iommu_group_isp>;
+        samsung,pmu-syscon = <&pmu_system_controller 0x3ebc>;
     };

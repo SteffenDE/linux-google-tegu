@@ -16,7 +16,8 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/pm_domain.h>
-#include <linux/delay.h>
+#include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pm_runtime.h>
@@ -25,6 +26,8 @@ struct exynos_pm_domain_config {
 	/* Value for LOCAL_PWR_CFG and STATUS fields for each domain */
 	u32 local_pwr_cfg;
 	bool secure_pmu;
+	/* How long STATUS is given to follow CONFIGURATION */
+	unsigned int wait_us;
 };
 
 /*
@@ -38,6 +41,7 @@ struct exynos_pm_domain {
 	u32 local_pwr_cfg;
 	u32 secure_pwr_id;
 	bool secure_pmu;
+	unsigned int wait_us;
 };
 
 #define EXYNOS_PD_SMC_CMD		0x82000410
@@ -47,6 +51,8 @@ struct exynos_pm_domain {
 #define EXYNOS_PRIV_REG_SMC_CMD		0x82000504
 #define EXYNOS_PRIV_REG_WRITE		1
 #define EXYNOS_PD_CMU_RESET_DISABLE	BIT(24)
+#define EXYNOS_PD_STATUS		0x4
+#define EXYNOS_PD_POLL_US		100
 
 static void exynos_pd_secure_control(struct exynos_pm_domain *pd, bool power_on)
 {
@@ -90,7 +96,8 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 {
 	struct exynos_pm_domain *pd;
 	void __iomem *base;
-	u32 timeout, pwr;
+	u32 status, pwr;
+	ktime_t start;
 	char *op;
 	int ret;
 
@@ -111,18 +118,24 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
 	if (ret)
 		return ret;
 
-	/* Wait max 1ms */
-	timeout = 10;
-
-	while ((readl_relaxed(base + 0x4) & pd->local_pwr_cfg) != pwr) {
-		if (!timeout) {
-			op = (power_on) ? "enable" : "disable";
-			pr_err("Power domain %s %s failed\n", domain->name, op);
-			return -ETIMEDOUT;
-		}
-		timeout--;
-		cpu_relax();
-		usleep_range(80, 100);
+	start = ktime_get();
+	ret = readl_poll_timeout(base + EXYNOS_PD_STATUS, status,
+				 (status & pd->local_pwr_cfg) == pwr,
+				 EXYNOS_PD_POLL_US, pd->wait_us);
+	if (ret) {
+		op = (power_on) ? "enable" : "disable";
+		/*
+		 * CONFIGURATION as well as STATUS: on a secure-PMU domain the
+		 * write went through an SMC that reports success without
+		 * proving anything landed, and "the PMU never accepted the
+		 * command" and "the block will not quiesce" are different
+		 * faults with the same symptom.  Both registers are in PMU
+		 * ALIVE, so reading them is safe whatever the block is doing.
+		 */
+		pr_err("Power domain %s %s failed after %lld us, config %#010x status %#010x\n",
+		       domain->name, op, ktime_us_delta(ktime_get(), start),
+		       readl_relaxed(base), status);
+		return ret;
 	}
 
 	if (power_on)
@@ -143,15 +156,26 @@ static int exynos_pd_power_off(struct generic_pm_domain *domain)
 
 static const struct exynos_pm_domain_config exynos4210_cfg = {
 	.local_pwr_cfg		= 0x7,
+	.wait_us		= 1000,
 };
 
 static const struct exynos_pm_domain_config exynos5433_cfg = {
 	.local_pwr_cfg		= 0xf,
+	.wait_us		= 1000,
 };
 
+/*
+ * Five times the budget the others get, because that is what the vendor's own
+ * PMU sequencer allows on this SoC: pmucal_rae_wait() polls at 1 us and gives
+ * up after 5000 of them, and BLK_ISPFE has been seen to need 520 us of that
+ * just to power on.  1 ms leaves nothing over for a block that has been
+ * streaming, and the failure is not a clean -ETIMEDOUT: an aborted transition
+ * takes ACPM down with it.
+ */
 static const struct exynos_pm_domain_config zumapro_cfg = {
 	.local_pwr_cfg		= BIT(0),
 	.secure_pmu		= true,
+	.wait_us		= 5000,
 };
 
 static const struct of_device_id exynos_pm_domain_of_match[] = {
@@ -219,6 +243,8 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	pd->pd.power_on = exynos_pd_power_on;
 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
 	pd->secure_pmu = pm_domain_cfg->secure_pmu;
+	/* readl_poll_timeout() never gives up on a zero timeout. */
+	pd->wait_us = pm_domain_cfg->wait_us ?: 1000;
 	if (of_property_read_bool(np, "samsung,always-on"))
 		pd->pd.flags |= GENPD_FLAG_ALWAYS_ON;
 

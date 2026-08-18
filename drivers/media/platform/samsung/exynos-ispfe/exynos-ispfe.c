@@ -2625,12 +2625,12 @@ static int ispfe_probe(struct platform_device *pdev)
 		.link = 1, .phy = 1, .lanes = 4, .width = 4208, .height = 3120,
 		/*
 		 * A standalone physical-output RAW capture allocated this sensor
-		 * on logical channel and frame-controller context 0.  The earlier
-		 * mixed preview's channel 1/context 2 were allocator choices, not
-		 * sensor properties.  Keep the measured sensor-mode words while
-		 * making the same allocation as the captured PDMA program.
+		 * on logical/PDMA channel 0, frame-controller context 4 and line-
+		 * memory slot 2.  The earlier mixed preview's channel 1/context 2
+		 * were allocator choices, not sensor properties.  Keep the measured
+		 * sensor-mode words while making the captured allocation.
 		 */
-		.loch = 0, .fcctx = 0, .slot = 0,
+		.loch = 0, .fcctx = 4, .slot = 2,
 		.mode_word0 = 0x000c44a0, .mode_word1 = 0x000014f8,
 	};
 

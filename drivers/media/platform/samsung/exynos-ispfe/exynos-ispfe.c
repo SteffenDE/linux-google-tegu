@@ -31,6 +31,10 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-ioctl.h>
+#include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-v4l2.h>
 
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-seeds.h"
@@ -375,7 +379,17 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define PDMA_BASE_LO			0x04
 #define PDMA_BASE_HI			0x08
 #define PDMA_SIZE			0x0c
-#define PDMA_SIZE_VAL			0x3e8
+/*
+ * The vendor's ring is 1000 bytes, which is 62 sixteen-byte records and eight
+ * bytes left over -- so its head reaches 0x3e0, whose record wraps with half at
+ * the end of the ring and half at the start.  A producer that rewrites each
+ * record before publishing it can use that; one that fills the ring in advance
+ * cannot, because offset 0 would have to be both the tail of the wrapped record
+ * and the head of the first.  Round the size down to whole records instead of
+ * leaving those eight bytes to be reasoned about: then a lap is exactly
+ * PDMA_NUM_RECORDS credits and the head arithmetic closes.
+ */
+#define PDMA_SIZE_VAL			0x3e0
 #define PDMA_HEAD			0x10
 #define PDMA_INT0_SRC			0x20
 #define PDMA_INT0_MSK			0x2c
@@ -417,15 +431,32 @@ struct ispfe_pdma_desc {
  * shared program to be rewritten underneath the hardware. Slots are page-
  * aligned, as the vendor's rotating program buffers were.
  */
-#define PDMA_SLOTS			4
+/*
+ * How many further credits must exist before the buffer a credit named can be
+ * handed back.  One, because a record credited at a frame start governs the
+ * frame after it: the frame ending at the next end-of-frame is the one the
+ * credit before it placed.
+ */
+#define ISPFE_CREDIT_LATENCY_DEFAULT	1
+
+#define PDMA_BUF_SLOTS			4
+/*
+ * One more, aimed at a buffer nobody reads.  The receiver runs continuously, so
+ * every frame boundary needs a program whether or not userspace has a buffer
+ * ready; without somewhere harmless to put those frames the only choices are to
+ * stall the ring or to write over a buffer that has already been handed out.
+ */
+#define PDMA_DUMP_SLOT			PDMA_BUF_SLOTS
+#define PDMA_SLOTS			(PDMA_BUF_SLOTS + 1)
 #define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_RECIPE_BYTES, PAGE_SIZE)
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 
 /*
- * The blocks the indirect bursts stream in do not change between frames, so
- * every slot's program points at the same shared area.
+ * The working areas the front end writes back to.  The blocks it *reads* do not
+ * change between frames and live in one shared area every slot's program points
+ * at; these are the other direction, and are equally shared because only one
+ * stream runs at a time.
  */
-
 struct ispfe_pdma_output {
 	size_t size;
 	enum dma_data_direction direction;
@@ -712,6 +743,39 @@ struct ispfe_device {
 	 */
 	u32 bayer_lo;
 	u32 bayer_hi;
+
+	/*
+	 * Who is driving the hardware.  The debugfs diagnostic and the V4L2
+	 * queue arm the same single receive path, so they are mutually
+	 * exclusive rather than layered.
+	 */
+	enum ispfe_owner {
+		ISPFE_OWNER_NONE,
+		ISPFE_OWNER_DEBUGFS,
+		ISPFE_OWNER_V4L2,
+	} owner;
+
+	struct v4l2_device v4l2_dev;
+	struct video_device vdev;
+	struct vb2_queue queue;
+	struct v4l2_pix_format fmt;
+	struct work_struct fill_work;
+	u32 sequence;
+	/*
+	 * How many frame boundaries pass between a ring record being credited
+	 * and the frame it governs finishing.  Measured rather than assumed,
+	 * and a control because getting it wrong hands userspace a buffer the
+	 * receiver has not written yet.
+	 */
+	u32 credit_latency;
+
+	/* Guards the three buffer lists and the slot bitmap against the IRQs. */
+	spinlock_t slock;
+	struct list_head pending;
+	struct list_head ready;
+	struct list_head flight;
+	unsigned int flight_count;
+	unsigned long slots_used;
 	struct ispfe_pdma_desc *ring;
 	dma_addr_t ring_dma;
 	struct {
@@ -1313,6 +1377,109 @@ static u32 ispfe_ack(void __iomem *link, u32 reg)
 	return val;
 }
 
+static dma_addr_t ispfe_slot_dma(struct ispfe_device *ispfe, unsigned int slot)
+{
+	return ispfe->programs_dma + slot * PDMA_SLOT_STRIDE;
+}
+
+/* Point one ring record at a program.  The caller owns the head. */
+static void ispfe_ring_record(struct ispfe_device *ispfe, unsigned int index,
+			      unsigned int slot)
+{
+	dma_addr_t dma = ispfe_slot_dma(ispfe, slot);
+
+	ispfe->ring[index].cmd = cpu_to_le32(READ_ONCE(ispfe->pdma_cmd));
+	ispfe->ring[index].addr_lo = cpu_to_le32(lower_32_bits(dma));
+	ispfe->ring[index].addr_hi = cpu_to_le32(upper_32_bits(dma));
+	ispfe->ring[index].bytes = cpu_to_le32(READ_ONCE(ispfe->pdma_bytes));
+}
+
+struct ispfe_buffer {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+	unsigned int slot;
+};
+
+static struct ispfe_buffer *to_ispfe_buffer(struct vb2_v4l2_buffer *vbuf)
+{
+	return container_of(vbuf, struct ispfe_buffer, vb);
+}
+
+/*
+ * Hand the ring one program, at a frame start.  PDMA fetches a credited record
+ * almost immediately but only applies it at the following frame boundary, so
+ * what this credits is where the *next* frame lands, not this one.  A credit
+ * per frame start is also the pacing the vendor uses: crediting several at once
+ * lets the front end fetch and overwrite them faster than frames consume them.
+ */
+static void ispfe_queue_credit(struct ispfe_device *ispfe)
+{
+	struct ispfe_buffer *buf;
+	unsigned int slot = PDMA_DUMP_SLOT;
+
+	spin_lock(&ispfe->slock);
+	if (!list_empty(&ispfe->ready)) {
+		buf = list_first_entry(&ispfe->ready, struct ispfe_buffer, list);
+		list_move_tail(&buf->list, &ispfe->flight);
+		ispfe->flight_count++;
+		slot = buf->slot;
+	}
+	spin_unlock(&ispfe->slock);
+
+	ispfe_ring_record(ispfe, ispfe->head / sizeof(*ispfe->ring), slot);
+	ispfe->head += sizeof(*ispfe->ring);
+	if (ispfe->head >= PDMA_NUM_RECORDS * sizeof(*ispfe->ring))
+		ispfe->head = 0;
+	dma_wmb();
+	writel_relaxed(ispfe->head, ispfe->base[ISPFE_WIN_PDMA] +
+		       PDMA_CTX(ispfe->active.loch) + PDMA_HEAD);
+}
+
+/*
+ * Complete the oldest frame in flight, at the line-memory end-of-frame.  The
+ * buffer that just finished is not the one credited at the preceding frame
+ * start but the one before it, because a credit governs the following frame --
+ * so a buffer is only done once enough later credits exist to place it.
+ */
+static void ispfe_queue_complete(struct ispfe_device *ispfe)
+{
+	struct ispfe_buffer *buf = NULL;
+
+	spin_lock(&ispfe->slock);
+	/*
+	 * Clamped: a latency the queue can never reach means no buffer is ever
+	 * completed and DQBUF blocks for ever, with nothing said.
+	 */
+	if (ispfe->flight_count >
+	    min_t(u32, READ_ONCE(ispfe->credit_latency), PDMA_BUF_SLOTS - 1)) {
+		buf = list_first_entry(&ispfe->flight, struct ispfe_buffer,
+				       list);
+		list_del(&buf->list);
+		ispfe->flight_count--;
+		__clear_bit(buf->slot, &ispfe->slots_used);
+	}
+	spin_unlock(&ispfe->slock);
+
+	if (!buf)
+		return;
+
+	/*
+	 * The frame counter, not a count of buffers handed back: frames that
+	 * landed in the dump slot because nothing was queued then show up as a
+	 * gap, which is what a sequence number is for.  The timestamp is this
+	 * end-of-frame, so it trails the buffer's own frame by the credit
+	 * latency.
+	 */
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	buf->vb.sequence = ispfe->sequence;
+	buf->vb.field = V4L2_FIELD_NONE;
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, ispfe->fmt.sizeimage);
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+
+	/* A slot is free now, so a pending buffer can be encoded into it. */
+	schedule_work(&ispfe->fill_work);
+}
+
 static irqreturn_t ispfe_link_isr(int irq, void *data)
 {
 	struct ispfe_device *ispfe = data;
@@ -1335,15 +1502,19 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 		 * -- which is what this did -- keeps the producer index behind
 		 * the consumer for the whole session, so the front end never
 		 * has a descriptor to fetch and never learns where to put a
-		 * frame.  Every record names the same buffer, so the value is
-		 * the same either way; the timing is the point.
+		 * frame.
 		 */
-		ispfe->head += sizeof(*ispfe->ring);
-		if (ispfe->head >= PDMA_NUM_RECORDS * sizeof(*ispfe->ring))
-			ispfe->head = 0;
-		writel_relaxed(ispfe->head,
-			       ispfe->base[ISPFE_WIN_PDMA] +
-			       PDMA_CTX(ispfe->active.loch) + PDMA_HEAD);
+		if (ispfe->owner == ISPFE_OWNER_V4L2) {
+			ispfe_queue_credit(ispfe);
+		} else {
+			/* Every record names one buffer; only the timing matters. */
+			ispfe->head += sizeof(*ispfe->ring);
+			if (ispfe->head >= PDMA_NUM_RECORDS * sizeof(*ispfe->ring))
+				ispfe->head = 0;
+			writel_relaxed(ispfe->head,
+				       ispfe->base[ISPFE_WIN_PDMA] +
+				       PDMA_CTX(ispfe->active.loch) + PDMA_HEAD);
+		}
 	}
 	if (fe)
 		atomic_inc(&ispfe->frame_end);
@@ -1542,21 +1713,21 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	const struct ispfe_pdma_reloc *reloc = ispfe_pdma_relocs;
 	const struct ispfe_pdma_reloc *last =
 		ispfe_pdma_relocs + ARRAY_SIZE(ispfe_pdma_relocs);
-	u8 *program = ispfe->programs + slot * PDMA_SLOT_STRIDE;
+	u32 bayer_lo = 0, bayer_hi = 0;
 	unsigned int i;
+	u8 *program;
 	size_t at = 0;
 
 	if (slot >= PDMA_SLOTS)
 		return -EINVAL;
+
+	program = ispfe->programs + slot * PDMA_SLOT_STRIDE;
 
 	if (ispfe_pdma_recipe_bytes() != ISPFE_PDMA_RECIPE_BYTES) {
 		dev_err(ispfe->dev, "PDMA recipe does not serialise to %#x bytes\n",
 			ISPFE_PDMA_RECIPE_BYTES);
 		return -EINVAL;
 	}
-
-	ispfe->bayer_lo = 0;
-	ispfe->bayer_hi = 0;
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_recipe); i++) {
 		const struct ispfe_pdma_cmd *cmd = &ispfe_pdma_recipe[i];
@@ -1616,8 +1787,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			put_unaligned_le32(upper_32_bits(dma),
 					   program + at + reloc->hi);
 			if (reloc->buffer == ISPFE_BUF_BAYER) {
-				ispfe->bayer_lo = at + reloc->lo;
-				ispfe->bayer_hi = at + reloc->hi;
+				bayer_lo = at + reloc->lo;
+				bayer_hi = at + reloc->hi;
 			}
 		}
 
@@ -1628,10 +1799,20 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 * Relocations are emitted in command order, so anything left over names
 	 * a command the recipe no longer has.
 	 */
-	if (reloc != last || !ispfe->bayer_lo) {
+	if (reloc != last || !bayer_lo) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
 		return -EINVAL;
 	}
+
+	/*
+	 * The same for every slot, because every slot encodes the same recipe.
+	 * Derived locally rather than accumulated in place: once a queue is
+	 * encoding buffers this runs concurrently with itself, and a walk that
+	 * cleared the device's copy on entry would let one encode fail the
+	 * check below on another's zero.
+	 */
+	ispfe->bayer_lo = bayer_lo;
+	ispfe->bayer_hi = bayer_hi;
 
 	return 0;
 }
@@ -1668,7 +1849,10 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 
 	memset(ispfe->programs, 0, PDMA_PROGRAMS_SIZE);
 	for (i = 0; i < PDMA_SLOTS; i++) {
-		ret = ispfe_pdma_encode(ispfe, i, ispfe->frame_dma);
+		ret = ispfe_pdma_encode(ispfe, i,
+					i == PDMA_DUMP_SLOT ?
+					ispfe->spare_frame_dma :
+					ispfe->frame_dma);
 		if (ret)
 			return ret;
 	}
@@ -1695,20 +1879,27 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
  */
 static void ispfe_ring_fill(struct ispfe_device *ispfe)
 {
+	unsigned int slot = ispfe->owner == ISPFE_OWNER_V4L2 ? PDMA_DUMP_SLOT : 0;
+	u32 addr = READ_ONCE(ispfe->pdma_addr);
 	unsigned int i;
 
+	/*
+	 * A record the producer has not refreshed still gets consumed, so what
+	 * it names matters.  Under the queue that is the dump slot, which puts
+	 * an unclaimed frame somewhere nobody reads; the diagnostic keeps its
+	 * single program, whose frame is the whole point of the exercise.
+	 */
 	for (i = 0; i < PDMA_NUM_RECORDS; i++) {
-		ispfe->ring[i].cmd = cpu_to_le32(READ_ONCE(ispfe->pdma_cmd));
-		u32 addr = READ_ONCE(ispfe->pdma_addr);
-
-		ispfe->ring[i].addr_lo = cpu_to_le32(
-			addr ? addr : lower_32_bits(ispfe->programs_dma));
-		ispfe->ring[i].addr_hi = cpu_to_le32(
-			addr ? 0 : upper_32_bits(ispfe->programs_dma));
+		ispfe_ring_record(ispfe, i, slot);
+		/* A deliberate address, for proving PDMA issues the read at all. */
+		if (addr) {
+			ispfe->ring[i].addr_lo = cpu_to_le32(addr);
+			ispfe->ring[i].addr_hi = cpu_to_le32(0);
+		}
 		/* Keep the separate first-record control for parser experiments. */
-		ispfe->ring[i].bytes =
-			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_bytes)
-				      : READ_ONCE(ispfe->pdma_bytes_first));
+		if (!i)
+			ispfe->ring[i].bytes =
+				cpu_to_le32(READ_ONCE(ispfe->pdma_bytes_first));
 	}
 }
 
@@ -2090,8 +2281,14 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 	 * reports EOF. This avoids changing live hardware at EOF: gating LOCH there
 	 * made its teardown path zero part of the buffer it had just completed.
 	 */
-	if (target_done)
-		ispfe_snapshot_complete(ispfe);
+	if (target_done) {
+		if (ispfe->owner == ISPFE_OWNER_V4L2) {
+			ispfe->sequence++;
+			ispfe_queue_complete(ispfe);
+		} else {
+			ispfe_snapshot_complete(ispfe);
+		}
+	}
 
 	return IRQ_HANDLED;
 }
@@ -2512,10 +2709,18 @@ static int ispfe_enable_set(void *data, u64 val)
 
 	if (!!val == ispfe->streaming)
 		return 0;
-	if (val)
+	/* One receive path, so the queue and the diagnostic take turns. */
+	if (ispfe->owner == ISPFE_OWNER_V4L2)
+		return -EBUSY;
+	if (val) {
+		ispfe->owner = ISPFE_OWNER_DEBUGFS;
 		ret = ispfe_start(ispfe);
-	else
+		if (ret)
+			ispfe->owner = ISPFE_OWNER_NONE;
+	} else {
 		ispfe_stop(ispfe);
+		ispfe->owner = ISPFE_OWNER_NONE;
+	}
 
 	return ret;
 }
@@ -2549,6 +2754,13 @@ static int ispfe_snapshot_set(void *data, u64 val)
 
 	if (!ispfe->streaming)
 		return -EPIPE;
+	/*
+	 * The queue routes end-of-frame to buffer completion, so an armed
+	 * snapshot would simply never advance -- which reads as a hang rather
+	 * than as the two owners overlapping.
+	 */
+	if (ispfe->owner == ISPFE_OWNER_V4L2)
+		return -EBUSY;
 	if (READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_READY)
 		return val ? 0 : -EBUSY;
 
@@ -2797,11 +3009,21 @@ DEFINE_SHOW_ATTRIBUTE(ispfe_regs);
 static int ispfe_status_show(struct seq_file *s, void *unused)
 {
 	struct ispfe_device *ispfe = s->private;
-	unsigned int isolation, i;
+	unsigned int isolation, i, flight;
+	unsigned long slots;
 
 	guard(mutex)(&ispfe->lock);
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
+	seq_printf(s, "owner        %s\n",
+		   ispfe->owner == ISPFE_OWNER_V4L2 ? "v4l2" :
+		   ispfe->owner == ISPFE_OWNER_DEBUGFS ? "debugfs" : "none");
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		flight = ispfe->flight_count;
+		slots = ispfe->slots_used;
+	}
+	seq_printf(s, "queue        %u in flight, slots %#lx, seq %u\n",
+		   flight, slots, ispfe->sequence);
 	seq_printf(s, "snapshot_state %u\n", READ_ONCE(ispfe->snapshot_state));
 	seq_printf(s, "snapshot_armed %u\n",
 		   READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_ARMED);
@@ -2968,6 +3190,7 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);
 	debugfs_create_u32("settle_us", 0644, d, &ispfe->settle_us);
 	debugfs_create_x32("lmp_alloc_ctrl", 0644, d, &ispfe->lmp_alloc_ctrl);
+	debugfs_create_u32("credit_latency", 0644, d, &ispfe->credit_latency);
 	debugfs_create_x32("pdma_cmd", 0644, d, &ispfe->pdma_cmd);
 	debugfs_create_x32("pdma_addr", 0644, d, &ispfe->pdma_addr);
 	debugfs_create_x32("pdma_bytes", 0644, d, &ispfe->pdma_bytes);
@@ -3007,6 +3230,429 @@ static void ispfe_report(struct ispfe_device *ispfe)
 		 version, readl(csis + CSIS_VERSION), live, CSIS_NUM_LINKS);
 }
 
+/* ---- the V4L2 capture queue -------------------------------------------- */
+
+/*
+ * The one format the receive path produces: ten bits per sample in a sixteen-
+ * bit little-endian container at the natural stride, which is what the vendor's
+ * own saved frames measure.  The Bayer order is the ultrawide IMX712's, read
+ * off the mosaic as it sits in memory rather than after any orientation
+ * transform.  Geometry is still the debugfs source description, because there
+ * is no sensor subdevice to negotiate it with yet.
+ */
+#define ISPFE_PIXFMT			V4L2_PIX_FMT_SRGGB10
+
+/* The vendor's own WDMA address writer rejects anything less aligned. */
+#define ISPFE_FRAME_ALIGN		32
+
+static void ispfe_fill_pix(struct ispfe_device *ispfe,
+			   struct v4l2_pix_format *pix)
+{
+	pix->width = ispfe->src.width;
+	pix->height = ispfe->src.height;
+	pix->pixelformat = ISPFE_PIXFMT;
+	pix->field = V4L2_FIELD_NONE;
+	pix->bytesperline = pix->width * ISPFE_BYTES_PER_PIXEL;
+	pix->sizeimage = pix->bytesperline * pix->height;
+	pix->colorspace = V4L2_COLORSPACE_RAW;
+	/*
+	 * Set rather than left alone: the core only sanitises these when the
+	 * application does not claim the extended format, so an app that does
+	 * would otherwise get its own values echoed back.
+	 */
+	pix->flags = 0;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
+
+static void ispfe_queue_return_all(struct ispfe_device *ispfe,
+				   enum vb2_buffer_state state)
+{
+	struct list_head done;
+	struct ispfe_buffer *buf, *tmp;
+
+	INIT_LIST_HEAD(&done);
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		list_splice_tail_init(&ispfe->flight, &done);
+		list_splice_tail_init(&ispfe->ready, &done);
+		list_splice_tail_init(&ispfe->pending, &done);
+		ispfe->flight_count = 0;
+		ispfe->slots_used = 0;
+	}
+
+	list_for_each_entry_safe(buf, tmp, &done, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+}
+
+/*
+ * Give queued buffers a program each.  Encoding is 6 KiB of work, so it happens
+ * here in process context rather than in the frame-start interrupt, which then
+ * only has to publish a sixteen-byte record.
+ */
+static void ispfe_queue_fill(struct ispfe_device *ispfe)
+{
+	for (;;) {
+		struct ispfe_buffer *buf;
+		unsigned int slot;
+		dma_addr_t dma;
+		int ret;
+
+		scoped_guard(spinlock_irqsave, &ispfe->slock) {
+			if (list_empty(&ispfe->pending))
+				return;
+			slot = find_first_zero_bit(&ispfe->slots_used,
+						   PDMA_BUF_SLOTS);
+			if (slot >= PDMA_BUF_SLOTS)
+				return;
+			__set_bit(slot, &ispfe->slots_used);
+			buf = list_first_entry(&ispfe->pending,
+					       struct ispfe_buffer, list);
+			list_del(&buf->list);
+			buf->slot = slot;
+		}
+
+		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+		ret = ispfe_pdma_encode(ispfe, slot, dma);
+		if (ret) {
+			scoped_guard(spinlock_irqsave, &ispfe->slock)
+				__clear_bit(slot, &ispfe->slots_used);
+			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+			continue;
+		}
+
+		/*
+		 * Only now is the slot safe to credit, which is why the buffer
+		 * reaches the ready list after its program is complete.
+		 */
+		scoped_guard(spinlock_irqsave, &ispfe->slock)
+			list_add_tail(&buf->list, &ispfe->ready);
+	}
+}
+
+static void ispfe_fill_work(struct work_struct *work)
+{
+	struct ispfe_device *ispfe =
+		container_of(work, struct ispfe_device, fill_work);
+
+	ispfe_queue_fill(ispfe);
+}
+
+static int ispfe_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
+			     unsigned int *nplanes, unsigned int sizes[],
+			     struct device *alloc_devs[])
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+	u32 size;
+
+	/*
+	 * The geometry is still a debugfs property, so latch it here: buffers
+	 * are sized now and the receiver is told the same numbers at start.
+	 */
+	ispfe_fill_pix(ispfe, &ispfe->fmt);
+	size = ispfe->fmt.sizeimage;
+
+	if (*nplanes) {
+		if (*nplanes != 1 || sizes[0] < size)
+			return -EINVAL;
+		return 0;
+	}
+
+	*nplanes = 1;
+	sizes[0] = size;
+
+	return 0;
+}
+
+static int ispfe_buf_prepare(struct vb2_buffer *vb)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(vb->vb2_queue);
+	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+	if (vb2_plane_size(vb, 0) < ispfe->fmt.sizeimage)
+		return -EINVAL;
+
+	/*
+	 * An imported buffer's address is not the driver's to choose, and the
+	 * front end simply drops the low bits rather than reporting a fault --
+	 * which would show up as a sheared image and nothing else.
+	 */
+	if (!IS_ALIGNED(dma, ISPFE_FRAME_ALIGN)) {
+		dev_err_ratelimited(ispfe->dev,
+				    "buffer at %pad is not %u-byte aligned\n",
+				    &dma, ISPFE_FRAME_ALIGN);
+		return -EINVAL;
+	}
+
+	vb2_set_plane_payload(vb, 0, ispfe->fmt.sizeimage);
+
+	return 0;
+}
+
+static void ispfe_buf_queue(struct vb2_buffer *vb)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(vb->vb2_queue);
+	struct ispfe_buffer *buf = to_ispfe_buffer(to_vb2_v4l2_buffer(vb));
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		list_add_tail(&buf->list, &ispfe->pending);
+
+	/*
+	 * Not vb2_is_streaming(): with a min_queued_buffers of two, STREAMON
+	 * with one buffer queued succeeds and defers the actual start to the
+	 * next QBUF -- which enqueues every buffer into the driver *before*
+	 * calling start_streaming.  So the queue can be streaming while there
+	 * is still no program area to encode into.  Gate on the driver's own
+	 * state instead; ispfe_start_streaming() drains what accumulated.
+	 */
+	if (ispfe->owner == ISPFE_OWNER_V4L2)
+		ispfe_queue_fill(ispfe);
+}
+
+static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+	int ret;
+
+	if (ispfe->owner != ISPFE_OWNER_NONE) {
+		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
+		return -EBUSY;
+	}
+
+	ispfe->sequence = 0;
+	ispfe->owner = ISPFE_OWNER_V4L2;
+
+	ret = ispfe_start(ispfe);
+	if (ret)
+		goto err_owner;
+
+	/*
+	 * The geometry is a debugfs property and the buffers were sized from it
+	 * at REQBUFS, so it can have moved since.  ispfe_start() has just
+	 * latched its own copy; if the two disagree the receiver would write
+	 * past the end of every buffer.
+	 */
+	if (ispfe->fmt.sizeimage != array3_size(ispfe->active.width,
+						ispfe->active.height,
+						ISPFE_BYTES_PER_PIXEL)) {
+		dev_err(ispfe->dev,
+			"geometry changed under the queue: %ux%u now\n",
+			ispfe->active.width, ispfe->active.height);
+		ispfe_stop(ispfe);
+		ret = -EINVAL;
+		goto err_owner;
+	}
+
+	ispfe_queue_fill(ispfe);
+
+	return 0;
+
+err_owner:
+	ispfe->owner = ISPFE_OWNER_NONE;
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
+	return ret;
+}
+
+static void ispfe_stop_streaming(struct vb2_queue *q)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	/*
+	 * ispfe_stop() frees the interrupts, so nothing can be crediting or
+	 * completing by the time the lists are emptied.
+	 */
+	ispfe_stop(ispfe);
+	cancel_work_sync(&ispfe->fill_work);
+	ispfe->owner = ISPFE_OWNER_NONE;
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR);
+}
+
+static const struct vb2_ops ispfe_vb2_ops = {
+	.queue_setup = ispfe_queue_setup,
+	.buf_prepare = ispfe_buf_prepare,
+	.buf_queue = ispfe_buf_queue,
+	.start_streaming = ispfe_start_streaming,
+	.stop_streaming = ispfe_stop_streaming,
+};
+
+static int ispfe_querycap(struct file *file, void *priv,
+			  struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, "exynos-ispfe", sizeof(cap->driver));
+	strscpy(cap->card, "zumapro ISPFE", sizeof(cap->card));
+
+	return 0;
+}
+
+static int ispfe_enum_fmt(struct file *file, void *priv,
+			  struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = ISPFE_PIXFMT;
+
+	return 0;
+}
+
+static int ispfe_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct ispfe_device *ispfe = video_drvdata(file);
+
+	ispfe_fill_pix(ispfe, &f->fmt.pix);
+
+	return 0;
+}
+
+/*
+ * The geometry is the sensor mode the driver was told to replay, so a format
+ * request is answered with what the hardware will actually produce rather than
+ * refused.  This becomes a real negotiation when there is a sensor subdevice.
+ */
+static int ispfe_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct ispfe_device *ispfe = video_drvdata(file);
+
+	if (vb2_is_busy(&ispfe->queue))
+		return -EBUSY;
+
+	ispfe_fill_pix(ispfe, &f->fmt.pix);
+
+	return 0;
+}
+
+static int ispfe_enum_framesizes(struct file *file, void *priv,
+				 struct v4l2_frmsizeenum *fsize)
+{
+	struct ispfe_device *ispfe = video_drvdata(file);
+
+	if (fsize->index || fsize->pixel_format != ISPFE_PIXFMT)
+		return -EINVAL;
+
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	fsize->discrete.width = ispfe->src.width;
+	fsize->discrete.height = ispfe->src.height;
+
+	return 0;
+}
+
+/*
+ * One input, because a capture device must have one even when there is nothing
+ * to choose between.  The receiver's twelve CSIS links are not inputs in the
+ * V4L2 sense -- they are internal routing, and which one a stream uses is a
+ * resource allocation the driver makes -- so they belong to the media graph
+ * that arrives with the sensor subdevice, not here.
+ */
+static int ispfe_enum_input(struct file *file, void *priv,
+			    struct v4l2_input *inp)
+{
+	if (inp->index)
+		return -EINVAL;
+
+	inp->type = V4L2_INPUT_TYPE_CAMERA;
+	strscpy(inp->name, "CSIS receiver", sizeof(inp->name));
+
+	return 0;
+}
+
+static int ispfe_g_input(struct file *file, void *priv, unsigned int *i)
+{
+	*i = 0;
+
+	return 0;
+}
+
+static int ispfe_s_input(struct file *file, void *priv, unsigned int i)
+{
+	return i ? -EINVAL : 0;
+}
+
+static const struct v4l2_ioctl_ops ispfe_ioctl_ops = {
+	.vidioc_querycap = ispfe_querycap,
+	.vidioc_enum_input = ispfe_enum_input,
+	.vidioc_g_input = ispfe_g_input,
+	.vidioc_s_input = ispfe_s_input,
+	.vidioc_enum_fmt_vid_cap = ispfe_enum_fmt,
+	.vidioc_g_fmt_vid_cap = ispfe_g_fmt,
+	.vidioc_s_fmt_vid_cap = ispfe_s_fmt,
+	.vidioc_try_fmt_vid_cap = ispfe_g_fmt,
+	.vidioc_enum_framesizes = ispfe_enum_framesizes,
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static const struct v4l2_file_operations ispfe_fops = {
+	.owner = THIS_MODULE,
+	.open = v4l2_fh_open,
+	.release = vb2_fop_release,
+	.poll = vb2_fop_poll,
+	.mmap = vb2_fop_mmap,
+	.unlocked_ioctl = video_ioctl2,
+};
+
+static const struct video_device ispfe_video_template = {
+	.name = "exynos-ispfe",
+	.fops = &ispfe_fops,
+	.ioctl_ops = &ispfe_ioctl_ops,
+	.release = video_device_release_empty,
+	.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING,
+	.vfl_dir = VFL_DIR_RX,
+};
+
+static int ispfe_video_register(struct ispfe_device *ispfe)
+{
+	struct vb2_queue *q = &ispfe->queue;
+	int ret;
+
+	ret = v4l2_device_register(ispfe->dev, &ispfe->v4l2_dev);
+	if (ret)
+		return ret;
+
+	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	q->io_modes = VB2_MMAP | VB2_DMABUF;
+	q->dev = ispfe->dev;
+	q->drv_priv = ispfe;
+	q->ops = &ispfe_vb2_ops;
+	q->mem_ops = &vb2_dma_contig_memops;
+	q->buf_struct_size = sizeof(struct ispfe_buffer);
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	/*
+	 * A frame lands in the buffer credited a frame earlier, so the queue
+	 * has to hold at least two before the first one can be completed.
+	 */
+	q->min_queued_buffers = 2;
+	q->lock = &ispfe->lock;
+	ret = vb2_queue_init(q);
+	if (ret)
+		goto err_v4l2;
+
+	ispfe->vdev = ispfe_video_template;
+	ispfe->vdev.v4l2_dev = &ispfe->v4l2_dev;
+	ispfe->vdev.queue = q;
+	ispfe->vdev.lock = &ispfe->lock;
+	video_set_drvdata(&ispfe->vdev, ispfe);
+
+	ret = video_register_device(&ispfe->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		goto err_v4l2;
+
+	return 0;
+
+err_v4l2:
+	v4l2_device_unregister(&ispfe->v4l2_dev);
+	return ret;
+}
+
 static int ispfe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3030,6 +3676,13 @@ static int ispfe_probe(struct platform_device *pdev)
 	ret = devm_mutex_init(dev, &ispfe->lock);
 	if (ret)
 		return ret;
+
+	spin_lock_init(&ispfe->slock);
+	INIT_LIST_HEAD(&ispfe->pending);
+	INIT_LIST_HEAD(&ispfe->ready);
+	INIT_LIST_HEAD(&ispfe->flight);
+	INIT_WORK(&ispfe->fill_work, ispfe_fill_work);
+	ispfe->credit_latency = ISPFE_CREDIT_LATENCY_DEFAULT;
 
 	/*
 	 * Stated rather than inherited.  A platform device defaults to a
@@ -3119,6 +3772,10 @@ static int ispfe_probe(struct platform_device *pdev)
 
 	pm_runtime_put(dev);
 
+	ret = ispfe_video_register(ispfe);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot register the video device\n");
+
 	ispfe_debugfs_init(ispfe);
 
 	return 0;
@@ -3135,6 +3792,14 @@ static void ispfe_remove(struct platform_device *pdev)
 	int ret;
 
 	debugfs_remove_recursive(ispfe->debugfs);
+	/*
+	 * Stops any stream and releases the queue, unlike a bare
+	 * video_unregister_device(), which would leave the fill work running
+	 * over the program area freed below.
+	 */
+	vb2_video_unregister_device(&ispfe->vdev);
+	cancel_work_sync(&ispfe->fill_work);
+	v4l2_device_unregister(&ispfe->v4l2_dev);
 
 	scoped_guard(mutex, &ispfe->lock) {
 		if (ispfe->streaming)

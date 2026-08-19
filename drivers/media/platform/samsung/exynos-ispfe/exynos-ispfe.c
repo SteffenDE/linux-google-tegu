@@ -699,10 +699,15 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
-	/* Armed by debugfs, completed by redirecting DMA at line-memory EOF. */
-	bool freeze_armed;
-	bool frame_frozen;
-	bool snapshot_redirected;
+	/* Advanced by debugfs and the line-memory EOF IRQ. */
+	enum {
+		ISPFE_SNAPSHOT_IDLE,
+		ISPFE_SNAPSHOT_ARMED,
+		ISPFE_SNAPSHOT_REDIRECTING,
+		ISPFE_SNAPSHOT_REDIRECTED,
+		ISPFE_SNAPSHOT_PUBLISHING,
+		ISPFE_SNAPSHOT_READY,
+	} snapshot_state;
 	int link_irq;
 	int core_irq;
 	int fc_irq;
@@ -1860,9 +1865,6 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 {
 	unsigned int patched;
 
-	if (!READ_ONCE(ispfe->freeze_armed))
-		return;
-
 	/*
 	 * A head credit makes PDMA fetch this program immediately. The credit
 	 * issued at frame start has therefore already captured the primary IOVA
@@ -1872,22 +1874,28 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 	 * spare IOVA. This is the debug interface's small two-buffer version of
 	 * the handoff a vb2 queue will provide.
 	 */
-	if (!READ_ONCE(ispfe->snapshot_redirected)) {
+	if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_ARMED,
+		    ISPFE_SNAPSHOT_REDIRECTING) == ISPFE_SNAPSHOT_ARMED) {
 		patched = ispfe_pdma_patch_iova(ispfe->program,
 						lower_32_bits(ispfe->frame_dma),
 						lower_32_bits(ispfe->spare_frame_dma));
 		if (WARN_ON_ONCE(patched != PDMA_BAYER_REFS)) {
-			WRITE_ONCE(ispfe->freeze_armed, false);
+			cmpxchg(&ispfe->snapshot_state,
+				ISPFE_SNAPSHOT_REDIRECTING, ISPFE_SNAPSHOT_IDLE);
 			return;
 		}
 		dma_wmb();
-		WRITE_ONCE(ispfe->snapshot_redirected, true);
+		cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_REDIRECTING,
+			ISPFE_SNAPSHOT_REDIRECTED);
 		return;
 	}
 
+	if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_REDIRECTED,
+		    ISPFE_SNAPSHOT_PUBLISHING) != ISPFE_SNAPSHOT_REDIRECTED)
+		return;
+
 	dma_rmb();
-	WRITE_ONCE(ispfe->freeze_armed, false);
-	smp_store_release(&ispfe->frame_frozen, true);
+	smp_store_release(&ispfe->snapshot_state, ISPFE_SNAPSHOT_READY);
 }
 
 static irqreturn_t ispfe_fc_isr(int irq, void *data)
@@ -2280,9 +2288,7 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	atomic_set(&ispfe->core_events, 0);
 	atomic_set(&ispfe->lmp_events, 0);
 	atomic_set(&ispfe->pdma_events, 0);
-	WRITE_ONCE(ispfe->freeze_armed, false);
-	WRITE_ONCE(ispfe->frame_frozen, false);
-	WRITE_ONCE(ispfe->snapshot_redirected, false);
+	WRITE_ONCE(ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
@@ -2343,7 +2349,8 @@ err_put:
  */
 static void ispfe_stop(struct ispfe_device *ispfe)
 {
-	WRITE_ONCE(ispfe->freeze_armed, false);
+	xchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
+	synchronize_irq(ispfe->lmp_irq);
 	ispfe_fc_stop(ispfe);
 	ispfe_phy_link_stop(ispfe);
 	ispfe_pdma_stop(ispfe);
@@ -2399,15 +2406,18 @@ static int ispfe_snapshot_set(void *data, u64 val)
 
 	if (!ispfe->streaming)
 		return -EPIPE;
-	if (READ_ONCE(ispfe->frame_frozen))
+	if (READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_READY)
 		return val ? 0 : -EBUSY;
-	if (READ_ONCE(ispfe->snapshot_redirected))
-		return -EBUSY;
 
 	if (val) {
-		WRITE_ONCE(ispfe->freeze_armed, true);
+		if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE,
+			    ISPFE_SNAPSHOT_ARMED) != ISPFE_SNAPSHOT_IDLE)
+			return -EBUSY;
 	} else {
-		WRITE_ONCE(ispfe->freeze_armed, false);
+		if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_ARMED,
+			    ISPFE_SNAPSHOT_IDLE) != ISPFE_SNAPSHOT_ARMED &&
+		    READ_ONCE(ispfe->snapshot_state) != ISPFE_SNAPSHOT_IDLE)
+			return -EBUSY;
 	}
 
 	return 0;
@@ -2418,7 +2428,8 @@ static int ispfe_snapshot_get(void *data, u64 *val)
 	struct ispfe_device *ispfe = data;
 
 	guard(mutex)(&ispfe->lock);
-	*val = READ_ONCE(ispfe->frame_frozen);
+	*val = smp_load_acquire(&ispfe->snapshot_state) ==
+		ISPFE_SNAPSHOT_READY;
 
 	return 0;
 }
@@ -2648,10 +2659,14 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	guard(mutex)(&ispfe->lock);
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
-	seq_printf(s, "snapshot_armed %u\n", READ_ONCE(ispfe->freeze_armed));
-	seq_printf(s, "frame_frozen %u\n", READ_ONCE(ispfe->frame_frozen));
+	seq_printf(s, "snapshot_state %u\n", READ_ONCE(ispfe->snapshot_state));
+	seq_printf(s, "snapshot_armed %u\n",
+		   READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_ARMED);
+	seq_printf(s, "frame_frozen %u\n",
+		   READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_READY);
 	seq_printf(s, "snapshot_redirected %u\n",
-		   READ_ONCE(ispfe->snapshot_redirected));
+		   READ_ONCE(ispfe->snapshot_state) >=
+		   ISPFE_SNAPSHOT_REDIRECTED);
 	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	if (!regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &isolation))
@@ -2736,7 +2751,8 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
 
 	if (!ispfe->frame)
 		return -ENODATA;
-	if (!smp_load_acquire(&ispfe->frame_frozen))
+	if (smp_load_acquire(&ispfe->snapshot_state) !=
+	    ISPFE_SNAPSHOT_READY)
 		return -EAGAIN;
 
 	return simple_read_from_buffer(buf, count, ppos, ispfe->frame,

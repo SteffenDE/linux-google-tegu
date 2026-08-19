@@ -32,6 +32,7 @@
 #include <linux/seq_file.h>
 
 #include "exynos-ispfe-pdma-program.h"
+#include "exynos-ispfe-pdma-seeds.h"
 
 /*
  * CSIS is licensed Samsung IP that mainline already drives as
@@ -415,9 +416,8 @@ struct ispfe_pdma_desc {
 /*
  * One captured physical-ultrawide RAW program plus the eight input-only
  * buffers reached by its 0x00010009 indirect records. Each input starts on a
- * page boundary, as it did in the vendor session. Output and read/write
- * working-buffer IOVAs are redirected to the large mainline frame allocation
- * for this diagnostic.
+ * page boundary, as it did in the vendor session. The Bayer destination and
+ * the thirteen private working buffers are relocated separately below.
  */
 #define PDMA_PROGRAM_AREA_SIZE		0x0000e000
 
@@ -446,19 +446,46 @@ static const struct ispfe_pdma_input ispfe_pdma_inputs[] = {
 
 struct ispfe_pdma_output {
 	u32 captured_iova;
+	size_t size;
+	enum dma_data_direction direction;
+	const u8 *seed;
+	size_t seed_size;
 	u8 refs;
 };
 
-#define PDMA_OUTPUT(_iova, _refs) { .captured_iova = (_iova), .refs = (_refs) }
+#define PDMA_OUTPUT(_iova, _size, _refs) { \
+	.captured_iova = (_iova), .size = (_size), \
+	.direction = DMA_FROM_DEVICE, .refs = (_refs), \
+}
+#define PDMA_OUTPUT_RW(_iova, _size, _refs, _seed) { \
+	.captured_iova = (_iova), .size = (_size), \
+	.direction = DMA_BIDIRECTIONAL, .seed = (_seed), \
+	.seed_size = sizeof(_seed), .refs = (_refs), \
+}
 
+/* The Bayer destination at +0x205c0 is the only userspace-visible output. */
+#define PDMA_BAYER_IOVA		0x15d00000
+#define PDMA_BAYER_REFS		1
+
+/*
+ * Captured allocation sizes and DMA directions for the thirteen remaining
+ * destinations. The three bidirectional buffers are seeded with the captured
+ * 0x2000-byte prefix; bytes beyond the captured prefix start at zero.
+ */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
-	PDMA_OUTPUT(0x15d00000, 1), PDMA_OUTPUT(0x1d55b000, 1),
-	PDMA_OUTPUT(0x1d678000, 2), PDMA_OUTPUT(0x1c9e0000, 2),
-	PDMA_OUTPUT(0x1d55c000, 1), PDMA_OUTPUT(0x1cc00000, 1),
-	PDMA_OUTPUT(0x1d780000, 1), PDMA_OUTPUT(0x1d5fc000, 1),
-	PDMA_OUTPUT(0x1d674000, 1), PDMA_OUTPUT(0x1d454000, 1),
-	PDMA_OUTPUT(0x1d700000, 1), PDMA_OUTPUT(0x1cb80000, 1),
-	PDMA_OUTPUT(0x1cb00000, 1), PDMA_OUTPUT(0x1c980000, 1),
+	PDMA_OUTPUT(0x1d55b000,   4096, 1),
+	PDMA_OUTPUT(0x1d678000,  20480, 2),
+	PDMA_OUTPUT(0x1c9e0000, 102400, 2),
+	PDMA_OUTPUT(0x1d55c000,   4096, 1),
+	PDMA_OUTPUT(0x1cc00000, 299008, 1),
+	PDMA_OUTPUT(0x1d780000, 299008, 1),
+	PDMA_OUTPUT(0x1d5fc000,  12288, 1),
+	PDMA_OUTPUT(0x1d674000,  12288, 1),
+	PDMA_OUTPUT(0x1d454000,  12288, 1),
+	PDMA_OUTPUT(0x1d700000, 299008, 1),
+	PDMA_OUTPUT_RW(0x1cb80000, 299008, 1, ispfe_pdma_seed_1cb80000),
+	PDMA_OUTPUT_RW(0x1cb00000, 462848, 1, ispfe_pdma_seed_1cb00000),
+	PDMA_OUTPUT_RW(0x1c980000, 311296, 1, ispfe_pdma_seed_1c980000),
 };
 
 static_assert(sizeof(ispfe_pdma_program_ultrawide) == PDMA_DESC_BYTES_FIRST);
@@ -691,6 +718,10 @@ struct ispfe_device {
 	dma_addr_t program_dma;
 	struct ispfe_pdma_desc *ring;
 	dma_addr_t ring_dma;
+	struct {
+		void *cpu;
+		dma_addr_t dma;
+	} pdma_output[ARRAY_SIZE(ispfe_pdma_outputs)];
 	u32 head;
 
 	/* Everything below is written from an interrupt. */
@@ -1484,6 +1515,15 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 	memcpy(ispfe->program, ispfe_pdma_program_ultrawide,
 	       sizeof(ispfe_pdma_program_ultrawide));
 
+	patched = ispfe_pdma_patch_iova(ispfe->program, PDMA_BAYER_IOVA,
+					lower_32_bits(ispfe->frame_dma));
+	if (patched != PDMA_BAYER_REFS) {
+		dev_err(ispfe->dev,
+			"program Bayer output %#x has %u references, expected %u\n",
+			PDMA_BAYER_IOVA, patched, PDMA_BAYER_REFS);
+		return -EINVAL;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_inputs); i++) {
 		const struct ispfe_pdma_input *input = &ispfe_pdma_inputs[i];
 		u32 replacement = lower_32_bits(ispfe->program_dma +
@@ -1506,10 +1546,14 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		const struct ispfe_pdma_output *output = &ispfe_pdma_outputs[i];
+		dma_addr_t dma = ispfe->pdma_output[i].dma;
+
+		if (upper_32_bits(dma + output->size - 1))
+			return -ERANGE;
 
 		patched = ispfe_pdma_patch_iova(ispfe->program,
 						output->captured_iova,
-						lower_32_bits(ispfe->frame_dma));
+						lower_32_bits(dma));
 		if (patched != output->refs) {
 			dev_err(ispfe->dev,
 				"program output %#x has %u references, expected %u\n",
@@ -1920,6 +1964,16 @@ static irqreturn_t ispfe_pdma_isr(int irq, void *data)
 
 static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		if (!ispfe->pdma_output[i].cpu)
+			continue;
+		dma_free_coherent(ispfe->dev, ispfe_pdma_outputs[i].size,
+				  ispfe->pdma_output[i].cpu,
+				  ispfe->pdma_output[i].dma);
+		ispfe->pdma_output[i].cpu = NULL;
+	}
 	if (ispfe->program) {
 		dma_free_coherent(ispfe->dev, PDMA_PROGRAM_AREA_SIZE,
 				  ispfe->program, ispfe->program_dma);
@@ -1938,6 +1992,35 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 	}
 }
 
+static void ispfe_pdma_outputs_reset(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		const struct ispfe_pdma_output *output = &ispfe_pdma_outputs[i];
+
+		memset(ispfe->pdma_output[i].cpu, 0, output->size);
+		if (output->direction == DMA_BIDIRECTIONAL) {
+			WARN_ON_ONCE(output->seed_size > output->size);
+			memcpy(ispfe->pdma_output[i].cpu, output->seed,
+			       min(output->seed_size, output->size));
+		}
+	}
+}
+
+static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	if (!ispfe->frame || !ispfe->ring || !ispfe->program)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
+		if (!ispfe->pdma_output[i].cpu)
+			return false;
+
+	return true;
+}
+
 /*
  * The frame buffer outlives the stream: a capture is read out after it has
  * been stopped, so freeing it on stop would throw away the only thing the
@@ -1948,14 +2031,15 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 {
 	size_t size = array3_size(ispfe->active.width, ispfe->active.height,
 				  ISPFE_BYTES_PER_PIXEL);
+	unsigned int i;
 	int ret;
 
 	if (size == SIZE_MAX)
 		return -EOVERFLOW;
 
-	if (ispfe->frame && ispfe->ring && ispfe->program &&
-	    ispfe->frame_size == size) {
+	if (ispfe_buffers_ready(ispfe) && ispfe->frame_size == size) {
 		memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+		ispfe_pdma_outputs_reset(ispfe);
 		ret = ispfe_pdma_program_prepare(ispfe);
 		if (ret)
 			return ret;
@@ -1984,12 +2068,22 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		ispfe->pdma_output[i].cpu = dma_alloc_coherent(
+			ispfe->dev, ispfe_pdma_outputs[i].size,
+			&ispfe->pdma_output[i].dma, GFP_KERNEL);
+		if (!ispfe->pdma_output[i].cpu) {
+			ispfe_buffers_free(ispfe);
+			return -ENOMEM;
+		}
+	}
 
 	/*
 	 * Poisoned rather than zeroed, so that a frame that never arrived is
 	 * distinguishable from one that arrived black.
 	 */
 	memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+	ispfe_pdma_outputs_reset(ispfe);
 	ret = ispfe_pdma_program_prepare(ispfe);
 	if (ret) {
 		ispfe_buffers_free(ispfe);
@@ -2453,6 +2547,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);
 	seq_printf(s, "program_iova %pad\n", &ispfe->program_dma);
 	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
+		seq_printf(s, "aux%02u_iova  %pad  size %zu\n", i,
+			   &ispfe->pdma_output[i].dma,
+			   ispfe_pdma_outputs[i].size);
 	seq_printf(s, "ring_head    %#x\n", ispfe->head);
 
 	if (ispfe->streaming) {

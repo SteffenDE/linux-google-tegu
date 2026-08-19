@@ -702,6 +702,7 @@ struct ispfe_device {
 	/* Armed by debugfs, completed by redirecting DMA at line-memory EOF. */
 	bool freeze_armed;
 	bool frame_frozen;
+	bool snapshot_redirected;
 	int link_irq;
 	int core_irq;
 	int fc_irq;
@@ -1863,21 +1864,27 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 		return;
 
 	/*
-	 * The captured command program is fetched at the next frame boundary.
-	 * Retarget its two Bayer destination words during vertical blanking, so
-	 * every later frame lands in the spare allocation and the just-completed
-	 * primary buffer becomes immutable. This is the debug interface's small
-	 * two-buffer version of the handoff a vb2 queue will provide.
+	 * A head credit makes PDMA fetch this program immediately. The credit
+	 * issued at frame start has therefore already captured the primary IOVA
+	 * by this EOF and can apply it to one more frame. Retarget the shared
+	 * program now, but do not publish the primary until the following EOF has
+	 * drained that in-flight descriptor. Every later credit then sees the
+	 * spare IOVA. This is the debug interface's small two-buffer version of
+	 * the handoff a vb2 queue will provide.
 	 */
-	patched = ispfe_pdma_patch_iova(ispfe->program,
-					lower_32_bits(ispfe->frame_dma),
-					lower_32_bits(ispfe->spare_frame_dma));
-	if (WARN_ON_ONCE(patched != PDMA_BAYER_REFS)) {
-		WRITE_ONCE(ispfe->freeze_armed, false);
+	if (!READ_ONCE(ispfe->snapshot_redirected)) {
+		patched = ispfe_pdma_patch_iova(ispfe->program,
+						lower_32_bits(ispfe->frame_dma),
+						lower_32_bits(ispfe->spare_frame_dma));
+		if (WARN_ON_ONCE(patched != PDMA_BAYER_REFS)) {
+			WRITE_ONCE(ispfe->freeze_armed, false);
+			return;
+		}
+		dma_wmb();
+		WRITE_ONCE(ispfe->snapshot_redirected, true);
 		return;
 	}
 
-	dma_wmb();
 	dma_rmb();
 	WRITE_ONCE(ispfe->freeze_armed, false);
 	smp_store_release(&ispfe->frame_frozen, true);
@@ -2275,6 +2282,7 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	atomic_set(&ispfe->pdma_events, 0);
 	WRITE_ONCE(ispfe->freeze_armed, false);
 	WRITE_ONCE(ispfe->frame_frozen, false);
+	WRITE_ONCE(ispfe->snapshot_redirected, false);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
@@ -2393,6 +2401,8 @@ static int ispfe_snapshot_set(void *data, u64 val)
 		return -EPIPE;
 	if (READ_ONCE(ispfe->frame_frozen))
 		return val ? 0 : -EBUSY;
+	if (READ_ONCE(ispfe->snapshot_redirected))
+		return -EBUSY;
 
 	if (val) {
 		WRITE_ONCE(ispfe->freeze_armed, true);
@@ -2640,6 +2650,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
 	seq_printf(s, "snapshot_armed %u\n", READ_ONCE(ispfe->freeze_armed));
 	seq_printf(s, "frame_frozen %u\n", READ_ONCE(ispfe->frame_frozen));
+	seq_printf(s, "snapshot_redirected %u\n",
+		   READ_ONCE(ispfe->snapshot_redirected));
 	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	if (!regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &isolation))

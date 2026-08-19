@@ -310,6 +310,7 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define LMP_INT_SRC			0x00
 #define LMP_INT_MSK			0x08
 #define LMP_INT_MSK_VAL			0x103ffffe
+#define LMP_INT_BAYER0_WDMA		BIT(15)
 #define LMP_INT_CFG			0x0c
 #define LMP_INT_CFG_BAYER_VAL		0x3fffffff
 #define LMP_INT_CFG_PDAF_VAL		0x000003ff
@@ -319,10 +320,8 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX_CTRL			0x308
 #define FC_CTX_CTRL_VAL		0x000007fc
 #define FC_CTX_MSK			0x30c
-#define FC_CTX_INT_EOF			BIT(1)
 #define FC_CTX_MSK_ARM		0x000007f8
 #define FC_CTX_MSK_RUN		0x000007fc
-#define FC_CTX_MSK_SNAPSHOT		(FC_CTX_MSK_RUN | FC_CTX_INT_EOF)
 
 /*
  * A pair of blocks with a slot per stream, eight bytes each from +0x30, both
@@ -700,7 +699,7 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
-	/* Armed by debugfs, completed from the frame-controller EOF IRQ. */
+	/* Armed by debugfs, completed from the Bayer0 WDMA-done IRQ. */
 	bool freeze_armed;
 	bool frame_frozen;
 	int link_irq;
@@ -739,6 +738,7 @@ struct ispfe_device {
 	u32 int0_seen;
 	u32 int1_seen;
 	u32 fc_seen;
+	u32 lmp_seen;
 	u32 core_seen[4];
 	u32 pdma_seen[3];
 };
@@ -1856,9 +1856,6 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe,
 	if (!READ_ONCE(ispfe->freeze_armed))
 		return;
 
-	/* Return EOF to its normal masked state before gating further frames. */
-	writel_relaxed(FC_CTX_MSK_RUN,
-		       core + FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
 	writel_relaxed(0, core + LOCH_ENABLE);
 	readl(core + LOCH_ENABLE);
 	dma_rmb();
@@ -1892,9 +1889,6 @@ static irqreturn_t ispfe_fc_isr(int irq, void *data)
 
 	WRITE_ONCE(ispfe->fc_seen, READ_ONCE(ispfe->fc_seen) | src);
 	atomic_inc(&ispfe->fc_events);
-	if (src & FC_CTX_INT_EOF)
-		ispfe_snapshot_complete(ispfe, core);
-
 	return IRQ_HANDLED;
 }
 
@@ -1923,8 +1917,12 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		u32 src = readl_relaxed(lmp + LMP_INT_SRC);
 		u32 bsrc = readl_relaxed(bank + FC_CTX_SRC);
 
-		if (i == ispfe->active.fcctx && (bsrc & FC_CTX_INT_EOF))
-			target_done = true;
+		if (i == ispfe->active.fcctx) {
+			WRITE_ONCE(ispfe->lmp_seen,
+				   READ_ONCE(ispfe->lmp_seen) | src);
+			if (src & LMP_INT_BAYER0_WDMA)
+				target_done = true;
+		}
 		seen |= src | bsrc;
 		writel_relaxed(src, lmp + LMP_INT_SRC);
 		writel_relaxed(bsrc, bank + FC_CTX_SRC);
@@ -1939,7 +1937,7 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 	 * The debug capture used to tear the receiver down at an arbitrary point
 	 * in the next frame. That left one moving zero-filled band in an otherwise
 	 * complete image. Once userspace asks for a snapshot, gate the logical
-	 * channel at the frame controller's true EOF event instead. This is
+	 * channel after the Bayer0 output WDMA reports completion. This is
 	 * the same ownership rule vb2 will need later: expose only a buffer whose
 	 * completion event has arrived, while the ordinary teardown may still run
 	 * afterward with the sensor supplying its clock.
@@ -2246,6 +2244,7 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
+	ispfe->lmp_seen = 0;
 	memset(ispfe->core_seen, 0, sizeof(ispfe->core_seen));
 	memset(ispfe->pdma_seen, 0, sizeof(ispfe->pdma_seen));
 
@@ -2344,7 +2343,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 
 /*
  * Writing one arms a one-shot handoff. Reading returns one only after the
-	 * frame controller reported EOF and its IRQ gated further writes to the
+ * Bayer0 WDMA reported completion and its IRQ gated further writes to the
 	 * Bayer buffer.
  */
 static int ispfe_snapshot_set(void *data, u64 val)
@@ -2362,19 +2361,8 @@ static int ispfe_snapshot_set(void *data, u64 val)
 		return val ? 0 : -EBUSY;
 
 	if (val) {
-		/* Arm software before unmasking EOF so the first event cannot race. */
 		WRITE_ONCE(ispfe->freeze_armed, true);
-		writel_relaxed(FC_CTX_MSK_SNAPSHOT,
-			       ispfe->base[ISPFE_WIN_CORE] +
-			       FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
-		readl(ispfe->base[ISPFE_WIN_CORE] +
-		      FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
 	} else {
-		writel_relaxed(FC_CTX_MSK_RUN,
-			       ispfe->base[ISPFE_WIN_CORE] +
-			       FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
-		readl(ispfe->base[ISPFE_WIN_CORE] +
-		      FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
 		WRITE_ONCE(ispfe->freeze_armed, false);
 	}
 
@@ -2638,6 +2626,7 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "int0_seen    %#010x\n", READ_ONCE(ispfe->int0_seen));
 	seq_printf(s, "int1_seen    %#010x\n", READ_ONCE(ispfe->int1_seen));
 	seq_printf(s, "fc_seen      %#010x\n", READ_ONCE(ispfe->fc_seen));
+	seq_printf(s, "lmp_seen     %#010x\n", READ_ONCE(ispfe->lmp_seen));
 	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);
 	seq_printf(s, "program_iova %pad\n", &ispfe->program_dma);

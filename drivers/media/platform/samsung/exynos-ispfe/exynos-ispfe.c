@@ -28,11 +28,17 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
+#include <media/media-device.h>
+#include <media/v4l2-async.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-fwnode.h>
 #include <media/v4l2-ioctl.h>
+#include <media/v4l2-mc.h>
+#include <media/v4l2-subdev.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
@@ -601,12 +607,41 @@ static const char * const ispfe_window_names[ISPFE_NUM_WINDOWS] = {
 };
 
 /*
- * What one CSI-2 source looks like to the receiver.  Everything here is a
- * board or sensor property that a V4L2 subdev would supply; until there is
- * one, it comes from debugfs so that a wrong guess costs a write rather than a
- * rebuild.  The defaults describe tegu's ultrawide IMX712: link bank 1, the
- * PHY at +0xC1700, four D-PHY lanes, 4208x3120 RAW10 with one line of
- * embedded data on the second virtual channel.
+ * Which combo D/C-PHY instance serves each CSIS link bank, and the two
+ * frame-controller context words that go with the sensor mode arriving on it.
+ *
+ * Nine PHYs serve twelve link banks, so a link's PHY is not its own index --
+ * the front camera is link 6 on PHY 5 -- and the mapping was measured by
+ * watching which PHY instance had its common and lane blocks programmed in
+ * the same segment that bound the link.  Only the three links this phone uses
+ * have been measured; a device tree naming any other link is refused rather
+ * than guessed at.
+ *
+ * The two words are the *mode's*, not the link's.  They are indexed by link
+ * only because each link here carries one sensor and one recovered mode; they
+ * are the same for a raw and a YUV stream on the same sensor, and they differ
+ * between the two identical IMX712s, so nothing about them is derivable yet.
+ * A second mode on one of these links needs them measured again.
+ */
+struct ispfe_link_cfg {
+	bool known;
+	u8 phy;
+	u32 mode_word0;
+	u32 mode_word1;
+};
+
+static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
+	[0] = { true, 0, 0x013bd6d0, 0x00000180 },	/* barghest, main */
+	[1] = { true, 1, 0x000c44a0, 0x000014f8 },	/* leshen-uw */
+	[6] = { true, 5, 0x0007ca00, 0x000015f0 },	/* leshen, front */
+};
+
+/*
+ * What one CSI-2 source looks like to the receiver.  The link bank, the lane
+ * count and the PHY type come from the device tree's endpoint, and the
+ * geometry from the format negotiated on the subdev's source pad.  What is
+ * left is the receiver's own resource allocation, which is the driver's to
+ * choose and stays a debugfs control while the choice is still being swept.
  */
 struct ispfe_source {
 	u32 link;
@@ -632,6 +667,48 @@ struct ispfe_source {
 	u32 mode_word1;
 };
 
+/*
+ * The media graph.  The sensor feeds the receiver's sink pad, the receiver's
+ * source pad feeds the capture node, and neither link can be switched: this
+ * block has twelve link banks but the driver drives one stream, and which bank
+ * that stream is on is the device tree's statement rather than a choice
+ * userspace makes.
+ */
+#define ISPFE_PAD_SINK			0
+#define ISPFE_PAD_SOURCE		1
+#define ISPFE_NUM_PADS			2
+
+/*
+ * The receive path does not convert: what the sensor puts on the link is what
+ * lands in memory, ten bits per sample in a sixteen-bit little-endian
+ * container at the natural stride.  So the mosaic order is the sensor's and
+ * these pairs are a renaming rather than a format list.
+ */
+struct ispfe_format {
+	u32 code;
+	u32 pixelformat;
+};
+
+static const struct ispfe_format ispfe_formats[] = {
+	{ MEDIA_BUS_FMT_SRGGB10_1X10, V4L2_PIX_FMT_SRGGB10 },
+	{ MEDIA_BUS_FMT_SGRBG10_1X10, V4L2_PIX_FMT_SGRBG10 },
+	{ MEDIA_BUS_FMT_SGBRG10_1X10, V4L2_PIX_FMT_SGBRG10 },
+	{ MEDIA_BUS_FMT_SBGGR10_1X10, V4L2_PIX_FMT_SBGGR10 },
+};
+
+/*
+ * The ultrawide IMX712's full-array mode, which is what every frame captured
+ * so far was taken at.  Used as the format the subdev starts in; the bounds
+ * are the CSIS resolution register's, which is sixteen bits per axis.
+ */
+#define ISPFE_DEFAULT_WIDTH		4208U
+#define ISPFE_DEFAULT_HEIGHT		3120U
+#define ISPFE_DEFAULT_CODE		MEDIA_BUS_FMT_SRGGB10_1X10
+#define ISPFE_MIN_WIDTH			32U
+#define ISPFE_MIN_HEIGHT		32U
+#define ISPFE_MAX_WIDTH			U16_MAX
+#define ISPFE_MAX_HEIGHT		U16_MAX
+
 struct ispfe_device {
 	struct device *dev;
 	struct notifier_block genpd_nb;
@@ -656,14 +733,19 @@ struct ispfe_device {
 	struct ispfe_source src;
 	struct ispfe_source active;
 	/*
-	 * Off by default, and that is a bug rather than a policy: after the
-	 * D/C-PHY isolation has been bypassed BLK_ISPFE will not power down
-	 * again -- "Power domain ISPFE disable failed", then the APM watchdog --
-	 * even though the block is re-isolated before genpd touches the PMU.  No
-	 * frame can arrive without it, so it is a control until that conflict is
-	 * understood.
+	 * Whether the diagnostic has asked for the shared D/C-PHY isolation to
+	 * be held open.  Streaming opens and closes it for itself; this is for
+	 * observing the two PMU edges separately from a domain power-down, and
+	 * while it is set the stream leaves the bypass alone on the way out.
 	 */
 	bool phy_isolation_bypass;
+	/*
+	 * Whether *this stream* took the bypass and therefore owes the restore.
+	 * Separate from the request above so that acquire and release test the
+	 * same fact: the request is the operator's and can in principle change,
+	 * where this is set exactly where the bypass is taken.
+	 */
+	bool phy_bypass_held;
 	/*
 	 * A deliberate runtime-PM reference for separating PHY isolation from
 	 * the domain power-down.  This is a bring-up control: downstream drops
@@ -755,8 +837,23 @@ struct ispfe_device {
 		ISPFE_OWNER_V4L2,
 	} owner;
 
+	struct media_device mdev;
 	struct v4l2_device v4l2_dev;
+	struct v4l2_subdev sd;
+	struct media_pad pads[ISPFE_NUM_PADS];
+	struct v4l2_async_notifier notifier;
+	/*
+	 * The sensor, and which of its pads the link comes from.  Written by
+	 * the notifier under the driver's own lock, and read from the capture
+	 * queue, which holds that lock for the whole of start and stop -- so an
+	 * unbind cannot take the subdev away from under a stream, it waits for
+	 * the stream to finish instead.
+	 */
+	struct v4l2_subdev *sensor;
+	u32 sensor_pad;
 	struct video_device vdev;
+	struct media_pad vdev_pad;
+	struct media_pipeline pipe;
 	struct vb2_queue queue;
 	struct v4l2_pix_format fmt;
 	struct work_struct fill_work;
@@ -816,12 +913,21 @@ static const u32 ispfe_phy_base[PHY_NUM_INSTANCES] = {
  * block of its own before the next instance's common block starts.  Writing
  * four lanes into one of those walks into its neighbour.
  */
+#define ISPFE_PHY_MAX_LANES		4
+
 static u32 ispfe_phy_lanes(u32 phy)
 {
 	u32 next = phy + 1 < PHY_NUM_INSTANCES ? ispfe_phy_base[phy + 1]
 					       : ispfe_phy_base[phy] + 0x500;
+	u32 room = (next - ispfe_phy_base[phy]) / 0x100 - 1;
 
-	return (next - ispfe_phy_base[phy]) / 0x100 - 1;
+	/*
+	 * The gap to the next instance is a bound on what can be written
+	 * without walking into a neighbour, not a lane count: instance 1 has
+	 * 0xb00 of room and the part is an m0s4s4s4s4s4, so four is the real
+	 * limit and the gap only ever lowers it.
+	 */
+	return min(room, ISPFE_PHY_MAX_LANES);
 }
 
 /*
@@ -959,12 +1065,17 @@ static void ispfe_cmu_restore(struct ispfe_device *ispfe)
  * the link's own registers read back correctly, because they are on the other
  * side of it.
  *
- * Isolation has to be restored before the domain goes down.  Downstream does
- * that from PHY power-off while the ISPFE runtime-PM reference is still held;
- * GENPD_NOTIFY_PRE_OFF is the final backstop here, delivered before genpd
- * touches the PMU.  Both placements have nevertheless failed the subsequent
- * power-down on hardware, so power_hold below can separate and expose the two
- * transitions instead of running straight into the watchdog.
+ * Isolation has to be restored before the domain goes down, which is why the
+ * bypass belongs to a stream: ispfe_start() takes it once the domain is up and
+ * ispfe_stop() puts it back while the runtime-PM reference is still held, the
+ * same place downstream does it from its PHY power-off.  GENPD_NOTIFY_PRE_OFF
+ * is the backstop, delivered before genpd touches the PMU.
+ *
+ * This was long thought to be what stopped BLK_ISPFE powering down after a
+ * capture.  It was not: the real cause was a program that activated frame-
+ * controller context 4 while teardown cleared context 0, and with the whole
+ * allocation matched a streamed domain reaches off cleanly with the bypass
+ * taken and restored here [HW 2026-08-19].
  */
 static int ispfe_phy_isolation(struct ispfe_device *ispfe, bool bypass)
 {
@@ -1093,13 +1204,13 @@ static void ispfe_links_reset(struct ispfe_device *ispfe)
 }
 
 /*
- * A domain that only had the shared isolation bypassed powers down again; one
- * that has streamed does not, and its ISPFE_STATUS bit never moves in the 5 ms
- * the vendor's own sequencer allows.  The PMU is not at fault -- CONFIGURATION
- * reads back as written -- and neither is the bus: all twelve links answer
- * right up to the refusal.  The block is alive and will not quiesce.
- * Re-resetting the links on the isolated side does not clear it either
- * [all HW 2026-08-18].
+ * A streamed domain does power down: it needed the program's own frame-
+ * controller context to be the one teardown quiesces, and with that matched the
+ * PMU handshake completes and the isolation bypass taken by ispfe_start() is
+ * not involved [HW 2026-08-19].  What follows is a knob left from when that was
+ * not understood and the refusal was being blamed on the Q-channels, kept
+ * because it is the one lever over the wrapper clocks and costs nothing while
+ * it is off.
  *
  * That leaves the Q-channels.  Twelve of the 45 CMU_ISPFE QCH_CON registers
  * are the MIPI PHY link wrapper's, one per CSIS bank, and the wrapper is
@@ -2574,7 +2685,20 @@ static void ispfe_free_irqs(struct ispfe_device *ispfe)
 static int ispfe_start(struct ispfe_device *ispfe)
 {
 	struct platform_device *pdev = to_platform_device(ispfe->dev);
+	struct v4l2_subdev_state *state;
+	const struct v4l2_mbus_framefmt *fmt;
 	int ret;
+
+	/*
+	 * The geometry the receiver is programmed with is the format on the
+	 * subdev's source pad, read once here so that a later S_FMT cannot move
+	 * it under a running stream.
+	 */
+	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
+	fmt = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+	ispfe->src.width = fmt->width;
+	ispfe->src.height = fmt->height;
+	v4l2_subdev_unlock_state(state);
 
 	/*
 	 * Validate, then snapshot.  Every one of these ends up as an array
@@ -2624,12 +2748,39 @@ static int ispfe_start(struct ispfe_device *ispfe)
 		return ret;
 
 	/*
+	 * The nine D/C-PHYs sit behind one PMU isolation bit, and while it is
+	 * set their whole register region reads zero and takes no writes -- so
+	 * a stream programmed through it produces no frame start, no frame end
+	 * and no error bits either, which reads like a lane or sensor fault and
+	 * is neither.  Bypassing it therefore belongs to starting a stream, not
+	 * to a diagnostic.  Isolation is restored in ispfe_stop() while this
+	 * runtime-PM reference is still held, which is where downstream does it
+	 * too, with GENPD_NOTIFY_PRE_OFF as the backstop.
+	 */
+	if (!ispfe->phy_isolation_bypass) {
+		/*
+		 * Claimed before the call rather than after it: the request can
+		 * fail with the bit already set, because the readback that
+		 * verifies it is a second register access.  Restoring is
+		 * idempotent, so owning it from here is what makes every exit
+		 * put it back.
+		 */
+		ispfe->phy_bypass_held = true;
+		ret = ispfe_phy_isolation(ispfe, true);
+		if (ret) {
+			dev_err(ispfe->dev,
+				"cannot bypass PHY isolation: %d\n", ret);
+			goto err_isolate;
+		}
+	}
+
+	/*
 	 * Requested before anything is unmasked, and after the domain is up:
 	 * the handlers touch the block's registers.
 	 */
 	ret = ispfe_request_irqs(ispfe);
 	if (ret)
-		goto err_put;
+		goto err_isolate;
 
 	ispfe_device_init(ispfe);
 
@@ -2657,7 +2808,11 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	return 0;
 
-err_put:
+err_isolate:
+	if (ispfe->phy_bypass_held) {
+		ispfe->phy_bypass_held = false;
+		ispfe_phy_isolation(ispfe, false);
+	}
 	pm_runtime_put(ispfe->dev);
 	return ret;
 }
@@ -2696,10 +2851,30 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	ispfe_pdma_stop(ispfe);
 	ispfe_links_reset(ispfe);
 	ispfe_free_irqs(ispfe);
+	/*
+	 * Before the runtime-PM reference goes, so that the edge is taken and
+	 * read back with the domain still up.  Not done when the diagnostic
+	 * control asked for the bypass, which owns it until it is cleared, and
+	 * reported when it fails: the readback is the cheapest measurement this
+	 * block offers and a silent disagreement is the one thing it cannot say.
+	 */
+	if (ispfe->phy_bypass_held) {
+		ispfe->phy_bypass_held = false;
+		if (ispfe_phy_isolation(ispfe, false))
+			dev_err(ispfe->dev, "cannot re-isolate the PHYs\n");
+	}
 	ispfe->streaming = false;
 	pm_runtime_put(ispfe->dev);
 }
 
+/*
+ * Arms the receiver and nothing else.  It does not power or start the sensor,
+ * which is deliberate: the cheapest oracle this block has is the arm flush,
+ * which the frame controller raises milliseconds after its START pulse with no
+ * sensor, no PHY traffic and no frame involved.  So this stays a receiver-only
+ * diagnostic, and anything that needs an actual frame goes through the capture
+ * queue, which owns the sensor.
+ */
 static int ispfe_enable_set(void *data, u64 val)
 {
 	struct ispfe_device *ispfe = data;
@@ -3172,12 +3347,13 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	d = debugfs_create_dir(dev_name(ispfe->dev), NULL);
 	ispfe->debugfs = d;
 
-	debugfs_create_u32("link", 0644, d, &ispfe->src.link);
+	/*
+	 * The link, its lane count and its PHY type describe how the board is
+	 * wired and now come from the device tree; the geometry comes from the
+	 * format negotiated on the subdev.  What is left here is the receiver's
+	 * own resource allocation and the values still being swept.
+	 */
 	debugfs_create_u32("phy", 0644, d, &ispfe->src.phy);
-	debugfs_create_u32("lanes", 0644, d, &ispfe->src.lanes);
-	debugfs_create_u32("width", 0644, d, &ispfe->src.width);
-	debugfs_create_u32("height", 0644, d, &ispfe->src.height);
-	debugfs_create_bool("cphy", 0644, d, &ispfe->src.cphy);
 	debugfs_create_file("phy_isolation_bypass", 0644, d, ispfe,
 			    &ispfe_phy_isolation_bypass_fops);
 	debugfs_create_file("power_hold", 0644, d, ispfe,
@@ -3232,25 +3408,35 @@ static void ispfe_report(struct ispfe_device *ispfe)
 
 /* ---- the V4L2 capture queue -------------------------------------------- */
 
-/*
- * The one format the receive path produces: ten bits per sample in a sixteen-
- * bit little-endian container at the natural stride, which is what the vendor's
- * own saved frames measure.  The Bayer order is the ultrawide IMX712's, read
- * off the mosaic as it sits in memory rather than after any orientation
- * transform.  Geometry is still the debugfs source description, because there
- * is no sensor subdevice to negotiate it with yet.
- */
-#define ISPFE_PIXFMT			V4L2_PIX_FMT_SRGGB10
-
 /* The vendor's own WDMA address writer rejects anything less aligned. */
 #define ISPFE_FRAME_ALIGN		32
 
-static void ispfe_fill_pix(struct ispfe_device *ispfe,
+static const struct ispfe_format *ispfe_format_by_code(u32 code)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_formats); i++)
+		if (ispfe_formats[i].code == code)
+			return &ispfe_formats[i];
+
+	return NULL;
+}
+
+/*
+ * The capture node's format is the media-bus format on the receiver's source
+ * pad, restated in pixel-format terms: ten bits per sample in a sixteen-bit
+ * little-endian container at the natural stride, which is what the vendor's
+ * own saved frames measure.  Nothing in the receive path converts, so the two
+ * cannot disagree and there is nothing here to negotiate separately.
+ */
+static void ispfe_fill_pix(const struct v4l2_mbus_framefmt *fmt,
 			   struct v4l2_pix_format *pix)
 {
-	pix->width = ispfe->src.width;
-	pix->height = ispfe->src.height;
-	pix->pixelformat = ISPFE_PIXFMT;
+	const struct ispfe_format *info = ispfe_format_by_code(fmt->code);
+
+	pix->width = fmt->width;
+	pix->height = fmt->height;
+	pix->pixelformat = info ? info->pixelformat : V4L2_PIX_FMT_SRGGB10;
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = pix->width * ISPFE_BYTES_PER_PIXEL;
 	pix->sizeimage = pix->bytesperline * pix->height;
@@ -3264,6 +3450,17 @@ static void ispfe_fill_pix(struct ispfe_device *ispfe,
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
 	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
+
+static void ispfe_active_pix(struct ispfe_device *ispfe,
+			     struct v4l2_pix_format *pix)
+{
+	struct v4l2_subdev_state *state;
+
+	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
+	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE),
+		       pix);
+	v4l2_subdev_unlock_state(state);
 }
 
 static void ispfe_queue_return_all(struct ispfe_device *ispfe,
@@ -3349,10 +3546,10 @@ static int ispfe_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
 	u32 size;
 
 	/*
-	 * The geometry is still a debugfs property, so latch it here: buffers
-	 * are sized now and the receiver is told the same numbers at start.
+	 * Latched here rather than read at start: buffers are sized now, and
+	 * the receiver has to be told the same numbers when it is armed.
 	 */
-	ispfe_fill_pix(ispfe, &ispfe->fmt);
+	ispfe_active_pix(ispfe, &ispfe->fmt);
 	size = ispfe->fmt.sizeimage;
 
 	if (*nplanes) {
@@ -3412,6 +3609,32 @@ static void ispfe_buf_queue(struct vb2_buffer *vb)
 		ispfe_queue_fill(ispfe);
 }
 
+/*
+ * Power the source without starting it.  The receiver is armed against a link
+ * that has to be alive already -- lanes in LP-11, master clock running -- but
+ * it must not see a frame before it is armed, which is what separates powering
+ * the sensor from streaming it.  A sensor with no such distinction simply
+ * answers -ENOIOCTLCMD and is powered by its stream instead.
+ */
+static int ispfe_sensor_power(struct ispfe_device *ispfe, bool on)
+{
+	int ret;
+
+	if (!ispfe->sensor)
+		return on ? -ENODEV : 0;
+
+	if (on) {
+		ret = v4l2_subdev_call(ispfe->sensor, video, pre_streamon, 0);
+		return ret == -ENOIOCTLCMD ? 0 : ret;
+	}
+
+	ret = v4l2_subdev_call(ispfe->sensor, video, post_streamoff);
+	if (ret && ret != -ENOIOCTLCMD)
+		dev_err(ispfe->dev, "cannot power the sensor down: %d\n", ret);
+
+	return 0;
+}
+
 static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
@@ -3422,18 +3645,26 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 		return -EBUSY;
 	}
 
+	ret = video_device_pipeline_start(&ispfe->vdev, &ispfe->pipe);
+	if (ret)
+		goto err_return;
+
 	ispfe->sequence = 0;
 	ispfe->owner = ISPFE_OWNER_V4L2;
 
+	ret = ispfe_sensor_power(ispfe, true);
+	if (ret)
+		goto err_pipeline;
+
 	ret = ispfe_start(ispfe);
 	if (ret)
-		goto err_owner;
+		goto err_power;
 
 	/*
-	 * The geometry is a debugfs property and the buffers were sized from it
-	 * at REQBUFS, so it can have moved since.  ispfe_start() has just
-	 * latched its own copy; if the two disagree the receiver would write
-	 * past the end of every buffer.
+	 * The buffers were sized at REQBUFS from the format on the source pad,
+	 * and ispfe_start() has just latched its own copy of the same format.
+	 * If the two disagree the receiver would write past the end of every
+	 * buffer, so this is a hard stop rather than a resize.
 	 */
 	if (ispfe->fmt.sizeimage != array3_size(ispfe->active.width,
 						ispfe->active.height,
@@ -3441,17 +3672,32 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 		dev_err(ispfe->dev,
 			"geometry changed under the queue: %ux%u now\n",
 			ispfe->active.width, ispfe->active.height);
-		ispfe_stop(ispfe);
 		ret = -EINVAL;
-		goto err_owner;
+		goto err_stop;
 	}
 
 	ispfe_queue_fill(ispfe);
 
+	/*
+	 * The sensor goes last.  Starting it before the receiver is armed loses
+	 * the first frames and can leave the link's error bits set, which reads
+	 * like a PHY fault and is not one.
+	 */
+	ret = v4l2_subdev_enable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					 BIT_ULL(0));
+	if (ret)
+		goto err_stop;
+
 	return 0;
 
-err_owner:
+err_stop:
+	ispfe_stop(ispfe);
+err_power:
+	ispfe_sensor_power(ispfe, false);
+err_pipeline:
 	ispfe->owner = ISPFE_OWNER_NONE;
+	video_device_pipeline_stop(&ispfe->vdev);
+err_return:
 	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
@@ -3459,14 +3705,28 @@ err_owner:
 static void ispfe_stop_streaming(struct vb2_queue *q)
 {
 	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+	int ret;
 
 	/*
+	 * The receiver goes down first, while the sensor is still clocking it.
+	 * Told to stop, the sensor drops the lanes mid-frame, and everything
+	 * downstream then has no clock -- the PHY's recovered one is gone -- so
+	 * a reset written into a clock domain that is not running does not
+	 * take, and the block will not quiesce for the power-down.  This is
+	 * also the order the vendor stack tears a session down in.
+	 *
 	 * ispfe_stop() frees the interrupts, so nothing can be crediting or
 	 * completing by the time the lists are emptied.
 	 */
 	ispfe_stop(ispfe);
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					  BIT_ULL(0));
+	if (ret)
+		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
+	ispfe_sensor_power(ispfe, false);
 	cancel_work_sync(&ispfe->fill_work);
 	ispfe->owner = ISPFE_OWNER_NONE;
+	video_device_pipeline_stop(&ispfe->vdev);
 	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR);
 }
 
@@ -3487,13 +3747,38 @@ static int ispfe_querycap(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * One entry, and it is the format the source pad currently carries.  The
+ * receive path does not convert, so the node cannot offer a choice: what the
+ * sensor puts on the link is what lands in memory, and the way to change it is
+ * to set a different format on the pads.
+ */
 static int ispfe_enum_fmt(struct file *file, void *priv,
 			  struct v4l2_fmtdesc *f)
 {
+	struct ispfe_device *ispfe = video_drvdata(file);
+	struct v4l2_subdev_state *state;
+	struct v4l2_pix_format pix;
+	u32 code;
+
 	if (f->index)
 		return -EINVAL;
 
-	f->pixelformat = ISPFE_PIXFMT;
+	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
+	code = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE)->code;
+	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE),
+		       &pix);
+	v4l2_subdev_unlock_state(state);
+
+	/*
+	 * The core leaves mbus_code alone for a media-controller node so that
+	 * the driver can filter on it, and the answer for a code this pipeline
+	 * is not carrying is that there is no such format.
+	 */
+	if (f->mbus_code && f->mbus_code != code)
+		return -EINVAL;
+
+	f->pixelformat = pix.pixelformat;
 
 	return 0;
 }
@@ -3502,15 +3787,15 @@ static int ispfe_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ispfe_device *ispfe = video_drvdata(file);
 
-	ispfe_fill_pix(ispfe, &f->fmt.pix);
+	ispfe_active_pix(ispfe, &f->fmt.pix);
 
 	return 0;
 }
 
 /*
- * The geometry is the sensor mode the driver was told to replay, so a format
- * request is answered with what the hardware will actually produce rather than
- * refused.  This becomes a real negotiation when there is a sensor subdevice.
+ * The node advertises V4L2_CAP_IO_MC, so the format is the pipeline's rather
+ * than the application's: a request is answered with what the pads are set to
+ * produce.  Changing it means setting a format on the subdev pads.
  */
 static int ispfe_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
@@ -3519,7 +3804,7 @@ static int ispfe_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	if (vb2_is_busy(&ispfe->queue))
 		return -EBUSY;
 
-	ispfe_fill_pix(ispfe, &f->fmt.pix);
+	ispfe_active_pix(ispfe, &f->fmt.pix);
 
 	return 0;
 }
@@ -3528,53 +3813,21 @@ static int ispfe_enum_framesizes(struct file *file, void *priv,
 				 struct v4l2_frmsizeenum *fsize)
 {
 	struct ispfe_device *ispfe = video_drvdata(file);
+	struct v4l2_pix_format pix;
 
-	if (fsize->index || fsize->pixel_format != ISPFE_PIXFMT)
+	ispfe_active_pix(ispfe, &pix);
+	if (fsize->index || fsize->pixel_format != pix.pixelformat)
 		return -EINVAL;
 
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = ispfe->src.width;
-	fsize->discrete.height = ispfe->src.height;
+	fsize->discrete.width = pix.width;
+	fsize->discrete.height = pix.height;
 
 	return 0;
-}
-
-/*
- * One input, because a capture device must have one even when there is nothing
- * to choose between.  The receiver's twelve CSIS links are not inputs in the
- * V4L2 sense -- they are internal routing, and which one a stream uses is a
- * resource allocation the driver makes -- so they belong to the media graph
- * that arrives with the sensor subdevice, not here.
- */
-static int ispfe_enum_input(struct file *file, void *priv,
-			    struct v4l2_input *inp)
-{
-	if (inp->index)
-		return -EINVAL;
-
-	inp->type = V4L2_INPUT_TYPE_CAMERA;
-	strscpy(inp->name, "CSIS receiver", sizeof(inp->name));
-
-	return 0;
-}
-
-static int ispfe_g_input(struct file *file, void *priv, unsigned int *i)
-{
-	*i = 0;
-
-	return 0;
-}
-
-static int ispfe_s_input(struct file *file, void *priv, unsigned int i)
-{
-	return i ? -EINVAL : 0;
 }
 
 static const struct v4l2_ioctl_ops ispfe_ioctl_ops = {
 	.vidioc_querycap = ispfe_querycap,
-	.vidioc_enum_input = ispfe_enum_input,
-	.vidioc_g_input = ispfe_g_input,
-	.vidioc_s_input = ispfe_s_input,
 	.vidioc_enum_fmt_vid_cap = ispfe_enum_fmt,
 	.vidioc_g_fmt_vid_cap = ispfe_g_fmt,
 	.vidioc_s_fmt_vid_cap = ispfe_s_fmt,
@@ -3601,22 +3854,426 @@ static const struct v4l2_file_operations ispfe_fops = {
 };
 
 static const struct video_device ispfe_video_template = {
-	.name = "exynos-ispfe",
+	/*
+	 * Distinct from the receiver subdev's entity name.  Both end up in the
+	 * same media graph and nothing dedups them, so a duplicate would make
+	 * media-ctl and libcamera resolve whichever was registered first.
+	 */
+	.name = "exynos-ispfe capture",
 	.fops = &ispfe_fops,
 	.ioctl_ops = &ispfe_ioctl_ops,
 	.release = video_device_release_empty,
-	.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING,
+	.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
+		       V4L2_CAP_IO_MC,
 	.vfl_dir = VFL_DIR_RX,
 };
 
-static int ispfe_video_register(struct ispfe_device *ispfe)
+/*
+ * The buffers were sized from the source pad's format at REQBUFS.  If a format
+ * has been set on the pads since, the pipeline is inconsistent and starting it
+ * would have the receiver write frames of one size into buffers of another.
+ */
+static int ispfe_vdev_link_validate(struct media_link *link)
+{
+	struct video_device *vdev =
+		media_entity_to_video_device(link->sink->entity);
+	struct ispfe_device *ispfe = video_get_drvdata(vdev);
+	struct v4l2_pix_format pix;
+
+	ispfe_active_pix(ispfe, &pix);
+	if (pix.width != ispfe->fmt.width || pix.height != ispfe->fmt.height ||
+	    pix.pixelformat != ispfe->fmt.pixelformat) {
+		dev_err(ispfe->dev,
+			"the queue holds %ux%u buffers, the pad carries %ux%u\n",
+			ispfe->fmt.width, ispfe->fmt.height, pix.width,
+			pix.height);
+		return -EPIPE;
+	}
+
+	return 0;
+}
+
+static const struct media_entity_operations ispfe_vdev_entity_ops = {
+	.link_validate = ispfe_vdev_link_validate,
+};
+
+/* ---- the receiver subdevice -------------------------------------------- */
+
+static struct ispfe_device *sd_to_ispfe(struct v4l2_subdev *sd)
+{
+	return container_of(sd, struct ispfe_device, sd);
+}
+
+static int ispfe_sd_init_state(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_state *state)
+{
+	struct v4l2_mbus_framefmt *sink =
+		v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
+	struct v4l2_mbus_framefmt *source =
+		v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+
+	sink->code = ISPFE_DEFAULT_CODE;
+	sink->width = ISPFE_DEFAULT_WIDTH;
+	sink->height = ISPFE_DEFAULT_HEIGHT;
+	sink->field = V4L2_FIELD_NONE;
+	sink->colorspace = V4L2_COLORSPACE_RAW;
+	sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	sink->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	sink->xfer_func = V4L2_XFER_FUNC_NONE;
+	*source = *sink;
+
+	return 0;
+}
+
+static int ispfe_sd_enum_mbus_code(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state,
+				   struct v4l2_subdev_mbus_code_enum *code)
+{
+	/* Nothing converts, so the source offers exactly what the sink took. */
+	if (code->pad == ISPFE_PAD_SOURCE) {
+		if (code->index)
+			return -EINVAL;
+		code->code = v4l2_subdev_state_get_format(state,
+							  ISPFE_PAD_SINK)->code;
+		return 0;
+	}
+
+	if (code->index >= ARRAY_SIZE(ispfe_formats))
+		return -EINVAL;
+
+	code->code = ispfe_formats[code->index].code;
+
+	return 0;
+}
+
+static int ispfe_sd_enum_frame_size(struct v4l2_subdev *sd,
+				    struct v4l2_subdev_state *state,
+				    struct v4l2_subdev_frame_size_enum *fse)
+{
+	if (fse->index)
+		return -EINVAL;
+
+	if (fse->pad == ISPFE_PAD_SOURCE) {
+		const struct v4l2_mbus_framefmt *sink =
+			v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
+
+		if (fse->code != sink->code)
+			return -EINVAL;
+
+		fse->min_width = sink->width;
+		fse->max_width = sink->width;
+		fse->min_height = sink->height;
+		fse->max_height = sink->height;
+
+		return 0;
+	}
+
+	if (!ispfe_format_by_code(fse->code))
+		return -EINVAL;
+
+	fse->min_width = ISPFE_MIN_WIDTH;
+	fse->max_width = ISPFE_MAX_WIDTH;
+	fse->min_height = ISPFE_MIN_HEIGHT;
+	fse->max_height = ISPFE_MAX_HEIGHT;
+
+	return 0;
+}
+
+/*
+ * The sink is what the link carries and the source repeats it: this block
+ * receives, and the crop, scale and format converters the line-memory
+ * processor has have never been programmed to do anything but pass through.
+ * So a format is only ever set on the sink, and the source follows it.
+ */
+static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
+			    struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *format)
+{
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	struct v4l2_mbus_framefmt *sink, *source;
+
+	if (format->pad == ISPFE_PAD_SOURCE)
+		return v4l2_subdev_get_fmt(sd, state, format);
+
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    vb2_is_busy(&ispfe->queue))
+		return -EBUSY;
+
+	if (!ispfe_format_by_code(format->format.code))
+		format->format.code = ISPFE_DEFAULT_CODE;
+
+	format->format.width = clamp(format->format.width, ISPFE_MIN_WIDTH,
+				     ISPFE_MAX_WIDTH);
+	format->format.height = clamp(format->format.height, ISPFE_MIN_HEIGHT,
+				      ISPFE_MAX_HEIGHT);
+	format->format.field = V4L2_FIELD_NONE;
+	format->format.colorspace = V4L2_COLORSPACE_RAW;
+	format->format.ycbcr_enc = V4L2_YCBCR_ENC_601;
+	format->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	format->format.xfer_func = V4L2_XFER_FUNC_NONE;
+
+	sink = v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
+	source = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+	*sink = format->format;
+	*source = *sink;
+
+	return 0;
+}
+
+/*
+ * The receiver is armed by the capture queue, which is where the buffers are;
+ * what the subdev owns is the sensor, so enabling the stream here is enabling
+ * the source that feeds the link.
+ */
+static int ispfe_sd_enable_streams(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state, u32 pad,
+				   u64 streams_mask)
+{
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+
+	if (!ispfe->sensor)
+		return -ENODEV;
+
+	return v4l2_subdev_enable_streams(ispfe->sensor, ispfe->sensor_pad,
+					  BIT_ULL(0));
+}
+
+/*
+ * A stop that reports failure leaves this subdev's pad marked as streaming, and
+ * the next start is then refused with -EALREADY for as long as the machine is
+ * up.  A sensor that has gone away has already stopped, and one that could not
+ * be told to stop is not made better by wedging the node, so both are reported
+ * and neither is returned.
+ */
+static int ispfe_sd_disable_streams(struct v4l2_subdev *sd,
+				    struct v4l2_subdev_state *state, u32 pad,
+				    u64 streams_mask)
+{
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	int ret;
+
+	if (!ispfe->sensor)
+		return 0;
+
+	ret = v4l2_subdev_disable_streams(ispfe->sensor, ispfe->sensor_pad,
+					  BIT_ULL(0));
+	if (ret)
+		dev_err(ispfe->dev, "sensor would not stop: %d\n", ret);
+
+	return 0;
+}
+
+static const struct v4l2_subdev_pad_ops ispfe_subdev_pad_ops = {
+	.enum_mbus_code = ispfe_sd_enum_mbus_code,
+	.enum_frame_size = ispfe_sd_enum_frame_size,
+	.get_fmt = v4l2_subdev_get_fmt,
+	.set_fmt = ispfe_sd_set_fmt,
+	.enable_streams = ispfe_sd_enable_streams,
+	.disable_streams = ispfe_sd_disable_streams,
+};
+
+static const struct v4l2_subdev_video_ops ispfe_subdev_video_ops = {
+	.s_stream = v4l2_subdev_s_stream_helper,
+};
+
+static const struct v4l2_subdev_ops ispfe_subdev_ops = {
+	.video = &ispfe_subdev_video_ops,
+	.pad = &ispfe_subdev_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops ispfe_subdev_internal_ops = {
+	.init_state = ispfe_sd_init_state,
+};
+
+static const struct media_entity_operations ispfe_subdev_entity_ops = {
+	.link_validate = v4l2_subdev_link_validate,
+};
+
+/* ---- binding the sensor ------------------------------------------------ */
+
+static int ispfe_notify_bound(struct v4l2_async_notifier *nf,
+			      struct v4l2_subdev *sd,
+			      struct v4l2_async_connection *asc)
+{
+	struct ispfe_device *ispfe =
+		container_of(nf, struct ispfe_device, notifier);
+	int pad;
+
+	pad = media_entity_get_fwnode_pad(&sd->entity, asc->match.fwnode,
+					  MEDIA_PAD_FL_SOURCE);
+	if (pad < 0) {
+		dev_err(ispfe->dev, "%s has no source pad for that endpoint\n",
+			sd->name);
+		return pad;
+	}
+
+	guard(mutex)(&ispfe->lock);
+	ispfe->sensor = sd;
+	ispfe->sensor_pad = pad;
+
+	return 0;
+}
+
+static void ispfe_notify_unbind(struct v4l2_async_notifier *nf,
+				struct v4l2_subdev *sd,
+				struct v4l2_async_connection *asc)
+{
+	struct ispfe_device *ispfe =
+		container_of(nf, struct ispfe_device, notifier);
+
+	guard(mutex)(&ispfe->lock);
+	ispfe->sensor = NULL;
+}
+
+/*
+ * Both links are immutable.  This block has twelve link banks, but the driver
+ * runs one stream and which bank it is on is a statement about how the board is
+ * wired rather than something userspace chooses.
+ */
+static int ispfe_notify_complete(struct v4l2_async_notifier *nf)
+{
+	struct ispfe_device *ispfe =
+		container_of(nf, struct ispfe_device, notifier);
+	int ret;
+
+	ret = media_create_pad_link(&ispfe->sensor->entity, ispfe->sensor_pad,
+				    &ispfe->sd.entity, ISPFE_PAD_SINK,
+				    MEDIA_LNK_FL_ENABLED |
+				    MEDIA_LNK_FL_IMMUTABLE);
+	if (ret)
+		return ret;
+
+	ret = v4l2_device_register_subdev_nodes(&ispfe->v4l2_dev);
+	if (ret)
+		return ret;
+
+	return media_device_register(&ispfe->mdev);
+}
+
+static const struct v4l2_async_notifier_operations ispfe_notifier_ops = {
+	.bound = ispfe_notify_bound,
+	.unbind = ispfe_notify_unbind,
+	.complete = ispfe_notify_complete,
+};
+
+/*
+ * The device tree says which CSIS link bank the sensor arrives on -- that is
+ * the port number -- and what the link looks like.  Everything else about the
+ * source is either the driver's own allocation or the negotiated format.
+ */
+static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
+				struct fwnode_handle *ep)
+{
+	struct v4l2_fwnode_endpoint vep = { .bus_type = V4L2_MBUS_UNKNOWN };
+	/*
+	 * Zeroed because the port number is only filled in when the port node
+	 * has a reg; without one this would carry stack contents into the link
+	 * bounds check and pick a CSIS bank at random.
+	 */
+	struct fwnode_endpoint fwep = {};
+	const struct ispfe_link_cfg *cfg;
+	int ret;
+
+	ret = fwnode_graph_parse_endpoint(ep, &fwep);
+	if (ret)
+		return dev_err_probe(ispfe->dev, ret,
+				     "cannot read the endpoint's port\n");
+
+	if (fwep.port >= CSIS_NUM_LINKS || !ispfe_link_cfg[fwep.port].known)
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "no PHY is known for CSIS link %u\n",
+				     fwep.port);
+
+	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
+	if (ret)
+		return dev_err_probe(ispfe->dev, ret,
+				     "cannot parse the endpoint\n");
+
+	switch (vep.bus_type) {
+	case V4L2_MBUS_CSI2_DPHY:
+		ispfe->src.cphy = false;
+		break;
+	case V4L2_MBUS_CSI2_CPHY:
+		ispfe->src.cphy = true;
+		break;
+	default:
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "bus type %u is not CSI-2\n",
+				     vep.bus_type);
+	}
+
+	cfg = &ispfe_link_cfg[fwep.port];
+	ispfe->src.link = fwep.port;
+	ispfe->src.phy = cfg->phy;
+	ispfe->src.lanes = vep.bus.mipi_csi2.num_data_lanes;
+	ispfe->src.mode_word0 = cfg->mode_word0;
+	ispfe->src.mode_word1 = cfg->mode_word1;
+
+	if (!ispfe->src.lanes ||
+	    ispfe->src.lanes > ispfe_phy_lanes(ispfe->src.phy))
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "%u data lanes, PHY %u has %u\n",
+				     ispfe->src.lanes, ispfe->src.phy,
+				     ispfe_phy_lanes(ispfe->src.phy));
+
+	return 0;
+}
+
+static int ispfe_media_register(struct ispfe_device *ispfe)
 {
 	struct vb2_queue *q = &ispfe->queue;
+	struct v4l2_async_connection *asc;
+	struct fwnode_handle *ep;
 	int ret;
+
+	ep = fwnode_graph_get_next_endpoint(dev_fwnode(ispfe->dev), NULL);
+	if (!ep)
+		return dev_err_probe(ispfe->dev, -ENXIO,
+				     "no sensor endpoint\n");
+
+	ret = ispfe_parse_endpoint(ispfe, ep);
+	if (ret)
+		goto err_ep;
+
+	ispfe->mdev.dev = ispfe->dev;
+	strscpy(ispfe->mdev.model, "zumapro ISPFE", sizeof(ispfe->mdev.model));
+	media_device_init(&ispfe->mdev);
+	ispfe->v4l2_dev.mdev = &ispfe->mdev;
 
 	ret = v4l2_device_register(ispfe->dev, &ispfe->v4l2_dev);
 	if (ret)
-		return ret;
+		goto err_mdev;
+
+	v4l2_subdev_init(&ispfe->sd, &ispfe_subdev_ops);
+	ispfe->sd.internal_ops = &ispfe_subdev_internal_ops;
+	ispfe->sd.owner = THIS_MODULE;
+	ispfe->sd.dev = ispfe->dev;
+	ispfe->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
+	ispfe->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
+	ispfe->sd.entity.ops = &ispfe_subdev_entity_ops;
+	snprintf(ispfe->sd.name, sizeof(ispfe->sd.name), "exynos-ispfe csis%u",
+		 ispfe->src.link);
+	v4l2_set_subdevdata(&ispfe->sd, ispfe);
+
+	/*
+	 * MUST_CONNECT, so that a pipeline with no sensor is refused before any
+	 * of the receiver is programmed rather than after it is fully armed.
+	 */
+	ispfe->pads[ISPFE_PAD_SINK].flags = MEDIA_PAD_FL_SINK |
+					    MEDIA_PAD_FL_MUST_CONNECT;
+	ispfe->pads[ISPFE_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&ispfe->sd.entity, ISPFE_NUM_PADS,
+				     ispfe->pads);
+	if (ret)
+		goto err_v4l2;
+
+	ret = v4l2_subdev_init_finalize(&ispfe->sd);
+	if (ret)
+		goto err_sd_entity;
+
+	ret = v4l2_device_register_subdev(&ispfe->v4l2_dev, &ispfe->sd);
+	if (ret)
+		goto err_sd;
 
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP | VB2_DMABUF;
@@ -3634,23 +4291,88 @@ static int ispfe_video_register(struct ispfe_device *ispfe)
 	q->lock = &ispfe->lock;
 	ret = vb2_queue_init(q);
 	if (ret)
-		goto err_v4l2;
+		goto err_unreg_sd;
 
 	ispfe->vdev = ispfe_video_template;
 	ispfe->vdev.v4l2_dev = &ispfe->v4l2_dev;
 	ispfe->vdev.queue = q;
 	ispfe->vdev.lock = &ispfe->lock;
+	ispfe->vdev.entity.ops = &ispfe_vdev_entity_ops;
 	video_set_drvdata(&ispfe->vdev, ispfe);
+
+	ispfe->vdev_pad.flags = MEDIA_PAD_FL_SINK;
+	ret = media_entity_pads_init(&ispfe->vdev.entity, 1, &ispfe->vdev_pad);
+	if (ret)
+		goto err_unreg_sd;
 
 	ret = video_register_device(&ispfe->vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
-		goto err_v4l2;
+		goto err_vdev_entity;
+
+	ret = media_create_pad_link(&ispfe->sd.entity, ISPFE_PAD_SOURCE,
+				    &ispfe->vdev.entity, 0,
+				    MEDIA_LNK_FL_ENABLED |
+				    MEDIA_LNK_FL_IMMUTABLE);
+	if (ret)
+		goto err_vdev;
+
+	v4l2_async_nf_init(&ispfe->notifier, &ispfe->v4l2_dev);
+	asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
+					      struct v4l2_async_connection);
+	if (IS_ERR(asc)) {
+		ret = PTR_ERR(asc);
+		goto err_nf;
+	}
+
+	ispfe->notifier.ops = &ispfe_notifier_ops;
+	ret = v4l2_async_nf_register(&ispfe->notifier);
+	if (ret)
+		goto err_nf;
+
+	fwnode_handle_put(ep);
 
 	return 0;
 
+err_nf:
+	v4l2_async_nf_cleanup(&ispfe->notifier);
+err_vdev:
+	video_unregister_device(&ispfe->vdev);
+err_vdev_entity:
+	media_entity_cleanup(&ispfe->vdev.entity);
+err_unreg_sd:
+	v4l2_device_unregister_subdev(&ispfe->sd);
+err_sd:
+	v4l2_subdev_cleanup(&ispfe->sd);
+err_sd_entity:
+	media_entity_cleanup(&ispfe->sd.entity);
 err_v4l2:
 	v4l2_device_unregister(&ispfe->v4l2_dev);
+err_mdev:
+	media_device_cleanup(&ispfe->mdev);
+err_ep:
+	fwnode_handle_put(ep);
 	return ret;
+}
+
+static void ispfe_media_unregister(struct ispfe_device *ispfe)
+{
+	/*
+	 * The video device goes first, because it is the only thing that can be
+	 * streaming and stopping the stream needs the sensor still bound.  It
+	 * also releases the queue, unlike a bare video_unregister_device(),
+	 * which would leave the fill work running over the program area freed
+	 * afterwards.
+	 */
+	vb2_video_unregister_device(&ispfe->vdev);
+	v4l2_async_nf_unregister(&ispfe->notifier);
+	v4l2_async_nf_cleanup(&ispfe->notifier);
+	media_device_unregister(&ispfe->mdev);
+	media_entity_cleanup(&ispfe->vdev.entity);
+	v4l2_device_unregister_subdev(&ispfe->sd);
+	v4l2_subdev_cleanup(&ispfe->sd);
+	media_entity_cleanup(&ispfe->sd.entity);
+	v4l2_device_unregister(&ispfe->v4l2_dev);
+	media_device_cleanup(&ispfe->mdev);
 }
 
 static int ispfe_probe(struct platform_device *pdev)
@@ -3696,22 +4418,17 @@ static int ispfe_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
 
 	/*
-	 * tegu's ultrawide IMX712 as the default source, because it is the
-	 * simplest of the three: one recovered mode at full readout and an
-	 * ordinary four-lane D-PHY, where the main camera is three-lane C-PHY.
+	 * The receiver's own resources, which are the driver's to allocate: a
+	 * standalone physical-output RAW capture put this sensor on logical
+	 * and PDMA channel 0, frame-controller context 4 and line-memory slot
+	 * 2, and an earlier mixed preview used channel 1 and context 2, so
+	 * these are allocator choices rather than sensor properties.  The rest
+	 * of the source description comes from the device tree's endpoint and
+	 * from the negotiated format.
 	 */
-	ispfe->src = (struct ispfe_source){
-		.link = 1, .phy = 1, .lanes = 4, .width = 4208, .height = 3120,
-		/*
-		 * A standalone physical-output RAW capture allocated this sensor
-		 * on logical/PDMA channel 0, frame-controller context 4 and line-
-		 * memory slot 2.  The earlier mixed preview's channel 1/context 2
-		 * were allocator choices, not sensor properties.  Keep the measured
-		 * sensor-mode words while making the captured allocation.
-		 */
-		.loch = 0, .fcctx = 4, .slot = 2,
-		.mode_word0 = 0x000c44a0, .mode_word1 = 0x000014f8,
-	};
+	ispfe->src.loch = 0;
+	ispfe->src.fcctx = 4;
+	ispfe->src.slot = 2;
 
 	for (i = 0; i < ISPFE_NUM_WINDOWS; i++) {
 		ispfe->base[i] = ispfe_map(pdev, ispfe_window_names[i]);
@@ -3772,9 +4489,9 @@ static int ispfe_probe(struct platform_device *pdev)
 
 	pm_runtime_put(dev);
 
-	ret = ispfe_video_register(ispfe);
+	ret = ispfe_media_register(ispfe);
 	if (ret)
-		return dev_err_probe(dev, ret, "cannot register the video device\n");
+		return ret;
 
 	ispfe_debugfs_init(ispfe);
 
@@ -3792,14 +4509,8 @@ static void ispfe_remove(struct platform_device *pdev)
 	int ret;
 
 	debugfs_remove_recursive(ispfe->debugfs);
-	/*
-	 * Stops any stream and releases the queue, unlike a bare
-	 * video_unregister_device(), which would leave the fill work running
-	 * over the program area freed below.
-	 */
-	vb2_video_unregister_device(&ispfe->vdev);
+	ispfe_media_unregister(ispfe);
 	cancel_work_sync(&ispfe->fill_work);
-	v4l2_device_unregister(&ispfe->v4l2_dev);
 
 	scoped_guard(mutex, &ispfe->lock) {
 		if (ispfe->streaming)

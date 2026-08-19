@@ -9,6 +9,7 @@
 /dts-v1/;
 
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/media/video-interfaces.h>
 
 #include "zumapro.dtsi"
 
@@ -523,67 +524,19 @@
 	};
 
 	/*
-	 * PHASE 1 SCAFFOLD.  There are no sensor drivers yet, so nothing claims
-	 * the camera rails and nothing can sequence them.  These expose each
-	 * rail's enable to userspace as a sysfs "state" file, so the recorded
-	 * power-up order can be replayed by hand -- which is how the sensors
-	 * get powered up at all until a driver does it.
+	 * There is no userspace power scaffold here any more.  A
+	 * "regulator-output" node takes an *exclusive* reference to the rail it
+	 * names, so a rail described that way cannot also be an ordinary supply
+	 * of a driver: whichever probed first would win and the other would fail
+	 * -- the sensor with -EPERM, the scaffold with -EBUSY.  L12S_CAMIO is
+	 * shared by all three camera modules, so the moment one of them had a
+	 * driver the two models became mutually exclusive.
 	 *
-	 * The two board rails are not here, because neither needs to be:
-	 * PP3200_CAM_BB comes up as the camera PMIC's input whenever one of
-	 * these LDOs is enabled, and PP1350_CAM as CAM_MAIN_VDIG's.  So both
-	 * arrive before anything that depends on them, though not in the
-	 * recording's order -- it brings both board rails up ahead of the I/O
-	 * rail, where this brings them up after it.  I/O before analog is the
-	 * safer direction.
-	 *
-	 * Delete this block together with scripts/camera-power-up.sh when the
-	 * sensor drivers land.
+	 * The main and front modules are therefore powered by their own sensor
+	 * subdevices when they get them, as the ultrawide now is, rather than by
+	 * hand.  The rails they need stay described above; nothing consumes them
+	 * yet.
 	 */
-	cam-rail-camio {
-		compatible = "regulator-output";
-		vout-supply = <&s2mpg15_ldo12>;
-	};
-
-	cam-rail-vdig {
-		compatible = "regulator-output";
-		vout-supply = <&cam_main_vdig>;
-	};
-
-	cam-rail-ldo1 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo1>;
-	};
-
-	cam-rail-ldo2 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo2>;
-	};
-
-	cam-rail-ldo3 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo3>;
-	};
-
-	cam-rail-ldo4 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo4>;
-	};
-
-	cam-rail-ldo5 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo5>;
-	};
-
-	cam-rail-ldo6 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo6>;
-	};
-
-	cam-rail-ldo7 {
-		compatible = "regulator-output";
-		vout-supply = <&cam_ldo7>;
-	};
 };
 
 &watchdog_cl0 {
@@ -2141,6 +2094,50 @@
 
 &hsi2c_2 {
 	status = "okay";
+
+	/*
+	 * leshen-uw, the rear ultrawide.  Its master clock is CIS_CLK0, taken
+	 * straight off the 24.576 MHz oscillator: the mux is pinned rather than
+	 * inherited because nothing else selects it, and the sensor's PLL
+	 * dividers -- which are constants inside its mode list -- are only
+	 * right at that rate.
+	 *
+	 * The pin states carry the master clock pad, which is muxed to its
+	 * CIS_CLK function while the module is powered and driven low the rest
+	 * of the time, and the reset pin, which is an output in both.
+	 */
+	cam_uw: camera@1a {
+		compatible = "sony,imx712";
+		reg = <0x1a>;
+
+		clocks = <&cmu_top CLK_GOUT_CMU_DFTMUX_CIS_CLK0>;
+		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK0>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clock-parents = <&ext_24_5m>;
+		assigned-clock-rates = <0>, <24576000>;
+
+		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_uw_reset>, <&cam_uw_mclk>;
+		pinctrl-1 = <&cam_uw_reset>, <&cam_uw_mclk_off>;
+
+		iovdd-supply = <&s2mpg15_ldo12>;
+		avdd-supply = <&cam_ldo3>;
+		dvdd-supply = <&cam_ldo6>;
+
+		/* Rear-facing. */
+		orientation = <1>;
+
+		port {
+			cam_uw_out: endpoint {
+				remote-endpoint = <&ispfe_uw_in>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <552960000>;
+			};
+		};
+	};
 };
 
 /* Front camera: sensor at 0x1a, module EEPROM at 0x50. */
@@ -2271,13 +2268,29 @@
 };
 
 /*
- * The camera receive complex.  Enabled for bring-up: the driver powers the
- * block, restores the CMU state the power domain leaves behind, and reports
- * its identification registers.  Nothing streams and no sensor is wired to a
- * link yet.
+ * The camera receive complex.  A port is one of the twelve CSIS link banks,
+ * named by its number, so the port a sensor's endpoint hangs off is the bank
+ * its data arrives on -- which is a fact about how the board is wired.  The
+ * ultrawide is on bank 1; the main camera is on bank 0 and the front camera on
+ * bank 6, and neither has a sensor driver yet.
  */
 &ispfe {
 	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+
+			ispfe_uw_in: endpoint {
+				remote-endpoint = <&cam_uw_out>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
 };
 
 /*

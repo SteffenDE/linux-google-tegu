@@ -698,6 +698,9 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
+	/* Armed by debugfs, completed from the configured line-memory IRQ. */
+	bool freeze_armed;
+	bool frame_frozen;
 	int link_irq;
 	int core_irq;
 	int fc_irq;
@@ -1887,6 +1890,7 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 {
 	struct ispfe_device *ispfe = data;
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	bool target_done = false;
 	unsigned int i;
 	u32 seen;
 
@@ -1899,6 +1903,8 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		u32 src = readl_relaxed(lmp + LMP_INT_SRC);
 		u32 bsrc = readl_relaxed(bank + FC_CTX_SRC);
 
+		if (i == ispfe->active.fcctx && src)
+			target_done = true;
 		seen |= src | bsrc;
 		writel_relaxed(src, lmp + LMP_INT_SRC);
 		writel_relaxed(bsrc, bank + FC_CTX_SRC);
@@ -1908,6 +1914,23 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		return IRQ_NONE;
 
 	atomic_inc(&ispfe->lmp_events);
+
+	/*
+	 * The debug capture used to tear the receiver down at an arbitrary point
+	 * in the next frame. That left one moving zero-filled band in an otherwise
+	 * complete image. Once userspace asks for a snapshot, gate the logical
+	 * channel at the next configured line-memory completion instead. This is
+	 * the same ownership rule vb2 will need later: expose only a buffer whose
+	 * completion event has arrived, while the ordinary teardown may still run
+	 * afterward with the sensor supplying its clock.
+	 */
+	if (target_done && READ_ONCE(ispfe->freeze_armed)) {
+		writel_relaxed(0, core + LOCH_ENABLE);
+		readl(core + LOCH_ENABLE);
+		dma_rmb();
+		WRITE_ONCE(ispfe->freeze_armed, false);
+		WRITE_ONCE(ispfe->frame_frozen, true);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -2203,6 +2226,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	atomic_set(&ispfe->core_events, 0);
 	atomic_set(&ispfe->lmp_events, 0);
 	atomic_set(&ispfe->pdma_events, 0);
+	WRITE_ONCE(ispfe->freeze_armed, false);
+	WRITE_ONCE(ispfe->frame_frozen, false);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
@@ -2262,6 +2287,7 @@ err_put:
  */
 static void ispfe_stop(struct ispfe_device *ispfe)
 {
+	WRITE_ONCE(ispfe->freeze_armed, false);
 	ispfe_fc_stop(ispfe);
 	ispfe_phy_link_stop(ispfe);
 	ispfe_pdma_stop(ispfe);
@@ -2300,6 +2326,43 @@ static int ispfe_enable_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 			 "%llu\n");
+
+/*
+ * Writing one arms a one-shot handoff. Reading returns one only after the
+ * configured line-memory context completed a frame and its IRQ gated further
+ * writes to the Bayer buffer.
+ */
+static int ispfe_snapshot_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (!ispfe->streaming)
+		return -EPIPE;
+	if (READ_ONCE(ispfe->frame_frozen))
+		return val ? 0 : -EBUSY;
+
+	WRITE_ONCE(ispfe->freeze_armed, val);
+
+	return 0;
+}
+
+static int ispfe_snapshot_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = READ_ONCE(ispfe->frame_frozen);
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_snapshot_fops, ispfe_snapshot_get,
+			 ispfe_snapshot_set, "%llu\n");
 
 static int ispfe_phy_isolation_bypass_set(void *data, u64 val)
 {
@@ -2523,6 +2586,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	guard(mutex)(&ispfe->lock);
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
+	seq_printf(s, "snapshot_armed %u\n", READ_ONCE(ispfe->freeze_armed));
+	seq_printf(s, "frame_frozen %u\n", READ_ONCE(ispfe->frame_frozen));
 	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	if (!regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &isolation))
@@ -2652,6 +2717,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("mode_word0", 0644, d, &ispfe->src.mode_word0);
 	debugfs_create_u32("mode_word1", 0644, d, &ispfe->src.mode_word1);
 	debugfs_create_file("enable", 0644, d, ispfe, &ispfe_enable_fops);
+	debugfs_create_file("snapshot", 0644, d, ispfe,
+			    &ispfe_snapshot_fops);
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 }

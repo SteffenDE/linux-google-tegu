@@ -1895,7 +1895,8 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 		return;
 
 	dma_rmb();
-	smp_store_release(&ispfe->snapshot_state, ISPFE_SNAPSHOT_READY);
+	cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_PUBLISHING,
+		ISPFE_SNAPSHOT_READY);
 }
 
 static irqreturn_t ispfe_fc_isr(int irq, void *data)

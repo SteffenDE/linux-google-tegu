@@ -22,14 +22,14 @@
 #include "exynos-ispfe-pdma.h"
 
 #define ISPFE_PDMA_RECIPE_BYTES		0x1800
-#define ISPFE_PDMA_AREA_START		0x2000
-#define ISPFE_PDMA_AREA_END		0xa100
+#define ISPFE_PDMA_BLOCKS_BYTES		0x9000
 
 /*
  * The blocks the program's indirect-burst records stream into the front
  * end: lookup tables for linearisation, lens shading, the histogram, the
- * global tone map, gamma and the scalers.  Each is placed on its own page
- * of the driver's program area, as the vendor session had them.
+ * global tone map, gamma and the scalers.  They do not change between
+ * frames, so one shared area holds them all, each on its own page as the
+ * vendor session had them.
  */
 
 /* enrol-iova1d55e000-fd265.txt: first 0x410 bytes consumed
@@ -996,21 +996,21 @@ static const u8 ispfe_pdma_input_1d45c000[0x100] = {
 };
 
 static const struct ispfe_pdma_input ispfe_pdma_inputs[] = {
-	{ .area_offset = 0x02000, .data = ispfe_pdma_input_1d55e000,
+	{ .area_offset = 0x00000, .data = ispfe_pdma_input_1d55e000,
 	  .size = sizeof(ispfe_pdma_input_1d55e000) },
-	{ .area_offset = 0x03000, .data = ispfe_pdma_input_1d5f2000,
+	{ .area_offset = 0x01000, .data = ispfe_pdma_input_1d5f2000,
 	  .size = sizeof(ispfe_pdma_input_1d5f2000) },
-	{ .area_offset = 0x05000, .data = ispfe_pdma_input_1d480000,
+	{ .area_offset = 0x03000, .data = ispfe_pdma_input_1d480000,
 	  .size = sizeof(ispfe_pdma_input_1d480000) },
-	{ .area_offset = 0x06000, .data = ispfe_pdma_input_1ca7d000,
+	{ .area_offset = 0x04000, .data = ispfe_pdma_input_1ca7d000,
 	  .size = sizeof(ispfe_pdma_input_1ca7d000) },
-	{ .area_offset = 0x07000, .data = ispfe_pdma_input_1d85c000,
+	{ .area_offset = 0x05000, .data = ispfe_pdma_input_1d85c000,
 	  .size = sizeof(ispfe_pdma_input_1d85c000) },
-	{ .area_offset = 0x08000, .data = ispfe_pdma_input_1d673000,
+	{ .area_offset = 0x06000, .data = ispfe_pdma_input_1d673000,
 	  .size = sizeof(ispfe_pdma_input_1d673000) },
-	{ .area_offset = 0x09000, .data = ispfe_pdma_input_1d84b000,
+	{ .area_offset = 0x07000, .data = ispfe_pdma_input_1d84b000,
 	  .size = sizeof(ispfe_pdma_input_1d84b000) },
-	{ .area_offset = 0x0a000, .data = ispfe_pdma_input_1d45c000,
+	{ .area_offset = 0x08000, .data = ispfe_pdma_input_1d45c000,
 	  .size = sizeof(ispfe_pdma_input_1d45c000) },
 };
 

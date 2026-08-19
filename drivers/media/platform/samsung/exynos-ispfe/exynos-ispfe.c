@@ -319,8 +319,10 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX_CTRL			0x308
 #define FC_CTX_CTRL_VAL		0x000007fc
 #define FC_CTX_MSK			0x30c
+#define FC_CTX_INT_EOF			BIT(1)
 #define FC_CTX_MSK_ARM		0x000007f8
 #define FC_CTX_MSK_RUN		0x000007fc
+#define FC_CTX_MSK_SNAPSHOT		(FC_CTX_MSK_RUN | FC_CTX_INT_EOF)
 
 /*
  * A pair of blocks with a slot per stream, eight bytes each from +0x30, both
@@ -698,7 +700,7 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
-	/* Armed by debugfs, completed from the configured line-memory IRQ. */
+	/* Armed by debugfs, completed from the frame-controller EOF IRQ. */
 	bool freeze_armed;
 	bool frame_frozen;
 	int link_irq;
@@ -1848,6 +1850,22 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static void ispfe_snapshot_complete(struct ispfe_device *ispfe,
+				    void __iomem *core)
+{
+	if (!READ_ONCE(ispfe->freeze_armed))
+		return;
+
+	/* Return EOF to its normal masked state before gating further frames. */
+	writel_relaxed(FC_CTX_MSK_RUN,
+		       core + FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
+	writel_relaxed(0, core + LOCH_ENABLE);
+	readl(core + LOCH_ENABLE);
+	dma_rmb();
+	WRITE_ONCE(ispfe->freeze_armed, false);
+	WRITE_ONCE(ispfe->frame_frozen, true);
+}
+
 static irqreturn_t ispfe_fc_isr(int irq, void *data)
 {
 	struct ispfe_device *ispfe = data;
@@ -1874,6 +1892,8 @@ static irqreturn_t ispfe_fc_isr(int irq, void *data)
 
 	WRITE_ONCE(ispfe->fc_seen, READ_ONCE(ispfe->fc_seen) | src);
 	atomic_inc(&ispfe->fc_events);
+	if (src & FC_CTX_INT_EOF)
+		ispfe_snapshot_complete(ispfe, core);
 
 	return IRQ_HANDLED;
 }
@@ -1903,7 +1923,7 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		u32 src = readl_relaxed(lmp + LMP_INT_SRC);
 		u32 bsrc = readl_relaxed(bank + FC_CTX_SRC);
 
-		if (i == ispfe->active.fcctx && src)
+		if (i == ispfe->active.fcctx && (bsrc & FC_CTX_INT_EOF))
 			target_done = true;
 		seen |= src | bsrc;
 		writel_relaxed(src, lmp + LMP_INT_SRC);
@@ -1919,18 +1939,13 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 	 * The debug capture used to tear the receiver down at an arbitrary point
 	 * in the next frame. That left one moving zero-filled band in an otherwise
 	 * complete image. Once userspace asks for a snapshot, gate the logical
-	 * channel at the next configured line-memory completion instead. This is
+	 * channel at the frame controller's true EOF event instead. This is
 	 * the same ownership rule vb2 will need later: expose only a buffer whose
 	 * completion event has arrived, while the ordinary teardown may still run
 	 * afterward with the sensor supplying its clock.
 	 */
-	if (target_done && READ_ONCE(ispfe->freeze_armed)) {
-		writel_relaxed(0, core + LOCH_ENABLE);
-		readl(core + LOCH_ENABLE);
-		dma_rmb();
-		WRITE_ONCE(ispfe->freeze_armed, false);
-		WRITE_ONCE(ispfe->frame_frozen, true);
-	}
+	if (target_done)
+		ispfe_snapshot_complete(ispfe, core);
 
 	return IRQ_HANDLED;
 }
@@ -2329,8 +2344,8 @@ DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 
 /*
  * Writing one arms a one-shot handoff. Reading returns one only after the
- * configured line-memory context completed a frame and its IRQ gated further
- * writes to the Bayer buffer.
+	 * frame controller reported EOF and its IRQ gated further writes to the
+	 * Bayer buffer.
  */
 static int ispfe_snapshot_set(void *data, u64 val)
 {
@@ -2346,7 +2361,22 @@ static int ispfe_snapshot_set(void *data, u64 val)
 	if (READ_ONCE(ispfe->frame_frozen))
 		return val ? 0 : -EBUSY;
 
-	WRITE_ONCE(ispfe->freeze_armed, val);
+	if (val) {
+		/* Arm software before unmasking EOF so the first event cannot race. */
+		WRITE_ONCE(ispfe->freeze_armed, true);
+		writel_relaxed(FC_CTX_MSK_SNAPSHOT,
+			       ispfe->base[ISPFE_WIN_CORE] +
+			       FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
+		readl(ispfe->base[ISPFE_WIN_CORE] +
+		      FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
+	} else {
+		writel_relaxed(FC_CTX_MSK_RUN,
+			       ispfe->base[ISPFE_WIN_CORE] +
+			       FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
+		readl(ispfe->base[ISPFE_WIN_CORE] +
+		      FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
+		WRITE_ONCE(ispfe->freeze_armed, false);
+	}
 
 	return 0;
 }

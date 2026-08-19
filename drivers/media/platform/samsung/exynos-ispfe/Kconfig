@@ -5,15 +5,17 @@ config VIDEO_EXYNOS_ISPFE
 	depends on ARCH_EXYNOS || COMPILE_TEST
 	depends on OF
 	depends on PM
+	depends on VIDEO_DEV
+	select VIDEOBUF2_DMA_CONTIG
 	help
 	  Bring-up driver for BLK_ISPFE on Google's zumapro (Tensor G4): the
 	  CSIS links and their combo D/C-PHYs, the ISPFE front end, and the
 	  PDMA that carries per-frame descriptors.
 
 	  At this stage the driver powers the block, restores the CMU state that
-	  the power domain does not, and provides debugfs controls for a captured
-	  sensor mode.  It registers no V4L2 devices and is of no use outside
-	  camera bring-up.
+	  the power domain does not, and offers one raw Bayer capture node whose
+	  geometry and receiver resources still come from debugfs rather than
+	  from a sensor subdevice.  It is of no use outside camera bring-up.
 
 	  This is built-in because module removal cannot be aborted if the shared
 	  PHY isolation fails to restore before the ISPFE power domain goes down.

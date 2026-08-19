@@ -2350,7 +2350,24 @@ err_put:
  */
 static void ispfe_stop(struct ispfe_device *ispfe)
 {
-	xchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
+	unsigned int state = READ_ONCE(ispfe->snapshot_state);
+
+	/*
+	 * A ready frame deliberately survives stop: debugfs reads it after the
+	 * hardware is quiescent. Let an IRQ that already owns publication finish,
+	 * but atomically cancel every earlier state before synchronizing the line.
+	 */
+	while (state != ISPFE_SNAPSHOT_IDLE &&
+	       state != ISPFE_SNAPSHOT_PUBLISHING &&
+	       state != ISPFE_SNAPSHOT_READY) {
+		unsigned int old;
+
+		old = cmpxchg(&ispfe->snapshot_state, state,
+			      ISPFE_SNAPSHOT_IDLE);
+		if (old == state)
+			break;
+		state = old;
+	}
 	synchronize_irq(ispfe->lmp_irq);
 	ispfe_fc_stop(ispfe);
 	ispfe_phy_link_stop(ispfe);

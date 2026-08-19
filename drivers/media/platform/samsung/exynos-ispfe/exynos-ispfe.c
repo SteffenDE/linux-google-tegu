@@ -30,6 +30,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-seeds.h"
@@ -310,7 +311,7 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define LMP_INT_SRC			0x00
 #define LMP_INT_MSK			0x08
 #define LMP_INT_MSK_VAL			0x103ffffe
-#define LMP_INT_BAYER0_WDMA		BIT(15)
+#define LMP_INT_EOF			BIT(1)
 #define LMP_INT_CFG			0x0c
 #define LMP_INT_CFG_BAYER_VAL		0x3fffffff
 #define LMP_INT_CFG_PDAF_VAL		0x000003ff
@@ -699,9 +700,12 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
-	/* Armed by debugfs, completed from the Bayer0 WDMA-done IRQ. */
+	/* Armed by debugfs, completed by copying at the line-memory EOF IRQ. */
 	bool freeze_armed;
 	bool frame_frozen;
+	bool snapshot_raced;
+	struct work_struct snapshot_work;
+	u32 snapshot_copy_us;
 	int link_irq;
 	int core_irq;
 	int fc_irq;
@@ -718,6 +722,7 @@ struct ispfe_device {
 	void *frame;
 	dma_addr_t frame_dma;
 	size_t frame_size;
+	void *snapshot_frame;
 	void *program;
 	dma_addr_t program_dma;
 	struct ispfe_pdma_desc *ring;
@@ -1850,17 +1855,22 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static void ispfe_snapshot_complete(struct ispfe_device *ispfe,
-				    void __iomem *core)
+static void ispfe_snapshot_work(struct work_struct *work)
 {
-	if (!READ_ONCE(ispfe->freeze_armed))
-		return;
+	struct ispfe_device *ispfe =
+		container_of(work, struct ispfe_device, snapshot_work);
+	unsigned int frame_start;
+	ktime_t started;
 
-	writel_relaxed(0, core + LOCH_ENABLE);
-	readl(core + LOCH_ENABLE);
+	frame_start = atomic_read(&ispfe->frame_start);
+	started = ktime_get();
 	dma_rmb();
-	WRITE_ONCE(ispfe->freeze_armed, false);
-	WRITE_ONCE(ispfe->frame_frozen, true);
+	memcpy(ispfe->snapshot_frame, ispfe->frame, ispfe->frame_size);
+	WRITE_ONCE(ispfe->snapshot_copy_us,
+		   ktime_us_delta(ktime_get(), started));
+	WRITE_ONCE(ispfe->snapshot_raced,
+		   atomic_read(&ispfe->frame_start) != frame_start);
+	smp_store_release(&ispfe->frame_frozen, true);
 }
 
 static irqreturn_t ispfe_fc_isr(int irq, void *data)
@@ -1920,7 +1930,7 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		if (i == ispfe->active.fcctx) {
 			WRITE_ONCE(ispfe->lmp_seen,
 				   READ_ONCE(ispfe->lmp_seen) | src);
-			if (src & LMP_INT_BAYER0_WDMA)
+			if (src & LMP_INT_EOF)
 				target_done = true;
 		}
 		seen |= src | bsrc;
@@ -1936,14 +1946,18 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 	/*
 	 * The debug capture used to tear the receiver down at an arbitrary point
 	 * in the next frame. That left one moving zero-filled band in an otherwise
-	 * complete image. Once userspace asks for a snapshot, gate the logical
-	 * channel after the Bayer0 output WDMA reports completion. This is
-	 * the same ownership rule vb2 will need later: expose only a buffer whose
-	 * completion event has arrived, while the ordinary teardown may still run
-	 * afterward with the sensor supplying its clock.
+	 * complete image. Once userspace asks for a snapshot, copy the completed
+	 * buffer after the configured line-memory context reports EOF. The sensor
+	 * has about 22 ms of vertical blanking in this mode, enough to make the
+	 * 25 MiB copy before the next frame starts. This avoids changing the live
+	 * hardware at EOF: gating LOCH there made its teardown path zero part of
+	 * the buffer it had just completed. A V4L2 driver will hand the hardware a
+	 * second buffer instead of making this debug-only CPU copy.
 	 */
-	if (target_done)
-		ispfe_snapshot_complete(ispfe, core);
+	if (target_done && READ_ONCE(ispfe->freeze_armed)) {
+		WRITE_ONCE(ispfe->freeze_armed, false);
+		schedule_work(&ispfe->snapshot_work);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -2002,6 +2016,9 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
+	cancel_work_sync(&ispfe->snapshot_work);
+	kvfree(ispfe->snapshot_frame);
+	ispfe->snapshot_frame = NULL;
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		if (!ispfe->pdma_output[i].cpu)
 			continue;
@@ -2048,7 +2065,8 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
-	if (!ispfe->frame || !ispfe->ring || !ispfe->program)
+	if (!ispfe->frame || !ispfe->snapshot_frame || !ispfe->ring ||
+	    !ispfe->program)
 		return false;
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		if (!ispfe->pdma_output[i].cpu)
@@ -2075,6 +2093,7 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 
 	if (ispfe_buffers_ready(ispfe) && ispfe->frame_size == size) {
 		memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+		memset(ispfe->snapshot_frame, ISPFE_FRAME_POISON, size);
 		ispfe_pdma_outputs_reset(ispfe);
 		ret = ispfe_pdma_program_prepare(ispfe);
 		if (ret)
@@ -2090,6 +2109,11 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	if (!ispfe->frame)
 		return -ENOMEM;
 	ispfe->frame_size = size;
+	ispfe->snapshot_frame = kvmalloc(size, GFP_KERNEL);
+	if (!ispfe->snapshot_frame) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
 
 	ispfe->ring = dma_alloc_coherent(ispfe->dev, PAGE_SIZE,
 					 &ispfe->ring_dma, GFP_KERNEL);
@@ -2119,6 +2143,7 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	 * distinguishable from one that arrived black.
 	 */
 	memset(ispfe->frame, ISPFE_FRAME_POISON, size);
+	memset(ispfe->snapshot_frame, ISPFE_FRAME_POISON, size);
 	ispfe_pdma_outputs_reset(ispfe);
 	ret = ispfe_pdma_program_prepare(ispfe);
 	if (ret) {
@@ -2241,6 +2266,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	atomic_set(&ispfe->pdma_events, 0);
 	WRITE_ONCE(ispfe->freeze_armed, false);
 	WRITE_ONCE(ispfe->frame_frozen, false);
+	WRITE_ONCE(ispfe->snapshot_raced, false);
+	WRITE_ONCE(ispfe->snapshot_copy_us, 0);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
@@ -2302,6 +2329,7 @@ err_put:
 static void ispfe_stop(struct ispfe_device *ispfe)
 {
 	WRITE_ONCE(ispfe->freeze_armed, false);
+	cancel_work_sync(&ispfe->snapshot_work);
 	ispfe_fc_stop(ispfe);
 	ispfe_phy_link_stop(ispfe);
 	ispfe_pdma_stop(ispfe);
@@ -2343,8 +2371,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 
 /*
  * Writing one arms a one-shot handoff. Reading returns one only after the
- * Bayer0 WDMA reported completion and its IRQ gated further writes to the
-	 * Bayer buffer.
+ * line-memory pipeline reported EOF and the worker copied the Bayer buffer.
  */
 static int ispfe_snapshot_set(void *data, u64 val)
 {
@@ -2606,6 +2633,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
 	seq_printf(s, "snapshot_armed %u\n", READ_ONCE(ispfe->freeze_armed));
 	seq_printf(s, "frame_frozen %u\n", READ_ONCE(ispfe->frame_frozen));
+	seq_printf(s, "snapshot_copy_us %u\n",
+		   READ_ONCE(ispfe->snapshot_copy_us));
+	seq_printf(s, "snapshot_raced %u\n",
+		   READ_ONCE(ispfe->snapshot_raced));
 	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	if (!regmap_read(ispfe->pmu, ispfe->pmu_iso_offset, &isolation))
@@ -2687,10 +2718,12 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
 
 	guard(mutex)(&ispfe->lock);
 
-	if (!ispfe->frame)
+	if (!ispfe->frame || !ispfe->snapshot_frame)
 		return -ENODATA;
 
-	return simple_read_from_buffer(buf, count, ppos, ispfe->frame,
+	return simple_read_from_buffer(buf, count, ppos,
+				       smp_load_acquire(&ispfe->frame_frozen) ?
+				       ispfe->snapshot_frame : ispfe->frame,
 				       ispfe->frame_size);
 }
 
@@ -2783,6 +2816,7 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->pdma_cmd = PDMA_DESC_CMD;
 	ispfe->pdma_bytes = PDMA_DESC_BYTES;
 	ispfe->pdma_bytes_first = PDMA_DESC_BYTES_FIRST;
+	INIT_WORK(&ispfe->snapshot_work, ispfe_snapshot_work);
 	platform_set_drvdata(pdev, ispfe);
 
 	ret = devm_mutex_init(dev, &ispfe->lock);

@@ -118,6 +118,14 @@
 #define IMX712_PIXEL_RATE		499712000LL
 
 /*
+ * The binned mode's PLL, from the same arithmetic: pre_pll_clk_div and
+ * vt_sys_clk_div do not move, so only pll_multiplier does, 122 -> 103.
+ * 24.576 / 3 * 103 / 2 = 421.888 MHz, and 2932 * 2398 / 421888000 = 16.67 ms,
+ * so the 2x2 mode runs at 60 fps where the full array runs at 29.4.
+ */
+#define IMX712_PIXEL_RATE_BINNED	421888000LL
+
+/*
  * The output PLL: op_pre_pll_clk_div 3, op_pll_multiplier 135 and
  * op_sys_clk_div 1 give 1105.92 MHz, so 552.96 MHz on the clock lane and
  * 1.10592 Gbps on each of the four data lanes.
@@ -131,6 +139,12 @@
  * arithmetic above rather than from either of them.
  */
 #define IMX712_LINK_FREQ		552960000LL
+
+/*
+ * And the binned mode's output PLL: op_pre_pll_clk_div 3 and op_sys_clk_div 1
+ * are unchanged, op_pll_multiplier is 135 -> 102, so 24.576 / 3 * 102 / 2.
+ */
+#define IMX712_LINK_FREQ_BINNED		417792000LL
 #define IMX712_DATA_LANES		4
 
 #define IMX712_NATIVE_WIDTH		4208U
@@ -150,6 +164,9 @@ struct imx712_mode {
 	u32 llp;
 	/* frame_length_lines the vendor applies with its exposure group. */
 	u32 fll_def;
+	/* Both PLLs move with the mode, so neither is a device constant. */
+	s64 pixel_rate;
+	u8 link_freq_index;
 	u32 code;
 	const struct cci_reg_sequence *regs;
 	unsigned int num_regs;
@@ -181,6 +198,8 @@ struct imx712 {
 	struct v4l2_ctrl *dgain;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *link_freq;
 
 	const struct imx712_mode *mode;
 	struct imx712_limits limits;
@@ -262,20 +281,115 @@ static const struct cci_reg_sequence imx712_mode_4208x3120[] = {
 	{ CCI_REG8(0x3123), 0x77 }, { CCI_REG8(0x3120), 0x00 }, { CCI_REG8(0x3121), 0x0f },
 };
 
+/*
+ * The 2x2 binned mode, 2104x1560 at 60 fps, from the same sensor driven at the
+ * other size Camera2 offers it as RAW.  It is a bin of the whole array rather
+ * than a crop -- 0x0344..0x034b is unchanged -- so it frames the same scene at
+ * a quarter of the pixels, which is what makes it the preview mode.
+ *
+ * Transcribed the same way and in the same order as the full mode, because the
+ * ordering is load-bearing: 0x484c..0x484f and 0x4850..0x4853 are each written
+ * twice with different values, and it is the second write of each that carries
+ * the mode.  Twenty-seven of the 126 differ from the full list.
+ */
+static const struct cci_reg_sequence imx712_mode_2104x1560[] = {
+	{ CCI_REG8(0x0136), 0x18 }, { CCI_REG8(0x0137), 0x93 },
+	{ CCI_REG8(0x3040), 0x01 }, { CCI_REG8(0x3041), 0x01 },
+	{ CCI_REG8(0x0101), 0x00 }, { CCI_REG8(0x300b), 0x00 },
+	{ CCI_REG8(0x4350), 0x3c }, { CCI_REG8(0x4516), 0x3e },
+	{ CCI_REG8(0x4518), 0x56 }, { CCI_REG8(0x451a), 0x02 },
+	{ CCI_REG8(0x451b), 0xdb }, { CCI_REG8(0x4527), 0x00 },
+	{ CCI_REG8(0x4528), 0xff }, { CCI_REG8(0x45be), 0x4b },
+	{ CCI_REG8(0x45bf), 0xcc }, { CCI_REG8(0x45c6), 0x4b },
+	{ CCI_REG8(0x45c7), 0xcc }, { CCI_REG8(0x4702), 0x0a },
+	{ CCI_REG8(0x4828), 0x08 }, { CCI_REG8(0x484c), 0x2b },
+	{ CCI_REG8(0x484d), 0x2b }, { CCI_REG8(0x484e), 0x2b },
+	{ CCI_REG8(0x484f), 0x2b }, { CCI_REG8(0x4850), 0x20 },
+	{ CCI_REG8(0x4851), 0x20 }, { CCI_REG8(0x4852), 0x20 },
+	{ CCI_REG8(0x4853), 0x20 }, { CCI_REG8(0x4856), 0x05 },
+	{ CCI_REG8(0x4857), 0x05 }, { CCI_REG8(0x4858), 0x05 },
+	{ CCI_REG8(0x4859), 0x05 }, { CCI_REG8(0x485a), 0x04 },
+	{ CCI_REG8(0x485b), 0x04 }, { CCI_REG8(0x485c), 0x04 },
+	{ CCI_REG8(0x485d), 0x04 }, { CCI_REG8(0x4879), 0x00 },
+	{ CCI_REG8(0x4899), 0x0a }, { CCI_REG8(0x48a9), 0x2e },
+	{ CCI_REG8(0x6a10), 0x0a }, { CCI_REG8(0x70b0), 0x00 },
+	{ CCI_REG8(0x70a8), 0xff }, { CCI_REG8(0x4012), 0x00 },
+	{ CCI_REG8(0x4013), 0xdf }, { CCI_REG8(0x7088), 0x00 },
+	{ CCI_REG8(0x4108), 0x01 }, { CCI_REG8(0x4109), 0x07 },
+	{ CCI_REG8(0x0106), 0x01 }, { CCI_REG8(0x0112), 0x0a },
+	{ CCI_REG8(0x0113), 0x0a }, { CCI_REG8(0x0114), 0x03 },
+	{ CCI_REG8(0x0342), 0x0b }, { CCI_REG8(0x0343), 0x74 },
+	{ CCI_REG8(0x0340), 0x09 }, { CCI_REG8(0x0341), 0x5e },
+	{ CCI_REG8(0x0344), 0x00 }, { CCI_REG8(0x0345), 0x00 },
+	{ CCI_REG8(0x0346), 0x00 }, { CCI_REG8(0x0347), 0x00 },
+	{ CCI_REG8(0x0348), 0x10 }, { CCI_REG8(0x0349), 0x6f },
+	{ CCI_REG8(0x034a), 0x0c }, { CCI_REG8(0x034b), 0x2f },
+	{ CCI_REG8(0x0900), 0x01 }, { CCI_REG8(0x0901), 0x22 },
+	{ CCI_REG8(0x0902), 0x00 }, { CCI_REG8(0x3130), 0x01 },
+	{ CCI_REG8(0x034c), 0x08 }, { CCI_REG8(0x034d), 0x38 },
+	{ CCI_REG8(0x034e), 0x06 }, { CCI_REG8(0x034f), 0x18 },
+	{ CCI_REG8(0x0301), 0x04 }, { CCI_REG8(0x0303), 0x02 },
+	{ CCI_REG8(0x0305), 0x03 }, { CCI_REG8(0x0306), 0x00 },
+	{ CCI_REG8(0x0307), 0x67 }, { CCI_REG8(0x030b), 0x01 },
+	{ CCI_REG8(0x030d), 0x03 }, { CCI_REG8(0x030e), 0x00 },
+	{ CCI_REG8(0x030f), 0x66 }, { CCI_REG8(0x0700), 0x00 },
+	{ CCI_REG8(0x0701), 0x30 }, { CCI_REG8(0x0820), 0x0d },
+	{ CCI_REG8(0x0821), 0x0e }, { CCI_REG8(0x3100), 0x05 },
+	{ CCI_REG8(0x7013), 0x01 }, { CCI_REG8(0x0202), 0x09 },
+	{ CCI_REG8(0x0203), 0x54 }, { CCI_REG8(0x0204), 0x00 },
+	{ CCI_REG8(0x0205), 0x00 }, { CCI_REG8(0x020e), 0x01 },
+	{ CCI_REG8(0x020f), 0x00 }, { CCI_REG8(0x0b06), 0x01 },
+	{ CCI_REG8(0x484c), 0x2b }, { CCI_REG8(0x484d), 0x2b },
+	{ CCI_REG8(0x484e), 0x2b }, { CCI_REG8(0x484f), 0x2b },
+	{ CCI_REG8(0x4850), 0x4d }, { CCI_REG8(0x4851), 0x4d },
+	{ CCI_REG8(0x4852), 0x4d }, { CCI_REG8(0x4853), 0x4d },
+	{ CCI_REG8(0x500c), 0x00 }, { CCI_REG8(0x500d), 0x00 },
+	{ CCI_REG8(0x500e), 0x00 }, { CCI_REG8(0x500f), 0x01 },
+	{ CCI_REG8(0x0808), 0x02 }, { CCI_REG8(0x080a), 0x00 },
+	{ CCI_REG8(0x080b), 0x87 }, { CCI_REG8(0x080c), 0x00 },
+	{ CCI_REG8(0x080d), 0x47 }, { CCI_REG8(0x080e), 0x00 },
+	{ CCI_REG8(0x080f), 0x87 }, { CCI_REG8(0x0810), 0x00 },
+	{ CCI_REG8(0x0811), 0x47 }, { CCI_REG8(0x0812), 0x00 },
+	{ CCI_REG8(0x0813), 0x47 }, { CCI_REG8(0x0814), 0x00 },
+	{ CCI_REG8(0x0815), 0x47 }, { CCI_REG8(0x0816), 0x01 },
+	{ CCI_REG8(0x0817), 0x27 }, { CCI_REG8(0x0818), 0x00 },
+	{ CCI_REG8(0x0819), 0x3f }, { CCI_REG8(0x0820), 0x47 },
+	{ CCI_REG8(0x3122), 0x00 }, { CCI_REG8(0x3123), 0x77 },
+	{ CCI_REG8(0x3120), 0x00 }, { CCI_REG8(0x3121), 0x0f },
+};
+
 static const struct imx712_mode imx712_modes[] = {
 	{
 		.width = IMX712_NATIVE_WIDTH,
 		.height = IMX712_NATIVE_HEIGHT,
 		.llp = 5192,
 		.fll_def = 3269,
+		.pixel_rate = IMX712_PIXEL_RATE,
+		.link_freq_index = 0,
 		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.regs = imx712_mode_4208x3120,
 		.num_regs = ARRAY_SIZE(imx712_mode_4208x3120),
+	},
+	{
+		.width = IMX712_NATIVE_WIDTH / 2,
+		.height = IMX712_NATIVE_HEIGHT / 2,
+		.llp = 2932,
+		.fll_def = 2398,
+		.pixel_rate = IMX712_PIXEL_RATE_BINNED,
+		.link_freq_index = 1,
+		/*
+		 * A 2x2 bin of an RGGB mosaic is still RGGB: it averages each
+		 * colour with its own kind, so the phase does not move.
+		 */
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.regs = imx712_mode_2104x1560,
+		.num_regs = ARRAY_SIZE(imx712_mode_2104x1560),
 	},
 };
 
 static const s64 imx712_link_freq[] = {
 	IMX712_LINK_FREQ,
+	IMX712_LINK_FREQ_BINNED,
 };
 
 /* ---- register helpers --------------------------------------------------- */
@@ -306,20 +420,28 @@ static int imx712_write_held(struct imx712 *sensor, u32 reg, u64 val)
  * The whole per-frame set, in the order and the single hold the recording puts
  * it in, so that the values a stream starts with land on one frame boundary
  * exactly as they were captured.
+ *
+ * The control values are read straight out of the handler rather than through
+ * v4l2_ctrl_g_ctrl(): this runs from enable_streams, which already holds the
+ * subdev state lock, and that is the control handler's lock too, so the
+ * locking accessor deadlocks the caller against itself.  That is a hung task
+ * rather than an error return, so the assertion below is worth its line.
  */
 static int imx712_apply_frame_group(struct imx712 *sensor)
 {
 	int ret = 0, release;
 
+	lockdep_assert_held(sensor->hdl.lock);
+
 	cci_write(sensor->regmap, IMX712_GROUPED_HOLD, 1, &ret);
 	cci_write(sensor->regmap, IMX712_DIGITAL_GAIN,
-		  v4l2_ctrl_g_ctrl(sensor->dgain), &ret);
+		  sensor->dgain->cur.val, &ret);
 	cci_write(sensor->regmap, IMX712_ANALOGUE_GAIN,
-		  v4l2_ctrl_g_ctrl(sensor->again), &ret);
+		  sensor->again->cur.val, &ret);
 	cci_write(sensor->regmap, IMX712_EXPOSURE,
-		  v4l2_ctrl_g_ctrl(sensor->exposure), &ret);
+		  sensor->exposure->cur.val, &ret);
 	cci_write(sensor->regmap, IMX712_FRAME_LENGTH,
-		  sensor->mode->height + v4l2_ctrl_g_ctrl(sensor->vblank),
+		  sensor->mode->height + sensor->vblank->cur.val,
 		  &ret);
 	cci_write(sensor->regmap, IMX712_UNDECODED_3004, 0, &ret);
 	release = cci_write(sensor->regmap, IMX712_GROUPED_HOLD, 0, NULL);
@@ -492,7 +614,6 @@ static int imx712_init_controls(struct imx712 *sensor)
 	struct v4l2_ctrl_handler *hdl = &sensor->hdl;
 	struct v4l2_fwnode_device_properties props;
 	u32 hblank, vblank, exposure_max;
-	struct v4l2_ctrl *ctrl;
 	int ret;
 
 	ret = v4l2_fwnode_device_parse(dev, &props);
@@ -501,21 +622,30 @@ static int imx712_init_controls(struct imx712 *sensor)
 
 	v4l2_ctrl_handler_init(hdl, 10);
 
-	ctrl = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE,
-				 IMX712_PIXEL_RATE, IMX712_PIXEL_RATE, 1,
-				 IMX712_PIXEL_RATE);
-	if (ctrl)
-		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	/*
+	 * Read-only but not constant: both PLLs are inside the mode lists, so
+	 * a format change moves them.  The range is widened to whichever mode
+	 * is selected rather than left at the first one's value.
+	 */
+	sensor->pixel_rate = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE,
+					       mode->pixel_rate,
+					       mode->pixel_rate, 1,
+					       mode->pixel_rate);
+	if (sensor->pixel_rate)
+		sensor->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
-	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ,
-				      ARRAY_SIZE(imx712_link_freq) - 1, 0,
-				      imx712_link_freq);
-	if (ctrl)
-		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sensor->link_freq = v4l2_ctrl_new_int_menu(hdl, NULL,
+						   V4L2_CID_LINK_FREQ,
+						   ARRAY_SIZE(imx712_link_freq) - 1,
+						   mode->link_freq_index,
+						   imx712_link_freq);
+	if (sensor->link_freq)
+		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/*
 	 * Read-only, because line_length_pck is one of the registers inside the
-	 * transcribed mode list and no capture ever changes it.
+	 * transcribed mode list and no control changes it -- but it differs
+	 * between the modes, so it is re-ranged when one is selected.
 	 */
 	hblank = mode->llp - mode->width;
 	sensor->hblank = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_HBLANK, hblank,
@@ -725,8 +855,45 @@ static int imx712_set_format(struct v4l2_subdev *sd,
 		.height = mode->height,
 	};
 
-	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && mode != sensor->mode) {
+		const struct imx712_limits *lim = &sensor->limits;
+		u32 hblank = mode->llp - mode->width;
+		u32 vblank = mode->fll_def - mode->height;
+		u32 exposure_max = mode->fll_def - lim->exposure_margin;
+		int ret;
+
 		sensor->mode = mode;
+
+		/*
+		 * VBLANK first: its handler re-ranges the exposure against the
+		 * frame length, so setting exposure before it would be undone.
+		 */
+		ret = __v4l2_ctrl_modify_range(sensor->vblank, vblank,
+					       IMX712_FRAME_LENGTH_MAX -
+					       mode->height, 1, vblank);
+		if (!ret)
+			ret = __v4l2_ctrl_s_ctrl(sensor->vblank, vblank);
+		if (!ret)
+			ret = __v4l2_ctrl_modify_range(sensor->hblank, hblank,
+						       hblank, 1, hblank);
+		if (!ret)
+			ret = __v4l2_ctrl_modify_range(sensor->exposure,
+						       lim->exposure_min,
+						       exposure_max, 1,
+						       imx712_snap(IMX712_EXPOSURE_DEFAULT,
+								   lim->exposure_min,
+								   exposure_max, 1));
+		if (!ret)
+			ret = __v4l2_ctrl_modify_range(sensor->pixel_rate,
+						       mode->pixel_rate,
+						       mode->pixel_rate, 1,
+						       mode->pixel_rate);
+		if (!ret)
+			ret = __v4l2_ctrl_s_ctrl(sensor->link_freq,
+						 mode->link_freq_index);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1041,6 +1208,13 @@ static int imx712_probe(struct i2c_client *client)
 	ret = imx712_init_controls(sensor);
 	if (ret)
 		goto err_entity;
+
+	/*
+	 * Share one lock between the subdev state and the control handler, so
+	 * that set_format -- which holds the state lock -- may use the __-
+	 * prefixed control helpers to re-range the per-mode controls.
+	 */
+	sensor->sd.state_lock = sensor->hdl.lock;
 
 	ret = v4l2_subdev_init_finalize(&sensor->sd);
 	if (ret)

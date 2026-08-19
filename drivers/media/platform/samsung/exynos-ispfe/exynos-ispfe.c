@@ -412,15 +412,19 @@ struct ispfe_pdma_desc {
 	(PDMA_SIZE_VAL / sizeof(struct ispfe_pdma_desc))
 
 /*
- * The program the driver encodes, followed by the blocks its indirect bursts
- * stream into the front end. Each of those starts on a page boundary, as it did
- * in the vendor session.
+ * PDMA applies one program per frame boundary, so a stream that puts each frame
+ * in a different buffer needs one program per frame in flight rather than one
+ * shared program to be rewritten underneath the hardware. Slots are page-
+ * aligned, as the vendor's rotating program buffers were.
  */
-#define PDMA_PROGRAM_AREA_SIZE		0x0000e000
+#define PDMA_SLOTS			4
+#define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_RECIPE_BYTES, PAGE_SIZE)
+#define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 
-static_assert(ISPFE_PDMA_AREA_END <= PDMA_PROGRAM_AREA_SIZE);
-/* The encoder writes from offset 0 up, over the page the first block sits on. */
-static_assert(ISPFE_PDMA_RECIPE_BYTES <= ISPFE_PDMA_AREA_START);
+/*
+ * The blocks the indirect bursts stream in do not change between frames, so
+ * every slot's program points at the same shared area.
+ */
 
 struct ispfe_pdma_output {
 	size_t size;
@@ -696,12 +700,15 @@ struct ispfe_device {
 	size_t frame_size;
 	void *spare_frame;
 	dma_addr_t spare_frame_dma;
-	void *program;
-	dma_addr_t program_dma;
+	/* PDMA_SLOTS programs, and the block area every one of them shares. */
+	void *programs;
+	dma_addr_t programs_dma;
+	void *blocks;
+	dma_addr_t blocks_dma;
 	/*
-	 * Byte offsets into the encoded program of the frame destination's two
-	 * address halves, so the completed-frame handoff can retarget it
-	 * without searching the program for an address.
+	 * Byte offsets within a program of the frame destination's two address
+	 * halves, so a destination can be retargeted without searching the
+	 * program for an address.
 	 */
 	u32 bayer_lo;
 	u32 bayer_hi;
@@ -1460,17 +1467,22 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
 	}
 }
 
-/* What the recipe's buffer names resolve to for this driver's allocations. */
-static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer)
+/*
+ * What the recipe's buffer names resolve to for this driver's allocations.  The
+ * frame destination is per program rather than per driver, because each program
+ * aims one frame at one buffer.
+ */
+static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
+				    dma_addr_t bayer)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
 
 	switch (ISPFE_BUF_TO_KIND(buffer)) {
 	case ISPFE_BUF_KIND_BAYER:
-		return ispfe->frame_dma;
+		return bayer;
 	case ISPFE_BUF_KIND_INPUT:
 		if (index < ARRAY_SIZE(ispfe_pdma_inputs))
-			return ispfe->program_dma +
+			return ispfe->blocks_dma +
 			       ispfe_pdma_inputs[index].area_offset;
 		break;
 	case ISPFE_BUF_KIND_OUTPUT:
@@ -1524,14 +1536,18 @@ static size_t ispfe_pdma_recipe_bytes(void)
  * Sizes are checked before anything is written, so the writes below are known
  * to stay inside the program area.
  */
-static int ispfe_pdma_encode(struct ispfe_device *ispfe)
+static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
+			     dma_addr_t bayer)
 {
 	const struct ispfe_pdma_reloc *reloc = ispfe_pdma_relocs;
 	const struct ispfe_pdma_reloc *last =
 		ispfe_pdma_relocs + ARRAY_SIZE(ispfe_pdma_relocs);
-	u8 *program = ispfe->program;
+	u8 *program = ispfe->programs + slot * PDMA_SLOT_STRIDE;
 	unsigned int i;
 	size_t at = 0;
+
+	if (slot >= PDMA_SLOTS)
+		return -EINVAL;
 
 	if (ispfe_pdma_recipe_bytes() != ISPFE_PDMA_RECIPE_BYTES) {
 		dev_err(ispfe->dev, "PDMA recipe does not serialise to %#x bytes\n",
@@ -1553,7 +1569,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe)
 			at += PDMA_CMD_SELECT_BLOCK_SIZE;
 			continue;
 		case ISPFE_PDMA_INDIRECT_BURST:
-			dma = ispfe_pdma_buffer(ispfe, cmd->buffer);
+			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			/*
@@ -1592,7 +1608,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe)
 		for (; reloc < last && reloc->cmd == i; reloc++) {
 			if (reloc->lo + 4 > cmd->len || reloc->hi + 4 > cmd->len)
 				return -EINVAL;
-			dma = ispfe_pdma_buffer(ispfe, reloc->buffer);
+			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma),
@@ -1620,11 +1636,17 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe)
 	return 0;
 }
 
+/*
+ * Stage the shared blocks and encode one program per slot.  Every slot starts
+ * out aimed at the primary frame buffer; a queue retargets them per buffer.
+ */
 static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 {
 	unsigned int i;
+	int ret;
 
-	if (upper_32_bits(ispfe->program_dma + PDMA_PROGRAM_AREA_SIZE - 1) ||
+	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_BLOCKS_BYTES - 1) ||
+	    upper_32_bits(ispfe->programs_dma + PDMA_PROGRAMS_SIZE - 1) ||
 	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1) ||
 	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1))
 		return -ERANGE;
@@ -1634,18 +1656,24 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 				  ispfe_pdma_outputs[i].size - 1))
 			return -ERANGE;
 
-	memset(ispfe->program, 0, PDMA_PROGRAM_AREA_SIZE);
-
+	memset(ispfe->blocks, 0, ISPFE_PDMA_BLOCKS_BYTES);
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_inputs); i++) {
 		const struct ispfe_pdma_input *input = &ispfe_pdma_inputs[i];
 
-		if (input->area_offset + input->size > PDMA_PROGRAM_AREA_SIZE)
+		if (input->area_offset + input->size > ISPFE_PDMA_BLOCKS_BYTES)
 			return -EOVERFLOW;
-		memcpy((u8 *)ispfe->program + input->area_offset,
+		memcpy((u8 *)ispfe->blocks + input->area_offset,
 		       input->data, input->size);
 	}
 
-	return ispfe_pdma_encode(ispfe);
+	memset(ispfe->programs, 0, PDMA_PROGRAMS_SIZE);
+	for (i = 0; i < PDMA_SLOTS; i++) {
+		ret = ispfe_pdma_encode(ispfe, i, ispfe->frame_dma);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 /*
@@ -1674,9 +1702,9 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 		u32 addr = READ_ONCE(ispfe->pdma_addr);
 
 		ispfe->ring[i].addr_lo = cpu_to_le32(
-			addr ? addr : lower_32_bits(ispfe->program_dma));
+			addr ? addr : lower_32_bits(ispfe->programs_dma));
 		ispfe->ring[i].addr_hi = cpu_to_le32(
-			addr ? 0 : upper_32_bits(ispfe->program_dma));
+			addr ? 0 : upper_32_bits(ispfe->programs_dma));
 		/* Keep the separate first-record control for parser experiments. */
 		ispfe->ring[i].bytes =
 			cpu_to_le32(i ? READ_ONCE(ispfe->pdma_bytes)
@@ -1947,7 +1975,7 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 
 static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 {
-	u8 *program = ispfe->program;
+	u8 *program = ispfe->programs;
 
 	/*
 	 * A head credit makes PDMA fetch this program immediately. The credit
@@ -2130,12 +2158,17 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 				  ispfe->pdma_output[i].dma);
 		ispfe->pdma_output[i].cpu = NULL;
 	}
-	if (ispfe->program) {
-		dma_free_coherent(ispfe->dev, PDMA_PROGRAM_AREA_SIZE,
-				  ispfe->program, ispfe->program_dma);
-		ispfe->program = NULL;
+	if (ispfe->programs) {
+		dma_free_coherent(ispfe->dev, PDMA_PROGRAMS_SIZE,
+				  ispfe->programs, ispfe->programs_dma);
+		ispfe->programs = NULL;
 		ispfe->bayer_lo = 0;
 		ispfe->bayer_hi = 0;
+	}
+	if (ispfe->blocks) {
+		dma_free_coherent(ispfe->dev, ISPFE_PDMA_BLOCKS_BYTES,
+				  ispfe->blocks, ispfe->blocks_dma);
+		ispfe->blocks = NULL;
 	}
 	if (ispfe->ring) {
 		dma_free_coherent(ispfe->dev, PAGE_SIZE, ispfe->ring,
@@ -2176,7 +2209,7 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 	unsigned int i;
 
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
-	    !ispfe->program)
+	    !ispfe->programs || !ispfe->blocks)
 		return false;
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		if (!ispfe->pdma_output[i].cpu)
@@ -2233,10 +2266,15 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
-	ispfe->program = dma_alloc_coherent(ispfe->dev,
-					    PDMA_PROGRAM_AREA_SIZE,
-					    &ispfe->program_dma, GFP_KERNEL);
-	if (!ispfe->program) {
+	ispfe->blocks = dma_alloc_coherent(ispfe->dev, ISPFE_PDMA_BLOCKS_BYTES,
+					   &ispfe->blocks_dma, GFP_KERNEL);
+	if (!ispfe->blocks) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
+	ispfe->programs = dma_alloc_coherent(ispfe->dev, PDMA_PROGRAMS_SIZE,
+					     &ispfe->programs_dma, GFP_KERNEL);
+	if (!ispfe->programs) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
@@ -2796,7 +2834,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
 	seq_printf(s, "spare_iova   %pad\n", &ispfe->spare_frame_dma);
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);
-	seq_printf(s, "program_iova %pad\n", &ispfe->program_dma);
+	seq_printf(s, "program_iova %pad  %u slots of %#x\n",
+		   &ispfe->programs_dma, PDMA_SLOTS, PDMA_SLOT_STRIDE);
+	seq_printf(s, "blocks_iova  %pad\n", &ispfe->blocks_dma);
 	seq_printf(s, "program_size %u\n", ISPFE_PDMA_RECIPE_BYTES);
 	seq_printf(s, "bayer_reloc  %#x/%#x\n", ispfe->bayer_lo,
 		   ispfe->bayer_hi);
@@ -2886,10 +2926,11 @@ static ssize_t ispfe_program_read(struct file *file, char __user *buf,
 
 	guard(mutex)(&ispfe->lock);
 
-	if (!ispfe->program)
+	if (!ispfe->programs)
 		return -ENODATA;
 
-	return simple_read_from_buffer(buf, count, ppos, ispfe->program,
+	/* Slot 0, which is the one the diagnostic's ring records point at. */
+	return simple_read_from_buffer(buf, count, ppos, ispfe->programs,
 				       ISPFE_PDMA_RECIPE_BYTES);
 }
 

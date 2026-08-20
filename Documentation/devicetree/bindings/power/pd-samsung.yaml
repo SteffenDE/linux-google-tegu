@@ -18,7 +18,10 @@ allOf:
   - if:
       properties:
         compatible:
-          const: google,zumapro-pd
+          enum:
+            - google,zumapro-pd
+            - google,zumapro-rgbp-pd
+            - google,zumapro-yuvp-pd
     then:
       properties:
         reg-names:
@@ -30,23 +33,62 @@ allOf:
         reg-names: false
         samsung,always-on: false
         samsung,secure-pd-id: false
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-rgbp-pd
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 5
+        reg-names:
+          minItems: 5
+          maxItems: 5
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-yuvp-pd
+    then:
+      properties:
+        reg:
+          minItems: 4
+          maxItems: 4
+        reg-names:
+          minItems: 4
+          maxItems: 4
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-pd
+    then:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
 
 properties:
   compatible:
     enum:
       - google,zumapro-pd
+      - google,zumapro-rgbp-pd
+      - google,zumapro-yuvp-pd
       - samsung,exynos4210-pd
       - samsung,exynos5433-pd
 
   reg:
     minItems: 1
-    maxItems: 2
+    maxItems: 5
 
   reg-names:
     minItems: 1
     items:
       - const: pmu
       - const: cmu
+      - const: bus
+      - const: s2mpu0
+      - const: s2mpu1
 
   clocks:
     deprecated: true

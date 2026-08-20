@@ -199,9 +199,9 @@
  * on a reconfiguration, 19 times across one session.  Nothing else in the
  * front end is touched until it clears, and START is always at least 10 ms
  * later.  This driver used to continue microseconds afterwards, issuing the
- * LMP_CTRL transitions, the PDMA wrap resets, the allocator init and the START
- * pulse into a block that was still initialising -- which register contents
- * survive, so every readback still matched, and pulses do not.
+ * LMP_CTRL transitions, the PDMA wrap resets, the FC LMP-IDMA init and the
+ * START pulse into a block that was still initialising -- which register
+ * contents survive, so every readback still matched, and pulses do not.
  * research/data/camera-session-2026-08-17/isp-fe-stream-configure.txt:2.
  */
 #define FC_INIT_BUSY			0x2003c
@@ -342,30 +342,32 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX_MSK_RUN		0x000007fc
 
 /*
- * A pair of blocks with a slot per stream, eight bytes each from +0x30, both
- * written with the same values, and a control word at +0x08 that changes with
- * the sensor: 0x6c for the main camera, 0x1a for either IMX712, 0x2 with
- * nothing streaming.  It reads like an allocator for a shared resource and it
- * is not decoded; these are the values measured for one IMX712 alone.
+ * Two frame-controller LMP-IDMA AXI common banks.  Lyric's register
+ * descriptors name the first four words and the per-context threshold pairs;
+ * the capture writes the same thresholds to both banks.  The threshold entry
+ * is selected by the frame-controller context itself, not by an independent
+ * allocator slot.
  */
-#define LMP_ALLOC_A			0x30c00
-#define LMP_ALLOC_B			0x30d00
-#define LMP_ALLOC_INIT0			0x00
-#define LMP_ALLOC_INIT1			0x04
-#define LMP_ALLOC_INIT2			0x0c
-#define LMP_ALLOC_CTRL			0x08
-#define LMP_ALLOC_CTRL_IMX712		0x0000001a
-#define LMP_ALLOC_CTRL_B		0x00000002
-/* What the allocator words read with nothing streaming, and what stop writes. */
-#define LMP_ALLOC_CTRL_IDLE		0x00000002
-#define LMP_ALLOC_SLOT(s)		(0x30 + (s) * 8)
-#define LMP_ALLOC_NUM_SLOTS		((LMP_ALLOC_B - LMP_ALLOC_A - 0x30) / 8)
-#define LMP_ALLOC_SLOT_VAL0		0x00000040
-#define LMP_ALLOC_SLOT_VAL1		0x00000020
-#define LMP_ALLOC_GATE			0x30f00
-#define LMP_ALLOC_GATE_VAL		0x00000001
-#define LMP_ALLOC_MODE			0x30100
-#define LMP_ALLOC_MODE_VAL		0x00000053
+#define FC_LMP_IDMA0			0x30c00
+#define FC_LMP_IDMA1			0x30d00
+#define FC_LMP_IDMA_MAX_BURST		0x00
+#define FC_LMP_IDMA_AXI_REORDER_EN	0x04
+#define FC_LMP_IDMA_AXI_MAX_OST		0x08
+#define FC_LMP_IDMA_AXCACHE		0x0c
+#define FC_LMP_IDMA_MAX_BURST_VAL	0x00000001
+#define FC_LMP_IDMA_AXI_REORDER_EN_VAL	0x00000001
+#define FC_LMP_IDMA_AXCACHE_VAL		0x00000000
+#define FC_LMP_IDMA_AXI_MAX_OST_IMX712	0x0000001a
+#define FC_LMP_IDMA1_AXI_MAX_OST_VAL	0x00000002
+/* What both max-outstanding words read idle, and what stop writes. */
+#define FC_LMP_IDMA_AXI_MAX_OST_IDLE	0x00000002
+#define FC_LMP_IDMA_AXI_THRE(ctx)	(0x20 + (ctx) * 8)
+#define FC_LMP_IDMA_AXI_THRE_HIGH_VAL	0x00000040
+#define FC_LMP_IDMA_AXI_THRE_LOW_VAL	0x00000020
+#define FC_CFG_BUS_CTRL			0x30f00
+#define FC_CFG_BUS_CTRL_VAL		0x00000001
+#define FC_LMCS_COMN			0x30100
+#define FC_LMCS_COMN_VAL		0x00000053
 
 /*
  * PDMA: five contexts of a small DRAM control ring.  Each ring record points at
@@ -614,8 +616,7 @@ struct ispfe_pdma_program {
 	bool fixed_resources;
 	u8 required_loch;
 	u8 required_fcctx;
-	u8 required_slot;
-	u32 required_lmp_alloc_ctrl;
+	u32 required_fc_axi_max_ost;
 };
 
 static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
@@ -660,8 +661,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.fixed_resources = true,
 		.required_loch = 0,
 		.required_fcctx = 3,
-		.required_slot = 1,
-		.required_lmp_alloc_ctrl = 0x1a,
+		.required_fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712,
 	},
 };
 
@@ -832,15 +832,13 @@ struct ispfe_source {
 	bool cphy;
 
 	/*
-	 * Which of the receiver's own resources the stream is put on.  A frame
-	 * controller context and a PDMA context of the same index went
-	 * together in every session captured, so they are one control; the
-	 * line-memory instance is separate because the vendor stack allocates
-	 * it independently, and the slot is separate again.
+	 * Which of the receiver's own resources the stream is put on.  The
+	 * logical channel also selects the PDMA context.  The frame-controller
+	 * context is independent, but directly selects its LMP-IDMA AXI threshold
+	 * pair; there is no third allocator-slot choice.
 	 */
 	u32 loch;
 	u32 fcctx;
-	u32 slot;
 
 	/* Not derived from anything: measured for one sensor mode. */
 	u32 mode_word0;
@@ -958,12 +956,13 @@ struct ispfe_device {
 	 */
 	u32 settle_us;
 	/*
-	 * The line-memory allocator's control word.  0x1a is what one IMX712
-	 * alone was measured writing; the ultrawide with a phase-detect stream
-	 * beside it wrote 0x88 and the main camera 0x6c, and nothing decodes
-	 * the value, so it is a knob rather than a constant.
+	 * The first FC LMP-IDMA bank's AXI max-outstanding word.  0x1a is what
+	 * one IMX712 alone was measured writing; the ultrawide with a
+	 * phase-detect stream beside it wrote 0x88 and the main camera 0x6c.
+	 * The register's purpose is known, but not how the value is packed, so
+	 * it remains a knob rather than a constant.
 	 */
-	u32 lmp_alloc_ctrl;
+	u32 fc_axi_max_ost;
 	/* Requested and stream-latched processed-output geometry experiment. */
 	u32 lmp_ml0_profile;
 	u32 active_lmp_ml0_profile;
@@ -1419,7 +1418,7 @@ static void ispfe_links_reset(struct ispfe_device *ispfe)
 	 * the busy bit reads 0x1 for the vendor one microsecond after these
 	 * same two writes and 0x0 a millisecond later, and reads 0x0
 	 * immediately for us -- so on this driver the poll returns at once and
-	 * the caller runs the LMP_CTRL transitions, the allocator, the PDMA
+	 * the caller runs the LMP_CTRL transitions, the FC LMP-IDMA setup, the PDMA
 	 * resets and the START pulse into a block that has had no settling
 	 * time at all.  Register contents survive that; pulses do not.  Sleep
 	 * the interval the vendor's own poll grants and leave the readback in
@@ -1877,10 +1876,10 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 }
 
 /*
- * Everything the front end wants before a stream: the frame controller, the
- * line-memory pool and its allocator, and PDMA's per-context enables.  Ordered
- * as the vendor stack does it, including the signature word at LMP_SIGNATURE,
- * which is not configuration.
+ * Everything the front end wants before a stream: the frame controller and
+ * its LMP-IDMA AXI state, plus PDMA's per-context enables.  Ordered as the
+ * vendor stack does it, including the signature word at LMP_SIGNATURE, which
+ * is not configuration.
  */
 static void ispfe_device_init(struct ispfe_device *ispfe)
 {
@@ -1933,14 +1932,20 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
 		writel_relaxed(0, lmp + 0x10);
 	}
 
-	writel_relaxed(LMP_ALLOC_GATE_VAL, core + LMP_ALLOC_GATE);
-	writel_relaxed(1, core + LMP_ALLOC_A + LMP_ALLOC_INIT0);
-	writel_relaxed(1, core + LMP_ALLOC_A + LMP_ALLOC_INIT1);
-	writel_relaxed(0, core + LMP_ALLOC_A + LMP_ALLOC_INIT2);
-	writel_relaxed(1, core + LMP_ALLOC_B + LMP_ALLOC_INIT0);
-	writel_relaxed(1, core + LMP_ALLOC_B + LMP_ALLOC_INIT1);
-	writel_relaxed(0, core + LMP_ALLOC_B + LMP_ALLOC_INIT2);
-	writel_relaxed(LMP_ALLOC_MODE_VAL, core + LMP_ALLOC_MODE);
+	writel_relaxed(FC_CFG_BUS_CTRL_VAL, core + FC_CFG_BUS_CTRL);
+	writel_relaxed(FC_LMP_IDMA_MAX_BURST_VAL,
+		       core + FC_LMP_IDMA0 + FC_LMP_IDMA_MAX_BURST);
+	writel_relaxed(FC_LMP_IDMA_AXI_REORDER_EN_VAL,
+		       core + FC_LMP_IDMA0 + FC_LMP_IDMA_AXI_REORDER_EN);
+	writel_relaxed(FC_LMP_IDMA_AXCACHE_VAL,
+		       core + FC_LMP_IDMA0 + FC_LMP_IDMA_AXCACHE);
+	writel_relaxed(FC_LMP_IDMA_MAX_BURST_VAL,
+		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_MAX_BURST);
+	writel_relaxed(FC_LMP_IDMA_AXI_REORDER_EN_VAL,
+		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_AXI_REORDER_EN);
+	writel_relaxed(FC_LMP_IDMA_AXCACHE_VAL,
+		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_AXCACHE);
+	writel_relaxed(FC_LMCS_COMN_VAL, core + FC_LMCS_COMN);
 
 	writel_relaxed(FC_INIT_MASK_VAL, core + FC_INIT_MASK);
 	writel_relaxed(FC_INIT_GO_VAL, core + FC_INIT_GO);
@@ -2772,23 +2777,26 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 	void __iomem *ctx = core + LOCH(ispfe->active.loch);
 	void __iomem *bind = core + FC_CTX_BIND(ispfe->active.fcctx);
 	void __iomem *bank = core + FC_CTX(ispfe->active.fcctx);
-	void __iomem *alloc = core + LMP_ALLOC_A;
+	void __iomem *idma0 = core + FC_LMP_IDMA0;
 	unsigned int i;
 
 	writel_relaxed(FC_CTX_CTRL_VAL, bank + FC_CTX_CTRL);
 	writel_relaxed(FC_CTX_MSK_ARM, bank + FC_CTX_MSK);
 
-	writel_relaxed(LMP_ALLOC_SLOT_VAL0,
-		       alloc + LMP_ALLOC_SLOT(ispfe->active.slot));
-	writel_relaxed(LMP_ALLOC_SLOT_VAL1,
-		       alloc + LMP_ALLOC_SLOT(ispfe->active.slot) + 4);
-	writel_relaxed(LMP_ALLOC_SLOT_VAL0,
-		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot));
-	writel_relaxed(LMP_ALLOC_SLOT_VAL1,
-		       core + LMP_ALLOC_B + LMP_ALLOC_SLOT(ispfe->active.slot) + 4);
-	writel_relaxed(READ_ONCE(ispfe->lmp_alloc_ctrl),
-		       alloc + LMP_ALLOC_CTRL);
-	writel_relaxed(LMP_ALLOC_CTRL_B, core + LMP_ALLOC_B + LMP_ALLOC_CTRL);
+	writel_relaxed(FC_LMP_IDMA_AXI_THRE_HIGH_VAL,
+		       idma0 + FC_LMP_IDMA_AXI_THRE(ispfe->active.fcctx));
+	writel_relaxed(FC_LMP_IDMA_AXI_THRE_LOW_VAL,
+		       idma0 + FC_LMP_IDMA_AXI_THRE(ispfe->active.fcctx) + 4);
+	writel_relaxed(FC_LMP_IDMA_AXI_THRE_HIGH_VAL,
+		       core + FC_LMP_IDMA1 +
+		       FC_LMP_IDMA_AXI_THRE(ispfe->active.fcctx));
+	writel_relaxed(FC_LMP_IDMA_AXI_THRE_LOW_VAL,
+		       core + FC_LMP_IDMA1 +
+		       FC_LMP_IDMA_AXI_THRE(ispfe->active.fcctx) + 4);
+	writel_relaxed(READ_ONCE(ispfe->fc_axi_max_ost),
+		       idma0 + FC_LMP_IDMA_AXI_MAX_OST);
+	writel_relaxed(FC_LMP_IDMA1_AXI_MAX_OST_VAL,
+		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_AXI_MAX_OST);
 
 	writel_relaxed(LMP_INT_MSK_VAL,
 		       core + LMP_INT(ispfe->active.fcctx) + LMP_INT_MSK);
@@ -2897,13 +2905,15 @@ static void ispfe_fc_stop(struct ispfe_device *ispfe)
 			  FC_CTX_CTRL);
 
 	/*
-	 * And the allocator back to what it reads with nothing streaming.
-	 * open.md still has "what the control word counts" open; this is not
-	 * an answer to that, only the value the vendor writes on the way out.
+	 * And both FC LMP-IDMA max-outstanding words back to what they read with
+	 * nothing streaming.  Their encoding remains unknown; this is only the
+	 * value the vendor writes on the way out.
 	 */
-	writel_relaxed(LMP_ALLOC_CTRL_IDLE, core + LMP_ALLOC_A + LMP_ALLOC_CTRL);
-	writel_relaxed(LMP_ALLOC_CTRL_IDLE, core + LMP_ALLOC_B + LMP_ALLOC_CTRL);
-	writel_relaxed(0, core + LMP_ALLOC_GATE);
+	writel_relaxed(FC_LMP_IDMA_AXI_MAX_OST_IDLE,
+		       core + FC_LMP_IDMA0 + FC_LMP_IDMA_AXI_MAX_OST);
+	writel_relaxed(FC_LMP_IDMA_AXI_MAX_OST_IDLE,
+		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_AXI_MAX_OST);
+	writel_relaxed(0, core + FC_CFG_BUS_CTRL);
 }
 
 /*
@@ -3521,7 +3531,6 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	    ispfe->src.lanes > ispfe_phy_lanes(ispfe->src.phy) ||
 	    ispfe->src.loch >= LOCH_COUNT ||
 	    ispfe->src.fcctx >= FC_NUM_CTX ||
-	    ispfe->src.slot >= LMP_ALLOC_NUM_SLOTS ||
 	    ispfe->lmp_ml0_profile >= ISPFE_LMP_ML0_PROFILE_COUNT ||
 	    ispfe->backend_recipe > 1 ||
 	    ispfe->src.width - 1 >= U16_MAX || ispfe->src.height - 1 >= U16_MAX)
@@ -3540,13 +3549,11 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	if (ispfe->prog->fixed_resources &&
 	    (ispfe->src.loch != ispfe->prog->required_loch ||
 	     ispfe->src.fcctx != ispfe->prog->required_fcctx ||
-	     ispfe->src.slot != ispfe->prog->required_slot ||
-	     ispfe->lmp_alloc_ctrl != ispfe->prog->required_lmp_alloc_ctrl)) {
+	     ispfe->fc_axi_max_ost != ispfe->prog->required_fc_axi_max_ost)) {
 		dev_err(ispfe->dev,
-			"PDMA recipe needs loch %u, FC %u, slot %u, allocator %#x\n",
+			"PDMA recipe needs loch %u, FC %u, AXI max OST %#x\n",
 			ispfe->prog->required_loch, ispfe->prog->required_fcctx,
-			ispfe->prog->required_slot,
-			ispfe->prog->required_lmp_alloc_ctrl);
+			ispfe->prog->required_fc_axi_max_ost);
 		return -EINVAL;
 	}
 	if (ispfe->prog->backend_recipe &&
@@ -4135,8 +4142,8 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 	ctx = core + LOCH(ispfe->active.loch);
 	link = ispfe_link(ispfe);
 
-	seq_printf(s, "# link %u ctx %u lmp %u slot %u\n", ispfe->active.link,
-		   ispfe->active.loch, ispfe->active.fcctx, ispfe->active.slot);
+	seq_printf(s, "# link %u loch %u fcctx %u\n", ispfe->active.link,
+		   ispfe->active.loch, ispfe->active.fcctx);
 
 	for (i = 0; i <= 0x2c; i += 4)
 		seq_printf(s, "link   +0x%04x %#010x\n", i,
@@ -4181,10 +4188,11 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 		   FC_CTX_BIND(ispfe->active.fcctx) + 4,
 		   readl_relaxed(core + FC_CTX_BIND(ispfe->active.fcctx) + 4));
 
-	seq_printf(s, "alloc  +0x%05x %#010x\n", LMP_ALLOC_A + LMP_ALLOC_CTRL,
-		   readl_relaxed(core + LMP_ALLOC_A + LMP_ALLOC_CTRL));
-	seq_printf(s, "alloc  +0x%05x %#010x\n", LMP_ALLOC_GATE,
-		   readl_relaxed(core + LMP_ALLOC_GATE));
+	seq_printf(s, "fcaxi  +0x%05x %#010x\n",
+		   FC_LMP_IDMA0 + FC_LMP_IDMA_AXI_MAX_OST,
+		   readl_relaxed(core + FC_LMP_IDMA0 + FC_LMP_IDMA_AXI_MAX_OST));
+	seq_printf(s, "fcaxi  +0x%05x %#010x\n", FC_CFG_BUS_CTRL,
+		   readl_relaxed(core + FC_CFG_BUS_CTRL));
 	seq_printf(s, "lmpctrl+0x%05x %#010x\n", LMP_CTRL,
 		   readl_relaxed(core + LMP_CTRL));
 
@@ -4610,9 +4618,9 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("regs", 0444, d, ispfe, &ispfe_regs_fops);
 	debugfs_create_u32("loch", 0644, d, &ispfe->src.loch);
 	debugfs_create_u32("fcctx", 0644, d, &ispfe->src.fcctx);
-	debugfs_create_u32("slot", 0644, d, &ispfe->src.slot);
 	debugfs_create_u32("settle_us", 0644, d, &ispfe->settle_us);
-	debugfs_create_x32("lmp_alloc_ctrl", 0644, d, &ispfe->lmp_alloc_ctrl);
+	debugfs_create_x32("fc_axi_max_ost", 0644, d,
+			   &ispfe->fc_axi_max_ost);
 	debugfs_create_u32("lmp_ml0_profile", 0644, d,
 			   &ispfe->lmp_ml0_profile);
 	debugfs_create_u32("backend_recipe", 0644, d,
@@ -5743,7 +5751,7 @@ static int ispfe_probe(struct platform_device *pdev)
 				     "cannot get memory path\n");
 	ispfe->predown_qch = ISPFE_PREDOWN_QCH_OFF;
 	ispfe->settle_us = ISPFE_SETTLE_US_DEFAULT;
-	ispfe->lmp_alloc_ctrl = LMP_ALLOC_CTRL_IMX712;
+	ispfe->fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712;
 	ispfe->pdma_cmd = PDMA_DESC_CMD;
 	ispfe->pdma_bytes = ISPFE_PDMA_RECIPE_BYTES;
 	ispfe->pdma_bytes_first = ISPFE_PDMA_RECIPE_BYTES;
@@ -5777,15 +5785,13 @@ static int ispfe_probe(struct platform_device *pdev)
 	/*
 	 * The receiver's own resources, which are the driver's to allocate: a
 	 * standalone physical-output RAW capture put this sensor on logical
-	 * and PDMA channel 0, frame-controller context 4 and line-memory slot
-	 * 2, and an earlier mixed preview used channel 1 and context 2, so
-	 * these are allocator choices rather than sensor properties.  The rest
-	 * of the source description comes from the device tree's endpoint and
-	 * from the negotiated format.
+	 * and PDMA channel 0 with frame-controller context 4, and an earlier mixed
+	 * preview used channel 1 and context 2.  The FC context directly selects
+	 * its LMP-IDMA AXI threshold pair.  The rest of the source description
+	 * comes from the device tree's endpoint and from the negotiated format.
 	 */
 	ispfe->src.loch = 0;
 	ispfe->src.fcctx = 4;
-	ispfe->src.slot = 2;
 
 	for (i = 0; i < ISPFE_NUM_WINDOWS; i++) {
 		ispfe->base[i] = ispfe_map(pdev, ispfe_window_names[i]);

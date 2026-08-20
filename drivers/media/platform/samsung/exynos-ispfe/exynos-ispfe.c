@@ -1927,6 +1927,8 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 	return DMA_MAPPING_ERROR;
 }
 
+#define ISPFE_LMP_DDS_CONFIG_REG		0x00056154
+#define ISPFE_LMP_RGB_SCALER_CONFIG_REG	0x00056208
 #define ISPFE_LMP_SCALER_CONFIG_REG	0x00056228
 #define ISPFE_LMP_FORMATTER0_CONFIG_REG	0x0005626c
 #define ISPFE_LMP_BATCH_CONFIG_REG	0x000567d8
@@ -2026,18 +2028,145 @@ static size_t ispfe_pdma_recipe_bytes(const struct ispfe_pdma_program *prog)
 	return total;
 }
 
+static bool ispfe_pdma_reloc_byte(const struct ispfe_pdma_program *prog,
+				  unsigned int command, size_t byte)
+{
+	unsigned int i;
+
+	for (i = 0; i < prog->num_relocs; i++) {
+		const struct ispfe_pdma_reloc *reloc = &prog->relocs[i];
+
+		if (reloc->cmd != command)
+			continue;
+		if ((byte >= reloc->lo && byte < reloc->lo + sizeof(u32)) ||
+		    (byte >= reloc->hi && byte < reloc->hi + sizeof(u32)))
+			return true;
+	}
+
+	return false;
+}
+
+/* The address-free fields needed for the current DDS/scaler experiment. */
+static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
+				     size_t byte)
+{
+	switch (cmd->reg) {
+	case ISPFE_LMP_DDS_CONFIG_REG:
+		return byte < sizeof(u32);
+	case ISPFE_LMP_RGB_SCALER_CONFIG_REG:
+		return (byte >= 0x08 && byte < 0x10) ||
+		       (byte >= 0x18 && byte < 0x1c);
+	case ISPFE_LMP_SCALER_CONFIG_REG:
+		return (byte >= 0x1c && byte < 0x24) ||
+		       (byte >= 0x2c && byte < 0x34) ||
+		       (byte >= 0x3c && byte < 0x44);
+	case ISPFE_LMP_FORMATTER0_CONFIG_REG:
+		return byte >= 0x20 && byte < 0x28;
+	case ISPFE_LMP_BATCH_CONFIG_REG:
+		return byte >= 0x08 && byte < 0x10;
+	default:
+		return false;
+	}
+}
+
+static u32 ispfe_pdma_scale_factor(u32 source, u32 destination)
+{
+	return div_u64((u64)source << 21, destination);
+}
+
+static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
+						const u8 *scaler,
+						const u8 *formatter,
+						const u8 *batch)
+{
+	u32 flags = get_unaligned_le32(dds);
+	u32 source = get_unaligned_le32(dds + 8);
+	u32 input = get_unaligned_le32(scaler + 0x1c);
+	u32 destination = get_unaligned_le32(scaler + 0x20);
+	u32 output2 = get_unaligned_le32(scaler + 0x28);
+	u32 width = source & U16_MAX, height = source >> 16;
+	u32 input_width, input_height, dest_width, dest_height;
+	u32 rgb_width, rgb_height, rgb_destination;
+	u32 y_stride = get_unaligned_le32(formatter + 0x20);
+	u32 uv_stride = get_unaligned_le32(formatter + 0x24);
+	u32 uv_offset = get_unaligned_le32(batch + 0x08);
+	u32 plane2 = get_unaligned_le32(batch + 0x0c);
+	u32 divisor = 1 << (((flags >> 8) & 3) + 1);
+	u64 y_size, total_size;
+
+	if (!width || !height || width % divisor || height % divisor)
+		return -EINVAL;
+	input_width = width / divisor;
+	input_height = height / divisor;
+	if (input != (input_width | input_height << 16))
+		return -EINVAL;
+
+	dest_width = destination & U16_MAX;
+	dest_height = destination >> 16;
+	if (!dest_width || !dest_height || dest_width & 1 || dest_height & 1 ||
+	    dest_width > input_width || dest_height > input_height ||
+	    y_stride != uv_stride || y_stride < dest_width || y_stride % 32 ||
+	    get_unaligned_le32(scaler + 0x2c) !=
+	    ispfe_pdma_scale_factor(input_width, dest_width) ||
+	    get_unaligned_le32(scaler + 0x30) !=
+	    ispfe_pdma_scale_factor(input_height, dest_height))
+		return -EINVAL;
+
+	y_size = (u64)y_stride * dest_height;
+	total_size = y_size + (u64)uv_stride * dest_height / 2;
+	if (uv_offset != y_size || plane2 != y_size * 2 ||
+	    total_size > ISPFE_LMP_ML0_MAX_SIZE)
+		return -EINVAL;
+
+	/* Output 2 stays enabled, so its factors must follow the new input too. */
+	dest_width = output2 & U16_MAX;
+	dest_height = output2 >> 16;
+	if (!dest_width || !dest_height ||
+	    get_unaligned_le32(scaler + 0x3c) !=
+	    ispfe_pdma_scale_factor(input_width, dest_width) ||
+	    get_unaligned_le32(scaler + 0x40) !=
+	    ispfe_pdma_scale_factor(input_height, dest_height))
+		return -EINVAL;
+
+	/* The enabled linear-RGB branch has one automatic 2x pre-bin stage. */
+	rgb_width = input_width;
+	rgb_height = input_height;
+	if (rgb_width > 1024 || rgb_height > 768) {
+		if (rgb_width & 1 || rgb_height & 1)
+			return -EINVAL;
+		rgb_width /= 2;
+		rgb_height /= 2;
+	}
+	if (get_unaligned_le32(rgb + 0x18) !=
+	    (rgb_width | rgb_height << 16))
+		return -EINVAL;
+	rgb_destination = get_unaligned_le32(rgb + 4);
+	dest_width = rgb_destination & U16_MAX;
+	dest_height = rgb_destination >> 16;
+	if (!dest_width || !dest_height ||
+	    get_unaligned_le32(rgb + 8) !=
+	    ispfe_pdma_scale_factor(rgb_width, dest_width) ||
+	    get_unaligned_le32(rgb + 0x0c) !=
+	    ispfe_pdma_scale_factor(rgb_height, dest_height))
+		return -EINVAL;
+
+	return 0;
+}
+
 /*
- * A staged program is an editable payload template, not an executable DMA
+ * A staged program is an editable geometry template, not an executable DMA
  * stream supplied by userspace.  Keep the captured recipe's complete command
- * skeleton and, for grouped writes, its register words.  This lets a bring-up
- * tool change configuration values without gaining a way to target unrelated
- * MMIO.  Indirect and embedded buffer addresses are ignored here and replaced
- * from the driver's relocation table while encoding each slot.
+ * skeleton, grouped register words, gates and every address-capable field.
+ * Only the decoded address-free geometry words above and known relocations may
+ * differ.  Indirect and embedded buffer addresses are then regenerated from
+ * the driver's relocation table while encoding each slot.
  */
 static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
 	const u8 *program = ispfe->pdma_program_staged;
+	const u8 *dds = NULL, *rgb = NULL, *scaler = NULL;
+	const u8 *formatter = NULL, *batch = NULL;
 	size_t at = 0;
 	unsigned int i;
 
@@ -2048,6 +2177,7 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 
 	for (i = 0; i < prog->num_cmds; i++) {
 		const struct ispfe_pdma_cmd *cmd = &prog->cmds[i];
+		const u8 *payload;
 		size_t j;
 
 		switch (cmd->op) {
@@ -2076,6 +2206,10 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 				if (get_unaligned_le32(program + at + j) !=
 				    get_unaligned_le32(cmd->payload + j))
 					return -EINVAL;
+			for (j = 0; j < cmd->len; j++)
+				if (!ispfe_pdma_reloc_byte(prog, i, j) &&
+				    program[at + j] != cmd->payload[j])
+					return -EINVAL;
 			at += cmd->len;
 			break;
 		case ISPFE_PDMA_INLINE_BURST:
@@ -2083,14 +2217,46 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 			    PDMA_CMD_INLINE_BURST(cmd->len) ||
 			    get_unaligned_le32(program + at + 4) != cmd->reg)
 				return -EINVAL;
-			at += PDMA_CMD_INLINE_BURST_HEAD + cmd->len;
+			at += PDMA_CMD_INLINE_BURST_HEAD;
+			payload = program + at;
+			for (j = 0; j < cmd->len; j++)
+				if (!ispfe_pdma_reloc_byte(prog, i, j) &&
+				    !ispfe_pdma_geometry_byte(cmd, j) &&
+				    payload[j] != cmd->payload[j])
+					return -EINVAL;
+			switch (cmd->reg) {
+			case ISPFE_LMP_DDS_CONFIG_REG:
+				dds = payload;
+				if ((get_unaligned_le32(payload) ^
+				     get_unaligned_le32(cmd->payload)) & ~(3 << 8))
+					return -EINVAL;
+				break;
+			case ISPFE_LMP_RGB_SCALER_CONFIG_REG:
+				rgb = payload;
+				break;
+			case ISPFE_LMP_SCALER_CONFIG_REG:
+				scaler = payload;
+				break;
+			case ISPFE_LMP_FORMATTER0_CONFIG_REG:
+				formatter = payload;
+				break;
+			case ISPFE_LMP_BATCH_CONFIG_REG:
+				batch = payload;
+				break;
+			}
+			at += cmd->len;
 			break;
 		default:
 			return -EINVAL;
 		}
 	}
 
-	return at == ISPFE_PDMA_RECIPE_BYTES ? 0 : -EINVAL;
+	if (at != ISPFE_PDMA_RECIPE_BYTES || !dds || !rgb || !scaler ||
+	    !formatter || !batch)
+		return -EINVAL;
+
+	return ispfe_pdma_staged_geometry_validate(dds, rgb, scaler, formatter,
+						    batch);
 }
 
 /*
@@ -3687,18 +3853,21 @@ static ssize_t ispfe_pdma_stage_write(struct ispfe_device *ispfe,
 {
 	ssize_t ret = count;
 
+	if (!count)
+		return 0;
+
 	guard(mutex)(&ispfe->lock);
 
 	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
 		return -EBUSY;
 	if (*ppos < 0 || *ppos > capacity)
 		return -EINVAL;
+	if (count > capacity - *ppos)
+		return -EFBIG;
 	if (*ppos == 0)
 		*staged_bytes = 0;
 	if (*ppos != *staged_bytes)
 		return -ESPIPE;
-	if (count > capacity - *staged_bytes)
-		return -EFBIG;
 	if (copy_from_user(staged + *staged_bytes, buf, count))
 		return -EFAULT;
 

@@ -3992,6 +3992,7 @@
 					  "csis-core", "fc", "lmp-bayer",
 					  "lmp-pdaf", "pdma";
 			power-domains = <&pd_ispfe>;
+			google,backend = <&becore>;
 			iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>,
 				 <&sysmmu_ispfe_s2>;
 			samsung,iommu-group = <&iommu_group_isp>;

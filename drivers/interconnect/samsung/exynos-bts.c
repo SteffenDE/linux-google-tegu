@@ -481,10 +481,15 @@ static int exynos_bts_icc_get_bw(struct icc_node *node, u32 *avg, u32 *peak)
 static void exynos_bts_unregister(void *data)
 {
 	struct exynos_bts *bts = data;
+	int ret;
 
 	icc_provider_deregister(&bts->provider);
 	mutex_lock(&bts->lock);
-	exynos_bts_set_idle(bts);
+	ret = exynos_bts_set_idle(bts);
+	if (ret)
+		dev_warn(bts->dev,
+			 "cannot restore idle clock rates while removing: %d\n",
+			 ret);
 	exynos_bts_program_scenario(bts, false);
 	mutex_unlock(&bts->lock);
 	icc_nodes_remove(&bts->provider);
@@ -550,12 +555,20 @@ static int exynos_bts_resume(struct device *dev)
 	int ret = 0;
 
 	mutex_lock(&bts->lock);
+	/* Retry an ICC rollback which failed before the system suspended. */
+	if (bts->rates_saved && !bts->camera_active) {
+		ret = exynos_bts_set_idle(bts);
+		if (ret)
+			goto unlock;
+	}
 	exynos_bts_program_scenario(bts, bts->camera_active);
 	if (bts->camera_active) {
 		ret = clk_set_rate(bts->mif_clk, bts->target_mif_rate);
 		if (!ret)
 			ret = clk_set_rate(bts->int_clk, bts->target_int_rate);
 	}
+
+unlock:
 	mutex_unlock(&bts->lock);
 
 	return ret;

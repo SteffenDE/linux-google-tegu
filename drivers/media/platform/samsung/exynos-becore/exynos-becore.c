@@ -1036,6 +1036,21 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_producer_complete);
 
+void exynos_becore_input_producer_abort(struct exynos_becore_input *input)
+{
+	struct becore_device *becore = input->becore;
+
+	mutex_lock(&becore->lock);
+	if (becore->input_producer == input && input->producing) {
+		dma_sync_sgtable_for_cpu(input->producer, &input->sgt,
+					 DMA_FROM_DEVICE);
+		input->producing = false;
+		becore->input.staged_bytes = 0;
+	}
+	mutex_unlock(&becore->lock);
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_producer_abort);
+
 static ssize_t becore_stage_write(struct becore_device *becore,
 				  const char __user *buf, size_t count,
 				  loff_t *ppos, void *staged, size_t capacity,

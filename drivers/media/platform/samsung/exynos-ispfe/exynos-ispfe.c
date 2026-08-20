@@ -2810,11 +2810,13 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 	writel_relaxed(1, bind + FC_BIND_ENABLE);
 
 	/*
-	 * Arm the channel, then start it.  The vendor writes these one
-	 * microsecond apart and in this order, immediately after the line
-	 * memory it just bound is enabled; see LOCH_ARM.
+	 * The arm belongs to the CSIS Bayer WDMA, not to the logical channel as
+	 * a whole.  A raw program configures that WDMA before committing it;
+	 * ordinary LMP/back-end programs leave its config-enable clear.  Arming
+	 * the latter raises and latches wdma_config_miss on the first frame.
 	 */
-	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
+	if (ispfe->prog->raw_output)
+		writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
 	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_START);
 
 	writel_relaxed(ispfe->active.mode_word0, ctx + LOCH_WORD0);

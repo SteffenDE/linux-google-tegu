@@ -2046,13 +2046,11 @@ static bool ispfe_pdma_reloc_byte(const struct ispfe_pdma_program *prog,
 	return false;
 }
 
-/* The address-free fields needed for the current DDS/scaler experiment. */
+/* The address-free fields needed for the current scaler experiment. */
 static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
 				     size_t byte)
 {
 	switch (cmd->reg) {
-	case ISPFE_LMP_DDS_CONFIG_REG:
-		return byte < sizeof(u32);
 	case ISPFE_LMP_RGB_SCALER_CONFIG_REG:
 		return (byte >= 0x08 && byte < 0x10) ||
 		       (byte >= 0x18 && byte < 0x1c);
@@ -2069,9 +2067,20 @@ static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
 	}
 }
 
-static u32 ispfe_pdma_scale_factor(u32 source, u32 destination)
+#define ISPFE_LMP_SCALER_FACTOR_MAX	GENMASK(23, 0)
+
+static u64 ispfe_pdma_scale_factor(u32 source, u32 destination)
 {
 	return div_u64((u64)source << 21, destination);
+}
+
+static bool ispfe_pdma_scale_factor_matches(const u8 *payload, size_t offset,
+					     u32 source, u32 destination)
+{
+	u64 factor = ispfe_pdma_scale_factor(source, destination);
+
+	return factor <= ISPFE_LMP_SCALER_FACTOR_MAX &&
+	       get_unaligned_le32(payload + offset) == factor;
 }
 
 static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
@@ -2106,10 +2115,10 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 	if (!dest_width || !dest_height || dest_width & 1 || dest_height & 1 ||
 	    dest_width > input_width || dest_height > input_height ||
 	    y_stride != uv_stride || y_stride < dest_width || y_stride % 32 ||
-	    get_unaligned_le32(scaler + 0x2c) !=
-	    ispfe_pdma_scale_factor(input_width, dest_width) ||
-	    get_unaligned_le32(scaler + 0x30) !=
-	    ispfe_pdma_scale_factor(input_height, dest_height))
+	    !ispfe_pdma_scale_factor_matches(scaler, 0x2c, input_width,
+					     dest_width) ||
+	    !ispfe_pdma_scale_factor_matches(scaler, 0x30, input_height,
+					     dest_height))
 		return -EINVAL;
 
 	y_size = (u64)y_stride * dest_height;
@@ -2122,10 +2131,10 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 	dest_width = output2 & U16_MAX;
 	dest_height = output2 >> 16;
 	if (!dest_width || !dest_height ||
-	    get_unaligned_le32(scaler + 0x3c) !=
-	    ispfe_pdma_scale_factor(input_width, dest_width) ||
-	    get_unaligned_le32(scaler + 0x40) !=
-	    ispfe_pdma_scale_factor(input_height, dest_height))
+	    !ispfe_pdma_scale_factor_matches(scaler, 0x3c, input_width,
+					     dest_width) ||
+	    !ispfe_pdma_scale_factor_matches(scaler, 0x40, input_height,
+					     dest_height))
 		return -EINVAL;
 
 	/* The enabled linear-RGB branch has one automatic 2x pre-bin stage. */
@@ -2144,10 +2153,10 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 	dest_width = rgb_destination & U16_MAX;
 	dest_height = rgb_destination >> 16;
 	if (!dest_width || !dest_height ||
-	    get_unaligned_le32(rgb + 8) !=
-	    ispfe_pdma_scale_factor(rgb_width, dest_width) ||
-	    get_unaligned_le32(rgb + 0x0c) !=
-	    ispfe_pdma_scale_factor(rgb_height, dest_height))
+	    !ispfe_pdma_scale_factor_matches(rgb, 0x08, rgb_width,
+					     dest_width) ||
+	    !ispfe_pdma_scale_factor_matches(rgb, 0x0c, rgb_height,
+					     dest_height))
 		return -EINVAL;
 
 	return 0;
@@ -2227,8 +2236,15 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 			switch (cmd->reg) {
 			case ISPFE_LMP_DDS_CONFIG_REG:
 				dds = payload;
-				if ((get_unaligned_le32(payload) ^
-				     get_unaligned_le32(cmd->payload)) & ~(3 << 8))
+				/*
+				 * Both vendor recipes deliver 1052x780 here.  The
+				 * full-mode /2 experiment instead delivered 2104x1560
+				 * and left LMP unable to quiesce [HW 2026-08-20].
+				 * DDS is therefore part of the captured hardware
+				 * envelope, not editable output geometry.
+				 */
+				if (get_unaligned_le32(payload) !=
+				    get_unaligned_le32(cmd->payload))
 					return -EINVAL;
 				break;
 			case ISPFE_LMP_RGB_SCALER_CONFIG_REG:

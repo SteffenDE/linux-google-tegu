@@ -467,6 +467,22 @@ struct ispfe_pdma_desc {
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 #define ISPFE_PDMA_MAX_BLOCKS_BYTES	ISPFE_PDMA_BACKEND_BLOCKS_BYTES
 
+enum ispfe_backend_buffer_state {
+	ISPFE_BACKEND_BUFFER_IDLE,
+	ISPFE_BACKEND_BUFFER_PREPARING,
+	ISPFE_BACKEND_BUFFER_READY,
+	ISPFE_BACKEND_BUFFER_FLIGHT,
+	ISPFE_BACKEND_BUFFER_DONE,
+};
+
+struct ispfe_backend_buffer {
+	struct exynos_becore_input_buffer ticket;
+	struct list_head list;
+	enum ispfe_backend_buffer_state state;
+	unsigned int program_slot;
+	u64 retire_credit;
+};
+
 /*
  * The working areas the front end writes back to.  The blocks it *reads* do not
  * change between frames and live in one shared area every slot's program points
@@ -1045,6 +1061,18 @@ struct ispfe_device {
 	/* Full-mode LMP main-Bayer output shared with the camera back end. */
 	struct exynos_becore_input *backend_input;
 	struct exynos_becore_input_buffer backend_buffer;
+	struct ispfe_backend_buffer backend_buffers[PDMA_BUF_SLOTS];
+	struct work_struct backend_fill_work;
+	struct list_head backend_ready;
+	struct list_head backend_flight;
+	struct list_head backend_done;
+	unsigned long backend_programs_used;
+	unsigned int backend_flight_count;
+	u64 backend_credit_count;
+	u32 backend_completed;
+	u32 backend_dropped;
+	int backend_queue_error;
+	bool backend_queue_active;
 	void *backend_spare;
 	dma_addr_t backend_spare_dma;
 	size_t backend_input_size;
@@ -1065,6 +1093,7 @@ struct ispfe_device {
 	enum ispfe_owner {
 		ISPFE_OWNER_NONE,
 		ISPFE_OWNER_DEBUGFS,
+		ISPFE_OWNER_BACKEND,
 		ISPFE_OWNER_V4L2,
 	} owner;
 
@@ -1824,6 +1853,63 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	schedule_work(&ispfe->fill_work);
 }
 
+static void ispfe_backend_queue_credit(struct ispfe_device *ispfe)
+{
+	struct ispfe_backend_buffer *buf = NULL;
+	unsigned int slot = PDMA_DUMP_SLOT;
+
+	spin_lock(&ispfe->slock);
+	ispfe->backend_credit_count++;
+	if (!list_empty(&ispfe->backend_ready)) {
+		buf = list_first_entry(&ispfe->backend_ready,
+				       struct ispfe_backend_buffer, list);
+		list_move_tail(&buf->list, &ispfe->backend_flight);
+		buf->state = ISPFE_BACKEND_BUFFER_FLIGHT;
+		buf->retire_credit = ispfe->backend_credit_count +
+			min_t(u32, READ_ONCE(ispfe->credit_latency),
+			      PDMA_BUF_SLOTS - 1);
+		ispfe->backend_flight_count++;
+		slot = buf->program_slot;
+	} else {
+		ispfe->backend_dropped++;
+	}
+	spin_unlock(&ispfe->slock);
+
+	ispfe_ring_record(ispfe, ispfe->head / sizeof(*ispfe->ring), slot);
+	ispfe->head += sizeof(*ispfe->ring);
+	if (ispfe->head >= PDMA_NUM_RECORDS * sizeof(*ispfe->ring))
+		ispfe->head = 0;
+	dma_wmb();
+	writel_relaxed(ispfe->head, ispfe->base[ISPFE_WIN_PDMA] +
+		       PDMA_CTX(ispfe->active.loch) + PDMA_HEAD);
+
+	if (!buf)
+		schedule_work(&ispfe->backend_fill_work);
+}
+
+static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
+{
+	struct ispfe_backend_buffer *buf = NULL;
+
+	spin_lock(&ispfe->slock);
+	/* Dump credits age a real buffer too; they are backpressure, not a stall. */
+	if (!list_empty(&ispfe->backend_flight)) {
+		buf = list_first_entry(&ispfe->backend_flight,
+				       struct ispfe_backend_buffer, list);
+		if (ispfe->backend_credit_count >= buf->retire_credit) {
+			list_move_tail(&buf->list, &ispfe->backend_done);
+			buf->state = ISPFE_BACKEND_BUFFER_DONE;
+			ispfe->backend_flight_count--;
+		} else {
+			buf = NULL;
+		}
+	}
+	spin_unlock(&ispfe->slock);
+
+	if (buf)
+		schedule_work(&ispfe->backend_fill_work);
+}
+
 static irqreturn_t ispfe_link_isr(int irq, void *data)
 {
 	struct ispfe_device *ispfe = data;
@@ -1850,6 +1936,8 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 		 */
 		if (ispfe->owner == ISPFE_OWNER_V4L2) {
 			ispfe_queue_credit(ispfe);
+		} else if (ispfe->owner == ISPFE_OWNER_BACKEND) {
+			ispfe_backend_queue_credit(ispfe);
 		} else {
 			/* Every record names one buffer; only the timing matters. */
 			ispfe->head += sizeof(*ispfe->ring);
@@ -1994,7 +2082,7 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
  * aims one frame at one buffer.
  */
 static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
-				    dma_addr_t bayer)
+				    dma_addr_t bayer, dma_addr_t backend)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
 
@@ -2013,10 +2101,9 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 	case ISPFE_BUF_KIND_BACKEND:
 		switch (index) {
 		case 0:
-			return ispfe->backend_buffer.dma;
+			return backend;
 		case 1:
-			return ispfe->backend_buffer.dma +
-			       ISPFE_BACKEND_IMAGE_OFFSET;
+			return backend + ISPFE_BACKEND_IMAGE_OFFSET;
 		case 2:
 			return ispfe->tnr_pyramid_dma;
 		}
@@ -2040,12 +2127,11 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 
 static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 					   const struct ispfe_pdma_cmd *cmd,
-					   u8 *payload, u32 payload_at,
+					   dma_addr_t dma, u8 *payload,
+					   u32 payload_at,
 					   u32 *image_lo, u32 *image_hi,
 					   u32 *header_lo, u32 *header_hi)
 {
-	dma_addr_t dma;
-
 	if (!ispfe->prog->patch_backend_output)
 		return 0;
 
@@ -2072,7 +2158,6 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		    get_unaligned_le32(payload + 0x20) !=
 		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
 			return -EINVAL;
-		dma = ispfe->backend_buffer.dma;
 		if (upper_32_bits(dma) ||
 		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET) ||
 		    upper_32_bits(ispfe->tnr_pyramid_dma))
@@ -2459,7 +2544,7 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
  * to stay inside the program area.
  */
 static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
-			     dma_addr_t bayer)
+			     dma_addr_t bayer, dma_addr_t backend)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
@@ -2495,7 +2580,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			at += PDMA_CMD_SELECT_BLOCK_SIZE;
 			continue;
 		case ISPFE_PDMA_INDIRECT_BURST:
-			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer);
+			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer,
+						backend);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			/*
@@ -2539,8 +2625,9 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			if (ret)
 				return ret;
 		}
-		ret = ispfe_pdma_apply_backend_output(ispfe, cmd, program + at,
-						      at, &backend_image_lo,
+		ret = ispfe_pdma_apply_backend_output(ispfe, cmd, backend,
+						      program + at, at,
+						      &backend_image_lo,
 						      &backend_image_hi,
 						      &backend_header_lo,
 						      &backend_header_hi);
@@ -2552,7 +2639,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			    (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH &&
 			     reloc->hi + 4 > cmd->len))
 				return -EINVAL;
-			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer);
+			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer,
+						backend);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma),
@@ -2607,12 +2695,126 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	return 0;
 }
 
+static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
+{
+	for (;;) {
+		struct ispfe_backend_buffer *buf;
+		int ret;
+
+		spin_lock_irq(&ispfe->slock);
+		if (!ispfe->backend_queue_active ||
+		    list_empty(&ispfe->backend_done)) {
+			spin_unlock_irq(&ispfe->slock);
+			break;
+		}
+		buf = list_first_entry(&ispfe->backend_done,
+				       struct ispfe_backend_buffer, list);
+		list_del_init(&buf->list);
+		buf->state = ISPFE_BACKEND_BUFFER_PREPARING;
+		spin_unlock_irq(&ispfe->slock);
+
+		ret = exynos_becore_input_producer_complete(ispfe->backend_input,
+							    &buf->ticket);
+		if (ret)
+			exynos_becore_input_producer_abort(ispfe->backend_input,
+							   &buf->ticket);
+
+		spin_lock_irq(&ispfe->slock);
+		__clear_bit(buf->program_slot,
+			    &ispfe->backend_programs_used);
+		buf->state = ISPFE_BACKEND_BUFFER_IDLE;
+		if (ret)
+			ispfe->backend_queue_error = ret;
+		else
+			ispfe->backend_completed++;
+		spin_unlock_irq(&ispfe->slock);
+	}
+
+	for (;;) {
+		struct ispfe_backend_buffer *buf = NULL;
+		unsigned int program_slot;
+		unsigned int i;
+		bool acquired = false;
+		int ret;
+
+		spin_lock_irq(&ispfe->slock);
+		if (!ispfe->backend_queue_active ||
+		    ispfe->backend_queue_error) {
+			spin_unlock_irq(&ispfe->slock);
+			return;
+		}
+		program_slot = find_first_zero_bit(&ispfe->backend_programs_used,
+						   PDMA_BUF_SLOTS);
+		if (program_slot >= PDMA_BUF_SLOTS) {
+			spin_unlock_irq(&ispfe->slock);
+			return;
+		}
+		for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++)
+			if (ispfe->backend_buffers[i].state ==
+			    ISPFE_BACKEND_BUFFER_IDLE) {
+				buf = &ispfe->backend_buffers[i];
+				break;
+			}
+		if (!buf) {
+			spin_unlock_irq(&ispfe->slock);
+			return;
+		}
+		__set_bit(program_slot, &ispfe->backend_programs_used);
+		buf->program_slot = program_slot;
+		buf->state = ISPFE_BACKEND_BUFFER_PREPARING;
+		spin_unlock_irq(&ispfe->slock);
+
+		ret = exynos_becore_input_producer_acquire(ispfe->backend_input,
+							   &buf->ticket);
+		if (!ret) {
+			acquired = true;
+			ret = ispfe_pdma_encode(ispfe, program_slot,
+						ispfe->frame_dma,
+						buf->ticket.dma);
+		}
+		if (ret && acquired)
+			exynos_becore_input_producer_abort(ispfe->backend_input,
+							   &buf->ticket);
+
+		spin_lock_irq(&ispfe->slock);
+		if (ret || !ispfe->backend_queue_active) {
+			__clear_bit(program_slot,
+				    &ispfe->backend_programs_used);
+			buf->state = ISPFE_BACKEND_BUFFER_IDLE;
+			if (!ret) {
+				spin_unlock_irq(&ispfe->slock);
+				exynos_becore_input_producer_abort(ispfe->backend_input,
+								   &buf->ticket);
+				return;
+			}
+			if (ret != -EBUSY)
+				ispfe->backend_queue_error = ret;
+			spin_unlock_irq(&ispfe->slock);
+			return;
+		}
+		buf->state = ISPFE_BACKEND_BUFFER_READY;
+		list_add_tail(&buf->list, &ispfe->backend_ready);
+		spin_unlock_irq(&ispfe->slock);
+	}
+}
+
+static void ispfe_backend_fill_work(struct work_struct *work)
+{
+	struct ispfe_device *ispfe =
+		container_of(work, struct ispfe_device, backend_fill_work);
+
+	ispfe_backend_queue_fill(ispfe);
+}
+
 /*
  * Stage the shared blocks and encode one program per slot.  Every slot starts
  * out aimed at the primary frame buffer; a queue retargets them per buffer.
  */
 static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 {
+	dma_addr_t backend = ispfe->owner == ISPFE_OWNER_BACKEND ?
+			     ispfe->backend_spare_dma :
+			     ispfe->backend_buffer.dma;
 	unsigned int i;
 	int ret;
 
@@ -2653,7 +2855,8 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 		ret = ispfe_pdma_encode(ispfe, i,
 					i == PDMA_DUMP_SLOT ?
 					ispfe->spare_frame_dma :
-					ispfe->frame_dma);
+					ispfe->frame_dma,
+					backend);
 		if (ret)
 			return ret;
 	}
@@ -2680,7 +2883,9 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
  */
 static void ispfe_ring_fill(struct ispfe_device *ispfe)
 {
-	unsigned int slot = ispfe->owner == ISPFE_OWNER_V4L2 ? PDMA_DUMP_SLOT : 0;
+	unsigned int slot = ispfe->owner == ISPFE_OWNER_V4L2 ||
+			    ispfe->owner == ISPFE_OWNER_BACKEND ?
+			    PDMA_DUMP_SLOT : 0;
 	u32 addr = READ_ONCE(ispfe->pdma_addr);
 	unsigned int i;
 
@@ -3119,6 +3324,9 @@ static irqreturn_t ispfe_lmp_isr(int irq, void *data)
 		if (ispfe->owner == ISPFE_OWNER_V4L2) {
 			ispfe->sequence++;
 			ispfe_queue_complete(ispfe);
+		} else if (ispfe->owner == ISPFE_OWNER_BACKEND) {
+			ispfe->sequence++;
+			ispfe_backend_queue_complete(ispfe);
 		} else {
 			ispfe_snapshot_complete(ispfe);
 		}
@@ -3596,7 +3804,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	ispfe->link_irq = ret;
 
 	/* Reserve the exact slot whose IOVA the program encoder will publish. */
-	if (ispfe->prog->backend_output) {
+	if (ispfe->prog->backend_output &&
+	    ispfe->owner != ISPFE_OWNER_BACKEND) {
 		ret = exynos_becore_input_producer_acquire(ispfe->backend_input,
 							   &ispfe->backend_buffer);
 		if (ret)
@@ -3814,7 +4023,8 @@ static int ispfe_enable_set(void *data, u64 val)
 	if (!!val == ispfe->streaming)
 		return 0;
 	/* One receive path, so the queue and the diagnostic take turns. */
-	if (ispfe->owner == ISPFE_OWNER_V4L2)
+	if (ispfe->owner == ISPFE_OWNER_V4L2 ||
+	    ispfe->owner == ISPFE_OWNER_BACKEND)
 		return -EBUSY;
 	if (val) {
 		ispfe->owner = ISPFE_OWNER_DEBUGFS;
@@ -3852,7 +4062,8 @@ static int ispfe_capture_set(void *data, u64 val)
 		return -EINVAL;
 
 	guard(mutex)(&ispfe->lock);
-	if (ispfe->owner == ISPFE_OWNER_V4L2)
+	if (ispfe->owner == ISPFE_OWNER_V4L2 ||
+	    ispfe->owner == ISPFE_OWNER_BACKEND)
 		return -EBUSY;
 	if (!!val == ispfe->sensor_streaming)
 		return 0;
@@ -3908,6 +4119,151 @@ static int ispfe_capture_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(ispfe_capture_fops, ispfe_capture_get,
 			 ispfe_capture_set, "%llu\n");
 
+static void ispfe_backend_queue_reset(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	spin_lock_irq(&ispfe->slock);
+	INIT_LIST_HEAD(&ispfe->backend_ready);
+	INIT_LIST_HEAD(&ispfe->backend_flight);
+	INIT_LIST_HEAD(&ispfe->backend_done);
+	ispfe->backend_programs_used = 0;
+	ispfe->backend_flight_count = 0;
+	ispfe->backend_credit_count = 0;
+	ispfe->backend_completed = 0;
+	ispfe->backend_dropped = 0;
+	ispfe->backend_queue_error = 0;
+	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++) {
+		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
+		ispfe->backend_buffers[i].state = ISPFE_BACKEND_BUFFER_IDLE;
+	}
+	spin_unlock_irq(&ispfe->slock);
+}
+
+static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++) {
+		struct ispfe_backend_buffer *buf = &ispfe->backend_buffers[i];
+
+		if (buf->state != ISPFE_BACKEND_BUFFER_IDLE)
+			exynos_becore_input_producer_abort(ispfe->backend_input,
+							   &buf->ticket);
+	}
+
+	spin_lock_irq(&ispfe->slock);
+	INIT_LIST_HEAD(&ispfe->backend_ready);
+	INIT_LIST_HEAD(&ispfe->backend_flight);
+	INIT_LIST_HEAD(&ispfe->backend_done);
+	ispfe->backend_programs_used = 0;
+	ispfe->backend_flight_count = 0;
+	ispfe->backend_credit_count = 0;
+	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++) {
+		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
+		ispfe->backend_buffers[i].state = ISPFE_BACKEND_BUFFER_IDLE;
+	}
+	spin_unlock_irq(&ispfe->slock);
+}
+
+static int ispfe_backend_queue_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+	bool ready;
+	int ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+	if (!!val == ispfe->backend_queue_active)
+		return 0;
+	if (val) {
+		if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+			return -EBUSY;
+		if (ispfe->backend_recipe != 1)
+			return -EINVAL;
+
+		ispfe->owner = ISPFE_OWNER_BACKEND;
+		ispfe_backend_queue_reset(ispfe);
+		spin_lock_irq(&ispfe->slock);
+		ispfe->backend_queue_active = true;
+		spin_unlock_irq(&ispfe->slock);
+
+		ret = ispfe_sensor_power(ispfe, true);
+		if (ret)
+			goto err_queue;
+		ret = ispfe_start(ispfe);
+		if (ret)
+			goto err_power;
+
+		ispfe_backend_queue_fill(ispfe);
+		spin_lock_irq(&ispfe->slock);
+		ready = !list_empty(&ispfe->backend_ready);
+		ret = ispfe->backend_queue_error;
+		spin_unlock_irq(&ispfe->slock);
+		if (ret || !ready) {
+			if (!ret)
+				ret = -ENOBUFS;
+			goto err_stop;
+		}
+
+		ret = v4l2_subdev_enable_streams(&ispfe->sd,
+						 ISPFE_PAD_SOURCE, BIT_ULL(0));
+		if (ret)
+			goto err_stop;
+		ispfe->sensor_streaming = true;
+		return 0;
+	}
+
+	spin_lock_irq(&ispfe->slock);
+	ispfe->backend_queue_active = false;
+	spin_unlock_irq(&ispfe->slock);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ispfe_stop(ispfe);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					  BIT_ULL(0));
+	if (ret)
+		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
+	ispfe_sensor_power(ispfe, false);
+	ispfe->sensor_streaming = false;
+	ispfe_backend_queue_abort_all(ispfe);
+	ispfe->owner = ISPFE_OWNER_NONE;
+
+	return 0;
+
+err_stop:
+	spin_lock_irq(&ispfe->slock);
+	ispfe->backend_queue_active = false;
+	spin_unlock_irq(&ispfe->slock);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ispfe_stop(ispfe);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ispfe_backend_queue_abort_all(ispfe);
+err_power:
+	ispfe_sensor_power(ispfe, false);
+err_queue:
+	spin_lock_irq(&ispfe->slock);
+	ispfe->backend_queue_active = false;
+	spin_unlock_irq(&ispfe->slock);
+	ispfe->owner = ISPFE_OWNER_NONE;
+	return ret;
+}
+
+static int ispfe_backend_queue_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = ispfe->backend_queue_active;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_backend_queue_fops, ispfe_backend_queue_get,
+			 ispfe_backend_queue_set, "%llu\n");
+
 /*
  * Writing one arms a one-shot handoff. Reading returns one only after the
  * line-memory pipeline reported EOF and future frames were redirected to the
@@ -3929,7 +4285,8 @@ static int ispfe_snapshot_set(void *data, u64 val)
 	 * snapshot would simply never advance -- which reads as a hang rather
 	 * than as the two owners overlapping.
 	 */
-	if (ispfe->owner == ISPFE_OWNER_V4L2)
+	if (ispfe->owner == ISPFE_OWNER_V4L2 ||
+	    ispfe->owner == ISPFE_OWNER_BACKEND)
 		return -EBUSY;
 	if (READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_READY)
 		return val ? 0 : -EBUSY;
@@ -4230,9 +4587,15 @@ DEFINE_SHOW_ATTRIBUTE(ispfe_regs);
 static int ispfe_status_show(struct seq_file *s, void *unused)
 {
 	struct ispfe_device *ispfe = s->private;
+	struct list_head *pos;
+	unsigned int backend_ready = 0, backend_done = 0;
+	unsigned int backend_flight, backend_completed, backend_dropped;
+	u64 backend_credits;
 	unsigned int isolation, i, flight;
 	dma_addr_t backend_dma;
-	unsigned long slots;
+	unsigned long backend_programs, slots;
+	int backend_error;
+	bool backend_active;
 
 	guard(mutex)(&ispfe->lock);
 	backend_dma = ispfe->backend_buffer.dma;
@@ -4241,13 +4604,30 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "sensor_stream %u\n", ispfe->sensor_streaming);
 	seq_printf(s, "owner        %s\n",
 		   ispfe->owner == ISPFE_OWNER_V4L2 ? "v4l2" :
+		   ispfe->owner == ISPFE_OWNER_BACKEND ? "backend" :
 		   ispfe->owner == ISPFE_OWNER_DEBUGFS ? "debugfs" : "none");
 	scoped_guard(spinlock_irqsave, &ispfe->slock) {
 		flight = ispfe->flight_count;
 		slots = ispfe->slots_used;
+		backend_flight = ispfe->backend_flight_count;
+		backend_programs = ispfe->backend_programs_used;
+		backend_credits = ispfe->backend_credit_count;
+		backend_completed = ispfe->backend_completed;
+		backend_dropped = ispfe->backend_dropped;
+		backend_error = ispfe->backend_queue_error;
+		backend_active = ispfe->backend_queue_active;
+		list_for_each(pos, &ispfe->backend_ready)
+			backend_ready++;
+		list_for_each(pos, &ispfe->backend_done)
+			backend_done++;
 	}
 	seq_printf(s, "queue        %u in flight, slots %#lx, seq %u\n",
 		   flight, slots, ispfe->sequence);
+	seq_printf(s,
+		   "backend_queue active %u, ready %u, flight %u, done %u, programs %#lx, credits %llu, completed %u, dropped %u, error %d\n",
+		   backend_active, backend_ready, backend_flight, backend_done,
+		   backend_programs, backend_credits, backend_completed,
+		   backend_dropped, backend_error);
 	seq_printf(s, "snapshot_state %u\n", READ_ONCE(ispfe->snapshot_state));
 	seq_printf(s, "snapshot_armed %u\n",
 		   READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_ARMED);
@@ -4655,6 +5035,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			    &ispfe_snapshot_fops);
 	debugfs_create_file("backend_handoff", 0644, d, ispfe,
 			    &ispfe_backend_handoff_fops);
+	debugfs_create_file("backend_queue", 0644, d, ispfe,
+			    &ispfe_backend_queue_fops);
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
@@ -4804,7 +5186,8 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		}
 
 		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		ret = ispfe_pdma_encode(ispfe, slot, dma);
+		ret = ispfe_pdma_encode(ispfe, slot, dma,
+					ispfe->backend_buffer.dma);
 		if (ret) {
 			scoped_guard(spinlock_irqsave, &ispfe->slock)
 				__clear_bit(slot, &ispfe->slots_used);
@@ -5782,6 +6165,12 @@ static int ispfe_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&ispfe->ready);
 	INIT_LIST_HEAD(&ispfe->flight);
 	INIT_WORK(&ispfe->fill_work, ispfe_fill_work);
+	INIT_LIST_HEAD(&ispfe->backend_ready);
+	INIT_LIST_HEAD(&ispfe->backend_flight);
+	INIT_LIST_HEAD(&ispfe->backend_done);
+	INIT_WORK(&ispfe->backend_fill_work, ispfe_backend_fill_work);
+	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++)
+		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
 	ispfe->credit_latency = ISPFE_CREDIT_LATENCY_DEFAULT;
 
 	/*
@@ -5888,6 +6277,31 @@ static void ispfe_remove(struct platform_device *pdev)
 	int ret;
 
 	debugfs_remove_recursive(ispfe->debugfs);
+
+	/* A debug queue does not belong to the video device, so stop it first. */
+	scoped_guard(mutex, &ispfe->lock) {
+		if (ispfe->owner == ISPFE_OWNER_BACKEND) {
+			spin_lock_irq(&ispfe->slock);
+			ispfe->backend_queue_active = false;
+			spin_unlock_irq(&ispfe->slock);
+		}
+	}
+	cancel_work_sync(&ispfe->backend_fill_work);
+	scoped_guard(mutex, &ispfe->lock) {
+		if (ispfe->owner == ISPFE_OWNER_BACKEND) {
+			if (ispfe->sensor_streaming) {
+				ispfe_stop(ispfe);
+				v4l2_subdev_disable_streams(&ispfe->sd,
+							    ISPFE_PAD_SOURCE,
+							    BIT_ULL(0));
+				ispfe_sensor_power(ispfe, false);
+				ispfe->sensor_streaming = false;
+			}
+			cancel_work_sync(&ispfe->backend_fill_work);
+			ispfe_backend_queue_abort_all(ispfe);
+			ispfe->owner = ISPFE_OWNER_NONE;
+		}
+	}
 	ispfe_media_unregister(ispfe);
 	cancel_work_sync(&ispfe->fill_work);
 

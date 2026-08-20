@@ -659,7 +659,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.backend_recipe = true,
 		.fixed_resources = true,
 		.required_loch = 1,
-		.required_fcctx = 2,
+		.required_fcctx = 3,
 		.required_slot = 1,
 		.required_lmp_alloc_ctrl = 0x1a,
 	},

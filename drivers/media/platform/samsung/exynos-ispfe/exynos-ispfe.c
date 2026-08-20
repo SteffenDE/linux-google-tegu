@@ -3595,6 +3595,13 @@ err_qos:
 static void ispfe_stop(struct ispfe_device *ispfe)
 {
 	unsigned int state = READ_ONCE(ispfe->snapshot_state);
+	int ret;
+
+	/* Downstream gives the teardown MMIO the same short CAM pulse as setup. */
+	ret = clk_set_rate(ispfe->cam_clk,
+			   max(ispfe->saved_cam_rate, ISPFE_CAM_SETUP_RATE));
+	if (ret)
+		dev_err(ispfe->dev, "cannot set teardown CAM rate: %d\n", ret);
 
 	/*
 	 * A ready frame deliberately survives stop: debugfs reads it after the

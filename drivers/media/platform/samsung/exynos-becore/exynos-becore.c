@@ -23,6 +23,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
@@ -71,8 +72,6 @@
 #define BECORE_CMDQ_PAYLOAD_BYTES	64
 #define BECORE_CMDQ_MODE		0x9000
 
-#define BECORE_INPUT_SIZE		0x1a17000
-#define BECORE_INPUT_IMAGE_OFFSET	0x30c00
 #define BECORE_GRID_SIZE			0x18000
 #define BECORE_OUTPUT_SIZE		0x949000
 #define BECORE_OUTPUT_PLANE2_OFFSET	0x630640
@@ -83,6 +82,15 @@
 
 #define BECORE_RGBP_INPUT_IMAGE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c50)
 #define BECORE_RGBP_INPUT_HEADER_REG	(BECORE_RGBP_PHYS_BASE + 0x1d10)
+#define BECORE_RGBP_INPUT_ENABLE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c00)
+#define BECORE_RGBP_INPUT_COMP_REG	(BECORE_RGBP_PHYS_BASE + 0x1c04)
+#define BECORE_RGBP_INPUT_FORMAT_REG	(BECORE_RGBP_PHYS_BASE + 0x1c10)
+#define BECORE_RGBP_INPUT_WIDTH_REG	(BECORE_RGBP_PHYS_BASE + 0x1c20)
+#define BECORE_RGBP_INPUT_HEIGHT_REG	(BECORE_RGBP_PHYS_BASE + 0x1c24)
+#define BECORE_RGBP_INPUT_STRIDE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c28)
+#define BECORE_RGBP_INPUT_HEADER_STRIDE_REG \
+	(BECORE_RGBP_PHYS_BASE + 0x1c34)
+#define BECORE_RGBP_INPUT_BUSINFO_REG	(BECORE_RGBP_PHYS_BASE + 0x1c4c)
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
@@ -97,6 +105,59 @@ enum becore_block_id {
 struct becore_regval {
 	u32 offset;
 	u32 value;
+};
+
+struct becore_rgbp_input_profile {
+	u32 width;
+	u32 height;
+	u32 data_format;
+	u32 comp_control;
+	u32 sbwc_block_width;
+	u32 bytes_per_pixel;
+	u32 header_stride;
+	u32 businfo;
+};
+
+/*
+ * The active dimensions and DMA fields are from the live ultrawide program.
+ * As in Pablo's common DMA API, the payload and header geometry are derived
+ * from the image profile.  Lyric additionally writes the 256-pixel-aligned
+ * SBWC storage width after enabling the RDMA.
+ */
+static const struct becore_rgbp_input_profile becore_rgbp_input = {
+	.width = 4208,
+	.height = 3120,
+	.data_format = 0x18,
+	.comp_control = 0x9,
+	.sbwc_block_width = 256,
+	.bytes_per_pixel = 2,
+	.header_stride = 0x40,
+	.businfo = 0,
+};
+
+enum becore_rgbp_input_word {
+	BECORE_RGBP_INPUT_FORMAT,
+	BECORE_RGBP_INPUT_COMP,
+	BECORE_RGBP_INPUT_ACTIVE_WIDTH,
+	BECORE_RGBP_INPUT_HEIGHT,
+	BECORE_RGBP_INPUT_STRIDE,
+	BECORE_RGBP_INPUT_HEADER_STRIDE,
+	BECORE_RGBP_INPUT_BUSINFO,
+	BECORE_RGBP_INPUT_ENABLE,
+	BECORE_RGBP_INPUT_STORAGE_WIDTH,
+	BECORE_RGBP_INPUT_WORD_COUNT,
+};
+
+static const u32 becore_rgbp_input_regs[] = {
+	[BECORE_RGBP_INPUT_FORMAT] = BECORE_RGBP_INPUT_FORMAT_REG,
+	[BECORE_RGBP_INPUT_COMP] = BECORE_RGBP_INPUT_COMP_REG,
+	[BECORE_RGBP_INPUT_ACTIVE_WIDTH] = BECORE_RGBP_INPUT_WIDTH_REG,
+	[BECORE_RGBP_INPUT_HEIGHT] = BECORE_RGBP_INPUT_HEIGHT_REG,
+	[BECORE_RGBP_INPUT_STRIDE] = BECORE_RGBP_INPUT_STRIDE_REG,
+	[BECORE_RGBP_INPUT_HEADER_STRIDE] = BECORE_RGBP_INPUT_HEADER_STRIDE_REG,
+	[BECORE_RGBP_INPUT_BUSINFO] = BECORE_RGBP_INPUT_BUSINFO_REG,
+	[BECORE_RGBP_INPUT_ENABLE] = BECORE_RGBP_INPUT_ENABLE_REG,
+	[BECORE_RGBP_INPUT_STORAGE_WIDTH] = BECORE_RGBP_INPUT_WIDTH_REG,
 };
 
 struct becore_device;
@@ -312,6 +373,75 @@ static const u8 *becore_recipe_records(const struct becore_device *becore,
 	return records;
 }
 
+static u32 becore_rgbp_input_storage_width(void)
+{
+	return ALIGN(becore_rgbp_input.width,
+		     becore_rgbp_input.sbwc_block_width);
+}
+
+static u32 becore_rgbp_input_stride(void)
+{
+	return becore_rgbp_input_storage_width() *
+	       becore_rgbp_input.bytes_per_pixel;
+}
+
+static size_t becore_rgbp_input_image_offset(void)
+{
+	return (size_t)becore_rgbp_input.header_stride *
+	       becore_rgbp_input.height;
+}
+
+static size_t becore_rgbp_input_size(void)
+{
+	size_t image_bytes = (size_t)becore_rgbp_input_stride() *
+			     becore_rgbp_input.height;
+
+	return ALIGN(becore_rgbp_input_image_offset() + image_bytes, SZ_4K);
+}
+
+static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
+{
+	if (index >= BECORE_RGBP_INPUT_WORD_COUNT ||
+	    reg != becore_rgbp_input_regs[index])
+		return -EINVAL;
+	if (!value)
+		return 0;
+
+	switch (index) {
+	case BECORE_RGBP_INPUT_FORMAT:
+		*value = becore_rgbp_input.data_format;
+		break;
+	case BECORE_RGBP_INPUT_COMP:
+		*value = becore_rgbp_input.comp_control;
+		break;
+	case BECORE_RGBP_INPUT_ACTIVE_WIDTH:
+		*value = becore_rgbp_input.width;
+		break;
+	case BECORE_RGBP_INPUT_HEIGHT:
+		*value = becore_rgbp_input.height;
+		break;
+	case BECORE_RGBP_INPUT_STRIDE:
+		*value = becore_rgbp_input_stride();
+		break;
+	case BECORE_RGBP_INPUT_HEADER_STRIDE:
+		*value = becore_rgbp_input.header_stride;
+		break;
+	case BECORE_RGBP_INPUT_BUSINFO:
+		*value = becore_rgbp_input.businfo;
+		break;
+	case BECORE_RGBP_INPUT_ENABLE:
+		*value = 1;
+		break;
+	case BECORE_RGBP_INPUT_STORAGE_WIDTH:
+		*value = becore_rgbp_input_storage_width();
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int becore_recipe_header_validate(const struct becore_device *becore)
 {
 	const u8 *header = becore->recipe;
@@ -335,7 +465,7 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 {
 	switch (reg) {
 	case BECORE_RGBP_INPUT_IMAGE_REG:
-		return becore->input.dma + BECORE_INPUT_IMAGE_OFFSET;
+		return becore->input.dma + becore_rgbp_input_image_offset();
 	case BECORE_RGBP_INPUT_HEADER_REG:
 		return becore->input.dma;
 	case BECORE_YUVP_GRID_REG:
@@ -356,6 +486,7 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 {
 	const u8 *record = becore_recipe_records(becore, id);
 	u32 address_count = 0;
+	u32 typed_count = 0;
 	u32 i;
 
 	for (i = 0; i < header_count; i++, record += BECORE_RECIPE_RECORD_BYTES) {
@@ -371,8 +502,11 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 		    get_unaligned_le32(record + 4) != shape[i].target ||
 		    get_unaligned_le32(record + 8) != shape[i].type_map ||
 		    (shape[i].address_mask & ~used_mask) ||
+		    (shape[i].typed_mask & ~used_mask) ||
 		    (shape[i].fixed_mask & ~used_mask) ||
-		    (shape[i].address_mask & shape[i].fixed_mask))
+		    (shape[i].address_mask & shape[i].typed_mask) ||
+		    (shape[i].address_mask & shape[i].fixed_mask) ||
+		    (shape[i].typed_mask & shape[i].fixed_mask))
 			return -EINVAL;
 
 		for (word = 0; word < 16; word++) {
@@ -395,6 +529,18 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 					return -EINVAL;
 			}
 
+			if (shape[i].typed_mask & BIT(word)) {
+				u32 reg;
+
+				if (id != BECORE_RGBP ||
+				    shape[i].mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape[i].pair_registers[word / 2];
+				if (becore_rgbp_input_value(typed_count, reg, NULL))
+					return -EINVAL;
+				typed_count++;
+			}
+
 			if (shape[i].address_mask & BIT(word)) {
 				u32 reg;
 
@@ -413,6 +559,10 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	if ((id == BECORE_RGBP && address_count != 2) ||
 	    (id == BECORE_YUVP && address_count != 3))
 		return -EINVAL;
+	if ((id == BECORE_RGBP &&
+	     typed_count != BECORE_RGBP_INPUT_WORD_COUNT) ||
+	    (id == BECORE_YUVP && typed_count))
+		return -EINVAL;
 
 	return 0;
 }
@@ -424,7 +574,8 @@ static int becore_recipe_validate(struct becore_device *becore)
 	ret = becore_recipe_header_validate(becore);
 	if (ret)
 		return ret;
-	if (becore->input.staged_bytes != BECORE_INPUT_SIZE ||
+	if (becore->input.size != becore_rgbp_input_size() ||
+	    becore->input.staged_bytes != becore->input.size ||
 	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
 		return -EINVAL;
 
@@ -450,6 +601,7 @@ static int becore_encode_block(struct becore_device *becore,
 				      BECORE_CMDQ_HEADER_BYTES,
 				      BECORE_CMDQ_PAYLOAD_BYTES);
 	u32 i;
+	u32 typed_count = 0;
 
 	if (!program->cpu || program->header_count != header_count ||
 	    program->size != becore_cmdq_program_size(header_count) ||
@@ -476,6 +628,17 @@ static int becore_encode_block(struct becore_device *becore,
 		for (word = 0; word < shape[i].valid_words; word++) {
 			dma_addr_t dma;
 			u32 reg;
+			u32 value;
+
+			if (shape[i].typed_mask & BIT(word)) {
+				reg = shape[i].pair_registers[word / 2];
+				if (id != BECORE_RGBP ||
+				    becore_rgbp_input_value(typed_count, reg, &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
+				typed_count++;
+				continue;
+			}
 
 			if (!(shape[i].address_mask & BIT(word)))
 				continue;
@@ -486,6 +649,10 @@ static int becore_encode_block(struct becore_device *becore,
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
 	}
+	if ((id == BECORE_RGBP &&
+	     typed_count != BECORE_RGBP_INPUT_WORD_COUNT) ||
+	    (id == BECORE_YUVP && typed_count))
+		return -EINVAL;
 
 	return 0;
 }
@@ -776,7 +943,7 @@ static int becore_alloc_shared_input(struct becore_device *becore)
 	struct becore_dma_buffer *input = &becore->input;
 	int ret;
 
-	input->size = BECORE_INPUT_SIZE;
+	input->size = becore_rgbp_input_size();
 	input->sgt = dma_alloc_noncontiguous(becore->dev, input->size,
 					     DMA_BIDIRECTIONAL, GFP_KERNEL, 0);
 	if (!input->sgt)

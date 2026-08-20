@@ -7,7 +7,7 @@ config VIDEO_EXYNOS_BECORE
 	depends on PM
 	depends on VIDEO_DEV
 	select MEDIA_CONTROLLER
-	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_VMALLOC
 	help
 	  Bring-up driver for the RGBP, MCFP and YUVP image processors in
 	  Google's zumapro (Tensor G4) camera back end.

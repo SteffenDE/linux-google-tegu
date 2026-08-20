@@ -24,6 +24,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -33,6 +34,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <media/exynos-becore.h>
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-device.h>
@@ -483,6 +485,10 @@ struct ispfe_pdma_output {
 /* Large enough for a 2048x1536 NV12 runtime geometry experiment. */
 #define ISPFE_LMP_ML0_MAX_SIZE		0x00480000
 
+/* Exact full-mode LMP main-Bayer allocation observed on the ultrawide. */
+#define ISPFE_BACKEND_INPUT_SIZE		0x01a17000
+#define ISPFE_BACKEND_IMAGE_OFFSET	0x00030c00
+
 /*
  * The working areas the front end writes back to, in the order the recipe's
  * ISPFE_BUF_OUTPUT() indices name them. Sizes and directions are the vendor
@@ -593,6 +599,7 @@ struct ispfe_pdma_program {
 	u32 width;
 	u32 height;
 	u32 stride;
+	bool backend_output;
 };
 
 static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
@@ -604,6 +611,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.inputs = ispfe_pdma_inputs,
 		.num_inputs = ARRAY_SIZE(ispfe_pdma_inputs),
 		.width = 4208, .height = 3120, .stride = 8416,
+		.backend_output = true,
 	},
 	{
 		.cmds = ispfe_pdma_binned_recipe,
@@ -937,6 +945,7 @@ struct ispfe_device {
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
 	bool streaming;
+	bool sensor_streaming;
 	/* Advanced by debugfs and the line-memory EOF IRQ. */
 	enum {
 		ISPFE_SNAPSHOT_IDLE,
@@ -976,6 +985,17 @@ struct ispfe_device {
 	 */
 	u32 bayer_lo;
 	u32 bayer_hi;
+	/* Full-mode LMP main-Bayer output shared with the camera back end. */
+	struct exynos_becore_input *backend_input;
+	void *backend_spare;
+	dma_addr_t backend_spare_dma;
+	size_t backend_input_size;
+	bool backend_producing;
+	bool backend_handed_off;
+	u32 backend_image_lo;
+	u32 backend_image_hi;
+	u32 backend_header_lo;
+	u32 backend_header_hi;
 
 	/*
 	 * Who is driving the hardware.  The debugfs diagnostic and the V4L2
@@ -1931,7 +1951,71 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_RGB_SCALER_CONFIG_REG	0x00056208
 #define ISPFE_LMP_SCALER_CONFIG_REG	0x00056228
 #define ISPFE_LMP_FORMATTER0_CONFIG_REG	0x0005626c
+#define ISPFE_LMP_BACKEND_FORMATTER_REG	0x000565cc
+#define ISPFE_LMP_BACKEND_WDMA_CONFIG_REG 0x000565d8
 #define ISPFE_LMP_BATCH_CONFIG_REG	0x000567d8
+
+#define ISPFE_LMP_CAPTURED_OUTPUT_GATES	0x0000b1f8
+#define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
+
+static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
+					   const struct ispfe_pdma_cmd *cmd,
+					   u8 *payload, u32 payload_at,
+					   u32 *image_lo, u32 *image_hi,
+					   u32 *header_lo, u32 *header_hi)
+{
+	dma_addr_t dma;
+
+	if (!ispfe->prog->backend_output)
+		return 0;
+
+	switch (cmd->reg) {
+	case ISPFE_LMP_BACKEND_FORMATTER_REG:
+		if (cmd->len != 0x0c)
+			return -EINVAL;
+		put_unaligned_le32(0x000d0003, payload);
+		put_unaligned_le32(0x00001000, payload + 0x04);
+		put_unaligned_le32(0x00000003, payload + 0x08);
+		break;
+	case ISPFE_LMP_BACKEND_WDMA_CONFIG_REG:
+		if (cmd->len != 0x3c)
+			return -EINVAL;
+		memset(payload, 0, cmd->len);
+		put_unaligned_le32(0x0c301070, payload);
+		put_unaligned_le32(0x00000b51, payload + 0x04);
+		put_unaligned_le32(0x00000110, payload + 0x08);
+		put_unaligned_le32(0x00000002, payload + 0x14);
+		put_unaligned_le32(0x00000001, payload + 0x20);
+		break;
+	case ISPFE_LMP_BATCH_CONFIG_REG:
+		if (cmd->len < 0x90 ||
+		    get_unaligned_le32(payload + 0x20) !=
+		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
+			return -EINVAL;
+		dma = exynos_becore_input_dma(ispfe->backend_input);
+		if (upper_32_bits(dma) ||
+		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET))
+			return -ERANGE;
+		put_unaligned_le32(ISPFE_LMP_CAPTURED_OUTPUT_GATES |
+				     ISPFE_LMP_BACKEND_OUTPUT_GATE,
+				     payload + 0x20);
+		put_unaligned_le32(lower_32_bits(dma +
+						 ISPFE_BACKEND_IMAGE_OFFSET),
+				     payload + 0x80);
+		put_unaligned_le32(upper_32_bits(dma +
+						 ISPFE_BACKEND_IMAGE_OFFSET),
+				     payload + 0x84);
+		put_unaligned_le32(lower_32_bits(dma), payload + 0x88);
+		put_unaligned_le32(upper_32_bits(dma), payload + 0x8c);
+		*image_lo = payload_at + 0x80;
+		*image_hi = payload_at + 0x84;
+		*header_lo = payload_at + 0x88;
+		*header_hi = payload_at + 0x8c;
+		break;
+	}
+
+	return 0;
+}
 
 /*
  * Apply the small, semantic delta from the captured ML0 profile after copying
@@ -2294,6 +2378,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
 	const struct ispfe_pdma_reloc *last = prog->relocs + prog->num_relocs;
 	u32 bayer_lo = 0, bayer_hi = 0;
+	u32 backend_image_lo = 0, backend_image_hi = 0;
+	u32 backend_header_lo = 0, backend_header_hi = 0;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -2365,6 +2451,13 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			if (ret)
 				return ret;
 		}
+		ret = ispfe_pdma_apply_backend_output(ispfe, cmd, program + at,
+						      at, &backend_image_lo,
+						      &backend_image_hi,
+						      &backend_header_lo,
+						      &backend_header_hi);
+		if (ret)
+			return ret;
 
 		for (; reloc < last && reloc->cmd == i; reloc++) {
 			if (reloc->lo + 4 > cmd->len || reloc->hi + 4 > cmd->len)
@@ -2393,6 +2486,12 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
 		return -EINVAL;
 	}
+	if (prog->backend_output &&
+	    (!backend_image_lo || !backend_image_hi ||
+	     !backend_header_lo || !backend_header_hi)) {
+		dev_err(ispfe->dev, "PDMA recipe has no back-end output addresses\n");
+		return -EINVAL;
+	}
 
 	/*
 	 * The same for every slot, because every slot encodes the same recipe.
@@ -2403,6 +2502,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 */
 	ispfe->bayer_lo = bayer_lo;
 	ispfe->bayer_hi = bayer_hi;
+	ispfe->backend_image_lo = backend_image_lo;
+	ispfe->backend_image_hi = backend_image_hi;
+	ispfe->backend_header_lo = backend_header_lo;
+	ispfe->backend_header_hi = backend_header_hi;
 
 	return 0;
 }
@@ -2764,6 +2867,19 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static void ispfe_backend_retarget(struct ispfe_device *ispfe, u8 *program,
+				   dma_addr_t dma)
+{
+	put_unaligned_le32(lower_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET),
+			   program + ispfe->backend_image_lo);
+	put_unaligned_le32(upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET),
+			   program + ispfe->backend_image_hi);
+	put_unaligned_le32(lower_32_bits(dma),
+			   program + ispfe->backend_header_lo);
+	put_unaligned_le32(upper_32_bits(dma),
+			   program + ispfe->backend_header_hi);
+}
+
 static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 {
 	u8 *program = ispfe->programs;
@@ -2788,6 +2904,17 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 				   program + ispfe->bayer_lo);
 		put_unaligned_le32(upper_32_bits(ispfe->spare_frame_dma),
 				   program + ispfe->bayer_hi);
+		if (ispfe->prog->backend_output) {
+			if (WARN_ON_ONCE(!ispfe->backend_image_lo ||
+					 !ispfe->backend_header_lo)) {
+				cmpxchg(&ispfe->snapshot_state,
+					ISPFE_SNAPSHOT_REDIRECTING,
+					ISPFE_SNAPSHOT_IDLE);
+				return;
+			}
+			ispfe_backend_retarget(ispfe, program,
+					       ispfe->backend_spare_dma);
+		}
 		dma_wmb();
 		cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_REDIRECTING,
 			ISPFE_SNAPSHOT_REDIRECTED);
@@ -2961,6 +3088,10 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 		ispfe->programs = NULL;
 		ispfe->bayer_lo = 0;
 		ispfe->bayer_hi = 0;
+		ispfe->backend_image_lo = 0;
+		ispfe->backend_image_hi = 0;
+		ispfe->backend_header_lo = 0;
+		ispfe->backend_header_hi = 0;
 	}
 	if (ispfe->blocks) {
 		dma_free_coherent(ispfe->dev, ISPFE_PDMA_BLOCKS_BYTES,
@@ -3234,6 +3365,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	ispfe->active_pdma_blocks_generation =
 		ispfe->active_pdma_program_override ?
 		ispfe->pdma_blocks_staged_generation : 0;
+	if (ispfe->backend_producing)
+		return -EBUSY;
 
 	snprintf(ispfe->link_name, sizeof(ispfe->link_name), "csis%u",
 		 ispfe->active.link);
@@ -3298,6 +3431,13 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	ret = ispfe_request_irqs(ispfe);
 	if (ret)
 		goto err_isolate;
+	if (ispfe->prog->backend_output) {
+		ret = exynos_becore_input_producer_begin(ispfe->backend_input);
+		if (ret)
+			goto err_irqs;
+		ispfe->backend_producing = true;
+		ispfe->backend_handed_off = false;
+	}
 
 	ispfe_device_init(ispfe);
 
@@ -3325,6 +3465,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	return 0;
 
+err_irqs:
+	ispfe_free_irqs(ispfe);
 err_isolate:
 	if (ispfe->phy_bypass_held) {
 		ispfe->phy_bypass_held = false;
@@ -3368,6 +3510,12 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	ispfe_pdma_stop(ispfe);
 	ispfe_links_reset(ispfe);
 	ispfe_free_irqs(ispfe);
+	if (ispfe->backend_producing &&
+	    READ_ONCE(ispfe->snapshot_state) != ISPFE_SNAPSHOT_READY) {
+		exynos_becore_input_producer_abort(ispfe->backend_input);
+		ispfe->backend_producing = false;
+		ispfe->backend_handed_off = false;
+	}
 	/*
 	 * Before the runtime-PM reference goes, so that the edge is taken and
 	 * read back with the domain still up.  Not done when the diagnostic
@@ -3384,6 +3532,8 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	pm_runtime_put(ispfe->dev);
 }
 
+static int ispfe_sensor_power(struct ispfe_device *ispfe, bool on);
+
 /*
  * Arms the receiver and nothing else.  It does not power or start the sensor,
  * which is deliberate: the cheapest oracle this block has is the arm flush,
@@ -3399,6 +3549,8 @@ static int ispfe_enable_set(void *data, u64 val)
 
 	guard(mutex)(&ispfe->lock);
 
+	if (ispfe->sensor_streaming)
+		return -EBUSY;
 	if (!!val == ispfe->streaming)
 		return 0;
 	/* One receive path, so the queue and the diagnostic take turns. */
@@ -3429,6 +3581,72 @@ static int ispfe_enable_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(ispfe_enable_fops, ispfe_enable_get, ispfe_enable_set,
 			 "%llu\n");
+
+/* Start the real sensor behind the otherwise receiver-only diagnostic. */
+static int ispfe_capture_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+	int ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+	if (ispfe->owner == ISPFE_OWNER_V4L2)
+		return -EBUSY;
+	if (!!val == ispfe->sensor_streaming)
+		return 0;
+
+	if (val) {
+		if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+			return -EBUSY;
+		ispfe->owner = ISPFE_OWNER_DEBUGFS;
+		ret = ispfe_sensor_power(ispfe, true);
+		if (ret)
+			goto err_owner;
+		ret = ispfe_start(ispfe);
+		if (ret)
+			goto err_power;
+		ret = v4l2_subdev_enable_streams(&ispfe->sd,
+						 ISPFE_PAD_SOURCE, BIT_ULL(0));
+		if (ret)
+			goto err_stop;
+		ispfe->sensor_streaming = true;
+		return 0;
+	}
+
+	ispfe_stop(ispfe);
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					  BIT_ULL(0));
+	if (ret)
+		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
+	ispfe_sensor_power(ispfe, false);
+	ispfe->sensor_streaming = false;
+	ispfe->owner = ISPFE_OWNER_NONE;
+
+	return 0;
+
+err_stop:
+	ispfe_stop(ispfe);
+err_power:
+	ispfe_sensor_power(ispfe, false);
+err_owner:
+	ispfe->owner = ISPFE_OWNER_NONE;
+	return ret;
+}
+
+static int ispfe_capture_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = ispfe->sensor_streaming;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_capture_fops, ispfe_capture_get,
+			 ispfe_capture_set, "%llu\n");
 
 /*
  * Writing one arms a one-shot handoff. Reading returns one only after the
@@ -3483,6 +3701,54 @@ static int ispfe_snapshot_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(ispfe_snapshot_fops, ispfe_snapshot_get,
 			 ispfe_snapshot_set, "%llu\n");
+
+/* Transfer one quiesced, complete LMP main-Bayer frame to RGBP ownership. */
+static int ispfe_backend_handoff_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+	int ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+	if (ispfe->streaming)
+		return -EBUSY;
+	if (!ispfe->backend_producing)
+		return -EALREADY;
+
+	if (!val) {
+		exynos_becore_input_producer_abort(ispfe->backend_input);
+		ispfe->backend_producing = false;
+		ispfe->backend_handed_off = false;
+		return 0;
+	}
+	/* Pairs with the EOF-side publication of the completed snapshot. */
+	if (smp_load_acquire(&ispfe->snapshot_state) != ISPFE_SNAPSHOT_READY)
+		return -ENODATA;
+
+	ret = exynos_becore_input_producer_complete(ispfe->backend_input);
+	if (!ret) {
+		ispfe->backend_producing = false;
+		ispfe->backend_handed_off = true;
+	}
+
+	return ret;
+}
+
+static int ispfe_backend_handoff_get(void *data, u64 *val)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	*val = ispfe->backend_handed_off;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(ispfe_backend_handoff_fops,
+			 ispfe_backend_handoff_get,
+			 ispfe_backend_handoff_set, "%llu\n");
 
 static int ispfe_phy_isolation_bypass_set(void *data, u64 val)
 {
@@ -3702,11 +3968,14 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 {
 	struct ispfe_device *ispfe = s->private;
 	unsigned int isolation, i, flight;
+	dma_addr_t backend_dma;
 	unsigned long slots;
 
 	guard(mutex)(&ispfe->lock);
+	backend_dma = exynos_becore_input_dma(ispfe->backend_input);
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
+	seq_printf(s, "sensor_stream %u\n", ispfe->sensor_streaming);
 	seq_printf(s, "owner        %s\n",
 		   ispfe->owner == ISPFE_OWNER_V4L2 ? "v4l2" :
 		   ispfe->owner == ISPFE_OWNER_DEBUGFS ? "debugfs" : "none");
@@ -3767,6 +4036,14 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "program_size %u\n", ISPFE_PDMA_RECIPE_BYTES);
 	seq_printf(s, "bayer_reloc  %#x/%#x\n", ispfe->bayer_lo,
 		   ispfe->bayer_hi);
+	seq_printf(s,
+		   "backend      input %pad, spare %pad, size %zu, producing %u, handed_off %u\n",
+		   &backend_dma,
+		   &ispfe->backend_spare_dma, ispfe->backend_input_size,
+		   ispfe->backend_producing, ispfe->backend_handed_off);
+	seq_printf(s, "backend_reloc image %#x/%#x, header %#x/%#x\n",
+		   ispfe->backend_image_lo, ispfe->backend_image_hi,
+		   ispfe->backend_header_lo, ispfe->backend_header_hi);
 	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		seq_printf(s, "aux%02u_iova  %pad  size %zu\n", i,
@@ -4099,8 +4376,11 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_u32("mode_word0", 0644, d, &ispfe->src.mode_word0);
 	debugfs_create_u32("mode_word1", 0644, d, &ispfe->src.mode_word1);
 	debugfs_create_file("enable", 0644, d, ispfe, &ispfe_enable_fops);
+	debugfs_create_file("capture", 0644, d, ispfe, &ispfe_capture_fops);
 	debugfs_create_file("snapshot", 0644, d, ispfe,
 			    &ispfe_snapshot_fops);
+	debugfs_create_file("backend_handoff", 0644, d, ispfe,
+			    &ispfe_backend_handoff_fops);
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
@@ -4423,6 +4703,7 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 					 BIT_ULL(0));
 	if (ret)
 		goto err_stop;
+	ispfe->sensor_streaming = true;
 
 	return 0;
 
@@ -4460,6 +4741,7 @@ static void ispfe_stop_streaming(struct vb2_queue *q)
 	if (ret)
 		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
 	ispfe_sensor_power(ispfe, false);
+	ispfe->sensor_streaming = false;
 	cancel_work_sync(&ispfe->fill_work);
 	ispfe->owner = ISPFE_OWNER_NONE;
 	video_device_pipeline_stop(&ispfe->vdev);
@@ -5111,6 +5393,77 @@ static void ispfe_media_unregister(struct ispfe_device *ispfe)
 	media_device_cleanup(&ispfe->mdev);
 }
 
+static void ispfe_backend_unmap(void *data)
+{
+	struct ispfe_device *ispfe = data;
+
+	if (ispfe->backend_producing)
+		exynos_becore_input_producer_abort(ispfe->backend_input);
+	exynos_becore_input_unmap(ispfe->backend_input);
+	ispfe->backend_input = NULL;
+	ispfe->backend_producing = false;
+	ispfe->backend_handed_off = false;
+}
+
+static int ispfe_backend_init(struct ispfe_device *ispfe)
+{
+	struct platform_device *backend;
+	struct device_node *np;
+	int ret;
+
+	np = of_parse_phandle(ispfe->dev->of_node, "google,backend", 0);
+	if (!np)
+		return dev_err_probe(ispfe->dev, -ENODEV,
+				     "no camera back-end phandle\n");
+	backend = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!backend)
+		return -EPROBE_DEFER;
+
+	ispfe->backend_input =
+		exynos_becore_input_map(&backend->dev, ispfe->dev);
+	put_device(&backend->dev);
+	if (IS_ERR(ispfe->backend_input)) {
+		ret = PTR_ERR(ispfe->backend_input);
+		ispfe->backend_input = NULL;
+		return dev_err_probe(ispfe->dev, ret,
+				     "cannot map camera back-end input\n");
+	}
+
+	ispfe->backend_input_size =
+		exynos_becore_input_size(ispfe->backend_input);
+	if (ispfe->backend_input_size != ISPFE_BACKEND_INPUT_SIZE) {
+		ret = -EINVAL;
+		goto err_unmap;
+	}
+	ispfe->backend_spare = dmam_alloc_coherent(ispfe->dev,
+						   ispfe->backend_input_size,
+						   &ispfe->backend_spare_dma,
+						   GFP_KERNEL);
+	if (!ispfe->backend_spare) {
+		ret = -ENOMEM;
+		goto err_unmap;
+	}
+	if (upper_32_bits(ispfe->backend_spare_dma) ||
+	    upper_32_bits(ispfe->backend_spare_dma +
+			  ispfe->backend_input_size - 1)) {
+		ret = -ERANGE;
+		goto err_unmap;
+	}
+
+	ret = devm_add_action_or_reset(ispfe->dev, ispfe_backend_unmap, ispfe);
+	if (ret)
+		return ret;
+
+	return 0;
+
+err_unmap:
+	exynos_becore_input_unmap(ispfe->backend_input);
+	ispfe->backend_input = NULL;
+	return dev_err_probe(ispfe->dev, ret,
+			     "invalid camera back-end input allocation\n");
+}
+
 static int ispfe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -5158,6 +5511,9 @@ static int ispfe_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
+	ret = ispfe_backend_init(ispfe);
+	if (ret)
+		return ret;
 
 	/*
 	 * The receiver's own resources, which are the driver's to allocate: a
@@ -5255,8 +5611,16 @@ static void ispfe_remove(struct platform_device *pdev)
 	cancel_work_sync(&ispfe->fill_work);
 
 	scoped_guard(mutex, &ispfe->lock) {
-		if (ispfe->streaming)
+		if (ispfe->sensor_streaming) {
 			ispfe_stop(ispfe);
+			v4l2_subdev_disable_streams(&ispfe->sd,
+						    ISPFE_PAD_SOURCE, BIT_ULL(0));
+			ispfe_sensor_power(ispfe, false);
+			ispfe->sensor_streaming = false;
+			ispfe->owner = ISPFE_OWNER_NONE;
+		} else if (ispfe->streaming) {
+			ispfe_stop(ispfe);
+		}
 		if (ispfe->power_hold) {
 			ret = ispfe_phy_isolation(ispfe, false);
 			if (ret) {

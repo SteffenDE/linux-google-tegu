@@ -18,5 +18,6 @@ size_t exynos_becore_input_size(struct exynos_becore_input *input);
 
 int exynos_becore_input_producer_begin(struct exynos_becore_input *input);
 int exynos_becore_input_producer_complete(struct exynos_becore_input *input);
+void exynos_becore_input_producer_abort(struct exynos_becore_input *input);
 
 #endif /* __MEDIA_EXYNOS_BECORE_H__ */

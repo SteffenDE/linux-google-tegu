@@ -20,6 +20,7 @@ allOf:
         compatible:
           enum:
             - google,zumapro-pd
+            - google,zumapro-gdc-pd
             - google,zumapro-rgbp-pd
             - google,zumapro-yuvp-pd
     then:
@@ -33,6 +34,18 @@ allOf:
         reg-names: false
         samsung,always-on: false
         samsung,secure-pd-id: false
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-gdc-pd
+    then:
+      properties:
+        reg:
+          minItems: 4
+          maxItems: 4
+        reg-names:
+          minItems: 4
+          maxItems: 4
   - if:
       properties:
         compatible:
@@ -72,6 +85,7 @@ properties:
   compatible:
     enum:
       - google,zumapro-pd
+      - google,zumapro-gdc-pd
       - google,zumapro-rgbp-pd
       - google,zumapro-yuvp-pd
       - samsung,exynos4210-pd

@@ -79,6 +79,7 @@ struct exynos_bts {
 	unsigned long saved_int_rate;
 	unsigned long target_mif_rate;
 	unsigned long target_int_rate;
+	bool rates_saved;
 	bool camera_active;
 
 	struct exynos_bts_block *blocks;
@@ -344,10 +345,11 @@ static u32 exynos_bts_int_floor(u32 write_bw, u32 peak_bw)
 static int exynos_bts_set_active(struct exynos_bts *bts, u32 avg_bw,
 				 u32 peak_bw)
 {
-	unsigned long old_mif = bts->target_mif_rate;
+	unsigned long old_mif;
 	unsigned long mif_rate;
 	unsigned long int_rate;
 	u32 floor;
+	int rollback_ret;
 	int ret;
 
 	floor = exynos_bts_mif_floor(avg_bw, avg_bw);
@@ -361,14 +363,16 @@ static int exynos_bts_set_active(struct exynos_bts *bts, u32 avg_bw,
 						 ARRAY_SIZE(zumapro_int_rates),
 						 floor) * 1000;
 
-	if (!bts->camera_active) {
+	if (!bts->rates_saved) {
 		bts->saved_mif_rate = clk_get_rate(bts->mif_clk);
 		bts->saved_int_rate = clk_get_rate(bts->int_clk);
 		if (!bts->saved_mif_rate || !bts->saved_int_rate)
 			return -EIO;
+		bts->rates_saved = true;
 	}
 	mif_rate = max(mif_rate, bts->saved_mif_rate);
 	int_rate = max(int_rate, bts->saved_int_rate);
+	old_mif = bts->target_mif_rate ?: bts->saved_mif_rate;
 
 	ret = clk_set_rate(bts->mif_clk, mif_rate);
 	if (ret)
@@ -376,10 +380,14 @@ static int exynos_bts_set_active(struct exynos_bts *bts, u32 avg_bw,
 
 	ret = clk_set_rate(bts->int_clk, int_rate);
 	if (ret) {
-		if (old_mif)
-			clk_set_rate(bts->mif_clk, old_mif);
-		else if (bts->saved_mif_rate)
-			clk_set_rate(bts->mif_clk, bts->saved_mif_rate);
+		rollback_ret = clk_set_rate(bts->mif_clk, old_mif);
+		if (rollback_ret) {
+			/* Retain enough state for the ICC rollback to retry. */
+			bts->target_mif_rate = mif_rate;
+			dev_err(bts->dev,
+				"cannot roll MIF back to %lu Hz: %d\n",
+				old_mif, rollback_ret);
+		}
 		return ret;
 	}
 
@@ -398,26 +406,44 @@ static int exynos_bts_set_active(struct exynos_bts *bts, u32 avg_bw,
 
 static int exynos_bts_set_idle(struct exynos_bts *bts)
 {
-	int int_ret = 0;
-	int mif_ret = 0;
+	int rollback_ret;
+	int ret;
 
-	if (!bts->camera_active)
+	if (!bts->rates_saved && !bts->camera_active)
 		return 0;
 
 	/* Downstream removes the bandwidth vote before the global scenario. */
-	if (bts->saved_mif_rate)
-		mif_ret = clk_set_rate(bts->mif_clk, bts->saved_mif_rate);
-	if (bts->saved_int_rate)
-		int_ret = clk_set_rate(bts->int_clk, bts->saved_int_rate);
+	if (bts->rates_saved) {
+		ret = clk_set_rate(bts->mif_clk, bts->saved_mif_rate);
+		if (ret)
+			return ret;
 
-	exynos_bts_program_scenario(bts, false);
+		ret = clk_set_rate(bts->int_clk, bts->saved_int_rate);
+		if (ret) {
+			/* Keep the active state coherent until ICC retries/rolls back. */
+			if (bts->target_mif_rate) {
+				rollback_ret = clk_set_rate(bts->mif_clk,
+							    bts->target_mif_rate);
+				if (rollback_ret)
+					dev_err(bts->dev,
+						"cannot restore active MIF rate %lu Hz: %d\n",
+						bts->target_mif_rate,
+						rollback_ret);
+			}
+			return ret;
+		}
+	}
+
+	if (bts->camera_active)
+		exynos_bts_program_scenario(bts, false);
+	bts->rates_saved = false;
 	bts->camera_active = false;
 	bts->saved_mif_rate = 0;
 	bts->saved_int_rate = 0;
 	bts->target_mif_rate = 0;
 	bts->target_int_rate = 0;
 
-	return mif_ret ?: int_ret;
+	return 0;
 }
 
 static int exynos_bts_icc_set(struct icc_node *src, struct icc_node *dst)

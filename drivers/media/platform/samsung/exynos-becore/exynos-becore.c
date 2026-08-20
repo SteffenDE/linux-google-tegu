@@ -294,7 +294,7 @@ struct becore_mcsc_dma_profile {
 
 /*
  * The physical-ultrawide 4000x3000 request carries YUVP's 4160x3120 lossy
- * SBWC intermediate into MCSC and writes output zero as linear NV12.  Keep
+ * SBWC intermediate into MCSC and writes output zero as linear NV21.  Keep
  * this dormant profile separate from the interim P010 capture surface: MCSC
  * is not submitted until GTNR/GDC ownership and lifecycle are established.
  */

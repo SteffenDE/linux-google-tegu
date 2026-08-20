@@ -1102,6 +1102,35 @@
 		};
 
 		/*
+		 * Camera-relevant Bus Traffic Shaper slice.  The nine windows are
+		 * the four ISPFE masters plus every DPU/G2D master whose outstanding
+		 * limit actually changes in downstream's camera_default scenario;
+		 * bases and extents come from zuma-bts.dtsi.  The provider owns the
+		 * shared MIF/INT ACPM floors so camera consumers do not race direct
+		 * CCF requests against one another.
+		 */
+		bts: interconnect@26c48000 {
+			compatible = "google,zumapro-bts";
+			reg = <0x26c48000 0x80>,
+			      <0x26c48080 0x80>,
+			      <0x26c48180 0x80>,
+			      <0x26c48200 0x80>,
+			      <0x26c48280 0x80>,
+			      <0x26c48300 0x80>,
+			      <0x27048200 0x80>,
+			      <0x27048280 0x80>,
+			      <0x27048300 0x80>;
+			reg-names = "dpu0", "dpu1", "ispfe0", "ispfe1",
+				    "ispfe2", "ispfe3", "g2d0", "g2d1",
+				    "g2d2";
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MIF>,
+				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INT>;
+			clock-names = "mif", "int";
+			#interconnect-cells = <1>;
+			status = "disabled";
+		};
+
+		/*
 		 * CMU_MISC clocks the Multi-Core Timer (MCT).  Modelled only far
 		 * enough to gate the MCT register-access pclk; the NOC USER mux
 		 * selects either the oscillator or the CMU_TOP MISC feed.

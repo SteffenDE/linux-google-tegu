@@ -2263,6 +2263,10 @@
 	status = "okay";
 };
 
+&bts {
+	status = "okay";
+};
+
 /*
  * The camera receive complex.  A port is one of the twelve CSIS link banks,
  * named by its number, so the port a sensor's endpoint hangs off is the bank

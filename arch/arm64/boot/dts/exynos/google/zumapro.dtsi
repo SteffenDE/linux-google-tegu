@@ -951,14 +951,19 @@
 	/*
 	 * Camera back-end processing domains.  Source: downstream Zumapro
 	 * pd-rgbp@15462100 and pd-yuvp@15462200.  MCFP lives in BLK_RGBP;
-	 * YUVP is a separate domain.  Keep both passive until the native
-	 * BE-core driver owns their CMU restore and reset sequences.
+	 * YUVP is a separate domain.  Their dedicated compatibles replay the
+	 * source-backed CMU/Q-channel state and open the S2MPUs at the genpd
+	 * power-on boundary, before any System MMU can resume.  Keep both passive
+	 * until the native BE-core driver owns the processing-block resets.
 	 */
 	pd_rgbp: power-domain@15462100 {
-		compatible = "google,zumapro-pd";
+		compatible = "google,zumapro-rgbp-pd";
 		reg = <0x0 0x15462100 0x20>,
-		      <0x0 0x1c400800 0x4>;
-		reg-names = "pmu", "cmu";
+		      <0x0 0x1c400000 0x10000>,
+		      <0x0 0x1c420000 0x404>,
+		      <0x0 0x1c4d0000 0x10000>,
+		      <0x0 0x1c510000 0x10000>;
+		reg-names = "pmu", "cmu", "bus", "s2mpu0", "s2mpu1";
 		samsung,secure-pd-id = <0x1c410204>;
 		#power-domain-cells = <0>;
 		label = "RGBP";
@@ -966,10 +971,12 @@
 	};
 
 	pd_yuvp: power-domain@15462200 {
-		compatible = "google,zumapro-pd";
+		compatible = "google,zumapro-yuvp-pd";
 		reg = <0x0 0x15462200 0x20>,
-		      <0x0 0x1c800800 0x4>;
-		reg-names = "pmu", "cmu";
+		      <0x0 0x1c800000 0x10000>,
+		      <0x0 0x1c820000 0x10c>,
+		      <0x0 0x1c8a0000 0x10000>;
+		reg-names = "pmu", "cmu", "bus", "s2mpu0";
 		samsung,secure-pd-id = <0x1c810204>;
 		#power-domain-cells = <0>;
 		label = "YUVP";

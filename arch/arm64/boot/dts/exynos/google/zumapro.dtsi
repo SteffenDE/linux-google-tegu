@@ -951,14 +951,17 @@
 	/*
 	 * BLK_GDC is also a BE-core dependency: downstream documents that RGBP's
 	 * command loader resides there, even when GDC receives no per-frame
-	 * program.  Keep it passive with the other back-end domains until its CMU
-	 * and stage-2 restore is modeled.
+	 * program.  Its dedicated compatible restores the CMU and opens the S2MPU
+	 * before the GDC System MMU resumes.  Keep it passive with the other
+	 * back-end domains until the native BE-core driver owns their lifecycle.
 	 */
 	pd_gdc: power-domain@15461f00 {
-		compatible = "google,zumapro-pd";
+		compatible = "google,zumapro-gdc-pd";
 		reg = <0x0 0x15461f00 0x20>,
-		      <0x0 0x1d400800 0x4>;
-		reg-names = "pmu", "cmu";
+		      <0x0 0x1d400000 0x10000>,
+		      <0x0 0x1d420000 0x404>,
+		      <0x0 0x1d4f0000 0x10000>;
+		reg-names = "pmu", "cmu", "bus", "s2mpu0";
 		samsung,secure-pd-id = <0x1d410204>;
 		#power-domain-cells = <0>;
 		label = "GDC";

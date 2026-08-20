@@ -67,6 +67,7 @@ struct becore_block {
 	u32 int0_mask_prepare;
 	u32 int0_mask;
 	u32 int1_mask;
+	u32 cmdq_int_mask;
 	u32 last_int0;
 	u32 last_int1;
 	u32 last_cmdq_int;
@@ -76,6 +77,7 @@ struct becore_block {
 
 struct becore_irq {
 	struct becore_block *block;
+	int irq;
 	bool int1;
 };
 
@@ -86,6 +88,8 @@ struct becore_device {
 	void __iomem *ssmt[7];
 	void __iomem *sysreg_rgbp;
 	struct dev_pm_domain_list *pm_domains;
+	bool irqs_enabled;
+	bool reset_failed;
 };
 
 static const char * const becore_pm_domain_names[] = {
@@ -158,16 +162,19 @@ static void becore_write_table(struct becore_block *block,
 		writel_relaxed(table[i].value, block->base + table[i].offset);
 }
 
-static int becore_reset_block(struct becore_block *block)
+static void becore_issue_reset(struct becore_block *block)
 {
-	u32 value;
-	int ret;
-
 	if (block != &block->becore->blocks[BECORE_RGBP])
 		writel_relaxed(0, block->base + BECORE_C_LOADER_ENABLE);
 
 	writel_relaxed(1, block->base + BECORE_SW_RESET);
 	writel_relaxed(0, block->base + BECORE_SET_CTRL);
+}
+
+static int becore_wait_reset(struct becore_block *block)
+{
+	u32 value;
+	int ret;
 
 	ret = readl_poll_timeout(block->base + BECORE_SW_RESET, value, !value,
 				  1, BECORE_RESET_TIMEOUT_US);
@@ -184,9 +191,13 @@ static int becore_reset_all(struct becore_device *becore)
 	unsigned int i;
 	int ret;
 
-	/* Attempt every reset even if an earlier block failed. */
+	/* The OTF-connected chain has to receive reset as one hardware phase. */
+	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
+		becore_issue_reset(&becore->blocks[i]);
+
+	/* Wait for every block even if an earlier one failed. */
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++) {
-		ret = becore_reset_block(&becore->blocks[i]);
+		ret = becore_wait_reset(&becore->blocks[i]);
 		if (ret && !first_error)
 			first_error = ret;
 	}
@@ -194,35 +205,60 @@ static int becore_reset_all(struct becore_device *becore)
 	return first_error;
 }
 
-static void becore_enable_irqs(struct becore_block *block)
+static void becore_prepare_irqs(struct becore_block *block)
 {
 	writel_relaxed(block->int0_mask_prepare,
 		       block->base + BECORE_INT0_ENABLE);
 	if (block->int1_mask)
 		writel_relaxed(block->int1_mask,
 			       block->base + BECORE_INT1_ENABLE);
-	writel_relaxed(0x7, block->base + BECORE_CMDQ_INT_ENABLE);
-	writel_relaxed(block->int0_mask, block->base + BECORE_INT0_ENABLE);
+	writel_relaxed(block->cmdq_int_mask,
+		       block->base + BECORE_CMDQ_INT_ENABLE);
 }
 
-static void becore_disable_irqs(struct becore_block *block)
+static void becore_quiesce_irqs(struct becore_block *block)
 {
-	/* Preserve the vendor quiesce order before asserting software reset. */
 	writel_relaxed(BIT(2), block->base + BECORE_INT0_ENABLE);
 	if (block->int1_mask)
 		writel_relaxed(0, block->base + BECORE_INT1_ENABLE);
 	writel_relaxed(0, block->base + BECORE_CMDQ_INT_ENABLE);
-	writel_relaxed(0, block->base + BECORE_INT0_ENABLE);
+}
+
+static void becore_enable_linux_irqs(struct becore_device *becore)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(becore->irqs); i++)
+		enable_irq(becore->irqs[i].irq);
+	becore->irqs_enabled = true;
+}
+
+static void becore_disable_linux_irqs(struct becore_device *becore)
+{
+	unsigned int i;
+
+	if (!becore->irqs_enabled)
+		return;
+
+	/* disable_irq() also waits for a handler already running on another CPU. */
+	for (i = 0; i < ARRAY_SIZE(becore->irqs); i++)
+		disable_irq(becore->irqs[i].irq);
+	becore->irqs_enabled = false;
 }
 
 static int becore_runtime_resume(struct device *dev)
 {
 	struct becore_device *becore = dev_get_drvdata(dev);
+	unsigned int i;
 	int ret;
 
 	ret = becore_reset_all(becore);
-	if (ret)
-		return ret;
+	if (ret) {
+		/* Report success so runtime PM retains all supplier references. */
+		becore->reset_failed = true;
+		return 0;
+	}
+	becore->reset_failed = false;
 
 	becore_write_table(&becore->blocks[BECORE_RGBP], becore_rgbp_init,
 			   ARRAY_SIZE(becore_rgbp_init));
@@ -231,9 +267,13 @@ static int becore_runtime_resume(struct device *dev)
 	becore_write_table(&becore->blocks[BECORE_YUVP], becore_yuvp_init,
 			   ARRAY_SIZE(becore_yuvp_init));
 
-	becore_enable_irqs(&becore->blocks[BECORE_RGBP]);
-	becore_enable_irqs(&becore->blocks[BECORE_MCFP]);
-	becore_enable_irqs(&becore->blocks[BECORE_YUVP]);
+	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
+		becore_prepare_irqs(&becore->blocks[i]);
+	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
+		writel_relaxed(becore->blocks[i].int0_mask,
+			       becore->blocks[i].base + BECORE_INT0_ENABLE);
+
+	becore_enable_linux_irqs(becore);
 
 	return 0;
 }
@@ -242,12 +282,19 @@ static int becore_runtime_suspend(struct device *dev)
 {
 	struct becore_device *becore = dev_get_drvdata(dev);
 	unsigned int i;
+	int ret;
 
+	becore_disable_linux_irqs(becore);
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
-		becore_disable_irqs(&becore->blocks[i]);
+		becore_quiesce_irqs(&becore->blocks[i]);
+	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
+		writel_relaxed(0, becore->blocks[i].base + BECORE_INT0_ENABLE);
 
 	/* A failed reset must veto the following genpd power-down. */
-	return becore_reset_all(becore);
+	ret = becore_reset_all(becore);
+	becore->reset_failed = !!ret;
+
+	return ret;
 }
 
 static irqreturn_t becore_irq_handler(int irq, void *data)
@@ -332,8 +379,10 @@ static int becore_request_irqs(struct platform_device *pdev,
 			return irq;
 
 		becore->irqs[i].block = &becore->blocks[i / 2];
+		becore->irqs[i].irq = irq;
 		becore->irqs[i].int1 = i & 1;
-		ret = devm_request_irq(dev, irq, becore_irq_handler, 0,
+		ret = devm_request_irq(dev, irq, becore_irq_handler,
+				       IRQF_NO_AUTOEN,
 				       becore_irq_names[i], &becore->irqs[i]);
 		if (ret)
 			return dev_err_probe(dev, ret, "cannot request %s\n",
@@ -364,12 +413,14 @@ static int becore_probe(struct platform_device *pdev)
 		.int0_mask_prepare = 0x18e1fc02,
 		.int0_mask = 0x18e1fc06,
 		.int1_mask = 0x7fff,
+		.cmdq_int_mask = 0x7,
 	};
 	becore->blocks[BECORE_MCFP] = (struct becore_block) {
 		.becore = becore,
 		.name = "MCFP",
 		.int0_mask_prepare = 0x3ffffc02,
 		.int0_mask = 0x3ffffc06,
+		.cmdq_int_mask = 0x7,
 	};
 	becore->blocks[BECORE_YUVP] = (struct becore_block) {
 		.becore = becore,
@@ -377,6 +428,7 @@ static int becore_probe(struct platform_device *pdev)
 		.int0_mask_prepare = 0x3fe1fc02,
 		.int0_mask = 0x3fe1fc06,
 		.int1_mask = 0x1ffffff,
+		.cmdq_int_mask = 0xff,
 	};
 	platform_set_drvdata(pdev, becore);
 
@@ -408,6 +460,10 @@ static int becore_probe(struct platform_device *pdev)
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot power camera back end\n");
+	if (becore->reset_failed) {
+		dev_crit(dev, "processor reset failed; retaining power\n");
+		return 0;
+	}
 
 	ret = pm_runtime_put_sync(dev);
 	if (ret < 0) {

@@ -49,6 +49,7 @@
 
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-program-binned.h"
+#include "exynos-ispfe-pdma-program-backend.h"
 #include "exynos-ispfe-pdma-seeds.h"
 
 /*
@@ -462,6 +463,7 @@ struct ispfe_pdma_desc {
 #define PDMA_SLOTS			(PDMA_BUF_SLOTS + 1)
 #define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_RECIPE_BYTES, PAGE_SIZE)
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
+#define ISPFE_PDMA_MAX_BLOCKS_BYTES	ISPFE_PDMA_BACKEND_BLOCKS_BYTES
 
 /*
  * The working areas the front end writes back to.  The blocks it *reads* do not
@@ -603,7 +605,17 @@ struct ispfe_pdma_program {
 	u32 width;
 	u32 height;
 	u32 stride;
+	u32 recipe_bytes;
+	u32 blocks_bytes;
+	bool raw_output;
 	bool backend_output;
+	bool patch_backend_output;
+	bool backend_recipe;
+	bool fixed_resources;
+	u8 required_loch;
+	u8 required_fcctx;
+	u8 required_slot;
+	u32 required_lmp_alloc_ctrl;
 };
 
 static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
@@ -615,7 +627,11 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.inputs = ispfe_pdma_inputs,
 		.num_inputs = ARRAY_SIZE(ispfe_pdma_inputs),
 		.width = 4208, .height = 3120, .stride = 8416,
+		.recipe_bytes = ISPFE_PDMA_RECIPE_BYTES,
+		.blocks_bytes = ISPFE_PDMA_BLOCKS_BYTES,
+		.raw_output = true,
 		.backend_output = true,
+		.patch_backend_output = true,
 	},
 	{
 		.cmds = ispfe_pdma_binned_recipe,
@@ -625,6 +641,27 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.inputs = ispfe_pdma_binned_inputs,
 		.num_inputs = ARRAY_SIZE(ispfe_pdma_binned_inputs),
 		.width = 2104, .height = 1560, .stride = 4224,
+		.recipe_bytes = ISPFE_PDMA_BINNED_RECIPE_BYTES,
+		.blocks_bytes = ISPFE_PDMA_BINNED_BLOCKS_BYTES,
+		.raw_output = true,
+	},
+	{
+		.cmds = ispfe_pdma_backend_recipe,
+		.num_cmds = ARRAY_SIZE(ispfe_pdma_backend_recipe),
+		.relocs = ispfe_pdma_backend_relocs,
+		.num_relocs = ARRAY_SIZE(ispfe_pdma_backend_relocs),
+		.inputs = ispfe_pdma_backend_inputs,
+		.num_inputs = ARRAY_SIZE(ispfe_pdma_backend_inputs),
+		.width = 4208, .height = 3120, .stride = 8416,
+		.recipe_bytes = ISPFE_PDMA_BACKEND_RECIPE_BYTES,
+		.blocks_bytes = ISPFE_PDMA_BACKEND_BLOCKS_BYTES,
+		.backend_output = true,
+		.backend_recipe = true,
+		.fixed_resources = true,
+		.required_loch = 1,
+		.required_fcctx = 2,
+		.required_slot = 1,
+		.required_lmp_alloc_ctrl = 0x1a,
 	},
 };
 
@@ -635,15 +672,19 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
  */
 static_assert(ISPFE_PDMA_BINNED_RECIPE_BYTES == ISPFE_PDMA_RECIPE_BYTES);
 static_assert(ISPFE_PDMA_BINNED_BLOCKS_BYTES == ISPFE_PDMA_BLOCKS_BYTES);
+static_assert(ISPFE_PDMA_BACKEND_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
+static_assert(ISPFE_PDMA_BLOCKS_BYTES <= ISPFE_PDMA_MAX_BLOCKS_BYTES);
 
 /* The recipe for a geometry, or NULL if none was captured for it. */
-static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height)
+static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,
+						  bool backend_recipe)
 {
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_programs); i++)
 		if (ispfe_pdma_programs[i].width == width &&
-		    ispfe_pdma_programs[i].height == height)
+		    ispfe_pdma_programs[i].height == height &&
+		    ispfe_pdma_programs[i].backend_recipe == backend_recipe)
 			return &ispfe_pdma_programs[i];
 
 	return NULL;
@@ -926,6 +967,9 @@ struct ispfe_device {
 	/* Requested and stream-latched processed-output geometry experiment. */
 	u32 lmp_ml0_profile;
 	u32 active_lmp_ml0_profile;
+	/* Select the captured ordinary back-end program for a debugfs run. */
+	u32 backend_recipe;
+	bool active_backend_recipe;
 	/*
 	 * Idle-only debugfs staging for runtime PDMA experiments.  The program
 	 * remains tied to the selected captured recipe: its command grammar,
@@ -1685,11 +1729,13 @@ static void ispfe_ring_record(struct ispfe_device *ispfe, unsigned int index,
 			      unsigned int slot)
 {
 	dma_addr_t dma = ispfe_slot_dma(ispfe, slot);
+	u32 bytes = ispfe->active_backend_recipe ?
+		    ispfe->prog->recipe_bytes : READ_ONCE(ispfe->pdma_bytes);
 
 	ispfe->ring[index].cmd = cpu_to_le32(READ_ONCE(ispfe->pdma_cmd));
 	ispfe->ring[index].addr_lo = cpu_to_le32(lower_32_bits(dma));
 	ispfe->ring[index].addr_hi = cpu_to_le32(upper_32_bits(dma));
-	ispfe->ring[index].bytes = cpu_to_le32(READ_ONCE(ispfe->pdma_bytes));
+	ispfe->ring[index].bytes = cpu_to_le32(bytes);
 }
 
 struct ispfe_buffer {
@@ -1958,6 +2004,17 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 		if (index < ARRAY_SIZE(ispfe_pdma_outputs))
 			return ispfe->pdma_output[index].dma;
 		break;
+	case ISPFE_BUF_KIND_BACKEND:
+		switch (index) {
+		case 0:
+			return exynos_becore_input_dma(ispfe->backend_input);
+		case 1:
+			return exynos_becore_input_dma(ispfe->backend_input) +
+			       ISPFE_BACKEND_IMAGE_OFFSET;
+		case 2:
+			return ispfe->tnr_pyramid_dma;
+		}
+		break;
 	}
 
 	return DMA_MAPPING_ERROR;
@@ -1983,7 +2040,7 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 {
 	dma_addr_t dma;
 
-	if (!ispfe->prog->backend_output)
+	if (!ispfe->prog->patch_backend_output)
 		return 0;
 
 	switch (cmd->reg) {
@@ -2097,7 +2154,7 @@ static int ispfe_pdma_prepare_ml0_lut(struct ispfe_device *ispfe)
 	input = &ispfe->prog->inputs[ISPFE_LMP_ML0_SCALER_INPUT];
 	if (input->size < sizeof(ispfe_lmp_ml0_1024_lut) ||
 	    input->area_offset + sizeof(ispfe_lmp_ml0_1024_lut) >
-	    ISPFE_PDMA_BLOCKS_BYTES)
+	    ispfe->prog->blocks_bytes)
 		return -EINVAL;
 
 	memcpy((u8 *)ispfe->blocks + input->area_offset,
@@ -2146,7 +2203,8 @@ static bool ispfe_pdma_reloc_byte(const struct ispfe_pdma_program *prog,
 		if (reloc->cmd != command)
 			continue;
 		if ((byte >= reloc->lo && byte < reloc->lo + sizeof(u32)) ||
-		    (byte >= reloc->hi && byte < reloc->hi + sizeof(u32)))
+		    (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH &&
+		     byte >= reloc->hi && byte < reloc->hi + sizeof(u32)))
 			return true;
 	}
 
@@ -2413,9 +2471,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 
 	program = ispfe->programs + slot * PDMA_SLOT_STRIDE;
 
-	if (ispfe_pdma_recipe_bytes(prog) != ISPFE_PDMA_RECIPE_BYTES) {
+	if (ispfe_pdma_recipe_bytes(prog) != prog->recipe_bytes ||
+	    prog->recipe_bytes > PDMA_SLOT_STRIDE) {
 		dev_err(ispfe->dev, "PDMA recipe does not serialise to %#x bytes\n",
-			ISPFE_PDMA_RECIPE_BYTES);
+			prog->recipe_bytes);
 		return -EINVAL;
 	}
 
@@ -2483,18 +2542,27 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			return ret;
 
 		for (; reloc < last && reloc->cmd == i; reloc++) {
-			if (reloc->lo + 4 > cmd->len || reloc->hi + 4 > cmd->len)
+			if (reloc->lo + 4 > cmd->len ||
+			    (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH &&
+			     reloc->hi + 4 > cmd->len))
 				return -EINVAL;
 			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma),
 					   program + at + reloc->lo);
-			put_unaligned_le32(upper_32_bits(dma),
-					   program + at + reloc->hi);
+			if (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH)
+				put_unaligned_le32(upper_32_bits(dma),
+						   program + at + reloc->hi);
 			if (reloc->buffer == ISPFE_BUF_BAYER) {
 				bayer_lo = at + reloc->lo;
 				bayer_hi = at + reloc->hi;
+			} else if (reloc->buffer == ISPFE_BUF_BACKEND_IMAGE) {
+				backend_image_lo = at + reloc->lo;
+				backend_image_hi = at + reloc->hi;
+			} else if (reloc->buffer == ISPFE_BUF_BACKEND_HEADER) {
+				backend_header_lo = at + reloc->lo;
+				backend_header_hi = at + reloc->hi;
 			}
 		}
 
@@ -2505,7 +2573,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 * Relocations are emitted in command order, so anything left over names
 	 * a command the recipe no longer has.
 	 */
-	if (reloc != last || !bayer_lo) {
+	if (reloc != last || (prog->raw_output && !bayer_lo)) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
 		return -EINVAL;
 	}
@@ -2542,7 +2610,7 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 	unsigned int i;
 	int ret;
 
-	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_BLOCKS_BYTES - 1) ||
+	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_MAX_BLOCKS_BYTES - 1) ||
 	    upper_32_bits(ispfe->programs_dma + PDMA_PROGRAMS_SIZE - 1) ||
 	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1) ||
 	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1))
@@ -2554,16 +2622,17 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 			return -ERANGE;
 
 	if (ispfe->active_pdma_program_override) {
+		memset(ispfe->blocks, 0, ISPFE_PDMA_MAX_BLOCKS_BYTES);
 		memcpy(ispfe->blocks, ispfe->pdma_blocks_staged,
 		       ISPFE_PDMA_BLOCKS_BYTES);
 	} else {
-		memset(ispfe->blocks, 0, ISPFE_PDMA_BLOCKS_BYTES);
+		memset(ispfe->blocks, 0, ISPFE_PDMA_MAX_BLOCKS_BYTES);
 		for (i = 0; i < ispfe->prog->num_inputs; i++) {
 			const struct ispfe_pdma_input *input =
 				&ispfe->prog->inputs[i];
 
 			if (input->area_offset + input->size >
-			    ISPFE_PDMA_BLOCKS_BYTES)
+			    ispfe->prog->blocks_bytes)
 				return -EOVERFLOW;
 			memcpy((u8 *)ispfe->blocks + input->area_offset,
 			       input->data, input->size);
@@ -2623,7 +2692,7 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 			ispfe->ring[i].addr_hi = cpu_to_le32(0);
 		}
 		/* Keep the separate first-record control for parser experiments. */
-		if (!i)
+		if (!i && !ispfe->active_backend_recipe)
 			ispfe->ring[i].bytes =
 				cpu_to_le32(READ_ONCE(ispfe->pdma_bytes_first));
 	}
@@ -2918,15 +2987,17 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 	 */
 	if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_ARMED,
 		    ISPFE_SNAPSHOT_REDIRECTING) == ISPFE_SNAPSHOT_ARMED) {
-		if (WARN_ON_ONCE(!ispfe->bayer_lo)) {
+		if (ispfe->prog->raw_output && WARN_ON_ONCE(!ispfe->bayer_lo)) {
 			cmpxchg(&ispfe->snapshot_state,
 				ISPFE_SNAPSHOT_REDIRECTING, ISPFE_SNAPSHOT_IDLE);
 			return;
 		}
-		put_unaligned_le32(lower_32_bits(ispfe->spare_frame_dma),
-				   program + ispfe->bayer_lo);
-		put_unaligned_le32(upper_32_bits(ispfe->spare_frame_dma),
-				   program + ispfe->bayer_hi);
+		if (ispfe->prog->raw_output) {
+			put_unaligned_le32(lower_32_bits(ispfe->spare_frame_dma),
+					   program + ispfe->bayer_lo);
+			put_unaligned_le32(upper_32_bits(ispfe->spare_frame_dma),
+					   program + ispfe->bayer_hi);
+		}
 		if (ispfe->prog->backend_output) {
 			if (WARN_ON_ONCE(!ispfe->backend_image_lo ||
 					 !ispfe->backend_header_lo)) {
@@ -3122,7 +3193,7 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 		ispfe->backend_header_hi = 0;
 	}
 	if (ispfe->blocks) {
-		dma_free_coherent(ispfe->dev, ISPFE_PDMA_BLOCKS_BYTES,
+		dma_free_coherent(ispfe->dev, ISPFE_PDMA_MAX_BLOCKS_BYTES,
 				  ispfe->blocks, ispfe->blocks_dma);
 		ispfe->blocks = NULL;
 	}
@@ -3223,7 +3294,8 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
-	ispfe->blocks = dma_alloc_coherent(ispfe->dev, ISPFE_PDMA_BLOCKS_BYTES,
+	ispfe->blocks = dma_alloc_coherent(ispfe->dev,
+					   ISPFE_PDMA_MAX_BLOCKS_BYTES,
 					   &ispfe->blocks_dma, GFP_KERNEL);
 	if (!ispfe->blocks) {
 		ispfe_buffers_free(ispfe);
@@ -3449,17 +3521,38 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	    ispfe->src.fcctx >= FC_NUM_CTX ||
 	    ispfe->src.slot >= LMP_ALLOC_NUM_SLOTS ||
 	    ispfe->lmp_ml0_profile >= ISPFE_LMP_ML0_PROFILE_COUNT ||
+	    ispfe->backend_recipe > 1 ||
 	    ispfe->src.width - 1 >= U16_MAX || ispfe->src.height - 1 >= U16_MAX)
 		return -EINVAL;
 
-	ispfe->prog = ispfe_program_for(ispfe->src.width, ispfe->src.height);
+	ispfe->prog = ispfe_program_for(ispfe->src.width, ispfe->src.height,
+					ispfe->backend_recipe);
 	if (!ispfe->prog) {
 		dev_err(ispfe->dev,
 			"no PDMA recipe captured for %ux%u\n",
 			ispfe->src.width, ispfe->src.height);
 		return -EINVAL;
 	}
+	if (ispfe->prog->backend_recipe && ispfe->owner == ISPFE_OWNER_V4L2)
+		return -EOPNOTSUPP;
+	if (ispfe->prog->fixed_resources &&
+	    (ispfe->src.loch != ispfe->prog->required_loch ||
+	     ispfe->src.fcctx != ispfe->prog->required_fcctx ||
+	     ispfe->src.slot != ispfe->prog->required_slot ||
+	     ispfe->lmp_alloc_ctrl != ispfe->prog->required_lmp_alloc_ctrl)) {
+		dev_err(ispfe->dev,
+			"PDMA recipe needs loch %u, FC %u, slot %u, allocator %#x\n",
+			ispfe->prog->required_loch, ispfe->prog->required_fcctx,
+			ispfe->prog->required_slot,
+			ispfe->prog->required_lmp_alloc_ctrl);
+		return -EINVAL;
+	}
+	if (ispfe->prog->backend_recipe &&
+	    ispfe->lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
+		return -EINVAL;
 	if (ispfe->pdma_program_override) {
+		if (ispfe->prog->backend_recipe)
+			return -EINVAL;
 		/* A staged program already contains its final profile payload. */
 		if (ispfe->lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
 			return -EINVAL;
@@ -3474,6 +3567,7 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	ispfe->active = ispfe->src;
 	ispfe->active_lmp_ml0_profile = ispfe->lmp_ml0_profile;
+	ispfe->active_backend_recipe = ispfe->prog->backend_recipe;
 	ispfe->active_pdma_program_override = ispfe->pdma_program_override;
 	ispfe->active_pdma_program_generation =
 		ispfe->active_pdma_program_override ?
@@ -4144,6 +4238,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	seq_printf(s, "lmp_ml0_profile %u requested, %u active\n",
 		   ispfe->lmp_ml0_profile, ispfe->active_lmp_ml0_profile);
+	seq_printf(s, "backend_recipe %u requested, %u active\n",
+		   ispfe->backend_recipe, ispfe->active_backend_recipe);
 	seq_printf(s, "pdma_override %u requested, %u active\n",
 		   ispfe->pdma_program_override,
 		   ispfe->active_pdma_program_override);
@@ -4180,7 +4276,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "program_iova %pad  %u slots of %#x\n",
 		   &ispfe->programs_dma, PDMA_SLOTS, PDMA_SLOT_STRIDE);
 	seq_printf(s, "blocks_iova  %pad\n", &ispfe->blocks_dma);
-	seq_printf(s, "program_size %u\n", ISPFE_PDMA_RECIPE_BYTES);
+	seq_printf(s, "program_size %u\n",
+		   ispfe->prog ? ispfe->prog->recipe_bytes :
+		   ISPFE_PDMA_RECIPE_BYTES);
 	seq_printf(s, "bayer_reloc  %#x/%#x\n", ispfe->bayer_lo,
 		   ispfe->bayer_hi);
 	seq_printf(s,
@@ -4191,6 +4289,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "backend_reloc image %#x/%#x, header %#x/%#x\n",
 		   ispfe->backend_image_lo, ispfe->backend_image_hi,
 		   ispfe->backend_header_lo, ispfe->backend_header_hi);
+	seq_printf(s, "tnr_iova     %pad  size %u\n",
+		   &ispfe->tnr_pyramid_dma, ISPFE_TNR_PYRAMID_SIZE);
 	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		seq_printf(s, "aux%02u_iova  %pad  size %zu\n", i,
@@ -4282,7 +4382,7 @@ static ssize_t ispfe_program_read(struct file *file, char __user *buf,
 
 	/* Slot 0, which is the one the diagnostic's ring records point at. */
 	return simple_read_from_buffer(buf, count, ppos, ispfe->programs,
-				       ISPFE_PDMA_RECIPE_BYTES);
+				       ispfe->prog->recipe_bytes);
 }
 
 static ssize_t ispfe_pdma_stage_write(struct ispfe_device *ispfe,
@@ -4352,7 +4452,7 @@ static ssize_t ispfe_blocks_read(struct file *file, char __user *buf,
 		return -ENODATA;
 
 	return simple_read_from_buffer(buf, count, ppos, ispfe->blocks,
-				       ISPFE_PDMA_BLOCKS_BYTES);
+				       ispfe->prog->blocks_bytes);
 }
 
 static ssize_t ispfe_blocks_write(struct file *file, const char __user *buf,
@@ -4513,6 +4613,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_x32("lmp_alloc_ctrl", 0644, d, &ispfe->lmp_alloc_ctrl);
 	debugfs_create_u32("lmp_ml0_profile", 0644, d,
 			   &ispfe->lmp_ml0_profile);
+	debugfs_create_u32("backend_recipe", 0644, d,
+			   &ispfe->backend_recipe);
 	debugfs_create_u32("credit_latency", 0644, d, &ispfe->credit_latency);
 	debugfs_create_x32("pdma_cmd", 0644, d, &ispfe->pdma_cmd);
 	debugfs_create_x32("pdma_addr", 0644, d, &ispfe->pdma_addr);
@@ -4600,7 +4702,7 @@ static void ispfe_fill_pix(const struct v4l2_mbus_framefmt *fmt,
 	 * -- 4224 for 2104 pixels, not 4208 -- so reporting width * 2 would
 	 * under-size every buffer by sixteen bytes a line.
 	 */
-	prog = ispfe_program_for(pix->width, pix->height);
+	prog = ispfe_program_for(pix->width, pix->height, false);
 	pix->bytesperline = prog ? prog->stride :
 			    pix->width * ISPFE_BYTES_PER_PIXEL;
 	pix->sizeimage = pix->bytesperline * pix->height;

@@ -57,6 +57,7 @@ enum ispfe_pdma_op {
 #define ISPFE_BUF_KIND_BAYER		0
 #define ISPFE_BUF_KIND_INPUT		1
 #define ISPFE_BUF_KIND_OUTPUT		2
+#define ISPFE_BUF_KIND_BACKEND		3
 
 #define ISPFE_BUF_KIND_SHIFT		6
 #define ISPFE_BUF_INDEX_MASK		0x3f
@@ -68,6 +69,9 @@ enum ispfe_pdma_op {
 #define ISPFE_BUF_BAYER			ISPFE_BUF(ISPFE_BUF_KIND_BAYER, 0)
 #define ISPFE_BUF_INPUT(n)		ISPFE_BUF(ISPFE_BUF_KIND_INPUT, (n))
 #define ISPFE_BUF_OUTPUT(n)		ISPFE_BUF(ISPFE_BUF_KIND_OUTPUT, (n))
+#define ISPFE_BUF_BACKEND_HEADER	ISPFE_BUF(ISPFE_BUF_KIND_BACKEND, 0)
+#define ISPFE_BUF_BACKEND_IMAGE		ISPFE_BUF(ISPFE_BUF_KIND_BACKEND, 1)
+#define ISPFE_BUF_TNR_PYRAMID		ISPFE_BUF(ISPFE_BUF_KIND_BACKEND, 2)
 
 /*
  * One command.  @reg is the target register, or the block base for a block
@@ -95,6 +99,9 @@ struct ispfe_pdma_reloc {
 	u16 hi;
 	u8 buffer;
 };
+
+/* Some block-local DMA base registers carry only the low 32 address bits. */
+#define ISPFE_PDMA_RELOC_NO_HIGH	0xffff
 
 /*
  * A block an indirect burst streams into the front end.  It has to be in DRAM

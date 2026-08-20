@@ -6,6 +6,7 @@
  * ../../../../../../research/dumped.dts unless another source is named.
  */
 
+#include <dt-bindings/clock/google,zumapro-acpm.h>
 #include <dt-bindings/clock/google,zumapro.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
@@ -567,7 +568,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x0>;
-			clocks = <&acpm_ipc 2>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL0>;
 			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
@@ -580,7 +581,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x100>;
-			clocks = <&acpm_ipc 2>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL0>;
 			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
@@ -592,7 +593,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x200>;
-			clocks = <&acpm_ipc 2>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL0>;
 			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
@@ -604,7 +605,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a520";
 			reg = <0x0 0x300>;
-			clocks = <&acpm_ipc 2>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL0>;
 			operating-points-v2 = <&cpucl0_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hayes_cpu_sleep>;
@@ -616,7 +617,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x400>;
-			clocks = <&acpm_ipc 3>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL1>;
 			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
@@ -629,7 +630,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x500>;
-			clocks = <&acpm_ipc 3>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL1>;
 			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
@@ -641,7 +642,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0 0x600>;
-			clocks = <&acpm_ipc 3>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL1>;
 			operating-points-v2 = <&cpucl1_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
@@ -653,7 +654,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-x4";
 			reg = <0x0 0x700>;
-			clocks = <&acpm_ipc 4>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CPUCL2>;
 			operating-points-v2 = <&cpucl2_opp_table>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunterelp_cpu_sleep>;
@@ -1596,7 +1597,8 @@
 			compatible = "google,zumapro-mali", "arm,mali-valhall-csf";
 			reg = <0x1f000000 0x480000>;
 			#cooling-cells = <2>;
-			clocks = <&acpm_ipc 7>, <&acpm_ipc 8>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_G3D>,
+				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_G3DL2>;
 			clock-names = "core", "coregroup";
 			interrupts = <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH 0>,

@@ -71,9 +71,7 @@ static const struct acpm_clk_driver_data acpm_clk_gs101 = {
  * gs101 -- the GPU cal_ids (0xb040007 = G3D, 0xb040008 = G3DL2) carry those
  * indices in their low 16 bits (cmucal MASK_OF_ID), and the driver passes the
  * array index straight to ACPM as the DVFS domain id, so the array order must
- * match the firmware enum exactly.  Only the prefix through G3DL2 is listed:
- * everything up to here is needed to keep index == domain-id for the GPU, and
- * later domains (TPU, CAM, ...) can be appended when a consumer lands.
+ * match the firmware enum exactly.
  */
 static const struct acpm_clk_variant zumapro_acpm_clks[] = {
 	ACPM_CLK("mif"),	/* 0 */
@@ -85,6 +83,10 @@ static const struct acpm_clk_variant zumapro_acpm_clks[] = {
 	ACPM_CLK("bci"),	/* 6 */
 	ACPM_CLK("g3d"),	/* 7 */
 	ACPM_CLK("g3dl2"),	/* 8 */
+	ACPM_CLK("tpu"),	/* 9 */
+	ACPM_CLK("intcam"),	/* 10 */
+	ACPM_CLK("tnr"),	/* 11 */
+	ACPM_CLK("cam"),	/* 12 */
 };
 
 static const struct acpm_clk_driver_data acpm_clk_zumapro = {

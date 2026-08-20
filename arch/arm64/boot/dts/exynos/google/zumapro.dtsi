@@ -3854,6 +3854,53 @@
 		};
 
 		/*
+		 * Camera back-end processing core.  Source: downstream
+		 * lwis_be_core@1C440000 in research/dumped.dts:13101.  The three
+		 * processor windows, seven SSMT windows and RGBP routing register
+		 * preserve the downstream resource order.  CMDQ shares each block's
+		 * INT0 GIC line, so the downstream nine interrupt entries reduce to
+		 * the six unique physical lines below.
+		 *
+		 * RGBP's command loader resides in BLK_GDC.  Consequently all three
+		 * domains and GDC's System MMU are dependencies even though the first
+		 * offline path only submits RGBP and YUVP programs.  Keep the complete
+		 * complex passive until the board opts into the lifecycle driver.
+		 */
+		becore: camera@1c440000 {
+			compatible = "google,zumapro-becore";
+			reg = <0x1c440000 0x10000>,
+			      <0x1c470000 0x10000>,
+			      <0x1c840000 0x10000>,
+			      <0x1c5d4000 0xe00>,
+			      <0x1c914000 0xe00>,
+			      <0x1c420404 0x4>,
+			      <0x1c604000 0xe00>,
+			      <0x1c614000 0xe00>,
+			      <0x1c624000 0xe00>,
+			      <0x1c634000 0xe00>,
+			      <0x1c644000 0xe00>;
+			reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp",
+				    "ssmt-yuvp", "sysreg-rgbp", "ssmt-mcfp0",
+				    "ssmt-mcfp1", "ssmt-mcfp2", "ssmt-mcfp3",
+				    "ssmt-mcfp4";
+			interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 664 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 744 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "rgbp-int0", "rgbp-int1",
+					  "mcfp-int0", "mcfp-int1",
+					  "yuvp-int0", "yuvp-int1";
+			power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>;
+			power-domain-names = "yuvp", "rgbp", "gdc";
+			iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>,
+				 <&sysmmu_rgbp_s1>, <&sysmmu_gdc>;
+			samsung,iommu-group = <&iommu_group_isp>;
+			status = "disabled";
+		};
+
+		/*
 		 * BLK_ISPFE, the camera receive complex: twelve CSIS links with
 		 * nine combo D/C-PHYs behind them, the ISPFE front end, and the
 		 * PDMA that carries per-frame descriptors.  Windows are the

@@ -33,7 +33,7 @@ struct exynos_pm_domain_config {
 
 struct exynos_pm_domain_restore {
 	u32 divider_offset;
-	u32 mux_offsets[2];
+	u32 mux_offsets[3];
 	u32 num_muxes;
 	u32 qch_first;
 	u32 qch_last;
@@ -41,6 +41,7 @@ struct exynos_pm_domain_restore {
 	u32 bus_drcg;
 	u32 bus_drcg1_offset;
 	u32 bus_drcg1;
+	u32 bus_memclk_offset;
 	u32 num_s2mpus;
 };
 
@@ -74,7 +75,6 @@ struct exynos_pm_domain {
 #define EXYNOS_PD_CMU_MUX_ON		0x10
 #define EXYNOS_PD_CMU_QCH_ON		0x2
 #define EXYNOS_PD_BUS_DRCG_EN		0x104
-#define EXYNOS_PD_BUS_MEMCLK		0x108
 #define EXYNOS_PD_S2MPU_PROT_CLR	0x54
 #define EXYNOS_PD_S2MPU_OPEN		0xff
 #define EXYNOS_PD_STATUS		0x4
@@ -102,7 +102,7 @@ static void exynos_pd_restore(struct exynos_pm_domain *pd)
 	if (restore->bus_drcg1_offset)
 		writel(restore->bus_drcg1,
 		       pd->bus + restore->bus_drcg1_offset);
-	writel(0, pd->bus + EXYNOS_PD_BUS_MEMCLK);
+	writel(0, pd->bus + restore->bus_memclk_offset);
 
 	for (i = 0; i < restore->num_s2mpus; i++)
 		writel(EXYNOS_PD_S2MPU_OPEN,
@@ -239,11 +239,25 @@ static const struct exynos_pm_domain_config zumapro_cfg = {
 };
 
 /*
- * These are the values restored by downstream PMUCAL on every BLK_RGBP and
- * BLK_YUVP power-up, corroborated by the Pixel 9a camera startup trace.  The
- * Q-channel ranges include the System MMUs, so the restore belongs here in
- * genpd: an IOMMU resumes before the camera device whose DMA it serves.
+ * These are the values restored by downstream PMUCAL on every BLK_GDC,
+ * BLK_RGBP and BLK_YUVP power-up, corroborated by the Pixel 9a camera startup
+ * trace.  The Q-channel ranges include the System MMUs, so the restore belongs
+ * here in genpd: an IOMMU resumes before the camera device whose DMA it serves.
  */
+static const struct exynos_pm_domain_restore zumapro_gdc_restore = {
+	.divider_offset	= 0x1800,
+	.mux_offsets	= { 0x600, 0x610, 0x620 },
+	.num_muxes	= 3,
+	.qch_first	= 0x3034,
+	.qch_last	= 0x30e8,
+	.qch_hole	= U32_MAX,
+	.bus_drcg	= 0xffffffff,
+	.bus_drcg1_offset = 0x400,
+	.bus_drcg1	= 0x00000001,
+	.bus_memclk_offset = 0x10c,
+	.num_s2mpus	= 1,
+};
+
 static const struct exynos_pm_domain_restore zumapro_rgbp_restore = {
 	.divider_offset	= 0x1800,
 	.mux_offsets	= { 0x600, 0x610 },
@@ -254,6 +268,7 @@ static const struct exynos_pm_domain_restore zumapro_rgbp_restore = {
 	.bus_drcg	= 0x07ffffff,
 	.bus_drcg1_offset = 0x400,
 	.bus_drcg1	= 0x007fffff,
+	.bus_memclk_offset = 0x108,
 	.num_s2mpus	= 2,
 };
 
@@ -265,7 +280,15 @@ static const struct exynos_pm_domain_restore zumapro_yuvp_restore = {
 	.qch_last	= 0x3070,
 	.qch_hole	= U32_MAX,
 	.bus_drcg	= 0x0000ffff,
+	.bus_memclk_offset = 0x108,
 	.num_s2mpus	= 1,
+};
+
+static const struct exynos_pm_domain_config zumapro_gdc_cfg = {
+	.local_pwr_cfg	= BIT(0),
+	.secure_pmu	= true,
+	.wait_us	= 5000,
+	.restore	= &zumapro_gdc_restore,
 };
 
 static const struct exynos_pm_domain_config zumapro_rgbp_cfg = {
@@ -292,6 +315,9 @@ static const struct of_device_id exynos_pm_domain_of_match[] = {
 	}, {
 		.compatible = "google,zumapro-pd",
 		.data = &zumapro_cfg,
+	}, {
+		.compatible = "google,zumapro-gdc-pd",
+		.data = &zumapro_gdc_cfg,
 	}, {
 		.compatible = "google,zumapro-rgbp-pd",
 		.data = &zumapro_rgbp_cfg,

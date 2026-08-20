@@ -1448,7 +1448,7 @@ static int ispfe_runtime_resume(struct device *dev)
 
 	ispfe_cmu_restore(ispfe);
 	ispfe_s2mpu_open(ispfe);
-	if (ispfe->phy_isolation_bypass)
+	if (ispfe->phy_isolation_bypass || ispfe->pdma_program_override)
 		return ispfe_phy_isolation(ispfe, true);
 
 	return 0;
@@ -3970,6 +3970,14 @@ static int ispfe_program_override_set(void *data, u64 value)
 
 	guard(mutex)(&ispfe->lock);
 	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+		return -EBUSY;
+	/*
+	 * An unproven program can leave LMP busy even after the receiver is
+	 * stopped.  Keep the domain live for register inspection and an orderly
+	 * reboot rather than asking genpd to power down a block that cannot
+	 * acknowledge the request.
+	 */
+	if (value && !ispfe->power_hold)
 		return -EBUSY;
 	if (value &&
 	    (ispfe->pdma_program_staged_bytes != ISPFE_PDMA_RECIPE_BYTES ||

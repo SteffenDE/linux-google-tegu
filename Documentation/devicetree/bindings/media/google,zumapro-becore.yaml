@@ -12,7 +12,9 @@ maintainers:
 description:
   The Zumapro camera back-end core contains the RGBP Bayer and RGB processor,
   the optional MCFP multi-frame processor, and the YUVP YUV processor.  RGBP
-  and YUVP have separate power domains; MCFP resides in the RGBP domain.
+  and YUVP have separate power domains; MCFP resides in the RGBP domain.  The
+  RGBP command loader resides in the GDC power domain, which is consequently a
+  dependency even when GDC receives no per-frame program.
 
 properties:
   compatible:
@@ -23,14 +25,28 @@ properties:
       - description: RGBP processor
       - description: MCFP processor
       - description: YUVP processor
+      - description: RGBP system memory stream-attribute mapper
+      - description: YUVP system memory stream-attribute mapper
       - description: RGBP system register controlling internal routing
+      - description: MCFP system memory stream-attribute mapper D0
+      - description: MCFP system memory stream-attribute mapper D1
+      - description: MCFP system memory stream-attribute mapper D2
+      - description: MCFP system memory stream-attribute mapper D3
+      - description: MCFP system memory stream-attribute mapper D4
 
   reg-names:
     items:
       - const: rgbp
       - const: mcfp
       - const: yuvp
+      - const: ssmt-rgbp
+      - const: ssmt-yuvp
       - const: sysreg-rgbp
+      - const: ssmt-mcfp0
+      - const: ssmt-mcfp1
+      - const: ssmt-mcfp2
+      - const: ssmt-mcfp3
+      - const: ssmt-mcfp4
 
   interrupts:
     items:
@@ -52,19 +68,22 @@ properties:
 
   power-domains:
     items:
-      - description: RGBP and MCFP power domain
       - description: YUVP power domain
+      - description: RGBP and MCFP power domain
+      - description: GDC power domain containing the RGBP command loader
 
   power-domain-names:
     items:
-      - const: rgbp
       - const: yuvp
+      - const: rgbp
+      - const: gdc
 
   iommus:
     items:
       - description: YUVP System MMU
       - description: RGBP System MMU S0
       - description: RGBP System MMU S1
+      - description: GDC System MMU used by the RGBP command loader
 
   samsung,iommu-group:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -93,8 +112,17 @@ examples:
         reg = <0x1c440000 0x10000>,
               <0x1c470000 0x10000>,
               <0x1c840000 0x10000>,
-              <0x1c420404 0x4>;
-        reg-names = "rgbp", "mcfp", "yuvp", "sysreg-rgbp";
+              <0x1c5d4000 0xe00>,
+              <0x1c914000 0xe00>,
+              <0x1c420404 0x4>,
+              <0x1c604000 0xe00>,
+              <0x1c614000 0xe00>,
+              <0x1c624000 0xe00>,
+              <0x1c634000 0xe00>,
+              <0x1c644000 0xe00>;
+        reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp", "ssmt-yuvp",
+                    "sysreg-rgbp", "ssmt-mcfp0", "ssmt-mcfp1",
+                    "ssmt-mcfp2", "ssmt-mcfp3", "ssmt-mcfp4";
         interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
@@ -104,9 +132,10 @@ examples:
         interrupt-names = "rgbp-int0", "rgbp-int1",
                           "mcfp-int0", "mcfp-int1",
                           "yuvp-int0", "yuvp-int1";
-        power-domains = <&pd_rgbp>, <&pd_yuvp>;
-        power-domain-names = "rgbp", "yuvp";
-        iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>;
+        power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>;
+        power-domain-names = "yuvp", "rgbp", "gdc";
+        iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>,
+                 <&sysmmu_gdc>;
         samsung,iommu-group = <&iommu_group_isp>;
     };
 ...

@@ -1044,6 +1044,7 @@ struct ispfe_device {
 	u32 bayer_hi;
 	/* Full-mode LMP main-Bayer output shared with the camera back end. */
 	struct exynos_becore_input *backend_input;
+	struct exynos_becore_input_buffer backend_buffer;
 	void *backend_spare;
 	dma_addr_t backend_spare_dma;
 	size_t backend_input_size;
@@ -2012,9 +2013,9 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 	case ISPFE_BUF_KIND_BACKEND:
 		switch (index) {
 		case 0:
-			return exynos_becore_input_dma(ispfe->backend_input);
+			return ispfe->backend_buffer.dma;
 		case 1:
-			return exynos_becore_input_dma(ispfe->backend_input) +
+			return ispfe->backend_buffer.dma +
 			       ISPFE_BACKEND_IMAGE_OFFSET;
 		case 2:
 			return ispfe->tnr_pyramid_dma;
@@ -2071,7 +2072,7 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		    get_unaligned_le32(payload + 0x20) !=
 		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
 			return -EINVAL;
-		dma = exynos_becore_input_dma(ispfe->backend_input);
+		dma = ispfe->backend_buffer.dma;
 		if (upper_32_bits(dma) ||
 		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET) ||
 		    upper_32_bits(ispfe->tnr_pyramid_dma))
@@ -3596,7 +3597,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	/* Reserve the exact slot whose IOVA the program encoder will publish. */
 	if (ispfe->prog->backend_output) {
-		ret = exynos_becore_input_producer_begin(ispfe->backend_input);
+		ret = exynos_becore_input_producer_acquire(ispfe->backend_input,
+							   &ispfe->backend_buffer);
 		if (ret)
 			return ret;
 		ispfe->backend_producing = true;
@@ -3699,7 +3701,8 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 err_backend:
 	if (ispfe->backend_producing) {
-		exynos_becore_input_producer_abort(ispfe->backend_input);
+		exynos_becore_input_producer_abort(ispfe->backend_input,
+						   &ispfe->backend_buffer);
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = false;
 	}
@@ -3715,7 +3718,8 @@ err_qos:
 		dev_err(ispfe->dev, "cannot restore camera QoS after start error\n");
 err_backend_early:
 	if (ispfe->backend_producing) {
-		exynos_becore_input_producer_abort(ispfe->backend_input);
+		exynos_becore_input_producer_abort(ispfe->backend_input,
+						   &ispfe->backend_buffer);
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = false;
 	}
@@ -3765,7 +3769,8 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	ispfe_free_irqs(ispfe);
 	if (ispfe->backend_producing &&
 	    READ_ONCE(ispfe->snapshot_state) != ISPFE_SNAPSHOT_READY) {
-		exynos_becore_input_producer_abort(ispfe->backend_input);
+		exynos_becore_input_producer_abort(ispfe->backend_input,
+						   &ispfe->backend_buffer);
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = false;
 	}
@@ -3973,7 +3978,8 @@ static int ispfe_backend_handoff_set(void *data, u64 val)
 		return -EALREADY;
 
 	if (!val) {
-		exynos_becore_input_producer_abort(ispfe->backend_input);
+		exynos_becore_input_producer_abort(ispfe->backend_input,
+						   &ispfe->backend_buffer);
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = false;
 		return 0;
@@ -3982,7 +3988,8 @@ static int ispfe_backend_handoff_set(void *data, u64 val)
 	if (smp_load_acquire(&ispfe->snapshot_state) != ISPFE_SNAPSHOT_READY)
 		return -ENODATA;
 
-	ret = exynos_becore_input_producer_complete(ispfe->backend_input);
+	ret = exynos_becore_input_producer_complete(ispfe->backend_input,
+						    &ispfe->backend_buffer);
 	if (!ret) {
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = true;
@@ -4228,7 +4235,7 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	unsigned long slots;
 
 	guard(mutex)(&ispfe->lock);
-	backend_dma = exynos_becore_input_dma(ispfe->backend_input);
+	backend_dma = ispfe->backend_buffer.dma;
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
 	seq_printf(s, "sensor_stream %u\n", ispfe->sensor_streaming);
@@ -5665,7 +5672,8 @@ static void ispfe_backend_unmap(void *data)
 	struct ispfe_device *ispfe = data;
 
 	if (ispfe->backend_producing)
-		exynos_becore_input_producer_abort(ispfe->backend_input);
+		exynos_becore_input_producer_abort(ispfe->backend_input,
+						   &ispfe->backend_buffer);
 	exynos_becore_input_unmap(ispfe->backend_input);
 	ispfe->backend_input = NULL;
 	ispfe->backend_producing = false;

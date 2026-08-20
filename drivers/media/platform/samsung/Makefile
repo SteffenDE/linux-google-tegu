@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+obj-y += exynos-becore/
 obj-y += exynos-gsc/
 obj-y += exynos-ispfe/
 obj-y += exynos4-is/

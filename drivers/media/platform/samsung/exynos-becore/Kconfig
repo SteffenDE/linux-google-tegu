@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_EXYNOS_BECORE
+	bool "Google zumapro camera back-end core"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	depends on PM
+	help
+	  Bring-up driver for the RGBP, MCFP and YUVP image processors in
+	  Google's zumapro (Tensor G4) camera back end.
+
+	  At this stage the driver restores the three power-domain dependencies,
+	  resets and initializes the processors, and handles their interrupts.  It
+	  does not yet expose a userspace image-processing interface.
+
+	  This is built-in because removal cannot be aborted if a processor fails
+	  to reset before its power domains are switched off.
+
+	  If unsure, say N.

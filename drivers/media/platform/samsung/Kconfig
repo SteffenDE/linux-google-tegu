@@ -2,6 +2,7 @@
 
 comment "Samsung media platform drivers"
 
+source "drivers/media/platform/samsung/exynos-becore/Kconfig"
 source "drivers/media/platform/samsung/exynos-gsc/Kconfig"
 source "drivers/media/platform/samsung/exynos-ispfe/Kconfig"
 source "drivers/media/platform/samsung/exynos4-is/Kconfig"

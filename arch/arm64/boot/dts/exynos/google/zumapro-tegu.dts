@@ -2310,3 +2310,41 @@
 &sysmmu_ispfe_s2 {
 	status = "okay";
 };
+
+/*
+ * Camera back-end lifecycle milestone.  The consumer's runtime-PM links keep
+ * YUVP, RGBP and GDC powered as one unit and their System MMUs resume before
+ * the processors are touched.  Per-frame routing, SSMT attributes and DMA
+ * remain disabled until a validated offline recipe is added to the driver.
+ */
+&pd_gdc {
+	status = "okay";
+};
+
+&pd_rgbp {
+	status = "okay";
+};
+
+&pd_yuvp {
+	status = "okay";
+};
+
+&sysmmu_gdc {
+	status = "okay";
+};
+
+&sysmmu_rgbp_s0 {
+	status = "okay";
+};
+
+&sysmmu_rgbp_s1 {
+	status = "okay";
+};
+
+&sysmmu_yuvp {
+	status = "okay";
+};
+
+&becore {
+	status = "okay";
+};

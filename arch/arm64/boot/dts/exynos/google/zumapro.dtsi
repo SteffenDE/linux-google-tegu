@@ -12,6 +12,7 @@
 #include <dt-bindings/interconnect/google,zumapro.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/interconnect/google,zumapro.h>
 #include <dt-bindings/thermal/thermal.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
 #include "zumapro-pinctrl.h"
@@ -3992,6 +3993,11 @@
 					  "csis-core", "fc", "lmp-bayer",
 					  "lmp-pdaf", "pdma";
 			power-domains = <&pd_ispfe>;
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CAM>;
+			clock-names = "cam";
+			interconnects = <&bts ZUMAPRO_BTS_MASTER_ISPFE>,
+					<&bts ZUMAPRO_BTS_SLAVE_MIF>;
+			interconnect-names = "memory";
 			google,backend = <&becore>;
 			iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>,
 				 <&sysmmu_ispfe_s2>;

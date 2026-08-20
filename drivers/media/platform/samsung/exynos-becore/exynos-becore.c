@@ -589,7 +589,6 @@ static void becore_process_frame_irq(struct becore_block *block, u32 status,
 	enum becore_block_id id = block - becore->blocks;
 	unsigned long flags;
 	bool complete_run = false;
-	bool start = false;
 
 	if (id != BECORE_RGBP && id != BECORE_YUVP)
 		return;
@@ -609,7 +608,11 @@ static void becore_process_frame_irq(struct becore_block *block, u32 status,
 		if (becore->cmdq_hold_mask == BECORE_ACTIVE_BLOCKS &&
 		    !becore->start_issued && !becore->abort_run) {
 			becore->start_issued = true;
-			start = true;
+			/* Release the downstream end of the chain first. */
+			writel(1, becore->blocks[BECORE_YUVP].base +
+			       BECORE_CMDQ_ADD_TO_QUEUE_0);
+			writel(1, becore->blocks[BECORE_RGBP].base +
+			       BECORE_CMDQ_ADD_TO_QUEUE_0);
 		}
 	}
 	if (status & BECORE_INT_FRAME_END) {
@@ -621,13 +624,6 @@ static void becore_process_frame_irq(struct becore_block *block, u32 status,
 unlock:
 	spin_unlock_irqrestore(&becore->run_lock, flags);
 
-	/* The vendor transaction starts the downstream end of the chain first. */
-	if (start) {
-		writel_relaxed(1, becore->blocks[BECORE_YUVP].base +
-			       BECORE_CMDQ_ADD_TO_QUEUE_0);
-		writel_relaxed(1, becore->blocks[BECORE_RGBP].base +
-			       BECORE_CMDQ_ADD_TO_QUEUE_0);
-	}
 	if (complete_run)
 		complete(&becore->run_completion);
 }
@@ -1175,9 +1171,9 @@ static int becore_cancel_set(void *data, u64 value)
 		cancelled = true;
 	}
 	spin_unlock_irqrestore(&becore->run_lock, flags);
-	mutex_unlock(&becore->lock);
 	if (cancelled)
 		complete(&becore->run_completion);
+	mutex_unlock(&becore->lock);
 
 	return cancelled ? 0 : -EALREADY;
 }

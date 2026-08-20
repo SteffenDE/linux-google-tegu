@@ -490,6 +490,8 @@ struct ispfe_pdma_output {
 /* Exact full-mode LMP main-Bayer allocation observed on the ultrawide. */
 #define ISPFE_BACKEND_INPUT_SIZE		0x01a17000
 #define ISPFE_BACKEND_IMAGE_OFFSET	0x00030c00
+/* Separate full-mode TNR-pyramid output allocation from the same request. */
+#define ISPFE_TNR_PYRAMID_SIZE		0x00468000
 
 /*
  * The working areas the front end writes back to, in the order the recipe's
@@ -1002,6 +1004,8 @@ struct ispfe_device {
 	void *backend_spare;
 	dma_addr_t backend_spare_dma;
 	size_t backend_input_size;
+	void *tnr_pyramid;
+	dma_addr_t tnr_pyramid_dma;
 	bool backend_producing;
 	bool backend_handed_off;
 	u32 backend_image_lo;
@@ -1969,6 +1973,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 
 #define ISPFE_LMP_CAPTURED_OUTPUT_GATES	0x0000b1f8
 #define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
+#define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
 
 static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 					   const struct ispfe_pdma_cmd *cmd,
@@ -2000,16 +2005,18 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		put_unaligned_le32(0x00000001, payload + 0x20);
 		break;
 	case ISPFE_LMP_BATCH_CONFIG_REG:
-		if (cmd->len < 0x90 ||
+		if (cmd->len < 0xc8 ||
 		    get_unaligned_le32(payload + 0x20) !=
 		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
 			return -EINVAL;
 		dma = exynos_becore_input_dma(ispfe->backend_input);
 		if (upper_32_bits(dma) ||
-		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET))
+		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET) ||
+		    upper_32_bits(ispfe->tnr_pyramid_dma))
 			return -ERANGE;
 		put_unaligned_le32(ISPFE_LMP_CAPTURED_OUTPUT_GATES |
-				     ISPFE_LMP_BACKEND_OUTPUT_GATE,
+				     ISPFE_LMP_BACKEND_OUTPUT_GATE |
+				     ISPFE_LMP_TNR_OUTPUT_GATE,
 				     payload + 0x20);
 		put_unaligned_le32(lower_32_bits(dma +
 						 ISPFE_BACKEND_IMAGE_OFFSET),
@@ -2019,6 +2026,10 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 				     payload + 0x84);
 		put_unaligned_le32(lower_32_bits(dma), payload + 0x88);
 		put_unaligned_le32(upper_32_bits(dma), payload + 0x8c);
+		put_unaligned_le32(lower_32_bits(ispfe->tnr_pyramid_dma),
+				     payload + 0xc0);
+		put_unaligned_le32(upper_32_bits(ispfe->tnr_pyramid_dma),
+				     payload + 0xc4);
 		*image_lo = payload_at + 0x80;
 		*image_hi = payload_at + 0x84;
 		*header_lo = payload_at + 0x88;
@@ -3086,6 +3097,11 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
+	if (ispfe->tnr_pyramid) {
+		dma_free_coherent(ispfe->dev, ISPFE_TNR_PYRAMID_SIZE,
+				  ispfe->tnr_pyramid, ispfe->tnr_pyramid_dma);
+		ispfe->tnr_pyramid = NULL;
+	}
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		if (!ispfe->pdma_output[i].cpu)
 			continue;
@@ -3150,6 +3166,8 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
 	    !ispfe->programs || !ispfe->blocks)
+		return false;
+	if (ispfe->prog->backend_output && !ispfe->tnr_pyramid)
 		return false;
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		if (!ispfe->pdma_output[i].cpu)
@@ -3216,6 +3234,15 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	if (!ispfe->programs) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
+	}
+	if (ispfe->prog->backend_output) {
+		ispfe->tnr_pyramid = dma_alloc_coherent(
+			ispfe->dev, ISPFE_TNR_PYRAMID_SIZE,
+			&ispfe->tnr_pyramid_dma, GFP_KERNEL);
+		if (!ispfe->tnr_pyramid) {
+			ispfe_buffers_free(ispfe);
+			return -ENOMEM;
+		}
 	}
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		ispfe->pdma_output[i].cpu = dma_alloc_coherent(

@@ -27,8 +27,14 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #include <media/exynos-becore.h>
+#include <media/media-device.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-ioctl.h>
+#include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-v4l2.h>
 
 #include "exynos-becore-recipe.h"
 
@@ -296,6 +302,17 @@ struct becore_irq {
 	bool int1;
 };
 
+struct becore_video_buffer {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+};
+
+static inline struct becore_video_buffer *
+to_becore_video_buffer(struct vb2_v4l2_buffer *vb)
+{
+	return container_of(vb, struct becore_video_buffer, vb);
+}
+
 struct becore_device {
 	struct device *dev;
 	struct becore_block blocks[BECORE_NUM_BLOCKS];
@@ -304,6 +321,17 @@ struct becore_device {
 	void __iomem *sysreg_rgbp;
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
+	struct media_device mdev;
+	struct v4l2_device v4l2_dev;
+	struct video_device vdev;
+	struct media_pad vdev_pad;
+	struct vb2_queue queue;
+	/* Serializes V4L2 ioctls and vb2 queue setup/teardown. */
+	struct mutex video_lock;
+	/* Protects the pending processed-output buffer list. */
+	spinlock_t queue_lock;
+	struct list_head queued_outputs;
+	struct work_struct video_work;
 	/* Serializes staging, input ownership, execution, and output inspection. */
 	struct mutex lock;
 	/* Protects IRQ-driven command-hold/frame completion state. */
@@ -322,12 +350,14 @@ struct becore_device {
 	u32 recipe_generation;
 	u32 run_generation;
 	u32 completed_generation;
+	u32 video_sequence;
 	u32 cmdq_hold_mask;
 	u32 frame_done_mask;
 	u32 output_changed_bytes;
 	u32 output_first_changed;
 	u32 output_profile;
 	u32 active_output_profile;
+	dma_addr_t active_output_dma;
 	size_t active_output_size;
 	size_t completed_output_size;
 	int last_run_result;
@@ -337,6 +367,7 @@ struct becore_device {
 	bool irq_error;
 	bool irqs_enabled;
 	bool reset_failed;
+	bool video_streaming;
 };
 
 struct exynos_becore_input {
@@ -717,9 +748,9 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 	case BECORE_YUVP_GRID_REG:
 		return becore->grid.dma;
 	case BECORE_YUVP_OUTPUT_PLANE1_REG:
-		return becore->output.dma;
+		return becore->active_output_dma;
 	case BECORE_YUVP_OUTPUT_PLANE2_REG:
-		return becore->output.dma +
+		return becore->active_output_dma +
 		       becore_active_output_plane2_offset(becore);
 	default:
 		return DMA_MAPPING_ERROR;
@@ -1521,6 +1552,8 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
 	slot->state = BECORE_INPUT_READY;
+	if (becore->video_streaming)
+		schedule_work(&becore->video_work);
 
 unlock:
 	mutex_unlock(&becore->lock);
@@ -1564,6 +1597,10 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		return 0;
 
 	mutex_lock(&becore->lock);
+	if (becore->video_streaming) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	if (becore->running) {
 		ret = -EBUSY;
 		goto unlock;
@@ -1611,7 +1648,7 @@ static ssize_t becore_recipe_read(struct file *file, char __user *buf,
 	ssize_t ret;
 
 	mutex_lock(&becore->lock);
-	if (becore->running)
+	if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else
 		ret = simple_read_from_buffer(buf, count, ppos, becore->recipe,
@@ -1682,7 +1719,7 @@ static ssize_t becore_output_read(struct file *file, char __user *buf,
 	ssize_t ret;
 
 	mutex_lock(&becore->lock);
-	if (becore->running)
+	if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else if (!becore->completed_generation)
 		ret = -ENODATA;
@@ -1711,7 +1748,7 @@ static ssize_t becore_encoded_read(struct file *file, char __user *buf,
 	ssize_t ret;
 
 	mutex_lock(&becore->lock);
-	if (becore->running)
+	if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else if (!becore->completed_generation)
 		ret = -ENODATA;
@@ -1788,7 +1825,8 @@ static void becore_measure_output(struct becore_device *becore)
 	becore->output_first_changed = first;
 }
 
-static struct becore_input_slot *becore_next_input(struct becore_device *becore)
+static struct becore_input_slot *
+becore_next_input(struct becore_device *becore, bool allow_staged)
 {
 	struct becore_input_slot *next = NULL;
 	unsigned int i;
@@ -1805,27 +1843,32 @@ static struct becore_input_slot *becore_next_input(struct becore_device *becore)
 		return next;
 
 	/* Slot zero remains the upload-and-repeat diagnostic oracle. */
-	if (becore->inputs[0].state == BECORE_INPUT_FREE)
+	if (allow_staged && becore->inputs[0].state == BECORE_INPUT_FREE)
 		return &becore->inputs[0];
 
 	return NULL;
 }
 
-static int becore_run_set(void *data, u64 value)
+static int becore_run_frame(struct becore_device *becore,
+			    dma_addr_t output_dma, u32 output_profile,
+			    bool ready_only, bool internal_output)
 {
-	struct becore_device *becore = data;
 	unsigned long flags;
 	unsigned long waited;
 	bool input_claimed = false;
 	int pm_ret;
 	int ret;
 	u32 i;
-	u32 output_profile;
-
-	if (value != 1)
-		return -EINVAL;
 
 	mutex_lock(&becore->lock);
+	if (internal_output && becore->video_streaming) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (!internal_output && !becore->video_streaming) {
+		ret = -ECANCELED;
+		goto unlock;
+	}
 	if (becore->running) {
 		ret = -EBUSY;
 		goto unlock;
@@ -1834,25 +1877,32 @@ static int becore_run_set(void *data, u64 value)
 		ret = -EIO;
 		goto record_error;
 	}
-	output_profile = READ_ONCE(becore->output_profile);
 	if (output_profile >= BECORE_YUVP_OUTPUT_PROFILE_COUNT) {
 		ret = -EINVAL;
 		goto record_error;
 	}
-	becore->run_input = becore_next_input(becore);
+	becore->run_input = becore_next_input(becore, !ready_only);
 	if (!becore->run_input) {
+		if (ready_only) {
+			ret = -ENODATA;
+			goto unlock;
+		}
 		ret = -EBUSY;
+		goto record_error;
+	}
+	becore->active_output_profile = output_profile;
+	becore->active_output_dma = output_dma;
+	becore->active_output_size = becore_active_output_size(becore);
+	if (!output_dma || upper_32_bits(output_dma) ||
+	    upper_32_bits(output_dma + becore->active_output_size - 1) ||
+	    (internal_output &&
+	     becore->active_output_size > becore->output.size)) {
+		ret = -EINVAL;
 		goto record_error;
 	}
 	ret = becore_recipe_validate(becore);
 	if (ret)
 		goto record_error;
-	becore->active_output_profile = output_profile;
-	becore->active_output_size = becore_active_output_size(becore);
-	if (becore->active_output_size > becore->output.size) {
-		ret = -EINVAL;
-		goto record_error;
-	}
 	becore->run_input->state = BECORE_INPUT_BACKEND;
 	input_claimed = true;
 
@@ -1869,7 +1919,8 @@ static int becore_run_set(void *data, u64 value)
 	if (ret)
 		goto put_power;
 
-	memset(becore->output.cpu, 0xa5, becore->output.size);
+	if (internal_output)
+		memset(becore->output.cpu, 0xa5, becore->output.size);
 	becore->output_changed_bytes = 0;
 	becore->output_first_changed = U32_MAX;
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++) {
@@ -1935,9 +1986,11 @@ static int becore_run_set(void *data, u64 value)
 	becore->run_input = NULL;
 	input_claimed = false;
 	dma_rmb();
-	becore_measure_output(becore);
-	becore->completed_generation = becore->run_generation;
-	becore->completed_output_size = becore->active_output_size;
+	if (internal_output) {
+		becore_measure_output(becore);
+		becore->completed_generation = becore->run_generation;
+		becore->completed_output_size = becore->active_output_size;
+	}
 	becore->last_run_result = ret;
 	mutex_unlock(&becore->lock);
 
@@ -1960,6 +2013,19 @@ record_error:
 unlock:
 	mutex_unlock(&becore->lock);
 	return ret;
+}
+
+static int becore_run_set(void *data, u64 value)
+{
+	struct becore_device *becore = data;
+
+	if (value != 1)
+		return -EINVAL;
+	if (READ_ONCE(becore->video_streaming))
+		return -EBUSY;
+
+	return becore_run_frame(becore, becore->output.dma,
+				READ_ONCE(becore->output_profile), false, true);
 }
 
 static int becore_run_get(void *data, u64 *value)
@@ -1985,6 +2051,10 @@ static int becore_cancel_set(void *data, u64 value)
 		return -EINVAL;
 
 	mutex_lock(&becore->lock);
+	if (becore->video_streaming) {
+		mutex_unlock(&becore->lock);
+		return -EBUSY;
+	}
 	spin_lock_irqsave(&becore->run_lock, flags);
 	if (becore->running) {
 		becore->abort_run = true;
@@ -1999,6 +2069,321 @@ static int becore_cancel_set(void *data, u64 value)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(becore_cancel_fops, NULL, becore_cancel_set, "%llu\n");
 
+/* ---- processed P010 capture queue -------------------------------------- */
+
+static void becore_video_fill_pix(struct v4l2_pix_format *pix)
+{
+	const struct becore_yuvp_output_profile *profile =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_P010];
+
+	pix->width = profile->width;
+	pix->height = profile->height;
+	pix->pixelformat = V4L2_PIX_FMT_P010;
+	pix->field = V4L2_FIELD_NONE;
+	pix->bytesperline = becore_yuvp_output_stride(profile);
+	pix->sizeimage = becore_yuvp_output_size(profile);
+	pix->colorspace = V4L2_COLORSPACE_DEFAULT;
+	pix->flags = 0;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
+
+static void becore_video_return_all(struct becore_device *becore,
+				    enum vb2_buffer_state state)
+{
+	struct becore_video_buffer *buf, *tmp;
+	LIST_HEAD(done);
+
+	spin_lock_irq(&becore->queue_lock);
+	list_splice_tail_init(&becore->queued_outputs, &done);
+	spin_unlock_irq(&becore->queue_lock);
+
+	list_for_each_entry_safe(buf, tmp, &done, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+}
+
+static void becore_video_fail(struct becore_device *becore,
+			      struct becore_video_buffer *buf)
+{
+	mutex_lock(&becore->lock);
+	becore->video_streaming = false;
+	mutex_unlock(&becore->lock);
+
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	vb2_queue_error(&becore->queue);
+	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
+}
+
+static void becore_video_work(struct work_struct *work)
+{
+	struct becore_device *becore =
+		container_of(work, struct becore_device, video_work);
+
+	for (;;) {
+		struct becore_video_buffer *buf;
+		dma_addr_t dma;
+		int ret;
+
+		mutex_lock(&becore->lock);
+		if (!becore->video_streaming) {
+			mutex_unlock(&becore->lock);
+			return;
+		}
+		mutex_unlock(&becore->lock);
+
+		spin_lock_irq(&becore->queue_lock);
+		if (list_empty(&becore->queued_outputs)) {
+			spin_unlock_irq(&becore->queue_lock);
+			return;
+		}
+		buf = list_first_entry(&becore->queued_outputs,
+				       struct becore_video_buffer, list);
+		list_del(&buf->list);
+		spin_unlock_irq(&becore->queue_lock);
+
+		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+		ret = becore_run_frame(becore, dma,
+				       BECORE_YUVP_OUTPUT_P010, true, false);
+		if (ret == -ENODATA || ret == -EBUSY) {
+			spin_lock_irq(&becore->queue_lock);
+			list_add(&buf->list, &becore->queued_outputs);
+			spin_unlock_irq(&becore->queue_lock);
+			return;
+		}
+		if (ret) {
+			bool stopping;
+
+			mutex_lock(&becore->lock);
+			stopping = !becore->video_streaming;
+			mutex_unlock(&becore->lock);
+			if (ret == -ECANCELED && stopping) {
+				vb2_buffer_done(&buf->vb.vb2_buf,
+						VB2_BUF_STATE_ERROR);
+				return;
+			}
+			becore_video_fail(becore, buf);
+			return;
+		}
+
+		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		mutex_lock(&becore->lock);
+		buf->vb.sequence = becore->video_sequence++;
+		mutex_unlock(&becore->lock);
+		buf->vb.field = V4L2_FIELD_NONE;
+		vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
+				      becore->active_output_size);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	}
+}
+
+static int becore_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
+			      unsigned int *nplanes, unsigned int sizes[],
+			      struct device *alloc_devs[])
+{
+	struct v4l2_pix_format pix;
+
+	becore_video_fill_pix(&pix);
+	if (*nplanes) {
+		if (*nplanes != 1 || sizes[0] < pix.sizeimage)
+			return -EINVAL;
+		return 0;
+	}
+
+	*nplanes = 1;
+	sizes[0] = pix.sizeimage;
+
+	return 0;
+}
+
+static int becore_buf_prepare(struct vb2_buffer *vb)
+{
+	struct v4l2_pix_format pix;
+	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+	becore_video_fill_pix(&pix);
+	if (vb2_plane_size(vb, 0) < pix.sizeimage ||
+	    !IS_ALIGNED(dma, SZ_4K) || upper_32_bits(dma) ||
+	    upper_32_bits(dma + pix.sizeimage - 1))
+		return -EINVAL;
+
+	vb2_set_plane_payload(vb, 0, pix.sizeimage);
+
+	return 0;
+}
+
+static void becore_buf_queue(struct vb2_buffer *vb)
+{
+	struct becore_device *becore = vb2_get_drv_priv(vb->vb2_queue);
+	struct becore_video_buffer *buf =
+		to_becore_video_buffer(to_vb2_v4l2_buffer(vb));
+
+	spin_lock_irq(&becore->queue_lock);
+	list_add_tail(&buf->list, &becore->queued_outputs);
+	spin_unlock_irq(&becore->queue_lock);
+
+	if (READ_ONCE(becore->video_streaming))
+		schedule_work(&becore->video_work);
+}
+
+static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+	int ret;
+
+	mutex_lock(&becore->lock);
+	if (becore->video_streaming || becore->running) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	ret = becore_recipe_header_validate(becore);
+	if (ret)
+		goto unlock;
+	if (becore->grid.staged_bytes != BECORE_GRID_SIZE) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (becore->reset_failed) {
+		ret = -EIO;
+		goto unlock;
+	}
+
+	becore->video_sequence = 0;
+	becore->video_streaming = true;
+	mutex_unlock(&becore->lock);
+	schedule_work(&becore->video_work);
+
+	return 0;
+
+unlock:
+	mutex_unlock(&becore->lock);
+	becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
+	return ret;
+}
+
+static void becore_stop_streaming(struct vb2_queue *q)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+	unsigned long flags;
+	bool cancel = false;
+
+	mutex_lock(&becore->lock);
+	becore->video_streaming = false;
+	spin_lock_irqsave(&becore->run_lock, flags);
+	if (becore->running) {
+		becore->abort_run = true;
+		cancel = true;
+	}
+	spin_unlock_irqrestore(&becore->run_lock, flags);
+	if (cancel)
+		complete(&becore->run_completion);
+	mutex_unlock(&becore->lock);
+
+	cancel_work_sync(&becore->video_work);
+	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
+}
+
+static const struct vb2_ops becore_vb2_ops = {
+	.queue_setup = becore_queue_setup,
+	.buf_prepare = becore_buf_prepare,
+	.buf_queue = becore_buf_queue,
+	.start_streaming = becore_start_streaming,
+	.stop_streaming = becore_stop_streaming,
+};
+
+static int becore_querycap(struct file *file, void *priv,
+			   struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, "exynos-becore", sizeof(cap->driver));
+	strscpy(cap->card, "zumapro BE-core P010", sizeof(cap->card));
+
+	return 0;
+}
+
+static int becore_enum_fmt(struct file *file, void *priv,
+			   struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_PIX_FMT_P010;
+
+	return 0;
+}
+
+static int becore_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	becore_video_fill_pix(&f->fmt.pix);
+
+	return 0;
+}
+
+static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct becore_device *becore = video_drvdata(file);
+
+	if (vb2_is_busy(&becore->queue))
+		return -EBUSY;
+
+	becore_video_fill_pix(&f->fmt.pix);
+
+	return 0;
+}
+
+static int becore_enum_framesizes(struct file *file, void *priv,
+				  struct v4l2_frmsizeenum *fsize)
+{
+	const struct becore_yuvp_output_profile *profile =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_P010];
+
+	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_P010)
+		return -EINVAL;
+
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	fsize->discrete.width = profile->width;
+	fsize->discrete.height = profile->height;
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops becore_ioctl_ops = {
+	.vidioc_querycap = becore_querycap,
+	.vidioc_enum_fmt_vid_cap = becore_enum_fmt,
+	.vidioc_g_fmt_vid_cap = becore_g_fmt,
+	.vidioc_s_fmt_vid_cap = becore_s_fmt,
+	.vidioc_try_fmt_vid_cap = becore_g_fmt,
+	.vidioc_enum_framesizes = becore_enum_framesizes,
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static const struct v4l2_file_operations becore_fops = {
+	.owner = THIS_MODULE,
+	.open = v4l2_fh_open,
+	.release = vb2_fop_release,
+	.poll = vb2_fop_poll,
+	.mmap = vb2_fop_mmap,
+	.unlocked_ioctl = video_ioctl2,
+};
+
+static const struct video_device becore_video_template = {
+	.name = "exynos-becore P010 capture",
+	.fops = &becore_fops,
+	.ioctl_ops = &becore_ioctl_ops,
+	.release = video_device_release_empty,
+	.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING,
+	.vfl_dir = VFL_DIR_RX,
+};
+
 static int becore_status_show(struct seq_file *s, void *unused)
 {
 	static const char * const input_state_names[] = {
@@ -2008,12 +2393,15 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		[BECORE_INPUT_BACKEND] = "backend",
 	};
 	struct becore_device *becore = s->private;
+	struct list_head *pos;
 	unsigned long flags;
+	unsigned int queued_outputs = 0;
 	u32 cmdq_hold_mask;
 	u32 frame_done_mask;
 	bool start_issued;
 	bool irq_error;
 	bool running;
+	bool video_streaming;
 	u32 i;
 
 	mutex_lock(&becore->lock);
@@ -2024,7 +2412,14 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	start_issued = becore->start_issued;
 	irq_error = becore->irq_error;
 	spin_unlock_irqrestore(&becore->run_lock, flags);
+	spin_lock_irqsave(&becore->queue_lock, flags);
+	list_for_each(pos, &becore->queued_outputs)
+		queued_outputs++;
+	spin_unlock_irqrestore(&becore->queue_lock, flags);
+	video_streaming = becore->video_streaming;
 	seq_printf(s, "running          %u\n", running);
+	seq_printf(s, "video_queue      streaming %u, queued %u, sequence %u\n",
+		   video_streaming, queued_outputs, becore->video_sequence);
 	seq_printf(s, "runtime          %s\n",
 		   pm_runtime_status_suspended(becore->dev) ? "suspended" : "active");
 	seq_printf(s, "recipe           %zu/%u bytes, generation %u\n",
@@ -2098,6 +2493,81 @@ static int becore_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(becore_status);
 
+static void becore_video_unregister(void *data)
+{
+	struct becore_device *becore = data;
+
+	vb2_video_unregister_device(&becore->vdev);
+	media_device_unregister(&becore->mdev);
+	media_entity_cleanup(&becore->vdev.entity);
+	v4l2_device_unregister(&becore->v4l2_dev);
+	media_device_cleanup(&becore->mdev);
+}
+
+static int becore_video_register(struct becore_device *becore)
+{
+	struct vb2_queue *q = &becore->queue;
+	int ret;
+
+	becore->mdev.dev = becore->dev;
+	strscpy(becore->mdev.model, "zumapro BE-core",
+		sizeof(becore->mdev.model));
+	media_device_init(&becore->mdev);
+	becore->v4l2_dev.mdev = &becore->mdev;
+
+	ret = v4l2_device_register(becore->dev, &becore->v4l2_dev);
+	if (ret)
+		goto err_mdev;
+
+	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	q->io_modes = VB2_MMAP | VB2_DMABUF;
+	q->dev = becore->dev;
+	q->drv_priv = becore;
+	q->ops = &becore_vb2_ops;
+	q->mem_ops = &vb2_dma_contig_memops;
+	q->buf_struct_size = sizeof(struct becore_video_buffer);
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->min_queued_buffers = 1;
+	q->lock = &becore->video_lock;
+	ret = vb2_queue_init(q);
+	if (ret)
+		goto err_v4l2;
+
+	becore->vdev = becore_video_template;
+	becore->vdev.v4l2_dev = &becore->v4l2_dev;
+	becore->vdev.queue = q;
+	becore->vdev.lock = &becore->video_lock;
+	becore->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
+	video_set_drvdata(&becore->vdev, becore);
+
+	becore->vdev_pad.flags = MEDIA_PAD_FL_SINK;
+	ret = media_entity_pads_init(&becore->vdev.entity, 1,
+				     &becore->vdev_pad);
+	if (ret)
+		goto err_v4l2;
+
+	ret = video_register_device(&becore->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		goto err_entity;
+
+	ret = media_device_register(&becore->mdev);
+	if (ret)
+		goto err_vdev;
+
+	return devm_add_action_or_reset(becore->dev,
+					becore_video_unregister, becore);
+
+err_vdev:
+	video_unregister_device(&becore->vdev);
+err_entity:
+	media_entity_cleanup(&becore->vdev.entity);
+err_v4l2:
+	v4l2_device_unregister(&becore->v4l2_dev);
+err_mdev:
+	media_device_cleanup(&becore->mdev);
+	return ret;
+}
+
 static void becore_debugfs_remove(void *data)
 {
 	struct becore_device *becore = data;
@@ -2147,8 +2617,12 @@ static int becore_probe(struct platform_device *pdev)
 
 	becore->dev = dev;
 	mutex_init(&becore->lock);
+	mutex_init(&becore->video_lock);
 	spin_lock_init(&becore->run_lock);
+	spin_lock_init(&becore->queue_lock);
 	init_completion(&becore->run_completion);
+	INIT_LIST_HEAD(&becore->queued_outputs);
+	INIT_WORK(&becore->video_work, becore_video_work);
 	becore->output_first_changed = U32_MAX;
 	becore->active_output_profile = BECORE_YUVP_OUTPUT_SBWCL;
 	becore->active_output_size = becore_active_output_size(becore);
@@ -2200,6 +2674,7 @@ static int becore_probe(struct platform_device *pdev)
 	ret = becore_alloc_diagnostic(becore);
 	if (ret)
 		return ret;
+	becore->active_output_dma = becore->output.dma;
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
@@ -2220,6 +2695,10 @@ static int becore_probe(struct platform_device *pdev)
 		dev_crit(dev, "cannot quiesce camera back end; retaining power\n");
 		return 0;
 	}
+
+	ret = becore_video_register(becore);
+	if (ret)
+		return ret;
 
 	return becore_debugfs_init(becore);
 }

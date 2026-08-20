@@ -9,9 +9,12 @@ config VIDEO_EXYNOS_BECORE
 	  Bring-up driver for the RGBP, MCFP and YUVP image processors in
 	  Google's zumapro (Tensor G4) camera back end.
 
-	  At this stage the driver restores the three power-domain dependencies,
-	  resets and initializes the processors, and handles their interrupts.  It
-	  does not yet expose a userspace image-processing interface.
+	  The driver restores the three power-domain dependencies, resets and
+	  initializes the processors, and handles their interrupts.  A debugfs-only
+	  diagnostic can upload one validated RGBP/YUVP command recipe, compressed
+	  Bayer input and YUVP statistics grid, then execute one offline frame into
+	  a driver-owned output allocation.  This is a bring-up interface, not a
+	  userspace camera ABI.
 
 	  This is built-in because removal cannot be aborted if a processor fails
 	  to reset before its power domains are switched off.

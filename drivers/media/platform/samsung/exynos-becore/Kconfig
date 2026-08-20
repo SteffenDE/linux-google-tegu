@@ -5,16 +5,20 @@ config VIDEO_EXYNOS_BECORE
 	depends on ARCH_EXYNOS || COMPILE_TEST
 	depends on OF
 	depends on PM
+	depends on VIDEO_DEV
+	select MEDIA_CONTROLLER
+	select VIDEOBUF2_DMA_CONTIG
 	help
 	  Bring-up driver for the RGBP, MCFP and YUVP image processors in
 	  Google's zumapro (Tensor G4) camera back end.
 
 	  The driver restores the three power-domain dependencies, resets and
-	  initializes the processors, and handles their interrupts.  A debugfs-only
-	  diagnostic can upload one validated RGBP/YUVP command recipe, compressed
-	  Bayer input and YUVP statistics grid, then execute one offline frame into
-	  a driver-owned output allocation.  This is a bring-up interface, not a
-	  userspace camera ABI.
+	  initializes the processors, and handles their interrupts.  It exposes a
+	  fixed P010 capture queue for processed diagnostic frames.  Debugfs can
+	  upload one validated RGBP/YUVP command recipe, compressed Bayer input and
+	  YUVP statistics grid, then execute one offline frame into a driver-owned
+	  output allocation; that upload path is a bring-up oracle, not a userspace
+	  camera ABI.
 
 	  This is built-in because removal cannot be aborted if a processor fails
 	  to reset before its power domains are switched off.

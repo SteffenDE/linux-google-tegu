@@ -484,8 +484,9 @@ struct ispfe_pdma_output {
  * ISPFE_BUF_OUTPUT() indices name them. Sizes and directions are the vendor
  * session's own allocation classes; the three bidirectional buffers are seeded
  * with its captured 0x2000-byte prefix and the rest of each starts at zero.
- * None of them is the image: that is ISPFE_BUF_BAYER, and it is the only
- * destination whose contents anyone reads.
+ * Outputs 0--9 are completion/statistics buffers. Outputs 10--12 are the LMP's
+ * processed-image destinations: planar linear RGB, YUV420 ML output 0 and
+ * interleaved RGB888 ML output 2 respectively.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -502,6 +503,10 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT_RW(462848, ispfe_pdma_seed_1cb00000),
 	PDMA_OUTPUT_RW(311296, ispfe_pdma_seed_1c980000),
 };
+
+#define ISPFE_PDMA_OUTPUT_RGB		10
+#define ISPFE_PDMA_OUTPUT_ML0		11
+#define ISPFE_PDMA_OUTPUT_ML2		12
 
 /*
  * The vendor stack's own saved frame is width * 2 * height with no padding, so
@@ -3419,6 +3424,74 @@ static const struct file_operations ispfe_program_fops = {
 	.llseek = default_llseek,
 };
 
+/*
+ * The captured program already enables three memory-backed processed outputs.
+ * Keep this diagnostic read-only and require the stream to be stopped: unlike
+ * the per-frame Bayer queue, these buffers are shared and hardware overwrites
+ * them continuously while streaming.
+ */
+static ssize_t ispfe_pdma_output_read(struct file *file, char __user *buf,
+				      size_t count, loff_t *ppos,
+				      unsigned int index)
+{
+	struct ispfe_device *ispfe = file->private_data;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (index >= ARRAY_SIZE(ispfe_pdma_outputs))
+		return -EINVAL;
+	if (ispfe->streaming)
+		return -EBUSY;
+	if (!ispfe->pdma_output[index].cpu)
+		return -ENODATA;
+
+	return simple_read_from_buffer(buf, count, ppos,
+				       ispfe->pdma_output[index].cpu,
+				       ispfe_pdma_outputs[index].size);
+}
+
+static ssize_t ispfe_lmp_rgb_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return ispfe_pdma_output_read(file, buf, count, ppos,
+				      ISPFE_PDMA_OUTPUT_RGB);
+}
+
+static const struct file_operations ispfe_lmp_rgb_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_lmp_rgb_read,
+	.llseek = default_llseek,
+};
+
+static ssize_t ispfe_lmp_ml0_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return ispfe_pdma_output_read(file, buf, count, ppos,
+				      ISPFE_PDMA_OUTPUT_ML0);
+}
+
+static const struct file_operations ispfe_lmp_ml0_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_lmp_ml0_read,
+	.llseek = default_llseek,
+};
+
+static ssize_t ispfe_lmp_ml2_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return ispfe_pdma_output_read(file, buf, count, ppos,
+				      ISPFE_PDMA_OUTPUT_ML2);
+}
+
+static const struct file_operations ispfe_lmp_ml2_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_lmp_ml2_read,
+	.llseek = default_llseek,
+};
+
 DEFINE_SHOW_ATTRIBUTE(ispfe_status);
 
 static void ispfe_debugfs_init(struct ispfe_device *ispfe)
@@ -3462,6 +3535,9 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("program", 0444, d, ispfe, &ispfe_program_fops);
+	debugfs_create_file("lmp_rgb", 0444, d, ispfe, &ispfe_lmp_rgb_fops);
+	debugfs_create_file("lmp_ml0", 0444, d, ispfe, &ispfe_lmp_ml0_fops);
+	debugfs_create_file("lmp_ml2", 0444, d, ispfe, &ispfe_lmp_ml2_fops);
 }
 
 static void ispfe_report(struct ispfe_device *ispfe)

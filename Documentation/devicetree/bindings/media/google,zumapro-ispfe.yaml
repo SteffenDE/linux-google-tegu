@@ -51,6 +51,22 @@ properties:
   power-domains:
     maxItems: 1
 
+  clocks:
+    maxItems: 1
+    description:
+      CAM ACPM DVFS domain used for ISPFE setup and steady-state operation.
+
+  clock-names:
+    items:
+      - const: cam
+
+  interconnects:
+    maxItems: 1
+
+  interconnect-names:
+    items:
+      - const: memory
+
   google,backend:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -143,6 +159,10 @@ required:
   - interrupts
   - interrupt-names
   - power-domains
+  - clocks
+  - clock-names
+  - interconnects
+  - interconnect-names
   - iommus
   - samsung,iommu-group
   - samsung,pmu-syscon
@@ -153,7 +173,9 @@ additionalProperties: false
 
 examples:
   - |
+    #include <dt-bindings/clock/google,zumapro-acpm.h>
     #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interconnect/google,zumapro.h>
     #include <dt-bindings/media/video-interfaces.h>
 
     camera@1c300000 {
@@ -171,6 +193,11 @@ examples:
                     "pdma", "pdma-wrap", "cmu",
                     "s2mpu0", "s2mpu1", "s2mpu2";
         power-domains = <&pd_ispfe>;
+        clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_CAM>;
+        clock-names = "cam";
+        interconnects = <&bts ZUMAPRO_BTS_MASTER_ISPFE>,
+                        <&bts ZUMAPRO_BTS_SLAVE_MIF>;
+        interconnect-names = "memory";
         google,backend = <&becore>;
         iommus = <&sysmmu_ispfe_s0>, <&sysmmu_ispfe_s1>, <&sysmmu_ispfe_s2>;
         interrupts = <GIC_SPI 467 IRQ_TYPE_LEVEL_HIGH 0>,

@@ -21,10 +21,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+
+#include <media/exynos-becore.h>
 
 #include "exynos-becore-recipe.h"
 
@@ -103,6 +106,7 @@ struct becore_dma_buffer {
 	dma_addr_t dma;
 	size_t size;
 	size_t staged_bytes;
+	struct sg_table *sgt;
 };
 
 struct becore_cmdq_program {
@@ -149,6 +153,7 @@ struct becore_device {
 	struct becore_dma_buffer input;
 	struct becore_dma_buffer grid;
 	struct becore_dma_buffer output;
+	struct exynos_becore_input *input_producer;
 	struct becore_cmdq_program program[BECORE_NUM_BLOCKS];
 	u8 *recipe;
 	size_t recipe_staged_bytes;
@@ -166,6 +171,14 @@ struct becore_device {
 	bool irq_error;
 	bool irqs_enabled;
 	bool reset_failed;
+};
+
+struct exynos_becore_input {
+	struct becore_device *becore;
+	struct device *producer;
+	struct sg_table sgt;
+	dma_addr_t dma;
+	bool producing;
 };
 
 static const char * const becore_pm_domain_names[] = {
@@ -744,6 +757,52 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 	return 0;
 }
 
+static void becore_free_shared_input(void *data)
+{
+	struct becore_device *becore = data;
+	struct becore_dma_buffer *input = &becore->input;
+
+	if (input->cpu)
+		dma_vunmap_noncontiguous(becore->dev, input->cpu);
+	if (input->sgt)
+		dma_free_noncontiguous(becore->dev, input->size, input->sgt,
+				       DMA_BIDIRECTIONAL);
+	input->cpu = NULL;
+	input->sgt = NULL;
+}
+
+static int becore_alloc_shared_input(struct becore_device *becore)
+{
+	struct becore_dma_buffer *input = &becore->input;
+	int ret;
+
+	input->size = BECORE_INPUT_SIZE;
+	input->sgt = dma_alloc_noncontiguous(becore->dev, input->size,
+					     DMA_BIDIRECTIONAL, GFP_KERNEL, 0);
+	if (!input->sgt)
+		return dev_err_probe(becore->dev, -ENOMEM,
+				     "cannot allocate Bayer input pages\n");
+
+	input->dma = sg_dma_address(input->sgt->sgl);
+	input->cpu = dma_vmap_noncontiguous(becore->dev, input->size,
+					    input->sgt);
+	if (!input->cpu) {
+		becore_free_shared_input(becore);
+		return dev_err_probe(becore->dev, -ENOMEM,
+				     "cannot map Bayer input pages\n");
+	}
+	if (upper_32_bits(input->dma) ||
+	    upper_32_bits(input->dma + input->size - 1)) {
+		becore_free_shared_input(becore);
+		return dev_err_probe(becore->dev, -ERANGE,
+				     "Bayer input is outside 32-bit DMA\n");
+	}
+
+	ret = devm_add_action_or_reset(becore->dev,
+				       becore_free_shared_input, becore);
+	return ret;
+}
+
 static int becore_alloc_cmdq_program(struct becore_device *becore,
 				     enum becore_block_id id,
 				     u32 header_count)
@@ -776,8 +835,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (!becore->recipe)
 		return -ENOMEM;
 
-	ret = becore_alloc_dma_buffer(becore, &becore->input,
-				      BECORE_INPUT_SIZE, "Bayer input");
+	ret = becore_alloc_shared_input(becore);
 	if (ret)
 		return ret;
 	ret = becore_alloc_dma_buffer(becore, &becore->grid,
@@ -797,6 +855,187 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 					 BECORE_YUVP_HEADER_COUNT);
 }
 
+static int becore_clone_sgtable(struct sg_table *dst,
+				struct sg_table *src)
+{
+	struct scatterlist *src_sg;
+	struct scatterlist *dst_sg;
+	unsigned int i;
+	int ret;
+
+	ret = sg_alloc_table(dst, src->orig_nents, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	dst_sg = dst->sgl;
+	for_each_sg(src->sgl, src_sg, src->orig_nents, i) {
+		sg_set_page(dst_sg, sg_page(src_sg), src_sg->length,
+			    src_sg->offset);
+		dst_sg = sg_next(dst_sg);
+	}
+
+	return 0;
+}
+
+/**
+ * exynos_becore_input_map() - map the BE-core input into its producer domain
+ * @backend: BE-core platform device
+ * @producer: device which will write the compressed Bayer object
+ *
+ * The returned DMA address belongs to @producer.  BE-core retains its own
+ * mapping of the same pages and never exposes that IOVA to the producer.
+ */
+struct exynos_becore_input *
+exynos_becore_input_map(struct device *backend, struct device *producer)
+{
+	struct becore_device *becore;
+	struct exynos_becore_input *input;
+	int ret;
+
+	if (!backend || !producer)
+		return ERR_PTR(-EINVAL);
+	becore = dev_get_drvdata(backend);
+	if (!becore || !becore->input.sgt)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	input = kzalloc_obj(*input, GFP_KERNEL);
+	if (!input)
+		return ERR_PTR(-ENOMEM);
+	input->becore = becore;
+	input->producer = get_device(producer);
+
+	ret = becore_clone_sgtable(&input->sgt, becore->input.sgt);
+	if (ret)
+		goto err_put;
+	ret = dma_map_sgtable(producer, &input->sgt, DMA_FROM_DEVICE, 0);
+	if (ret)
+		goto err_sg;
+	input->dma = sg_dma_address(input->sgt.sgl);
+	if (input->sgt.nents != 1 ||
+	    sg_dma_len(input->sgt.sgl) < becore->input.size ||
+	    upper_32_bits(input->dma) ||
+	    upper_32_bits(input->dma + becore->input.size - 1)) {
+		ret = -ERANGE;
+		goto err_unmap;
+	}
+
+	mutex_lock(&becore->lock);
+	if (becore->input_producer) {
+		ret = -EBUSY;
+		mutex_unlock(&becore->lock);
+		goto err_unmap;
+	}
+	becore->input_producer = input;
+	mutex_unlock(&becore->lock);
+
+	return input;
+
+err_unmap:
+	dma_unmap_sgtable(producer, &input->sgt, DMA_FROM_DEVICE, 0);
+err_sg:
+	sg_free_table(&input->sgt);
+err_put:
+	put_device(input->producer);
+	kfree(input);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_map);
+
+void exynos_becore_input_unmap(struct exynos_becore_input *input)
+{
+	struct becore_device *becore;
+
+	if (!input)
+		return;
+	becore = input->becore;
+
+	mutex_lock(&becore->lock);
+	if (WARN_ON_ONCE(becore->input_producer != input)) {
+		mutex_unlock(&becore->lock);
+		return;
+	}
+	if (input->producing) {
+		dma_sync_sgtable_for_cpu(input->producer, &input->sgt,
+					 DMA_FROM_DEVICE);
+		input->producing = false;
+		becore->input.staged_bytes = 0;
+	}
+	becore->input_producer = NULL;
+	mutex_unlock(&becore->lock);
+
+	dma_unmap_sgtable(input->producer, &input->sgt, DMA_FROM_DEVICE, 0);
+	sg_free_table(&input->sgt);
+	put_device(input->producer);
+	kfree(input);
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_unmap);
+
+dma_addr_t exynos_becore_input_dma(struct exynos_becore_input *input)
+{
+	return input->dma;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_dma);
+
+size_t exynos_becore_input_size(struct exynos_becore_input *input)
+{
+	return input->becore->input.size;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_size);
+
+int exynos_becore_input_producer_begin(struct exynos_becore_input *input)
+{
+	struct becore_device *becore = input->becore;
+	int ret = 0;
+
+	mutex_lock(&becore->lock);
+	if (becore->input_producer != input || input->producing) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (becore->running) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	/* Discard any cached CPU copy before the front end overwrites it. */
+	dma_sync_sgtable_for_device(becore->dev, becore->input.sgt,
+				    DMA_BIDIRECTIONAL);
+	dma_sync_sgtable_for_device(input->producer, &input->sgt,
+				    DMA_FROM_DEVICE);
+	becore->input.staged_bytes = 0;
+	input->producing = true;
+
+unlock:
+	mutex_unlock(&becore->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_producer_begin);
+
+int exynos_becore_input_producer_complete(struct exynos_becore_input *input)
+{
+	struct becore_device *becore = input->becore;
+	int ret = 0;
+
+	mutex_lock(&becore->lock);
+	if (becore->input_producer != input || !input->producing) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	/* The caller has quiesced the producer at a completed-frame boundary. */
+	dma_sync_sgtable_for_cpu(input->producer, &input->sgt,
+				 DMA_FROM_DEVICE);
+	dma_sync_sgtable_for_device(becore->dev, becore->input.sgt,
+				    DMA_TO_DEVICE);
+	input->producing = false;
+	becore->input.staged_bytes = becore->input.size;
+
+unlock:
+	mutex_unlock(&becore->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_producer_complete);
+
 static ssize_t becore_stage_write(struct becore_device *becore,
 				  const char __user *buf, size_t count,
 				  loff_t *ppos, void *staged, size_t capacity,
@@ -809,6 +1048,11 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 
 	mutex_lock(&becore->lock);
 	if (becore->running) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (staged == becore->input.cpu && becore->input_producer &&
+	    becore->input_producer->producing) {
 		ret = -EBUSY;
 		goto unlock;
 	}
@@ -1088,7 +1332,10 @@ static int becore_run_set(void *data, u64 value)
 	becore->run_generation++;
 	spin_unlock_irqrestore(&becore->run_lock, flags);
 
-	/* Make every coherent program and input write visible before publication. */
+	/* Move staged or producer-written Bayer pages into RGBP's DMA domain. */
+	dma_sync_sgtable_for_device(becore->dev, becore->input.sgt,
+				    DMA_TO_DEVICE);
+	/* Make the command programs and all DMA ownership changes visible. */
 	dma_wmb();
 	becore_publish_program(becore, BECORE_RGBP);
 	becore_publish_program(becore, BECORE_YUVP);
@@ -1120,6 +1367,8 @@ static int becore_run_set(void *data, u64 value)
 		if (!ret)
 			ret = pm_ret;
 	}
+	dma_sync_sgtable_for_cpu(becore->dev, becore->input.sgt,
+				 DMA_TO_DEVICE);
 	dma_rmb();
 	becore_measure_output(becore);
 	becore->completed_generation = becore->run_generation;
@@ -1207,6 +1456,11 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "input            %zu/%zu bytes, iova %pad\n",
 		   becore->input.staged_bytes, becore->input.size,
 		   &becore->input.dma);
+	if (becore->input_producer)
+		seq_printf(s, "input_producer   %s iova %pad, active %u\n",
+			   dev_name(becore->input_producer->producer),
+			   &becore->input_producer->dma,
+			   becore->input_producer->producing);
 	seq_printf(s, "grid             %zu/%zu bytes, iova %pad\n",
 		   becore->grid.staged_bytes, becore->grid.size,
 		   &becore->grid.dma);

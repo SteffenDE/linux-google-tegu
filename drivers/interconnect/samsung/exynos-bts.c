@@ -556,19 +556,16 @@ static int exynos_bts_resume(struct device *dev)
 
 	mutex_lock(&bts->lock);
 	/* Retry an ICC rollback which failed before the system suspended. */
-	if (bts->rates_saved && !bts->camera_active) {
+	if (bts->rates_saved && !bts->camera_active)
 		ret = exynos_bts_set_idle(bts);
-		if (ret)
-			goto unlock;
-	}
+
+	/* The BTS register state is lost independently of ACPM clock errors. */
 	exynos_bts_program_scenario(bts, bts->camera_active);
-	if (bts->camera_active) {
+	if (!ret && bts->camera_active) {
 		ret = clk_set_rate(bts->mif_clk, bts->target_mif_rate);
 		if (!ret)
 			ret = clk_set_rate(bts->int_clk, bts->target_int_rate);
 	}
-
-unlock:
 	mutex_unlock(&bts->lock);
 
 	return ret;

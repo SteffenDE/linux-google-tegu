@@ -33,8 +33,8 @@
 #include <media/media-device.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
-#include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
+#include <media/videobuf2-vmalloc.h>
 
 #include "exynos-becore-recipe.h"
 
@@ -265,6 +265,7 @@ enum becore_input_slot_state {
 	BECORE_INPUT_PRODUCER,
 	BECORE_INPUT_READY,
 	BECORE_INPUT_BACKEND,
+	BECORE_INPUT_QUARANTINED,
 };
 
 struct becore_input_slot {
@@ -367,6 +368,8 @@ struct becore_device {
 	bool irq_error;
 	bool irqs_enabled;
 	bool reset_failed;
+	bool active_output_packed;
+	bool output_quarantined;
 	bool video_streaming;
 };
 
@@ -623,17 +626,41 @@ becore_yuvp_output_size(const struct becore_yuvp_output_profile *profile)
 		     SZ_4K);
 }
 
+static size_t
+becore_yuvp_packed_plane2_offset(const struct becore_yuvp_output_profile *profile)
+{
+	return (size_t)becore_yuvp_output_stride(profile) * profile->height;
+}
+
+static size_t
+becore_yuvp_packed_output_size(const struct becore_yuvp_output_profile *profile)
+{
+	u32 chroma_height = DIV_ROUND_UP(profile->height, 2);
+
+	return becore_yuvp_packed_plane2_offset(profile) +
+	       (size_t)becore_yuvp_output_stride(profile) * chroma_height;
+}
+
 static size_t becore_active_output_plane2_offset(const struct becore_device *becore)
 {
 	const struct becore_yuvp_output_profile *profile =
 		becore_yuvp_output_profile(becore);
+
+	if (becore->active_output_packed)
+		return becore_yuvp_packed_plane2_offset(profile);
 
 	return becore_yuvp_output_plane2_offset(profile);
 }
 
 static size_t becore_active_output_size(const struct becore_device *becore)
 {
-	return becore_yuvp_output_size(becore_yuvp_output_profile(becore));
+	const struct becore_yuvp_output_profile *profile =
+		becore_yuvp_output_profile(becore);
+
+	if (becore->active_output_packed)
+		return becore_yuvp_packed_output_size(profile);
+
+	return becore_yuvp_output_size(profile);
 }
 
 static size_t becore_yuvp_output_allocation_size(void)
@@ -1387,6 +1414,11 @@ exynos_becore_input_map(struct device *backend, struct device *producer)
 		}
 	}
 	mutex_lock(&becore->lock);
+	if (becore->reset_failed) {
+		ret = -EIO;
+		mutex_unlock(&becore->lock);
+		goto err_mappings;
+	}
 	if (becore->input_producer) {
 		ret = -EBUSY;
 		mutex_unlock(&becore->lock);
@@ -1422,6 +1454,16 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input)
 	if (WARN_ON_ONCE(becore->input_producer != input)) {
 		mutex_unlock(&becore->lock);
 		return;
+	}
+	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
+		if (becore->inputs[i].state == BECORE_INPUT_BACKEND ||
+		    becore->inputs[i].state == BECORE_INPUT_QUARANTINED) {
+			dev_crit(becore->dev,
+				 "retaining producer mappings for active/quarantined input slot %u\n",
+				 i);
+			mutex_unlock(&becore->lock);
+			return;
+		}
 	}
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_input_slot *slot = &becore->inputs[i];
@@ -1488,6 +1530,10 @@ int exynos_becore_input_producer_acquire(struct exynos_becore_input *input,
 	mutex_lock(&becore->lock);
 	if (becore->input_producer != input) {
 		ret = -EINVAL;
+		goto unlock;
+	}
+	if (becore->reset_failed) {
+		ret = -EIO;
 		goto unlock;
 	}
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++)
@@ -1597,6 +1643,10 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		return 0;
 
 	mutex_lock(&becore->lock);
+	if (becore->reset_failed) {
+		ret = -EIO;
+		goto unlock;
+	}
 	if (becore->video_streaming) {
 		ret = -EBUSY;
 		goto unlock;
@@ -1648,7 +1698,9 @@ static ssize_t becore_recipe_read(struct file *file, char __user *buf,
 	ssize_t ret;
 
 	mutex_lock(&becore->lock);
-	if (becore->running || becore->video_streaming)
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else
 		ret = simple_read_from_buffer(buf, count, ppos, becore->recipe,
@@ -1719,7 +1771,9 @@ static ssize_t becore_output_read(struct file *file, char __user *buf,
 	ssize_t ret;
 
 	mutex_lock(&becore->lock);
-	if (becore->running || becore->video_streaming)
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else if (!becore->completed_generation)
 		ret = -ENODATA;
@@ -1849,23 +1903,24 @@ becore_next_input(struct becore_device *becore, bool allow_staged)
 	return NULL;
 }
 
-static int becore_run_frame(struct becore_device *becore,
-			    dma_addr_t output_dma, u32 output_profile,
-			    bool ready_only, bool internal_output)
+static int becore_run_frame(struct becore_device *becore, u32 output_profile,
+			    bool ready_only, void *capture_output,
+			    bool packed_output)
 {
 	unsigned long flags;
 	unsigned long waited;
+	bool diagnostic_output = !capture_output;
 	bool input_claimed = false;
 	int pm_ret;
 	int ret;
 	u32 i;
 
 	mutex_lock(&becore->lock);
-	if (internal_output && becore->video_streaming) {
+	if (diagnostic_output && becore->video_streaming) {
 		ret = -EBUSY;
 		goto unlock;
 	}
-	if (!internal_output && !becore->video_streaming) {
+	if (!diagnostic_output && !becore->video_streaming) {
 		ret = -ECANCELED;
 		goto unlock;
 	}
@@ -1881,6 +1936,10 @@ static int becore_run_frame(struct becore_device *becore,
 		ret = -EINVAL;
 		goto record_error;
 	}
+	if (packed_output && output_profile != BECORE_YUVP_OUTPUT_P010) {
+		ret = -EINVAL;
+		goto record_error;
+	}
 	becore->run_input = becore_next_input(becore, !ready_only);
 	if (!becore->run_input) {
 		if (ready_only) {
@@ -1891,12 +1950,14 @@ static int becore_run_frame(struct becore_device *becore,
 		goto record_error;
 	}
 	becore->active_output_profile = output_profile;
-	becore->active_output_dma = output_dma;
+	becore->active_output_packed = packed_output;
+	becore->active_output_dma = becore->output.dma;
 	becore->active_output_size = becore_active_output_size(becore);
-	if (!output_dma || upper_32_bits(output_dma) ||
-	    upper_32_bits(output_dma + becore->active_output_size - 1) ||
-	    (internal_output &&
-	     becore->active_output_size > becore->output.size)) {
+	if (!becore->active_output_dma ||
+	    upper_32_bits(becore->active_output_dma) ||
+	    upper_32_bits(becore->active_output_dma +
+			  becore->active_output_size - 1) ||
+	    becore->active_output_size > becore->output.size) {
 		ret = -EINVAL;
 		goto record_error;
 	}
@@ -1919,7 +1980,7 @@ static int becore_run_frame(struct becore_device *becore,
 	if (ret)
 		goto put_power;
 
-	if (internal_output)
+	if (diagnostic_output)
 		memset(becore->output.cpu, 0xa5, becore->output.size);
 	becore->output_changed_bytes = 0;
 	becore->output_first_changed = U32_MAX;
@@ -1976,17 +2037,32 @@ static int becore_run_frame(struct becore_device *becore,
 	if (pm_ret < 0) {
 		/* Match probe: never leave a failed-reset device at usage zero. */
 		pm_runtime_get_noresume(becore->dev);
+		/*
+		 * Neither DMA mapping may be returned after an unproven stop.
+		 * The output is driver-owned, so userspace's vb2 buffer was never
+		 * exposed to the processors and remains safe to return with ERROR.
+		 */
+		becore->run_input->state = BECORE_INPUT_QUARANTINED;
+		becore->output_quarantined = true;
+		becore->completed_generation = 0;
+		becore->completed_output_size = 0;
 		if (!ret)
 			ret = pm_ret;
+	} else {
+		dma_sync_sgtable_for_cpu(becore->dev,
+					 becore->run_input->buffer.sgt,
+					 DMA_TO_DEVICE);
+		becore->run_input->state = BECORE_INPUT_FREE;
+		becore->run_input->ready_sequence = 0;
 	}
-	dma_sync_sgtable_for_cpu(becore->dev, becore->run_input->buffer.sgt,
-				 DMA_TO_DEVICE);
-	becore->run_input->state = BECORE_INPUT_FREE;
-	becore->run_input->ready_sequence = 0;
 	becore->run_input = NULL;
 	input_claimed = false;
-	dma_rmb();
-	if (internal_output) {
+	if (pm_ret >= 0)
+		dma_rmb();
+	if (capture_output && !ret && pm_ret >= 0)
+		memcpy(capture_output, becore->output.cpu,
+		       becore->active_output_size);
+	if (diagnostic_output && pm_ret >= 0) {
 		becore_measure_output(becore);
 		becore->completed_generation = becore->run_generation;
 		becore->completed_output_size = becore->active_output_size;
@@ -2024,8 +2100,8 @@ static int becore_run_set(void *data, u64 value)
 	if (READ_ONCE(becore->video_streaming))
 		return -EBUSY;
 
-	return becore_run_frame(becore, becore->output.dma,
-				READ_ONCE(becore->output_profile), false, true);
+	return becore_run_frame(becore, READ_ONCE(becore->output_profile),
+				false, NULL, false);
 }
 
 static int becore_run_get(void *data, u64 *value)
@@ -2081,8 +2157,10 @@ static void becore_video_fill_pix(struct v4l2_pix_format *pix)
 	pix->pixelformat = V4L2_PIX_FMT_P010;
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = becore_yuvp_output_stride(profile);
-	pix->sizeimage = becore_yuvp_output_size(profile);
-	pix->colorspace = V4L2_COLORSPACE_DEFAULT;
+	/* Single-planar P010 places UV immediately after the luma rows. */
+	pix->sizeimage = becore_yuvp_packed_output_size(profile);
+	/* The captured recipe does not describe its range or YCbCr matrix. */
+	pix->colorspace = V4L2_COLORSPACE_RAW;
 	pix->flags = 0;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
@@ -2124,7 +2202,7 @@ static void becore_video_work(struct work_struct *work)
 
 	for (;;) {
 		struct becore_video_buffer *buf;
-		dma_addr_t dma;
+		void *vaddr;
 		int ret;
 
 		mutex_lock(&becore->lock);
@@ -2144,9 +2222,13 @@ static void becore_video_work(struct work_struct *work)
 		list_del(&buf->list);
 		spin_unlock_irq(&becore->queue_lock);
 
-		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		ret = becore_run_frame(becore, dma,
-				       BECORE_YUVP_OUTPUT_P010, true, false);
+		vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+		if (WARN_ON_ONCE(!vaddr)) {
+			becore_video_fail(becore, buf);
+			return;
+		}
+		ret = becore_run_frame(becore, BECORE_YUVP_OUTPUT_P010,
+				       true, vaddr, true);
 		if (ret == -ENODATA || ret == -EBUSY) {
 			spin_lock_irq(&becore->queue_lock);
 			list_add(&buf->list, &becore->queued_outputs);
@@ -2201,12 +2283,10 @@ static int becore_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
 static int becore_buf_prepare(struct vb2_buffer *vb)
 {
 	struct v4l2_pix_format pix;
-	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
 
 	becore_video_fill_pix(&pix);
 	if (vb2_plane_size(vb, 0) < pix.sizeimage ||
-	    !IS_ALIGNED(dma, SZ_4K) || upper_32_bits(dma) ||
-	    upper_32_bits(dma + pix.sizeimage - 1))
+	    !vb2_plane_vaddr(vb, 0))
 		return -EINVAL;
 
 	vb2_set_plane_payload(vb, 0, pix.sizeimage);
@@ -2251,6 +2331,9 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 
 	becore->video_sequence = 0;
+	/* The shared driver-owned output now becomes the video bounce buffer. */
+	becore->completed_generation = 0;
+	becore->completed_output_size = 0;
 	becore->video_streaming = true;
 	mutex_unlock(&becore->lock);
 	schedule_work(&becore->video_work);
@@ -2391,6 +2474,7 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		[BECORE_INPUT_PRODUCER] = "producer",
 		[BECORE_INPUT_READY] = "ready",
 		[BECORE_INPUT_BACKEND] = "backend",
+		[BECORE_INPUT_QUARANTINED] = "quarantined",
 	};
 	struct becore_device *becore = s->private;
 	struct list_head *pos;
@@ -2476,6 +2560,7 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "start_issued      %u\n", start_issued);
 	seq_printf(s, "irq_error         %u\n", irq_error);
 	seq_printf(s, "reset_failed      %u\n", becore->reset_failed);
+	seq_printf(s, "output_quarantined %u\n", becore->output_quarantined);
 	seq_printf(s, "output_changed    %u\n", becore->output_changed_bytes);
 	seq_printf(s, "output_first      %#x\n", becore->output_first_changed);
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
@@ -2520,11 +2605,11 @@ static int becore_video_register(struct becore_device *becore)
 		goto err_mdev;
 
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	q->io_modes = VB2_MMAP | VB2_DMABUF;
+	q->io_modes = VB2_MMAP;
 	q->dev = becore->dev;
 	q->drv_priv = becore;
 	q->ops = &becore_vb2_ops;
-	q->mem_ops = &vb2_dma_contig_memops;
+	q->mem_ops = &vb2_vmalloc_memops;
 	q->buf_struct_size = sizeof(struct becore_video_buffer);
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 1;

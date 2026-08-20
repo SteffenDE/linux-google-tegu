@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/google,zumapro-becore.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Zumapro camera back-end core
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  The Zumapro camera back-end core contains the RGBP Bayer and RGB processor,
+  the optional MCFP multi-frame processor, and the YUVP YUV processor.  RGBP
+  and YUVP have separate power domains; MCFP resides in the RGBP domain.
+
+properties:
+  compatible:
+    const: google,zumapro-becore
+
+  reg:
+    items:
+      - description: RGBP processor
+      - description: MCFP processor
+      - description: YUVP processor
+      - description: RGBP system register controlling internal routing
+
+  reg-names:
+    items:
+      - const: rgbp
+      - const: mcfp
+      - const: yuvp
+      - const: sysreg-rgbp
+
+  interrupts:
+    items:
+      - description: RGBP processing and command queue interrupt
+      - description: RGBP secondary interrupt
+      - description: MCFP processing and command queue interrupt
+      - description: MCFP secondary interrupt
+      - description: YUVP processing and command queue interrupt
+      - description: YUVP secondary interrupt
+
+  interrupt-names:
+    items:
+      - const: rgbp-int0
+      - const: rgbp-int1
+      - const: mcfp-int0
+      - const: mcfp-int1
+      - const: yuvp-int0
+      - const: yuvp-int1
+
+  power-domains:
+    items:
+      - description: RGBP and MCFP power domain
+      - description: YUVP power domain
+
+  power-domain-names:
+    items:
+      - const: rgbp
+      - const: yuvp
+
+  iommus:
+    items:
+      - description: YUVP System MMU
+      - description: RGBP System MMU S0
+      - description: RGBP System MMU S1
+
+  samsung,iommu-group:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Shared IOMMU group object used by the Samsung System MMU v9 driver.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - power-domains
+  - power-domain-names
+  - iommus
+  - samsung,iommu-group
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    camera@1c440000 {
+        compatible = "google,zumapro-becore";
+        reg = <0x1c440000 0x10000>,
+              <0x1c470000 0x10000>,
+              <0x1c840000 0x10000>,
+              <0x1c420404 0x4>;
+        reg-names = "rgbp", "mcfp", "yuvp", "sysreg-rgbp";
+        interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 664 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 744 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>;
+        interrupt-names = "rgbp-int0", "rgbp-int1",
+                          "mcfp-int0", "mcfp-int1",
+                          "yuvp-int0", "yuvp-int1";
+        power-domains = <&pd_rgbp>, <&pd_yuvp>;
+        power-domain-names = "rgbp", "yuvp";
+        iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>;
+        samsung,iommu-group = <&iommu_group_isp>;
+    };
+...

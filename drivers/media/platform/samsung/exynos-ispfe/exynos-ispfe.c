@@ -13,9 +13,11 @@
  */
 
 #include <linux/bits.h>
+#include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/interconnect.h>
 #include <linux/mfd/syscon.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -844,8 +846,18 @@ static const struct ispfe_format ispfe_formats[] = {
 #define ISPFE_MAX_WIDTH			U16_MAX
 #define ISPFE_MAX_HEIGHT		U16_MAX
 
+/* Exact ultrawide session requests measured at downstream's public APIs. */
+#define ISPFE_MEMORY_BW_KBPS		974745U
+#define ISPFE_CAM_SETUP_RATE		711000000UL
+#define ISPFE_CAM_ACTIVE_RATE		111000000UL
+
 struct ispfe_device {
 	struct device *dev;
+	struct clk *cam_clk;
+	struct icc_path *memory_path;
+	unsigned long saved_cam_rate;
+	bool cam_rate_active;
+	bool memory_vote_active;
 	struct notifier_block genpd_nb;
 	struct dentry *debugfs;
 	bool state_reported;
@@ -3293,6 +3305,83 @@ static void ispfe_free_irqs(struct ispfe_device *ispfe)
 }
 
 /*
+ * The downstream session has two distinct requirements: ISPFE's measured
+ * 974745 KB/s real-time memory vote, and a short CAM-domain pulse while the
+ * receiver is configured.  Keep ownership explicit so that a failed unwind
+ * remains retryable instead of silently becoming the next session's idle
+ * baseline.
+ */
+static int ispfe_qos_disable(struct ispfe_device *ispfe)
+{
+	int cam_ret = 0;
+	int memory_ret = 0;
+
+	if (ispfe->cam_rate_active) {
+		cam_ret = clk_set_rate(ispfe->cam_clk, ispfe->saved_cam_rate);
+		if (!cam_ret)
+			ispfe->cam_rate_active = false;
+	}
+	if (ispfe->memory_vote_active) {
+		memory_ret = icc_set_bw(ispfe->memory_path, 0, 0);
+		if (!memory_ret)
+			ispfe->memory_vote_active = false;
+	}
+	if (!ispfe->cam_rate_active && !ispfe->memory_vote_active)
+		ispfe->saved_cam_rate = 0;
+
+	return cam_ret ?: memory_ret;
+}
+
+static int ispfe_qos_enable(struct ispfe_device *ispfe)
+{
+	int cleanup_ret;
+	int ret;
+
+	/* Retry a restore left incomplete by the preceding stream. */
+	if (ispfe->cam_rate_active || ispfe->memory_vote_active) {
+		ret = ispfe_qos_disable(ispfe);
+		if (ret)
+			return ret;
+	}
+
+	ispfe->saved_cam_rate = clk_get_rate(ispfe->cam_clk);
+	if (!ispfe->saved_cam_rate)
+		return -EIO;
+
+	ret = icc_set_bw(ispfe->memory_path, ISPFE_MEMORY_BW_KBPS,
+			 ISPFE_MEMORY_BW_KBPS);
+	if (ret)
+		goto err_clear;
+	ispfe->memory_vote_active = true;
+
+	/* A transport error can arrive after firmware accepted the request. */
+	ispfe->cam_rate_active = true;
+	ret = clk_set_rate(ispfe->cam_clk,
+			   max(ispfe->saved_cam_rate, ISPFE_CAM_SETUP_RATE));
+	if (ret) {
+		cleanup_ret = ispfe_qos_disable(ispfe);
+		if (cleanup_ret)
+			dev_err(ispfe->dev,
+				"cannot restore QoS after CAM error: %d\n",
+				cleanup_ret);
+		return ret;
+	}
+
+	return 0;
+
+err_clear:
+	if (!ispfe->cam_rate_active && !ispfe->memory_vote_active)
+		ispfe->saved_cam_rate = 0;
+	return ret;
+}
+
+static int ispfe_qos_set_active(struct ispfe_device *ispfe)
+{
+	return clk_set_rate(ispfe->cam_clk,
+			    max(ispfe->saved_cam_rate, ISPFE_CAM_ACTIVE_RATE));
+}
+
+/*
  * Bring one raw stream up, in the order the vendor stack does: the block, the
  * line-memory pool, PDMA, the frame controller context, the PHY, the link, the
  * link's interrupts, and only then the mode word that makes the context run.
@@ -3393,9 +3482,14 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	memset(ispfe->core_seen, 0, sizeof(ispfe->core_seen));
 	memset(ispfe->pdma_seen, 0, sizeof(ispfe->pdma_seen));
 
+	ret = ispfe_qos_enable(ispfe);
+	if (ret)
+		return dev_err_probe(ispfe->dev, ret,
+				     "cannot establish camera QoS\n");
+
 	ret = pm_runtime_resume_and_get(ispfe->dev);
 	if (ret)
-		return ret;
+		goto err_qos;
 
 	/*
 	 * The nine D/C-PHYs sit behind one PMU isolation bit, and while it is
@@ -3440,6 +3534,11 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	}
 
 	ispfe_device_init(ispfe);
+	ret = ispfe_qos_set_active(ispfe);
+	if (ret) {
+		dev_err(ispfe->dev, "cannot set active CAM rate: %d\n", ret);
+		goto err_backend;
+	}
 
 	/*
 	 * The vendor leaves 110 ms between finishing the device init and
@@ -3465,6 +3564,12 @@ static int ispfe_start(struct ispfe_device *ispfe)
 
 	return 0;
 
+err_backend:
+	if (ispfe->backend_producing) {
+		exynos_becore_input_producer_abort(ispfe->backend_input);
+		ispfe->backend_producing = false;
+		ispfe->backend_handed_off = false;
+	}
 err_irqs:
 	ispfe_free_irqs(ispfe);
 err_isolate:
@@ -3473,6 +3578,9 @@ err_isolate:
 		ispfe_phy_isolation(ispfe, false);
 	}
 	pm_runtime_put(ispfe->dev);
+err_qos:
+	if (ispfe_qos_disable(ispfe))
+		dev_err(ispfe->dev, "cannot restore camera QoS after start error\n");
 	return ret;
 }
 
@@ -3528,6 +3636,8 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 		if (ispfe_phy_isolation(ispfe, false))
 			dev_err(ispfe->dev, "cannot re-isolate the PHYs\n");
 	}
+	if (ispfe_qos_disable(ispfe))
+		dev_err(ispfe->dev, "cannot restore camera QoS after stop\n");
 	ispfe->streaming = false;
 	pm_runtime_put(ispfe->dev);
 }
@@ -3994,6 +4104,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		   READ_ONCE(ispfe->snapshot_state) >=
 		   ISPFE_SNAPSHOT_REDIRECTED);
 	seq_printf(s, "power_hold   %u\n", ispfe->power_hold);
+	seq_printf(s, "camera_qos   CAM %lu Hz (saved %lu, owned %u), memory %u\n",
+		   clk_get_rate(ispfe->cam_clk), ispfe->saved_cam_rate,
+		   ispfe->cam_rate_active, ispfe->memory_vote_active);
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	seq_printf(s, "lmp_ml0_profile %u requested, %u active\n",
 		   ispfe->lmp_ml0_profile, ispfe->active_lmp_ml0_profile);
@@ -5482,6 +5595,14 @@ static int ispfe_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ispfe->dev = dev;
+	ispfe->cam_clk = devm_clk_get(dev, "cam");
+	if (IS_ERR(ispfe->cam_clk))
+		return dev_err_probe(dev, PTR_ERR(ispfe->cam_clk),
+				     "cannot get CAM clock\n");
+	ispfe->memory_path = devm_of_icc_get(dev, "memory");
+	if (IS_ERR(ispfe->memory_path))
+		return dev_err_probe(dev, PTR_ERR(ispfe->memory_path),
+				     "cannot get memory path\n");
 	ispfe->predown_qch = ISPFE_PREDOWN_QCH_OFF;
 	ispfe->settle_us = ISPFE_SETTLE_US_DEFAULT;
 	ispfe->lmp_alloc_ctrl = LMP_ALLOC_CTRL_IMX712;
@@ -5633,6 +5754,11 @@ static void ispfe_remove(struct platform_device *pdev)
 			ispfe->power_hold = false;
 			pm_runtime_put_sync(ispfe->dev);
 		}
+		ret = ispfe_qos_disable(ispfe);
+		if (ret)
+			dev_warn(ispfe->dev,
+				 "cannot restore camera QoS while removing: %d\n",
+				 ret);
 		ispfe_buffers_free(ispfe);
 	}
 }

@@ -3,6 +3,8 @@
 config VIDEO_EXYNOS_ISPFE
 	bool "Google zumapro ISPFE camera receive complex"
 	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on COMMON_CLK
+	depends on INTERCONNECT
 	depends on OF
 	depends on PM
 	depends on VIDEO_DEV

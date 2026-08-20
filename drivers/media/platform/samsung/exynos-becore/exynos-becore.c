@@ -5,8 +5,10 @@
  * The register sequences here are the common processor lifecycle observed on
  * the Pixel 9a vendor stack.  The debugfs diagnostic accepts a structurally
  * fixed, relocatable RGBP/YUVP program for offline bring-up; it is deliberately
- * not a camera ABI.  Powering a block down is safe only after all three
- * processors have accepted a software reset.
+ * not a camera ABI.  A separate MCSC recipe can be normalized into a dormant
+ * command list while that downstream stage is brought up.  Powering a block
+ * down is safe only after all three active processors have accepted a software
+ * reset.
  */
 
 #include <linux/completion.h>
@@ -37,6 +39,7 @@
 #include <media/videobuf2-vmalloc.h>
 
 #include "exynos-becore-recipe.h"
+#include "exynos-becore-mcsc-recipe.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
 #define BECORE_GLOBAL_ENABLE_CLEAR	0x0008
@@ -83,6 +86,7 @@
 
 #define BECORE_RGBP_PHYS_BASE		0x1c440000
 #define BECORE_YUVP_PHYS_BASE		0x1c840000
+#define BECORE_MCSC_PHYS_BASE		0x1d040000
 
 #define BECORE_RGBP_INPUT_IMAGE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c50)
 #define BECORE_RGBP_INPUT_HEADER_REG	(BECORE_RGBP_PHYS_BASE + 0x1d10)
@@ -108,6 +112,32 @@
 #define BECORE_YUVP_OUTPUT_STRIDE2_REG	(BECORE_YUVP_PHYS_BASE + 0x242c)
 #define BECORE_YUVP_OUTPUT_VOTF_REG	(BECORE_YUVP_PHYS_BASE + 0x243c)
 #define BECORE_YUVP_OUTPUT_BUSINFO_REG	(BECORE_YUVP_PHYS_BASE + 0x244c)
+
+#define BECORE_MCSC_INPUT_PLANE1_REG	(BECORE_MCSC_PHYS_BASE + 0x1850)
+#define BECORE_MCSC_INPUT_PLANE2_REG	(BECORE_MCSC_PHYS_BASE + 0x1890)
+#define BECORE_MCSC_INPUT_VOTF_REG	(BECORE_MCSC_PHYS_BASE + 0x183c)
+#define BECORE_MCSC_INPUT_FORMAT_REG	(BECORE_MCSC_PHYS_BASE + 0x1810)
+#define BECORE_MCSC_INPUT_LOSSY_REG	(BECORE_MCSC_PHYS_BASE + 0x1818)
+#define BECORE_MCSC_INPUT_COMP_REG	(BECORE_MCSC_PHYS_BASE + 0x1804)
+#define BECORE_MCSC_INPUT_WIDTH_REG	(BECORE_MCSC_PHYS_BASE + 0x1820)
+#define BECORE_MCSC_INPUT_HEIGHT_REG	(BECORE_MCSC_PHYS_BASE + 0x1824)
+#define BECORE_MCSC_INPUT_STRIDE1_REG	(BECORE_MCSC_PHYS_BASE + 0x1828)
+#define BECORE_MCSC_INPUT_STRIDE2_REG	(BECORE_MCSC_PHYS_BASE + 0x182c)
+#define BECORE_MCSC_INPUT_BUSINFO_REG	(BECORE_MCSC_PHYS_BASE + 0x184c)
+#define BECORE_MCSC_INPUT_MAX_BL_REG	(BECORE_MCSC_PHYS_BASE + 0x1848)
+#define BECORE_MCSC_INPUT_ENABLE_REG	(BECORE_MCSC_PHYS_BASE + 0x1800)
+#define BECORE_MCSC_OUTPUT_PLANE1_REG	(BECORE_MCSC_PHYS_BASE + 0x2050)
+#define BECORE_MCSC_OUTPUT_PLANE2_REG	(BECORE_MCSC_PHYS_BASE + 0x2090)
+#define BECORE_MCSC_OUTPUT_FORMAT_REG	(BECORE_MCSC_PHYS_BASE + 0x2010)
+#define BECORE_MCSC_OUTPUT_COMP_REG	(BECORE_MCSC_PHYS_BASE + 0x2004)
+#define BECORE_MCSC_OUTPUT_WIDTH_REG	(BECORE_MCSC_PHYS_BASE + 0x2020)
+#define BECORE_MCSC_OUTPUT_HEIGHT_REG	(BECORE_MCSC_PHYS_BASE + 0x2024)
+#define BECORE_MCSC_OUTPUT_STRIDE1_REG	(BECORE_MCSC_PHYS_BASE + 0x2028)
+#define BECORE_MCSC_OUTPUT_STRIDE2_REG	(BECORE_MCSC_PHYS_BASE + 0x202c)
+#define BECORE_MCSC_OUTPUT_BUSINFO_REG	(BECORE_MCSC_PHYS_BASE + 0x204c)
+#define BECORE_MCSC_OUTPUT_MAX_BL_REG	(BECORE_MCSC_PHYS_BASE + 0x2048)
+#define BECORE_MCSC_OUTPUT_ENABLE_REG	(BECORE_MCSC_PHYS_BASE + 0x2000)
+#define BECORE_MCSC_OUTPUT_DITHER_REG	(BECORE_MCSC_PHYS_BASE + 0x2f00)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -248,6 +278,100 @@ static const u32 becore_yuvp_output_regs[] = {
 	[BECORE_YUVP_OUTPUT_ENABLE] = BECORE_YUVP_OUTPUT_ENABLE_REG,
 };
 
+struct becore_mcsc_dma_profile {
+	u32 width;
+	u32 height;
+	u32 data_format;
+	u32 comp_control;
+	u32 lossy_byte32num;
+	u32 votf_enable;
+	u32 stride;
+	u32 businfo;
+	u32 max_bl;
+	u32 enable;
+	u32 dither;
+};
+
+/*
+ * The physical-ultrawide 4000x3000 request carries YUVP's 4160x3120 lossy
+ * SBWC intermediate into MCSC and writes output zero as linear NV12.  Keep
+ * this dormant profile separate from the interim P010 capture surface: MCSC
+ * is not submitted until GTNR/GDC ownership and lifecycle are established.
+ */
+static const struct becore_mcsc_dma_profile becore_mcsc_input = {
+	.width = 4160,
+	.height = 3120,
+	.data_format = 0x2000,
+	.comp_control = 0xa,
+	.lossy_byte32num = 2,
+	.votf_enable = 0x00400001,
+	.stride = 0x2080,
+	.businfo = 2,
+	.max_bl = 0x10,
+	.enable = 1,
+};
+
+static const struct becore_mcsc_dma_profile becore_mcsc_output = {
+	.width = 4000,
+	.height = 3000,
+	.data_format = 0x800,
+	.comp_control = 0,
+	.stride = 0xfc0,
+	.businfo = 0,
+	.max_bl = 4,
+	.enable = 1,
+	.dither = 0x10,
+};
+
+enum becore_mcsc_dma_word {
+	BECORE_MCSC_INPUT_VOTF,
+	BECORE_MCSC_INPUT_FORMAT,
+	BECORE_MCSC_INPUT_LOSSY,
+	BECORE_MCSC_INPUT_COMP,
+	BECORE_MCSC_INPUT_WIDTH,
+	BECORE_MCSC_INPUT_HEIGHT,
+	BECORE_MCSC_INPUT_STRIDE1,
+	BECORE_MCSC_INPUT_STRIDE2,
+	BECORE_MCSC_INPUT_BUSINFO,
+	BECORE_MCSC_INPUT_MAX_BL,
+	BECORE_MCSC_INPUT_ENABLE,
+	BECORE_MCSC_OUTPUT_FORMAT,
+	BECORE_MCSC_OUTPUT_COMP,
+	BECORE_MCSC_OUTPUT_WIDTH,
+	BECORE_MCSC_OUTPUT_HEIGHT,
+	BECORE_MCSC_OUTPUT_STRIDE1,
+	BECORE_MCSC_OUTPUT_STRIDE2,
+	BECORE_MCSC_OUTPUT_BUSINFO,
+	BECORE_MCSC_OUTPUT_MAX_BL,
+	BECORE_MCSC_OUTPUT_ENABLE,
+	BECORE_MCSC_OUTPUT_DITHER,
+	BECORE_MCSC_DMA_WORD_COUNT,
+};
+
+static const u32 becore_mcsc_dma_regs[] = {
+	[BECORE_MCSC_INPUT_VOTF] = BECORE_MCSC_INPUT_VOTF_REG,
+	[BECORE_MCSC_INPUT_FORMAT] = BECORE_MCSC_INPUT_FORMAT_REG,
+	[BECORE_MCSC_INPUT_LOSSY] = BECORE_MCSC_INPUT_LOSSY_REG,
+	[BECORE_MCSC_INPUT_COMP] = BECORE_MCSC_INPUT_COMP_REG,
+	[BECORE_MCSC_INPUT_WIDTH] = BECORE_MCSC_INPUT_WIDTH_REG,
+	[BECORE_MCSC_INPUT_HEIGHT] = BECORE_MCSC_INPUT_HEIGHT_REG,
+	[BECORE_MCSC_INPUT_STRIDE1] = BECORE_MCSC_INPUT_STRIDE1_REG,
+	[BECORE_MCSC_INPUT_STRIDE2] = BECORE_MCSC_INPUT_STRIDE2_REG,
+	[BECORE_MCSC_INPUT_BUSINFO] = BECORE_MCSC_INPUT_BUSINFO_REG,
+	[BECORE_MCSC_INPUT_MAX_BL] = BECORE_MCSC_INPUT_MAX_BL_REG,
+	[BECORE_MCSC_INPUT_ENABLE] = BECORE_MCSC_INPUT_ENABLE_REG,
+	[BECORE_MCSC_OUTPUT_FORMAT] = BECORE_MCSC_OUTPUT_FORMAT_REG,
+	[BECORE_MCSC_OUTPUT_COMP] = BECORE_MCSC_OUTPUT_COMP_REG,
+	[BECORE_MCSC_OUTPUT_WIDTH] = BECORE_MCSC_OUTPUT_WIDTH_REG,
+	[BECORE_MCSC_OUTPUT_HEIGHT] = BECORE_MCSC_OUTPUT_HEIGHT_REG,
+	[BECORE_MCSC_OUTPUT_STRIDE1] = BECORE_MCSC_OUTPUT_STRIDE1_REG,
+	[BECORE_MCSC_OUTPUT_STRIDE2] = BECORE_MCSC_OUTPUT_STRIDE2_REG,
+	[BECORE_MCSC_OUTPUT_BUSINFO] = BECORE_MCSC_OUTPUT_BUSINFO_REG,
+	[BECORE_MCSC_OUTPUT_MAX_BL] = BECORE_MCSC_OUTPUT_MAX_BL_REG,
+	[BECORE_MCSC_OUTPUT_ENABLE] = BECORE_MCSC_OUTPUT_ENABLE_REG,
+	[BECORE_MCSC_OUTPUT_DITHER] = BECORE_MCSC_OUTPUT_DITHER_REG,
+};
+
 struct becore_device;
 
 #define BECORE_INPUT_SLOT_COUNT	3
@@ -342,13 +466,19 @@ struct becore_device {
 	struct becore_input_slot *run_input;
 	struct becore_dma_buffer grid;
 	struct becore_dma_buffer output;
+	struct becore_dma_buffer mcsc_output;
 	struct exynos_becore_input *input_producer;
 	u64 producer_sequence;
 	u64 input_sequence;
 	struct becore_cmdq_program program[BECORE_NUM_BLOCKS];
+	struct becore_cmdq_program mcsc_program;
 	u8 *recipe;
+	u8 *mcsc_recipe;
 	size_t recipe_staged_bytes;
+	size_t mcsc_recipe_staged_bytes;
 	u32 recipe_generation;
+	u32 mcsc_recipe_generation;
+	u32 mcsc_encoded_generation;
 	u32 run_generation;
 	u32 completed_generation;
 	u32 video_sequence;
@@ -722,6 +852,114 @@ static int becore_yuvp_output_value(struct becore_device *becore, u32 index,
 	return 0;
 }
 
+static size_t becore_mcsc_output_plane2_offset(void)
+{
+	return (size_t)becore_mcsc_output.stride * becore_mcsc_output.height;
+}
+
+static size_t becore_mcsc_output_size(void)
+{
+	size_t chroma = (size_t)becore_mcsc_output.stride *
+			DIV_ROUND_UP(becore_mcsc_output.height, 2);
+
+	return ALIGN(becore_mcsc_output_plane2_offset() + chroma, SZ_4K);
+}
+
+static int becore_mcsc_dma_value(u32 index, u32 reg, u32 *value)
+{
+	if (index >= BECORE_MCSC_DMA_WORD_COUNT ||
+	    reg != becore_mcsc_dma_regs[index])
+		return -EINVAL;
+	if (!value)
+		return 0;
+
+	switch (index) {
+	case BECORE_MCSC_INPUT_VOTF:
+		*value = becore_mcsc_input.votf_enable;
+		break;
+	case BECORE_MCSC_INPUT_FORMAT:
+		*value = becore_mcsc_input.data_format;
+		break;
+	case BECORE_MCSC_INPUT_LOSSY:
+		*value = becore_mcsc_input.lossy_byte32num;
+		break;
+	case BECORE_MCSC_INPUT_COMP:
+		*value = becore_mcsc_input.comp_control;
+		break;
+	case BECORE_MCSC_INPUT_WIDTH:
+		*value = becore_mcsc_input.width;
+		break;
+	case BECORE_MCSC_INPUT_HEIGHT:
+		*value = becore_mcsc_input.height;
+		break;
+	case BECORE_MCSC_INPUT_STRIDE1:
+	case BECORE_MCSC_INPUT_STRIDE2:
+		*value = becore_mcsc_input.stride;
+		break;
+	case BECORE_MCSC_INPUT_BUSINFO:
+		*value = becore_mcsc_input.businfo;
+		break;
+	case BECORE_MCSC_INPUT_MAX_BL:
+		*value = becore_mcsc_input.max_bl;
+		break;
+	case BECORE_MCSC_INPUT_ENABLE:
+		*value = becore_mcsc_input.enable;
+		break;
+	case BECORE_MCSC_OUTPUT_FORMAT:
+		*value = becore_mcsc_output.data_format;
+		break;
+	case BECORE_MCSC_OUTPUT_COMP:
+		*value = becore_mcsc_output.comp_control;
+		break;
+	case BECORE_MCSC_OUTPUT_WIDTH:
+		*value = becore_mcsc_output.width;
+		break;
+	case BECORE_MCSC_OUTPUT_HEIGHT:
+		*value = becore_mcsc_output.height;
+		break;
+	case BECORE_MCSC_OUTPUT_STRIDE1:
+	case BECORE_MCSC_OUTPUT_STRIDE2:
+		*value = becore_mcsc_output.stride;
+		break;
+	case BECORE_MCSC_OUTPUT_BUSINFO:
+		*value = becore_mcsc_output.businfo;
+		break;
+	case BECORE_MCSC_OUTPUT_MAX_BL:
+		*value = becore_mcsc_output.max_bl;
+		break;
+	case BECORE_MCSC_OUTPUT_ENABLE:
+		*value = becore_mcsc_output.enable;
+		break;
+	case BECORE_MCSC_OUTPUT_DITHER:
+		*value = becore_mcsc_output.dither;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static dma_addr_t becore_mcsc_address_dma(struct becore_device *becore, u32 reg)
+{
+	const struct becore_yuvp_output_profile *input =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+
+	switch (reg) {
+	case BECORE_MCSC_INPUT_PLANE1_REG:
+		return becore->output.dma;
+	case BECORE_MCSC_INPUT_PLANE2_REG:
+		return becore->output.dma + becore_yuvp_output_plane2_offset(input);
+	case BECORE_MCSC_OUTPUT_PLANE1_REG:
+		return becore->mcsc_output.dma;
+	case BECORE_MCSC_OUTPUT_PLANE2_REG:
+		return becore->mcsc_output.dma +
+		       becore_mcsc_output_plane2_offset();
+	default:
+		return DMA_MAPPING_ERROR;
+	}
+}
+
 static u32 becore_typed_word_count(enum becore_block_id id)
 {
 	if (id == BECORE_RGBP)
@@ -970,6 +1208,161 @@ static int becore_encode_programs(struct becore_device *becore)
 
 	return becore_encode_block(becore, BECORE_YUVP, becore_yuvp_shape,
 				   BECORE_YUVP_HEADER_COUNT);
+}
+
+static int becore_mcsc_recipe_validate(struct becore_device *becore)
+{
+	const u8 *header = becore->mcsc_recipe;
+	const u8 *record = header + BECORE_MCSC_RECIPE_HEADER_BYTES;
+	const struct becore_yuvp_output_profile *input =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+	u32 address_count = 0;
+	u32 typed_count = 0;
+	u32 i;
+
+	if (becore->mcsc_recipe_staged_bytes != BECORE_MCSC_RECIPE_BYTES ||
+	    get_unaligned_le32(header) != BECORE_MCSC_RECIPE_MAGIC ||
+	    get_unaligned_le32(header + 4) != BECORE_MCSC_RECIPE_VERSION ||
+	    get_unaligned_le32(header + 8) != BECORE_MCSC_RECIPE_HEADER_BYTES ||
+	    get_unaligned_le32(header + 12) != BECORE_MCSC_RECIPE_RECORD_BYTES ||
+	    get_unaligned_le32(header + 16) != BECORE_MCSC_HEADER_COUNT ||
+	    get_unaligned_le32(header + 20) != BECORE_MCSC_RECIPE_BYTES ||
+	    get_unaligned_le32(header + 24) || get_unaligned_le32(header + 28))
+		return -EINVAL;
+	if (becore->output.size < becore_yuvp_output_size(input) ||
+	    becore->mcsc_output.size != becore_mcsc_output_size())
+		return -EINVAL;
+
+	for (i = 0; i < BECORE_MCSC_HEADER_COUNT;
+	     i++, record += BECORE_MCSC_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &becore_mcsc_shape[i];
+		const u8 *words = record + 12;
+		u16 used_mask;
+		u32 word;
+
+		if (!shape->valid_words || shape->valid_words > 16)
+			return -EINVAL;
+		used_mask = shape->valid_words == 16 ? U16_MAX :
+			    GENMASK(shape->valid_words - 1, 0);
+		if (get_unaligned_le32(record) != shape->mode ||
+		    get_unaligned_le32(record + 4) != shape->target ||
+		    get_unaligned_le32(record + 8) != shape->type_map ||
+		    (shape->address_mask & ~used_mask) ||
+		    (shape->typed_mask & ~used_mask) ||
+		    (shape->fixed_mask & ~used_mask) ||
+		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->fixed_mask) ||
+		    (shape->typed_mask & shape->fixed_mask))
+			return -EINVAL;
+
+		for (word = 0; word < 16; word++) {
+			u32 value = get_unaligned_le32(words + word * 4);
+
+			if (word >= shape->valid_words) {
+				if (value)
+					return -EINVAL;
+				continue;
+			}
+			if (shape->mode == 0x00090000 && !(word & 1)) {
+				if (value != shape->pair_registers[word / 2])
+					return -EINVAL;
+				continue;
+			}
+			if ((shape->fixed_mask & BIT(word)) &&
+			    value != shape->fixed_values[word])
+				return -EINVAL;
+
+			if (shape->typed_mask & BIT(word)) {
+				u32 reg;
+
+				if (shape->mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape->pair_registers[word / 2];
+				if (becore_mcsc_dma_value(typed_count, reg, NULL))
+					return -EINVAL;
+				typed_count++;
+			}
+			if (shape->address_mask & BIT(word)) {
+				u32 reg;
+
+				if (shape->mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape->pair_registers[word / 2];
+				if (becore_mcsc_address_dma(becore, reg) ==
+				    DMA_MAPPING_ERROR)
+					return -EINVAL;
+				address_count++;
+			}
+		}
+	}
+
+	if (address_count != 4 || typed_count != BECORE_MCSC_DMA_WORD_COUNT)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int becore_encode_mcsc(struct becore_device *becore)
+{
+	struct becore_cmdq_program *program = &becore->mcsc_program;
+	const u8 *record = becore->mcsc_recipe +
+			   BECORE_MCSC_RECIPE_HEADER_BYTES;
+	size_t payload_offset = ALIGN((size_t)BECORE_MCSC_HEADER_COUNT *
+				      BECORE_CMDQ_HEADER_BYTES,
+				      BECORE_CMDQ_PAYLOAD_BYTES);
+	u32 typed_count = 0;
+	u32 i;
+
+	if (!program->cpu || program->header_count != BECORE_MCSC_HEADER_COUNT ||
+	    program->size != becore_cmdq_program_size(BECORE_MCSC_HEADER_COUNT) ||
+	    upper_32_bits(program->dma) ||
+	    upper_32_bits(program->dma + program->size - 1))
+		return -EINVAL;
+
+	memset(program->cpu, 0, program->size);
+	for (i = 0; i < BECORE_MCSC_HEADER_COUNT;
+	     i++, record += BECORE_MCSC_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &becore_mcsc_shape[i];
+		u8 *header = (u8 *)program->cpu + i * BECORE_CMDQ_HEADER_BYTES;
+		u8 *payload = (u8 *)program->cpu + payload_offset +
+			      i * BECORE_CMDQ_PAYLOAD_BYTES;
+		dma_addr_t payload_dma = program->dma + payload_offset +
+					 i * BECORE_CMDQ_PAYLOAD_BYTES;
+		u32 word;
+
+		put_unaligned_le32(shape->mode, header);
+		put_unaligned_le32(lower_32_bits(payload_dma), header + 4);
+		put_unaligned_le32(shape->target, header + 8);
+		put_unaligned_le32(shape->type_map, header + 12);
+		memcpy(payload, record + 12, BECORE_CMDQ_PAYLOAD_BYTES);
+
+		for (word = 0; word < shape->valid_words; word++) {
+			dma_addr_t dma;
+			u32 reg;
+			u32 value;
+
+			if (shape->typed_mask & BIT(word)) {
+				reg = shape->pair_registers[word / 2];
+				if (becore_mcsc_dma_value(typed_count, reg, &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
+				typed_count++;
+				continue;
+			}
+			if (!(shape->address_mask & BIT(word)))
+				continue;
+			reg = shape->pair_registers[word / 2];
+			dma = becore_mcsc_address_dma(becore, reg);
+			if (dma == DMA_MAPPING_ERROR || upper_32_bits(dma))
+				return -EINVAL;
+			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
+		}
+	}
+
+	if (typed_count != BECORE_MCSC_DMA_WORD_COUNT)
+		return -EINVAL;
+
+	return 0;
 }
 
 static void becore_prepare_irqs(struct becore_block *block)
@@ -1285,12 +1678,10 @@ err_free:
 			     "cannot allocate Bayer input slot %u\n", i);
 }
 
-static int becore_alloc_cmdq_program(struct becore_device *becore,
-				     enum becore_block_id id,
-				     u32 header_count)
+static int becore_alloc_cmdq_buffer(struct becore_device *becore,
+				    struct becore_cmdq_program *program,
+				    u32 header_count, const char *name)
 {
-	struct becore_cmdq_program *program = &becore->program[id];
-
 	program->header_count = header_count;
 	program->size = becore_cmdq_program_size(header_count);
 	program->cpu = dmam_alloc_coherent(becore->dev, program->size,
@@ -1298,14 +1689,22 @@ static int becore_alloc_cmdq_program(struct becore_device *becore,
 	if (!program->cpu)
 		return dev_err_probe(becore->dev, -ENOMEM,
 				     "cannot allocate %s CMDQ program\n",
-				     becore->blocks[id].name);
+				     name);
 	if (upper_32_bits(program->dma) ||
 	    upper_32_bits(program->dma + program->size - 1))
 		return dev_err_probe(becore->dev, -ERANGE,
 				     "%s CMDQ program is outside 32-bit DMA\n",
-				     becore->blocks[id].name);
+				     name);
 
 	return 0;
+}
+
+static int becore_alloc_cmdq_program(struct becore_device *becore,
+				     enum becore_block_id id,
+				     u32 header_count)
+{
+	return becore_alloc_cmdq_buffer(becore, &becore->program[id],
+					header_count, becore->blocks[id].name);
 }
 
 static int becore_alloc_diagnostic(struct becore_device *becore)
@@ -1316,6 +1715,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	becore->recipe = devm_kzalloc(becore->dev, BECORE_RECIPE_BYTES,
 				      GFP_KERNEL);
 	if (!becore->recipe)
+		return -ENOMEM;
+	becore->mcsc_recipe = devm_kzalloc(becore->dev,
+					   BECORE_MCSC_RECIPE_BYTES, GFP_KERNEL);
+	if (!becore->mcsc_recipe)
 		return -ENOMEM;
 
 	ret = becore_alloc_shared_input(becore);
@@ -1329,13 +1732,22 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      output_size, "YUVP output");
 	if (ret)
 		return ret;
+	ret = becore_alloc_dma_buffer(becore, &becore->mcsc_output,
+				      becore_mcsc_output_size(), "MCSC output");
+	if (ret)
+		return ret;
 	ret = becore_alloc_cmdq_program(becore, BECORE_RGBP,
 					BECORE_RGBP_HEADER_COUNT);
 	if (ret)
 		return ret;
 
-	return becore_alloc_cmdq_program(becore, BECORE_YUVP,
-					 BECORE_YUVP_HEADER_COUNT);
+	ret = becore_alloc_cmdq_program(becore, BECORE_YUVP,
+					BECORE_YUVP_HEADER_COUNT);
+	if (ret)
+		return ret;
+
+	return becore_alloc_cmdq_buffer(becore, &becore->mcsc_program,
+					BECORE_MCSC_HEADER_COUNT, "MCSC");
 }
 
 static int becore_clone_sgtable(struct sg_table *dst,
@@ -1729,6 +2141,46 @@ static const struct file_operations becore_recipe_fops = {
 	.llseek = default_llseek,
 };
 
+static ssize_t becore_mcsc_recipe_read(struct file *file, char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else
+		ret = simple_read_from_buffer(buf, count, ppos,
+					      becore->mcsc_recipe,
+					      becore->mcsc_recipe_staged_bytes);
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
+static ssize_t becore_mcsc_recipe_write(struct file *file,
+					const char __user *buf, size_t count,
+					loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+
+	return becore_stage_write(becore, buf, count, ppos,
+				  becore->mcsc_recipe, BECORE_MCSC_RECIPE_BYTES,
+				  &becore->mcsc_recipe_staged_bytes,
+				  &becore->mcsc_recipe_generation);
+}
+
+static const struct file_operations becore_mcsc_recipe_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = becore_mcsc_recipe_read,
+	.write = becore_mcsc_recipe_write,
+	.llseek = default_llseek,
+};
+
 static ssize_t becore_input_write(struct file *file, const char __user *buf,
 				  size_t count, loff_t *ppos)
 {
@@ -1839,6 +2291,64 @@ static const struct file_operations becore_yuvp_encoded_fops = {
 	.read = becore_yuvp_encoded_read,
 	.llseek = default_llseek,
 };
+
+static ssize_t becore_mcsc_encoded_read(struct file *file, char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else if (becore->mcsc_recipe_staged_bytes != BECORE_MCSC_RECIPE_BYTES ||
+		 becore->mcsc_encoded_generation != becore->mcsc_recipe_generation)
+		ret = -ENODATA;
+	else
+		ret = simple_read_from_buffer(buf, count, ppos,
+					      becore->mcsc_program.cpu,
+					      becore->mcsc_program.size);
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
+static const struct file_operations becore_mcsc_encoded_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = becore_mcsc_encoded_read,
+	.llseek = default_llseek,
+};
+
+static int becore_mcsc_encode_set(void *data, u64 value)
+{
+	struct becore_device *becore = data;
+	int ret;
+
+	if (value != 1)
+		return -EINVAL;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed) {
+		ret = -EIO;
+	} else if (becore->running || becore->video_streaming) {
+		ret = -EBUSY;
+	} else {
+		ret = becore_mcsc_recipe_validate(becore);
+		if (!ret)
+			ret = becore_encode_mcsc(becore);
+		if (!ret)
+			becore->mcsc_encoded_generation =
+				becore->mcsc_recipe_generation;
+	}
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(becore_mcsc_encode_fops, NULL,
+			 becore_mcsc_encode_set, "%llu\n");
 
 static void becore_clear_pending_irqs(struct becore_block *block)
 {
@@ -2509,6 +3019,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "recipe           %zu/%u bytes, generation %u\n",
 		   becore->recipe_staged_bytes, BECORE_RECIPE_BYTES,
 		   becore->recipe_generation);
+	seq_printf(s, "mcsc_recipe      %zu/%u bytes, generation %u, encoded %u\n",
+		   becore->mcsc_recipe_staged_bytes, BECORE_MCSC_RECIPE_BYTES,
+		   becore->mcsc_recipe_generation,
+		   becore->mcsc_encoded_generation);
 	seq_printf(s, "input            %zu/%zu bytes, iova %pad\n",
 		   becore->inputs[0].buffer.staged_bytes,
 		   becore->inputs[0].buffer.size, &becore->inputs[0].buffer.dma);
@@ -2552,6 +3066,12 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->program[BECORE_YUVP].size,
 		   becore->program[BECORE_YUVP].header_count,
 		   &becore->program[BECORE_YUVP].dma);
+	seq_printf(s, "mcsc_output      %zu bytes, iova %pad\n",
+		   becore->mcsc_output.size, &becore->mcsc_output.dma);
+	seq_printf(s, "mcsc_cmdq        %zu bytes/%u headers, iova %pad\n",
+		   becore->mcsc_program.size,
+		   becore->mcsc_program.header_count,
+		   &becore->mcsc_program.dma);
 	seq_printf(s, "run_generation   %u\n", becore->run_generation);
 	seq_printf(s, "completed         %u\n", becore->completed_generation);
 	seq_printf(s, "last_result       %d\n", becore->last_run_result);
@@ -2669,6 +3189,8 @@ static int becore_debugfs_init(struct becore_device *becore)
 		return PTR_ERR(dir);
 	becore->debugfs = dir;
 	debugfs_create_file("program", 0600, dir, becore, &becore_recipe_fops);
+	debugfs_create_file("mcsc_program", 0600, dir, becore,
+			    &becore_mcsc_recipe_fops);
 	debugfs_create_file("input", 0200, dir, becore, &becore_input_fops);
 	debugfs_create_file("grid", 0200, dir, becore, &becore_grid_fops);
 	debugfs_create_u32("output_profile", 0644, dir,
@@ -2678,6 +3200,10 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_rgbp_encoded_fops);
 	debugfs_create_file("yuvp_cmdq", 0400, dir, becore,
 			    &becore_yuvp_encoded_fops);
+	debugfs_create_file("mcsc_cmdq", 0400, dir, becore,
+			    &becore_mcsc_encoded_fops);
+	debugfs_create_file("mcsc_encode", 0200, dir, becore,
+			    &becore_mcsc_encode_fops);
 	debugfs_create_file("run", 0600, dir, becore, &becore_run_fops);
 	debugfs_create_file("cancel", 0200, dir, becore, &becore_cancel_fops);
 	debugfs_create_file("status", 0400, dir, becore, &becore_status_fops);

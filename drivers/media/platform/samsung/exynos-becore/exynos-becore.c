@@ -73,8 +73,6 @@
 #define BECORE_CMDQ_MODE		0x9000
 
 #define BECORE_GRID_SIZE			0x18000
-#define BECORE_OUTPUT_SIZE		0x949000
-#define BECORE_OUTPUT_PLANE2_OFFSET	0x630640
 #define BECORE_RUN_TIMEOUT_MS		1000
 
 #define BECORE_RGBP_PHYS_BASE		0x1c440000
@@ -94,6 +92,16 @@
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
+#define BECORE_YUVP_OUTPUT_ENABLE_REG	(BECORE_YUVP_PHYS_BASE + 0x2400)
+#define BECORE_YUVP_OUTPUT_MODE_REG	(BECORE_YUVP_PHYS_BASE + 0x2404)
+#define BECORE_YUVP_OUTPUT_FORMAT_REG	(BECORE_YUVP_PHYS_BASE + 0x2410)
+#define BECORE_YUVP_OUTPUT_LOSSY_REG	(BECORE_YUVP_PHYS_BASE + 0x2418)
+#define BECORE_YUVP_OUTPUT_WIDTH_REG	(BECORE_YUVP_PHYS_BASE + 0x2420)
+#define BECORE_YUVP_OUTPUT_HEIGHT_REG	(BECORE_YUVP_PHYS_BASE + 0x2424)
+#define BECORE_YUVP_OUTPUT_STRIDE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2428)
+#define BECORE_YUVP_OUTPUT_STRIDE2_REG	(BECORE_YUVP_PHYS_BASE + 0x242c)
+#define BECORE_YUVP_OUTPUT_VOTF_REG	(BECORE_YUVP_PHYS_BASE + 0x243c)
+#define BECORE_YUVP_OUTPUT_BUSINFO_REG	(BECORE_YUVP_PHYS_BASE + 0x244c)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -158,6 +166,62 @@ static const u32 becore_rgbp_input_regs[] = {
 	[BECORE_RGBP_INPUT_BUSINFO] = BECORE_RGBP_INPUT_BUSINFO_REG,
 	[BECORE_RGBP_INPUT_ENABLE] = BECORE_RGBP_INPUT_ENABLE_REG,
 	[BECORE_RGBP_INPUT_STORAGE_WIDTH] = BECORE_RGBP_INPUT_WIDTH_REG,
+};
+
+struct becore_yuvp_output_profile {
+	u32 width;
+	u32 height;
+	u32 data_format;
+	u32 mode;
+	u32 lossy_byte32num;
+	u32 votf_enable;
+	u32 bytes_per_pixel;
+	u32 block_height;
+	u32 luma_height_align;
+	u32 plane_gap;
+	u32 businfo;
+};
+
+/* Pixel uses a combined, two-plane WDMA where Pablo v1.1 uses split blocks. */
+static const struct becore_yuvp_output_profile becore_yuvp_output = {
+	.width = 4160,
+	.height = 3120,
+	.data_format = 0x2000,
+	.mode = 0xa,
+	.lossy_byte32num = 2,
+	.votf_enable = 3,
+	.bytes_per_pixel = 2,
+	.block_height = 4,
+	.luma_height_align = 16,
+	.plane_gap = 0x40,
+	.businfo = 0,
+};
+
+enum becore_yuvp_output_word {
+	BECORE_YUVP_OUTPUT_VOTF,
+	BECORE_YUVP_OUTPUT_FORMAT,
+	BECORE_YUVP_OUTPUT_LOSSY,
+	BECORE_YUVP_OUTPUT_MODE,
+	BECORE_YUVP_OUTPUT_WIDTH,
+	BECORE_YUVP_OUTPUT_HEIGHT,
+	BECORE_YUVP_OUTPUT_STRIDE1,
+	BECORE_YUVP_OUTPUT_STRIDE2,
+	BECORE_YUVP_OUTPUT_BUSINFO,
+	BECORE_YUVP_OUTPUT_ENABLE,
+	BECORE_YUVP_OUTPUT_WORD_COUNT,
+};
+
+static const u32 becore_yuvp_output_regs[] = {
+	[BECORE_YUVP_OUTPUT_VOTF] = BECORE_YUVP_OUTPUT_VOTF_REG,
+	[BECORE_YUVP_OUTPUT_FORMAT] = BECORE_YUVP_OUTPUT_FORMAT_REG,
+	[BECORE_YUVP_OUTPUT_LOSSY] = BECORE_YUVP_OUTPUT_LOSSY_REG,
+	[BECORE_YUVP_OUTPUT_MODE] = BECORE_YUVP_OUTPUT_MODE_REG,
+	[BECORE_YUVP_OUTPUT_WIDTH] = BECORE_YUVP_OUTPUT_WIDTH_REG,
+	[BECORE_YUVP_OUTPUT_HEIGHT] = BECORE_YUVP_OUTPUT_HEIGHT_REG,
+	[BECORE_YUVP_OUTPUT_STRIDE1] = BECORE_YUVP_OUTPUT_STRIDE1_REG,
+	[BECORE_YUVP_OUTPUT_STRIDE2] = BECORE_YUVP_OUTPUT_STRIDE2_REG,
+	[BECORE_YUVP_OUTPUT_BUSINFO] = BECORE_YUVP_OUTPUT_BUSINFO_REG,
+	[BECORE_YUVP_OUTPUT_ENABLE] = BECORE_YUVP_OUTPUT_ENABLE_REG,
 };
 
 struct becore_device;
@@ -442,6 +506,99 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 	return 0;
 }
 
+static u32 becore_yuvp_output_stride(void)
+{
+	return becore_yuvp_output.width * becore_yuvp_output.bytes_per_pixel;
+}
+
+static size_t becore_yuvp_output_plane2_offset(void)
+{
+	u32 luma_height = ALIGN(becore_yuvp_output.height,
+				becore_yuvp_output.luma_height_align);
+	u32 luma_rows = DIV_ROUND_UP(luma_height,
+				     becore_yuvp_output.block_height);
+
+	return (size_t)becore_yuvp_output_stride() * luma_rows +
+	       becore_yuvp_output.plane_gap;
+}
+
+static size_t becore_yuvp_output_size(void)
+{
+	u32 chroma_height = DIV_ROUND_UP(becore_yuvp_output.height, 2);
+	u32 chroma_rows = DIV_ROUND_UP(chroma_height,
+				       becore_yuvp_output.block_height);
+	size_t chroma_bytes = (size_t)becore_yuvp_output_stride() *
+			      chroma_rows;
+
+	return ALIGN(becore_yuvp_output_plane2_offset() + chroma_bytes,
+		     SZ_4K);
+}
+
+static int becore_yuvp_output_value(u32 index, u32 reg, u32 *value)
+{
+	if (index >= BECORE_YUVP_OUTPUT_WORD_COUNT ||
+	    reg != becore_yuvp_output_regs[index])
+		return -EINVAL;
+	if (!value)
+		return 0;
+
+	switch (index) {
+	case BECORE_YUVP_OUTPUT_VOTF:
+		*value = becore_yuvp_output.votf_enable;
+		break;
+	case BECORE_YUVP_OUTPUT_FORMAT:
+		*value = becore_yuvp_output.data_format;
+		break;
+	case BECORE_YUVP_OUTPUT_LOSSY:
+		*value = becore_yuvp_output.lossy_byte32num;
+		break;
+	case BECORE_YUVP_OUTPUT_MODE:
+		*value = becore_yuvp_output.mode;
+		break;
+	case BECORE_YUVP_OUTPUT_WIDTH:
+		*value = becore_yuvp_output.width;
+		break;
+	case BECORE_YUVP_OUTPUT_HEIGHT:
+		*value = becore_yuvp_output.height;
+		break;
+	case BECORE_YUVP_OUTPUT_STRIDE1:
+	case BECORE_YUVP_OUTPUT_STRIDE2:
+		*value = becore_yuvp_output_stride();
+		break;
+	case BECORE_YUVP_OUTPUT_BUSINFO:
+		*value = becore_yuvp_output.businfo;
+		break;
+	case BECORE_YUVP_OUTPUT_ENABLE:
+		*value = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static u32 becore_typed_word_count(enum becore_block_id id)
+{
+	if (id == BECORE_RGBP)
+		return BECORE_RGBP_INPUT_WORD_COUNT;
+	if (id == BECORE_YUVP)
+		return BECORE_YUVP_OUTPUT_WORD_COUNT;
+
+	return 0;
+}
+
+static int becore_typed_value(enum becore_block_id id, u32 index, u32 reg,
+			      u32 *value)
+{
+	if (id == BECORE_RGBP)
+		return becore_rgbp_input_value(index, reg, value);
+	if (id == BECORE_YUVP)
+		return becore_yuvp_output_value(index, reg, value);
+
+	return -EINVAL;
+}
+
 static int becore_recipe_header_validate(const struct becore_device *becore)
 {
 	const u8 *header = becore->recipe;
@@ -473,7 +630,7 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 	case BECORE_YUVP_OUTPUT_PLANE1_REG:
 		return becore->output.dma;
 	case BECORE_YUVP_OUTPUT_PLANE2_REG:
-		return becore->output.dma + BECORE_OUTPUT_PLANE2_OFFSET;
+		return becore->output.dma + becore_yuvp_output_plane2_offset();
 	default:
 		return DMA_MAPPING_ERROR;
 	}
@@ -532,11 +689,10 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 			if (shape[i].typed_mask & BIT(word)) {
 				u32 reg;
 
-				if (id != BECORE_RGBP ||
-				    shape[i].mode != 0x00090000 || !(word & 1))
+				if (shape[i].mode != 0x00090000 || !(word & 1))
 					return -EINVAL;
 				reg = shape[i].pair_registers[word / 2];
-				if (becore_rgbp_input_value(typed_count, reg, NULL))
+				if (becore_typed_value(id, typed_count, reg, NULL))
 					return -EINVAL;
 				typed_count++;
 			}
@@ -559,9 +715,7 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	if ((id == BECORE_RGBP && address_count != 2) ||
 	    (id == BECORE_YUVP && address_count != 3))
 		return -EINVAL;
-	if ((id == BECORE_RGBP &&
-	     typed_count != BECORE_RGBP_INPUT_WORD_COUNT) ||
-	    (id == BECORE_YUVP && typed_count))
+	if (typed_count != becore_typed_word_count(id))
 		return -EINVAL;
 
 	return 0;
@@ -576,7 +730,8 @@ static int becore_recipe_validate(struct becore_device *becore)
 		return ret;
 	if (becore->input.size != becore_rgbp_input_size() ||
 	    becore->input.staged_bytes != becore->input.size ||
-	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
+	    becore->grid.staged_bytes != BECORE_GRID_SIZE ||
+	    becore->output.size != becore_yuvp_output_size())
 		return -EINVAL;
 
 	ret = becore_recipe_block_validate(becore, BECORE_RGBP,
@@ -632,8 +787,7 @@ static int becore_encode_block(struct becore_device *becore,
 
 			if (shape[i].typed_mask & BIT(word)) {
 				reg = shape[i].pair_registers[word / 2];
-				if (id != BECORE_RGBP ||
-				    becore_rgbp_input_value(typed_count, reg, &value))
+				if (becore_typed_value(id, typed_count, reg, &value))
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
 				typed_count++;
@@ -649,9 +803,7 @@ static int becore_encode_block(struct becore_device *becore,
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
 	}
-	if ((id == BECORE_RGBP &&
-	     typed_count != BECORE_RGBP_INPUT_WORD_COUNT) ||
-	    (id == BECORE_YUVP && typed_count))
+	if (typed_count != becore_typed_word_count(id))
 		return -EINVAL;
 
 	return 0;
@@ -1010,7 +1162,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (ret)
 		return ret;
 	ret = becore_alloc_dma_buffer(becore, &becore->output,
-				      BECORE_OUTPUT_SIZE, "YUVP output");
+				      becore_yuvp_output_size(), "YUVP output");
 	if (ret)
 		return ret;
 	ret = becore_alloc_cmdq_program(becore, BECORE_RGBP,

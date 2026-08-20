@@ -3594,9 +3594,18 @@ static int ispfe_start(struct ispfe_device *ispfe)
 		return ret;
 	ispfe->link_irq = ret;
 
+	/* Reserve the exact slot whose IOVA the program encoder will publish. */
+	if (ispfe->prog->backend_output) {
+		ret = exynos_becore_input_producer_begin(ispfe->backend_input);
+		if (ret)
+			return ret;
+		ispfe->backend_producing = true;
+		ispfe->backend_handed_off = false;
+	}
+
 	ret = ispfe_buffers_alloc(ispfe);
 	if (ret)
-		return ret;
+		goto err_backend_early;
 
 	atomic_set(&ispfe->frame_start, 0);
 	atomic_set(&ispfe->frame_end, 0);
@@ -3613,9 +3622,10 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	memset(ispfe->pdma_seen, 0, sizeof(ispfe->pdma_seen));
 
 	ret = ispfe_qos_enable(ispfe);
-	if (ret)
-		return dev_err_probe(ispfe->dev, ret,
-				     "cannot establish camera QoS\n");
+	if (ret) {
+		dev_err_probe(ispfe->dev, ret, "cannot establish camera QoS\n");
+		goto err_backend_early;
+	}
 
 	ret = pm_runtime_resume_and_get(ispfe->dev);
 	if (ret)
@@ -3655,13 +3665,6 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	ret = ispfe_request_irqs(ispfe);
 	if (ret)
 		goto err_isolate;
-	if (ispfe->prog->backend_output) {
-		ret = exynos_becore_input_producer_begin(ispfe->backend_input);
-		if (ret)
-			goto err_irqs;
-		ispfe->backend_producing = true;
-		ispfe->backend_handed_off = false;
-	}
 
 	ispfe_device_init(ispfe);
 	ret = ispfe_qos_set_active(ispfe);
@@ -3700,7 +3703,6 @@ err_backend:
 		ispfe->backend_producing = false;
 		ispfe->backend_handed_off = false;
 	}
-err_irqs:
 	ispfe_free_irqs(ispfe);
 err_isolate:
 	if (ispfe->phy_bypass_held) {
@@ -3711,6 +3713,12 @@ err_isolate:
 err_qos:
 	if (ispfe_qos_disable(ispfe))
 		dev_err(ispfe->dev, "cannot restore camera QoS after start error\n");
+err_backend_early:
+	if (ispfe->backend_producing) {
+		exynos_becore_input_producer_abort(ispfe->backend_input);
+		ispfe->backend_producing = false;
+		ispfe->backend_handed_off = false;
+	}
 	return ret;
 }
 

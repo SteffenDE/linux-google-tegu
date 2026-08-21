@@ -1728,33 +1728,37 @@ static int becore_encode_gtnr(struct becore_device *becore)
 	return 0;
 }
 
-static int becore_mcsc_recipe_generate(struct becore_device *becore)
+static int becore_recipe_records_generate(u8 *record,
+					  const struct becore_cmdq_shape *shapes,
+					  u32 header_count)
 {
-	u8 *header = becore->mcsc_recipe;
-	u8 *record = header + BECORE_MCSC_RECIPE_HEADER_BYTES;
 	u32 i;
 
-	memset(header, 0, BECORE_MCSC_RECIPE_BYTES);
-	put_unaligned_le32(BECORE_MCSC_RECIPE_MAGIC, header);
-	put_unaligned_le32(BECORE_MCSC_RECIPE_VERSION, header + 4);
-	put_unaligned_le32(BECORE_MCSC_RECIPE_HEADER_BYTES, header + 8);
-	put_unaligned_le32(BECORE_MCSC_RECIPE_RECORD_BYTES, header + 12);
-	put_unaligned_le32(BECORE_MCSC_HEADER_COUNT, header + 16);
-	put_unaligned_le32(BECORE_MCSC_RECIPE_BYTES, header + 20);
-
-	for (i = 0; i < BECORE_MCSC_HEADER_COUNT;
-	     i++, record += BECORE_MCSC_RECIPE_RECORD_BYTES) {
-		const struct becore_cmdq_shape *shape = &becore_mcsc_shape[i];
+	static_assert(BECORE_RECIPE_RECORD_BYTES ==
+		      BECORE_MCSC_RECIPE_RECORD_BYTES);
+	for (i = 0; i < header_count;
+	     i++, record += BECORE_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &shapes[i];
 		u16 used_mask;
 		u16 value_mask;
 		u32 word;
 
-		if (!shape->valid_words || shape->valid_words > 16 ||
-		    shape->mode != 0x00090000)
+		if (!shape->valid_words || shape->valid_words > 16)
 			return -EINVAL;
 		used_mask = shape->valid_words == 16 ? U16_MAX :
 			    GENMASK(shape->valid_words - 1, 0);
-		value_mask = used_mask & 0xaaaa;
+		if (shape->mode == 0x00090000) {
+			if (shape->valid_words & 1)
+				return -EINVAL;
+			value_mask = used_mask & 0xaaaa;
+		} else if (shape->mode == 0x00080000 ||
+			   shape->mode == 0x000b0000) {
+			if (shape->address_mask || shape->typed_mask)
+				return -EINVAL;
+			value_mask = used_mask;
+		} else {
+			return -EINVAL;
+		}
 		if ((shape->address_mask | shape->typed_mask |
 		     shape->fixed_mask) != value_mask ||
 		    (shape->address_mask & shape->typed_mask) ||
@@ -1768,13 +1772,66 @@ static int becore_mcsc_recipe_generate(struct becore_device *becore)
 		for (word = 0; word < shape->valid_words; word++) {
 			u32 value = 0;
 
-			if (!(word & 1))
+			if (shape->mode == 0x00090000 && !(word & 1))
 				value = shape->pair_registers[word / 2];
 			else if (shape->fixed_mask & BIT(word))
 				value = shape->fixed_values[word];
 			put_unaligned_le32(value, record + 12 + word * 4);
 		}
 	}
+
+	return 0;
+}
+
+static int becore_recipe_generate(struct becore_device *becore)
+{
+	u8 *header = becore->recipe;
+	u8 *record = header + BECORE_RECIPE_HEADER_BYTES;
+	int ret;
+
+	memset(header, 0, BECORE_RECIPE_BYTES);
+	put_unaligned_le32(BECORE_RECIPE_MAGIC, header);
+	put_unaligned_le32(BECORE_RECIPE_VERSION, header + 4);
+	put_unaligned_le32(BECORE_RECIPE_HEADER_BYTES, header + 8);
+	put_unaligned_le32(BECORE_RECIPE_RECORD_BYTES, header + 12);
+	put_unaligned_le32(BECORE_RGBP_HEADER_COUNT, header + 16);
+	put_unaligned_le32(BECORE_YUVP_HEADER_COUNT, header + 20);
+	put_unaligned_le32(BECORE_RECIPE_BYTES, header + 24);
+
+	ret = becore_recipe_records_generate(record, becore_rgbp_shape,
+					     BECORE_RGBP_HEADER_COUNT);
+	if (ret)
+		return ret;
+	record += BECORE_RGBP_HEADER_COUNT * BECORE_RECIPE_RECORD_BYTES;
+	ret = becore_recipe_records_generate(record, becore_yuvp_shape,
+					     BECORE_YUVP_HEADER_COUNT);
+	if (ret)
+		return ret;
+
+	becore->recipe_staged_bytes = BECORE_RECIPE_BYTES;
+	becore->recipe_generation = 1;
+
+	return 0;
+}
+
+static int becore_mcsc_recipe_generate(struct becore_device *becore)
+{
+	u8 *header = becore->mcsc_recipe;
+	int ret;
+
+	memset(header, 0, BECORE_MCSC_RECIPE_BYTES);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_MAGIC, header);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_VERSION, header + 4);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_HEADER_BYTES, header + 8);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_RECORD_BYTES, header + 12);
+	put_unaligned_le32(BECORE_MCSC_HEADER_COUNT, header + 16);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_BYTES, header + 20);
+
+	ret = becore_recipe_records_generate(header +
+			BECORE_MCSC_RECIPE_HEADER_BYTES,
+			becore_mcsc_shape, BECORE_MCSC_HEADER_COUNT);
+	if (ret)
+		return ret;
 
 	becore->mcsc_recipe_staged_bytes = BECORE_MCSC_RECIPE_BYTES;
 	becore->mcsc_recipe_generation = 1;
@@ -2352,6 +2409,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      GFP_KERNEL);
 	if (!becore->recipe)
 		return -ENOMEM;
+	ret = becore_recipe_generate(becore);
+	if (ret)
+		return dev_err_probe(becore->dev, ret,
+				     "invalid built-in RGBP/YUVP recipe\n");
 	becore->gtnr_recipe = devm_kzalloc(becore->dev,
 					   BECORE_GTNR_RECIPE_BYTES, GFP_KERNEL);
 	if (!becore->gtnr_recipe)

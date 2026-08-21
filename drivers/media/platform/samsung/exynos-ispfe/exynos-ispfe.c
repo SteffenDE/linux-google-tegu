@@ -2160,7 +2160,10 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
 #define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
-#define ISPFE_LMP_WBG_PROFILE_COMMANDS	2
+#define ISPFE_LMP_WBG_CONFIG		BIT(0)
+#define ISPFE_LMP_ALSC_WBG_CONFIG	BIT(1)
+#define ISPFE_LMP_WBG_CONFIGS		(ISPFE_LMP_WBG_CONFIG | \
+					 ISPFE_LMP_ALSC_WBG_CONFIG)
 
 /*
  * Replace the captured gain words with the recipe's semantic profile.  The
@@ -2172,20 +2175,24 @@ static int ispfe_pdma_apply_wbg(const struct ispfe_pdma_program *prog,
 				u8 *payload, unsigned int *applied)
 {
 	const struct ispfe_lmp_wbg_profile *wbg = prog->lmp_wbg;
+	unsigned int config;
 
 	if (!wbg)
 		return 0;
-	if (cmd->reg != ISPFE_LMP_WBG_CONFIG_REG &&
-	    cmd->reg != ISPFE_LMP_ALSC_WBG_CONFIG_REG)
+	if (cmd->reg == ISPFE_LMP_WBG_CONFIG_REG)
+		config = ISPFE_LMP_WBG_CONFIG;
+	else if (cmd->reg == ISPFE_LMP_ALSC_WBG_CONFIG_REG)
+		config = ISPFE_LMP_ALSC_WBG_CONFIG;
+	else
 		return 0;
-	if (cmd->len != ISPFE_LMP_WBG_CONFIG_SIZE)
+	if (cmd->len != ISPFE_LMP_WBG_CONFIG_SIZE || (*applied & config))
 		return -EINVAL;
 
 	put_unaligned_le32(wbg->red, payload + 0x04);
 	put_unaligned_le32(wbg->green_red, payload + 0x08);
 	put_unaligned_le32(wbg->green_blue, payload + 0x0c);
 	put_unaligned_le32(wbg->blue, payload + 0x10);
-	(*applied)++;
+	*applied |= config;
 
 	return 0;
 }
@@ -2618,7 +2625,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	u32 awb_lo = 0, awb_hi = 0;
 	u32 backend_image_lo = 0, backend_image_hi = 0;
 	u32 backend_header_lo = 0, backend_header_hi = 0;
-	unsigned int lmp_wbg_applied = 0;
+	unsigned int lmp_wbg_configs = 0;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -2688,7 +2695,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		else {
 			memcpy(program + at, cmd->payload, cmd->len);
 			ret = ispfe_pdma_apply_wbg(prog, cmd, program + at,
-						   &lmp_wbg_applied);
+						   &lmp_wbg_configs);
 			if (ret)
 				return ret;
 			ret = ispfe_pdma_apply_ml0_profile(ispfe, cmd,
@@ -2743,7 +2750,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 * a command the recipe no longer has.
 	 */
 	if ((!ispfe->active_pdma_program_override && prog->lmp_wbg &&
-	     lmp_wbg_applied != ISPFE_LMP_WBG_PROFILE_COMMANDS) ||
+	     lmp_wbg_configs != ISPFE_LMP_WBG_CONFIGS) ||
 	    reloc != last || !awb_lo || !awb_hi ||
 	    (prog->raw_output && !bayer_lo)) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");

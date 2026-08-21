@@ -26,7 +26,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
+		.generated_mask = 0xa0a0,
+		.fixed_mask = 0x0a0a,
 		.pair_registers = {
 			0x1d041800, 0x1d041804, 0x1d041a00, 0x1d041a04,
 			0x1d042000, 0x1d042004, 0x1d042200, 0x1d042204,
@@ -44,7 +45,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
+		.generated_mask = 0x0aaa,
+		.fixed_mask = 0xa000,
 		.pair_registers = {
 			0x1d042400, 0x1d042404, 0x1d042600, 0x1d042604,
 			0x1d042800, 0x1d042804, 0x1d045000, 0x1d046000,
@@ -80,7 +82,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
+		.generated_mask = 0x28a8,
+		.fixed_mask = 0x8202,
 		.pair_registers = {
 			0x1d040240, 0x1d040200, 0x1d041000, 0x1d041004,
 			0x1d04704c, 0x1d040210, 0x1d040214, 0x1d040b00,
@@ -88,8 +91,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.fixed_values = {
 			0x00000000, 0x00000001, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00001040,
-			0x00000000, 0x00000c30, 0x00000000, 0x00000000,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
 	{ /* h004 */
@@ -213,8 +216,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.generated_mask = 0xa00a,
-		.fixed_mask = 0x0aa0,
+		.generated_mask = 0xa2aa,
+		.fixed_mask = 0x0800,
 		.pair_registers = {
 			0x1d045010, 0x1d045014, 0x1d045018, 0x1d04501c,
 			0x1d045020, 0x1d045000, 0x1d04506c, 0x1d045070,
@@ -222,7 +225,7 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.fixed_values = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000001, 0x00000000, 0x00000001,
+			0x00000000, 0x00000000, 0x00000000, 0x00000001,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
@@ -365,15 +368,15 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0xa000,
-		.generated_mask = 0x0002,
-		.fixed_mask = 0x0aa8,
+		.generated_mask = 0x00aa,
+		.fixed_mask = 0x0a00,
 		.pair_registers = {
 			0x1d046010, 0x1d046014, 0x1d046018, 0x1d04601c,
 			0x1d046020, 0x1d046000, 0x1d042050, 0x1d042090,
 		},
 		.fixed_values = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000001,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
@@ -404,7 +407,8 @@ static const struct becore_cmdq_shape becore_mcsc_shape[] = {
 		.valid_words = 12,
 		.address_mask = 0x0000,
 		.typed_mask = 0x000a,
-		.fixed_mask = 0x0aa0,
+		.generated_mask = 0x00a0,
+		.fixed_mask = 0x0a00,
 		.pair_registers = {
 			0x1d042000, 0x1d042f00, 0x1d040080, 0x1d040084,
 			0x1d040030, 0x1d040000, 0x00000000, 0x00000000,

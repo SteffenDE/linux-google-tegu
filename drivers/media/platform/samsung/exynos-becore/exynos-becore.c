@@ -294,6 +294,48 @@
 #define BECORE_NOISE_SLOPE_SHIFT	11
 #define BECORE_NOISE_SLOPE_MASK		GENMASK(12, 0)
 #define BECORE_NOISE_SHIFT_NIBBLES	8
+/*
+ * A scaler that starts on a pixel. RGBP's SC, MCSC's POLY_SC0 and its POST_PC0
+ * chroma converter each put two 20-bit init phase offsets at the same place in
+ * their register map, and all six words are the field table's POR zero: no
+ * sub-pixel origin. Nothing here is scene-dependent, and a sub-pixel origin
+ * would need a reason none of these blocks has at this geometry -- though note
+ * that is a single-geometry observation, since POLY_SC0 and POST_PC0 run at
+ * unity here and DJAG does the scaling.
+ *
+ * The two MCSC blocks put a round-mode bit after the offsets, also at POR, and
+ * those are stated too. RGBP's scaler does not: its round mode is bit 0 of
+ * YUV_SC_CTRL1 two registers *earlier*, its POR is zero, and the capture sets
+ * it -- so RGBP rounds against the reset value and that word stays in the
+ * recipe. RGBP has no register at +0x4410 at all.
+ *
+ * The rest of what MCSC still replayed above its scalers is the shape of the
+ * job rather than a value: it reads memory, not an OTF stream, so CINFIFO and
+ * both IP_USE gates are clear and INPUT_TYPE is memory; it drives one output,
+ * so the four other WDMA channels and the HF statistics RDMA are off; and the
+ * raster it reads is YUVP's output, which the driver already describes.
+ */
+#define BECORE_RGBP_SC_PHASE_FIRST	(BECORE_RGBP_PHYS_BASE + 0x4408)
+#define BECORE_RGBP_SC_PHASE_LAST	(BECORE_RGBP_PHYS_BASE + 0x440c)
+#define BECORE_MCSC_SC0_PHASE_FIRST	(BECORE_MCSC_PHYS_BASE + 0x5018)
+#define BECORE_MCSC_PC0_PHASE_FIRST	(BECORE_MCSC_PHYS_BASE + 0x6014)
+/* Two offsets everywhere; the MCSC blocks add a round mode after them. */
+#define BECORE_SCALER_PHASE_LAST	0x08
+#define BECORE_MCSC_OTF_GATE_FIRST	(BECORE_MCSC_PHYS_BASE + 0x0080)
+#define BECORE_MCSC_OTF_GATE_LAST	(BECORE_MCSC_PHYS_BASE + 0x0084)
+#define BECORE_MCSC_INPUT_TYPE_REG	(BECORE_MCSC_PHYS_BASE + 0x0200)
+#define BECORE_MCSC_IN_WIDTH_REG	(BECORE_MCSC_PHYS_BASE + 0x0210)
+#define BECORE_MCSC_IN_HEIGHT_REG	(BECORE_MCSC_PHYS_BASE + 0x0214)
+#define BECORE_MCSC_CINFIFO_FIRST	(BECORE_MCSC_PHYS_BASE + 0x1000)
+#define BECORE_MCSC_CINFIFO_LAST	(BECORE_MCSC_PHYS_BASE + 0x1004)
+#define BECORE_MCSC_STAT_RDMA_FIRST	(BECORE_MCSC_PHYS_BASE + 0x1a00)
+#define BECORE_MCSC_STAT_RDMA_LAST	(BECORE_MCSC_PHYS_BASE + 0x1a04)
+#define BECORE_MCSC_WDMA_W1_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2200)
+#define BECORE_MCSC_WDMA_W2_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2400)
+#define BECORE_MCSC_WDMA_W3_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2600)
+#define BECORE_MCSC_WDMA_W4_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2800)
+/* Each unused channel is quiesced by its enable and its compression control. */
+#define BECORE_MCSC_WDMA_OFF_LAST	0x04
 #define BECORE_MCSC_DJAG_BASE		(BECORE_MCSC_PHYS_BASE + 0x4000)
 #define BECORE_MCSC_DJAG_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x000)
 #define BECORE_MCSC_DJAG_PS_FIRST	(BECORE_MCSC_DJAG_BASE + 0x01c)
@@ -314,6 +356,10 @@
 #define BECORE_RGBP_DNS_BINNING_UNITY	1024	/* Q10 */
 #define BECORE_RGBP_DNS_CENTRE_MASK	GENMASK(14, 0)
 #define BECORE_RGBP_CSC_BASE		(BECORE_RGBP_PHYS_BASE + 0x3b00)
+/* YUVP carries the same twenty words, bit for bit, 0x100 lower. */
+#define BECORE_YUVP_CSC_BASE		(BECORE_YUVP_PHYS_BASE + 0x3a00)
+#define BECORE_YUVP_CSC_FIRST		(BECORE_YUVP_CSC_BASE + 0x00)
+#define BECORE_YUVP_CSC_LAST		(BECORE_YUVP_CSC_BASE + 0x4c)
 #define BECORE_RGBP_CSC_FIRST		(BECORE_RGBP_CSC_BASE + 0x00)
 #define BECORE_RGBP_CSC_LAST		(BECORE_RGBP_CSC_BASE + 0x4c)
 #define BECORE_RGBP_CSC_Q		13
@@ -671,6 +717,8 @@ enum becore_generated_kind {
 	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
 	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
 	BECORE_GEN_NOISE_DOMAIN,	/* a chroma domain repeating the luma one */
+	BECORE_GEN_SCALER_PHASE,	/* a scaler starting on a pixel, rounding */
+	BECORE_GEN_MCSC_INPUT_SIZE,	/* the raster MCSC reads, from YUVP */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
@@ -691,9 +739,9 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	289
-#define BECORE_YUVP_GENERATED_WORDS	285
-#define BECORE_MCSC_GENERATED_WORDS	76
+#define BECORE_RGBP_GENERATED_WORDS	291
+#define BECORE_YUVP_GENERATED_WORDS	305
+#define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -771,6 +819,8 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_GAMMAHR_BYPASS_REG, BECORE_RGBP_GAMMAHR_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_RGBP_SC_PHASE_FIRST, BECORE_RGBP_SC_PHASE_LAST,
+	  BECORE_GEN_SCALER_PHASE },
 	{ BECORE_RGBP_SC_V_COEFF_FIRST, BECORE_RGBP_SC_V_COEFF_LAST,
 	  BECORE_GEN_SC_V_COEFF },
 	{ BECORE_RGBP_SC_H_COEFF_FIRST, BECORE_RGBP_SC_H_COEFF_LAST,
@@ -782,6 +832,7 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_YUVP_CSC_FIRST, BECORE_YUVP_CSC_LAST, BECORE_GEN_CSC },
 	{ BECORE_YUVP_NR_SLOPE_Y_REG,
 	  BECORE_YUVP_NR_SLOPE_Y_REG + BECORE_NOISE_TABLE_LAST,
 	  BECORE_GEN_NOISE_SLOPE },
@@ -810,6 +861,34 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 };
 
 static const struct becore_generated_range becore_mcsc_generated[] = {
+	{ BECORE_MCSC_OTF_GATE_FIRST, BECORE_MCSC_OTF_GATE_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_INPUT_TYPE_REG, BECORE_MCSC_INPUT_TYPE_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_IN_WIDTH_REG, BECORE_MCSC_IN_HEIGHT_REG,
+	  BECORE_GEN_MCSC_INPUT_SIZE },
+	{ BECORE_MCSC_CINFIFO_FIRST, BECORE_MCSC_CINFIFO_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_STAT_RDMA_FIRST, BECORE_MCSC_STAT_RDMA_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_WDMA_W1_FIRST,
+	  BECORE_MCSC_WDMA_W1_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_WDMA_W2_FIRST,
+	  BECORE_MCSC_WDMA_W2_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_WDMA_W3_FIRST,
+	  BECORE_MCSC_WDMA_W3_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_WDMA_W4_FIRST,
+	  BECORE_MCSC_WDMA_W4_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_SC0_PHASE_FIRST,
+	  BECORE_MCSC_SC0_PHASE_FIRST + BECORE_SCALER_PHASE_LAST,
+	  BECORE_GEN_SCALER_PHASE },
+	{ BECORE_MCSC_PC0_PHASE_FIRST,
+	  BECORE_MCSC_PC0_PHASE_FIRST + BECORE_SCALER_PHASE_LAST,
+	  BECORE_GEN_SCALER_PHASE },
 	{ BECORE_MCSC_DJAG_CTRL_REG, BECORE_MCSC_DJAG_CTRL_REG,
 	  BECORE_GEN_DJAG },
 	{ BECORE_MCSC_DJAG_PS_FIRST, BECORE_MCSC_DJAG_PS_LAST,
@@ -2605,6 +2684,37 @@ static int becore_rgbp_dmsc_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* Where each block's scaler puts its two init phase offsets and round mode. */
+static const u32 becore_scaler_phase_first[] = {
+	BECORE_RGBP_SC_PHASE_FIRST,
+	BECORE_MCSC_SC0_PHASE_FIRST,
+	BECORE_MCSC_PC0_PHASE_FIRST,
+};
+
+static int becore_scaler_phase_value(u32 reg, u32 *value)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_scaler_phase_first); i++) {
+		u32 first = becore_scaler_phase_first[i];
+
+		if (reg < first || reg > first + BECORE_SCALER_PHASE_LAST)
+			continue;
+		switch (reg - first) {
+		case 0x00:	/* H_INIT_PHASE_OFFSET: no sub-pixel origin */
+		case 0x04:	/* V_INIT_PHASE_OFFSET */
+			*value = 0;
+			return 0;
+		case 0x08:	/* ROUND_MODE, on the MCSC blocks only */
+			*value = 1;
+			return 0;
+		}
+		return -EINVAL;
+	}
+
+	return -EINVAL;
+}
+
 /*
  * BT.601 as exact rationals, column-major by input channel. Kr is 299/1000 and
  * Kb 114/1000; the chroma rows are those over 2 * (1 - Kb) and 2 * (1 - Kr),
@@ -3140,8 +3250,22 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 				return -EINVAL;
 			break;
 		case BECORE_GEN_CSC:
-			if (becore_rgbp_csc_value(reg - BECORE_RGBP_CSC_BASE,
+			if (becore_rgbp_csc_value(reg - (id == BECORE_RGBP ?
+							 BECORE_RGBP_CSC_BASE :
+							 BECORE_YUVP_CSC_BASE),
 						  &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_SCALER_PHASE:
+			if (becore_scaler_phase_value(reg, &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_MCSC_INPUT_SIZE:
+			if (reg == BECORE_MCSC_IN_WIDTH_REG)
+				result = becore_rgbp_out_width();
+			else if (reg == BECORE_MCSC_IN_HEIGHT_REG)
+				result = becore_rgbp_out_height();
+			else
 				return -EINVAL;
 			break;
 		case BECORE_GEN_CHROMA_LPF:

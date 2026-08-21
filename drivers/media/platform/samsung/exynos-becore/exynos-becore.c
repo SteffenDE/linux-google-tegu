@@ -19,6 +19,7 @@
 #include <linux/io.h>
 #include <linux/log2.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -525,6 +526,10 @@ static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_SLCGRID_ROWS *
  * std::array<unsigned char, 88>, and 88 bytes is 22 registers.
  */
 #define BECORE_YUVP_CLUT_BASE		(BECORE_YUVP_PHYS_BASE + 0x7b00)
+#define BECORE_YUVP_CLUT_BYPASS_REG	(BECORE_YUVP_CLUT_BASE + 0x000)
+#define BECORE_YUVP_CLUT_EN_CONFIG_REG	(BECORE_YUVP_CLUT_BASE + 0x004)
+#define BECORE_YUVP_CLUT_MATRIX_FIRST	(BECORE_YUVP_CLUT_BASE + 0x03c)
+#define BECORE_YUVP_CLUT_MATRIX_LAST	(BECORE_YUVP_CLUT_BASE + 0x04c)
 #define BECORE_YUVP_CLUT_1DLUT_Y_FIRST	(BECORE_YUVP_CLUT_BASE + 0x050)
 #define BECORE_YUVP_CLUT_1DLUT_U_FIRST	(BECORE_YUVP_CLUT_BASE + 0x0a8)
 #define BECORE_YUVP_CLUT_1DLUT_V_FIRST	(BECORE_YUVP_CLUT_BASE + 0x100)
@@ -545,6 +550,26 @@ static_assert((BECORE_CLUT_1DLUT_REGS - 1) * BECORE_CLUT_1DLUT_PER_REG ==
 /* The distance from the last entry to unity has to fit a field of its own. */
 static_assert(BECORE_CLUT_ONE - (BECORE_CLUT_1DLUT_ENTRIES - 1) *
 	      BECORE_CLUT_1DLUT_STEP <= BECORE_CLUT_FIELD_MAX);
+/*
+ * en_config gates the block's four optional stages, one bit each: the
+ * YUV-to-RGB matrix at bit 0 and the three input curves above it.
+ * TranslateStaticClut fills each bit from the corresponding tuning message's
+ * own enable flag, and the vendor enables only the matrix -- the curves are
+ * written and left off, which is consistent with their being the identity.
+ */
+#define BECORE_CLUT_EN_MATRIX		BIT(0)
+/*
+ * Nine coefficients as 13-bit signed fields, two per register, row-major. The
+ * ninth has no partner, so the fifth register's upper half is unused.
+ * TranslateStaticClut encodes each through QCodec(3, 10): three integer bits
+ * and ten fractional.
+ */
+#define BECORE_CLUT_MATRIX_Q		10
+#define BECORE_CLUT_MATRIX_FIELD_MASK	GENMASK(12, 0)
+#define BECORE_CLUT_MATRIX_COEFFICIENTS	9
+
+static_assert((BECORE_YUVP_CLUT_MATRIX_LAST - BECORE_YUVP_CLUT_MATRIX_FIRST) /
+	      4 + 1 == (BECORE_CLUT_MATRIX_COEFFICIENTS + 1) / 2);
 
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
@@ -761,6 +786,7 @@ enum becore_generated_kind {
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
+	BECORE_GEN_CLUT,	/* the colour LUT's gate and its YUV-to-RGB matrix */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -780,7 +806,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	371
+#define BECORE_YUVP_GENERATED_WORDS	378
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -898,6 +924,10 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_CLUT_BYPASS_REG, BECORE_YUVP_CLUT_EN_CONFIG_REG,
+	  BECORE_GEN_CLUT },
+	{ BECORE_YUVP_CLUT_MATRIX_FIRST, BECORE_YUVP_CLUT_MATRIX_LAST,
+	  BECORE_GEN_CLUT },
 	{ BECORE_YUVP_CLUT_1DLUT_Y_FIRST,
 	  BECORE_YUVP_CLUT_1DLUT_Y_FIRST + BECORE_CLUT_1DLUT_LAST,
 	  BECORE_GEN_CLUT_1DLUT },
@@ -2819,22 +2849,48 @@ static const struct becore_csc_coefficient {
 	{ { 114, 1000 }, { 1, 2 }, { -114, 1402 } },
 };
 
+/*
+ * BT.601 the other way, as exact rationals and row-major: R = Y + 2(1 - Kr) V,
+ * G = Y - Kb/(1 - Kr - Kb) * 2(1 - Kb) U - Kr/(1 - Kr - Kb) * 2(1 - Kr) V, and
+ * B = Y + 2(1 - Kb) U. The colour LUT converts to RGB before it looks a colour
+ * up, which is why a YUV block carries this at all.
+ */
+static const struct becore_csc_coefficient
+becore_clut_yuv2rgb[3][3] = {
+	{ { 1, 1 }, { 0, 1 },			{ 1402, 1000 } },
+	{ { 1, 1 }, { -114 * 1772, 587 * 1000 }, { -299 * 1402, 587 * 1000 } },
+	{ { 1, 1 }, { 1772, 1000 },		{ 0, 1 } },
+};
+
+static_assert(ARRAY_SIZE(becore_clut_yuv2rgb) *
+	      ARRAY_SIZE(becore_clut_yuv2rgb[0]) ==
+	      BECORE_CLUT_MATRIX_COEFFICIENTS);
+
 /* [1, 2, 1] / 4 scaled by 32, one byte per tap. */
 static const u8 becore_chroma_lpf_taps[] = { 0, 32, 64, 32, 0 };
 
 /* The sharpener's three low-pass kernels sum to these; all powers of two. */
 static const u32 becore_sharpenhancer_lpf_sums[] = { 16, 512, 4096 };
 
-static u32 becore_csc_coefficient(const struct becore_csc_coefficient *coef)
+/*
+ * round(coefficient << q), away from zero, as a signed field of its own.
+ *
+ * The rounded numerator does not fit 32 bits for every table here -- the
+ * inverse matrix below carries 419198 -- so it is formed at 64 bits rather
+ * than left to a bound each new coefficient would have to be checked against.
+ * Denominators stay small enough to divide by.
+ */
+static u32 becore_csc_coefficient(const struct becore_csc_coefficient *coef,
+				  u32 q, u32 mask)
 {
-	s32 magnitude = coef->numerator < 0 ? -coef->numerator : coef->numerator;
+	s64 magnitude = coef->numerator < 0 ? -coef->numerator : coef->numerator;
 
-	magnitude = (magnitude * (1 << BECORE_RGBP_CSC_Q) * 2 +
-		     coef->denominator) / (2 * coef->denominator);
+	magnitude = div_s64(magnitude * (1 << q) * 2 + coef->denominator,
+			    2 * coef->denominator);
 	if (coef->numerator < 0)
 		magnitude = -magnitude;
 
-	return magnitude & BECORE_RGBP_CSC_FIELD_MASK;
+	return (u32)magnitude & mask;
 }
 
 static int becore_rgbp_csc_value(u32 offset, u32 *value)
@@ -2845,7 +2901,9 @@ static int becore_rgbp_csc_value(u32 offset, u32 *value)
 		u32 index = (offset - 0x04) / 4;
 
 		*value = becore_csc_coefficient(&becore_csc_matrix[index / 3]
-								 [index % 3]);
+								 [index % 3],
+						BECORE_RGBP_CSC_Q,
+						BECORE_RGBP_CSC_FIELD_MASK);
 		return 0;
 	}
 
@@ -2870,6 +2928,56 @@ static int becore_rgbp_csc_value(u32 offset, u32 *value)
 	}
 
 	return -EINVAL;
+}
+
+/*
+ * The colour LUT's gate and the matrix in front of its lattice, by offset from
+ * BECORE_YUVP_CLUT_BASE.
+ *
+ * The lattice itself is not here and cannot be: 4,913 (R, G, B) nodes of a
+ * (U, V) pair is per-camera tuning, and it belongs in a parameters buffer
+ * rather than in this driver. What the block is *for* is stateable, and this
+ * is it -- run, convert YUV to RGB with the ordinary BT.601 inverse, and take
+ * the input curves as written.
+ */
+static int becore_yuvp_clut_value(u32 offset, u32 *value)
+{
+	u32 index;
+
+	if (offset & 3)
+		return -EINVAL;
+
+	switch (offset) {
+	case 0x000:		/* BYPASS: the block runs */
+		*value = 0;
+		return 0;
+	case 0x004:		/* EN_CONFIG: the matrix, and no input curve */
+		*value = BECORE_CLUT_EN_MATRIX;
+		return 0;
+	}
+
+	if (offset < 0x03c || offset > 0x04c)
+		return -EINVAL;
+
+	/*
+	 * Two coefficients per register, the lower-numbered one in the low
+	 * half. The ninth is the last, so the upper half of the fifth register
+	 * has nothing to carry.
+	 */
+	index = (offset - 0x03c) / 4 * 2;
+	*value = becore_csc_coefficient(&becore_clut_yuv2rgb[index / 3]
+							    [index % 3],
+					BECORE_CLUT_MATRIX_Q,
+					BECORE_CLUT_MATRIX_FIELD_MASK);
+	index++;
+	if (index < BECORE_CLUT_MATRIX_COEFFICIENTS)
+		*value |= becore_csc_coefficient(&becore_clut_yuv2rgb[index / 3]
+								     [index % 3],
+						 BECORE_CLUT_MATRIX_Q,
+						 BECORE_CLUT_MATRIX_FIELD_MASK)
+			  << 16;
+
+	return 0;
 }
 
 static int becore_rgbp_chroma_lpf_value(u32 offset, u32 *value)
@@ -3392,6 +3500,12 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_CLUT_1DLUT:
 			if (becore_yuvp_clut_1dlut_value(reg - table[i].first,
 							 &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_CLUT:
+			if (becore_yuvp_clut_value(reg -
+						   BECORE_YUVP_CLUT_BASE,
+						   &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_SC_V_COEFF:

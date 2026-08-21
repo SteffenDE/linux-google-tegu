@@ -2147,6 +2147,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 }
 
 #define ISPFE_LMP_DDS_CONFIG_REG		0x00056154
+#define ISPFE_LMP_DPC_CONFIG_REG		0x00054724
 #define ISPFE_LMP_WBG_CONFIG_REG		0x00054a38
 #define ISPFE_LMP_ALSC_WBG_CONFIG_REG	0x00054a94
 #define ISPFE_LMP_RGB_SCALER_CONFIG_REG	0x00056208
@@ -2159,6 +2160,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_CAPTURED_OUTPUT_GATES	0x0000b1f8
 #define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
 #define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
+#define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
 #define ISPFE_LMP_WBG_CONFIG		BIT(0)
 #define ISPFE_LMP_ALSC_WBG_CONFIG	BIT(1)
@@ -2193,6 +2195,31 @@ static int ispfe_pdma_apply_wbg(const struct ispfe_pdma_program *prog,
 	put_unaligned_le32(wbg->green_blue, payload + 0x0c);
 	put_unaligned_le32(wbg->blue, payload + 0x10);
 	*applied |= config;
+
+	return 0;
+}
+
+/* DPC consumes rounded Q7 R/B gains from the same live AWB state as WBG. */
+static int ispfe_pdma_apply_dpc(const struct ispfe_pdma_program *prog,
+				const struct ispfe_pdma_cmd *cmd,
+				u8 *payload, bool *applied)
+{
+	const struct ispfe_lmp_wbg_profile *wbg = prog->lmp_wbg;
+	u32 red, blue;
+
+	if (!wbg || cmd->reg != ISPFE_LMP_DPC_CONFIG_REG)
+		return 0;
+	if (cmd->len != ISPFE_LMP_DPC_CONFIG_SIZE || *applied)
+		return -EINVAL;
+
+	red = DIV_ROUND_CLOSEST(wbg->red, 1U << 5);
+	blue = DIV_ROUND_CLOSEST(wbg->blue, 1U << 5);
+	if (red > U16_MAX || blue > U16_MAX)
+		return -ERANGE;
+
+	put_unaligned_le16(red, payload + 0x04);
+	put_unaligned_le16(blue, payload + 0x06);
+	*applied = true;
 
 	return 0;
 }
@@ -2626,6 +2653,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	u32 backend_image_lo = 0, backend_image_hi = 0;
 	u32 backend_header_lo = 0, backend_header_hi = 0;
 	unsigned int lmp_wbg_configs = 0;
+	bool lmp_dpc_applied = false;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -2698,6 +2726,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						   &lmp_wbg_configs);
 			if (ret)
 				return ret;
+			ret = ispfe_pdma_apply_dpc(prog, cmd, program + at,
+						   &lmp_dpc_applied);
+			if (ret)
+				return ret;
 			ret = ispfe_pdma_apply_ml0_profile(ispfe, cmd,
 						   program + at);
 			if (ret)
@@ -2750,7 +2782,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 * a command the recipe no longer has.
 	 */
 	if ((!ispfe->active_pdma_program_override && prog->lmp_wbg &&
-	     lmp_wbg_configs != ISPFE_LMP_WBG_CONFIGS) ||
+	     (lmp_wbg_configs != ISPFE_LMP_WBG_CONFIGS ||
+	      !lmp_dpc_applied)) ||
 	    reloc != last || !awb_lo || !awb_hi ||
 	    (prog->raw_output && !bayer_lo)) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");

@@ -151,6 +151,35 @@
 #define BECORE_RGBP_GAMMALR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4600)
 #define BECORE_RGBP_UPSC_CTRL0_REG	(BECORE_RGBP_PHYS_BASE + 0x4800)
 #define BECORE_RGBP_GAMMAHR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4a00)
+/*
+ * RGBP's global tone map, named from Samsung RGBP v1.20. The block runs, but
+ * the curve it runs is an exact identity: at every one of its 64 knots the
+ * captured output is the input times 32. That factor is the block's own field
+ * widths -- v1.20 gives its input knots 13 bits and its output values 18, and
+ * 18 - 13 is 5 -- so times 32 is this block's unity, and there is no tuning
+ * here to recover. What is left is the knot grid, a description of where the
+ * curve is sampled, and the luma weights, which are BT.601's.
+ *
+ * IN_POINTS packs two knots per register with the even one in the low half,
+ * which the vendor's own field descriptors state; OUT_POINTS needs a register
+ * each because 18 bits do not fit beside anything.
+ */
+#define BECORE_RGBP_GTM_BASE		(BECORE_RGBP_PHYS_BASE + 0x3900)
+#define BECORE_RGBP_GTM_LAST		(BECORE_RGBP_PHYS_BASE + 0x3a94)
+#define BECORE_RGBP_GTM_BYPASS		0x000
+#define BECORE_RGBP_GTM_GAIN_MODE_EN	0x004
+#define BECORE_RGBP_GTM_IN_POINTS	0x008
+#define BECORE_RGBP_GTM_OUT_POINTS	0x088
+#define BECORE_RGBP_GTM_Y_WEIGHT_0	0x188
+#define BECORE_RGBP_GTM_Y_WEIGHT_1	0x18c
+#define BECORE_RGBP_GTM_V_BLEND_RATIO	0x190
+#define BECORE_RGBP_GTM_INPUT_RSHIFT	0x194
+#define BECORE_RGBP_GTM_KNOTS		64
+#define BECORE_RGBP_GTM_OUT_SHIFT	5
+/* BT.601 luma, Q8: the three sum to 256. */
+#define BECORE_RGBP_GTM_Y_WEIGHT_R	77
+#define BECORE_RGBP_GTM_Y_WEIGHT_G	150
+#define BECORE_RGBP_GTM_Y_WEIGHT_B	29
 #define BECORE_RGBP_INPUT_WIDTH_REG	(BECORE_RGBP_PHYS_BASE + 0x1c20)
 #define BECORE_RGBP_INPUT_HEIGHT_REG	(BECORE_RGBP_PHYS_BASE + 0x1c24)
 #define BECORE_RGBP_INPUT_STRIDE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c28)
@@ -320,6 +349,7 @@ enum becore_generated_kind {
 	BECORE_GEN_BYPASS,	/* an asserted bypass bit */
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
+	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 };
 
 struct becore_generated_range {
@@ -333,7 +363,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	11
+#define BECORE_RGBP_GENERATED_WORDS	113
 #define BECORE_YUVP_GENERATED_WORDS	0
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -349,6 +379,7 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_GTM_BASE, BECORE_RGBP_GTM_LAST, BECORE_GEN_GTM },
 	{ BECORE_RGBP_DECOMP_BYPASS_REG, BECORE_RGBP_DECOMP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
 	{ BECORE_RGBP_DECOMP_SIZE_REG, BECORE_RGBP_DECOMP_SIZE_REG,
@@ -1636,6 +1667,101 @@ static int becore_shape_register(const struct becore_cmdq_shape *shape,
 	return -EINVAL;
 }
 
+/*
+ * The knot grid: 16 knots every 16 codes across the first 256, then 8 every
+ * 32, 24 every 64 and 16 every 128. Each knot is the left edge of its segment
+ * and the segments tile the 12-bit input exactly, so the last knot is 3968
+ * rather than 4095. Finer where the eye is, which is the ordinary reason a
+ * tone curve is sampled unevenly; the grid decides where the curve is
+ * measured, not what it does.
+ *
+ * tools/camera-becore-recipe.py carries the same arithmetic and checks it
+ * against the vendor capture, which is the only thing that checks it -- the
+ * recipe holds zero for these words, so nothing here can be validated against
+ * it. Change one copy and change the other.
+ */
+static const struct {
+	u8 knots;
+	u16 step;
+} becore_rgbp_gtm_grid[] = {
+	{ 16, 16 }, { 8, 32 }, { 24, 64 }, { 16, 128 },
+};
+
+static_assert(16 + 8 + 24 + 16 == BECORE_RGBP_GTM_KNOTS);
+static_assert(16 * 16 + 8 * 32 + 24 * 64 + 16 * 128 == 1 << 12);
+
+static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
+{
+	u32 x = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_rgbp_gtm_grid); i++) {
+		if (index < becore_rgbp_gtm_grid[i].knots) {
+			*knot = x + index * becore_rgbp_gtm_grid[i].step;
+			return 0;
+		}
+		x += becore_rgbp_gtm_grid[i].knots *
+		     becore_rgbp_gtm_grid[i].step;
+		index -= becore_rgbp_gtm_grid[i].knots;
+	}
+
+	return -EINVAL;
+}
+
+/* The identity itself: out[i] == in[i] << 5 at every knot. */
+static int becore_rgbp_gtm_value(u32 offset, u32 *value)
+{
+	u32 knot;
+	u32 low;
+	int ret;
+
+	if (offset & 3)
+		return -EINVAL;
+
+	switch (offset) {
+	case BECORE_RGBP_GTM_BYPASS:		/* the block runs */
+	case BECORE_RGBP_GTM_GAIN_MODE_EN:
+	case BECORE_RGBP_GTM_V_BLEND_RATIO:
+	case BECORE_RGBP_GTM_INPUT_RSHIFT:
+		*value = 0;
+		return 0;
+	case BECORE_RGBP_GTM_Y_WEIGHT_0:
+		*value = (BECORE_RGBP_GTM_Y_WEIGHT_G << 16) |
+			 BECORE_RGBP_GTM_Y_WEIGHT_R;
+		return 0;
+	case BECORE_RGBP_GTM_Y_WEIGHT_1:
+		*value = BECORE_RGBP_GTM_Y_WEIGHT_B;
+		return 0;
+	}
+
+	if (offset >= BECORE_RGBP_GTM_IN_POINTS &&
+	    offset < BECORE_RGBP_GTM_OUT_POINTS) {
+		u32 index = (offset - BECORE_RGBP_GTM_IN_POINTS) / 4 * 2;
+
+		ret = becore_rgbp_gtm_knot(index, &low);
+		if (ret)
+			return ret;
+		ret = becore_rgbp_gtm_knot(index + 1, &knot);
+		if (ret)
+			return ret;
+		*value = (knot << 16) | low;
+		return 0;
+	}
+
+	if (offset >= BECORE_RGBP_GTM_OUT_POINTS &&
+	    offset < BECORE_RGBP_GTM_Y_WEIGHT_0) {
+		ret = becore_rgbp_gtm_knot((offset -
+					    BECORE_RGBP_GTM_OUT_POINTS) / 4,
+					   &knot);
+		if (ret)
+			return ret;
+		*value = knot << BECORE_RGBP_GTM_OUT_SHIFT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static u32 becore_generated_word_count(enum becore_block_id id)
 {
 	if (id == BECORE_RGBP)
@@ -1675,6 +1801,11 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_DECOMP_SIZE:
 			result = becore_pack_size(becore_rgbp_input.height,
 						  becore_rgbp_input.width);
+			break;
+		case BECORE_GEN_GTM:
+			if (becore_rgbp_gtm_value(reg - BECORE_RGBP_GTM_BASE,
+						  &result))
+				return -EINVAL;
 			break;
 		default:
 			return -EINVAL;

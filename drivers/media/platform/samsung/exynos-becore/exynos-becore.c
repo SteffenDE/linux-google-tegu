@@ -512,6 +512,26 @@ static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_SLCGRID_ROWS *
 	      BECORE_LTM_SLCGRID_DEPTH * BECORE_LTM_SLCGRID_CELL_SHORTS *
 	      sizeof(__le16) == BECORE_GRID_SIZE);
 /*
+ * YUVP's inverse colour matrix: nine signed Q10 coefficients that read as
+ * unity in every captured program and do *not* invert the DIABLO_CCM matrix
+ * beside them.  The same situation as RGBP's GTM -- the block is not being
+ * used, so what it holds is the identity rather than a calibration.  Its
+ * config at +0x00 is 0x02020224 and no published table names its fields, so
+ * that word stays in the recipe.
+ *
+ * Whether the nine are packed row- or column-major is unobservable while they
+ * are the identity, and the diagonal is at 0, 4 and 8 either way.
+ */
+#define BECORE_YUVP_INVCCM33_BASE	(BECORE_YUVP_PHYS_BASE + 0x3e00)
+#define BECORE_YUVP_INVCCM33_FIRST	(BECORE_YUVP_INVCCM33_BASE + 0x004)
+#define BECORE_YUVP_INVCCM33_LAST	(BECORE_YUVP_INVCCM33_BASE + 0x024)
+#define BECORE_INVCCM33_Q		10
+#define BECORE_INVCCM33_COEFFICIENTS	9
+
+static_assert((BECORE_YUVP_INVCCM33_LAST - BECORE_YUVP_INVCCM33_FIRST) / 4 +
+	      1 == BECORE_INVCCM33_COEFFICIENTS);
+
+/*
  * The colour LUT above 0x7b00, which Lyric's descriptors call
  * yuv_diablo_clut_*. Its input stage is three 1D LUTs, one per YUV channel,
  * each 22 registers at 0x7b50, 0x7ba8 and 0x7c00.
@@ -868,6 +888,7 @@ enum becore_generated_kind {
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
 	BECORE_GEN_CLUT,	/* the colour LUT's gate and its YUV-to-RGB matrix */
+	BECORE_GEN_INVCCM33,	/* the inverse colour matrix, an exact identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -887,7 +908,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	378
+#define BECORE_YUVP_GENERATED_WORDS	387
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1005,6 +1026,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_INVCCM33_FIRST, BECORE_YUVP_INVCCM33_LAST,
+	  BECORE_GEN_INVCCM33 },
 	{ BECORE_YUVP_CLUT_BYPASS_REG, BECORE_YUVP_CLUT_EN_CONFIG_REG,
 	  BECORE_GEN_CLUT },
 	{ BECORE_YUVP_CLUT_MATRIX_FIRST, BECORE_YUVP_CLUT_MATRIX_LAST,
@@ -2605,6 +2628,19 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* One coefficient of the inverse colour matrix, by offset from the first. */
+static int becore_yuvp_invccm33_value(u32 offset, u32 *value)
+{
+	u32 index = offset / 4;
+
+	if (offset & 3 || index >= BECORE_INVCCM33_COEFFICIENTS)
+		return -EINVAL;
+
+	*value = index % 4 ? 0 : 1 << BECORE_INVCCM33_Q;
+
+	return 0;
+}
+
 /*
  * One register of a colour-LUT input curve, by offset from the curve's first.
  *
@@ -3862,6 +3898,12 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_CLUT_1DLUT:
 			if (becore_yuvp_clut_1dlut_value(reg - table[i].first,
 							 &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_INVCCM33:
+			if (becore_yuvp_invccm33_value(reg -
+						BECORE_YUVP_INVCCM33_FIRST,
+						&result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_CLUT:

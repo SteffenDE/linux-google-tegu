@@ -1716,20 +1716,65 @@ static u32 becore_rgbp_out_height(void)
 }
 
 /*
- * The crop is centred in the Bayer input, so its origin is derived. An odd
- * margin would put the window on the wrong Bayer phase and swap colours, so
- * refuse it rather than round.
+ * DMSCCROP's window: the largest centred rectangle of the Bayer array that
+ * has the aspect ratio the chain hands downstream. Cropping is what makes the
+ * two aspects agree, so only one axis is ever narrowed; the other keeps the
+ * whole array.
+ *
+ * This is a policy choice rather than an arithmetic one, and the vendor makes
+ * a different one on some readouts -- it takes the aspect fit on every 4:3
+ * request, but keeps an eight-pixel margin on the rear camera's 16:9 modes.
+ * What is *not* a choice is that everything below reads the crop rather than
+ * the array: the scaler's ratios are the crop over the destination, and that
+ * holds bit-exactly on all eighteen captured programs where taking the array
+ * would be right only where the two coincide.
+ *
+ * Both sizes are kept even and the origin refused if it is odd, because a
+ * window on the wrong Bayer phase swaps the colours silently.
  */
-static int becore_rgbp_crop_origin(u32 *x, u32 *y)
-{
-	u32 w = becore_rgbp_out_width();
-	u32 h = becore_rgbp_out_height();
+struct becore_rect {
+	u32 x;
+	u32 y;
+	u32 width;
+	u32 height;
+};
 
-	if (w > becore_rgbp_input.width || h > becore_rgbp_input.height)
+static int becore_rgbp_crop(struct becore_rect *crop)
+{
+	u32 array_w = becore_rgbp_input.width;
+	u32 array_h = becore_rgbp_input.height;
+	u32 out_w = becore_rgbp_out_width();
+	u32 out_h = becore_rgbp_out_height();
+	u32 width;
+
+	if (!out_w || !out_h || !array_w || !array_h)
+		return -EINVAL;
+
+	width = 2 * (u32)DIV_ROUND_CLOSEST_ULL((u64)array_h * out_w,
+					       2 * out_h);
+	if (width <= array_w) {
+		crop->width = width;
+		crop->height = array_h;
+	} else {
+		crop->width = array_w;
+		crop->height = 2 * (u32)DIV_ROUND_CLOSEST_ULL(
+			(u64)array_w * out_h, 2 * out_w);
+	}
+	if (crop->height > array_h || !crop->width || !crop->height)
 		return -ERANGE;
-	*x = (becore_rgbp_input.width - w) / 2;
-	*y = (becore_rgbp_input.height - h) / 2;
-	if ((*x | *y) & 1)
+	/*
+	 * A centred window is only on the right Bayer phase when its margin
+	 * is a multiple of four, so widen it by the two pixels that are in
+	 * the way rather than accept an off-phase origin. That costs at most
+	 * a two-pixel aspect error, which is what the vendor accepts as well:
+	 * on both 16:9 readouts where the exact fit lands here it stops
+	 * cropping altogether, and widening reaches the same answer.
+	 */
+	crop->width += (array_w - crop->width) % 4;
+	crop->height += (array_h - crop->height) % 4;
+	crop->x = (array_w - crop->width) / 2;
+	crop->y = (array_h - crop->height) / 2;
+	if ((crop->x | crop->y) & 1)
 		return -ERANGE;
 
 	return 0;
@@ -1749,28 +1794,31 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 					       becore_rgbp_input.height);
 		break;
 	case BECORE_RGBP_CHAIN_DST_SIZE:
-	case BECORE_RGBP_CROP_SIZE:
 	case BECORE_RGBP_SC_DST_SIZE:
 		*value = becore_pack_size(becore_rgbp_out_width(),
 					       becore_rgbp_out_height());
 		break;
-	case BECORE_RGBP_CROP_START: {
-		u32 x, y;
-		int ret = becore_rgbp_crop_origin(&x, &y);
+	case BECORE_RGBP_CROP_SIZE:
+	case BECORE_RGBP_CROP_START:
+	case BECORE_RGBP_SC_H_RATIO:
+	case BECORE_RGBP_SC_V_RATIO: {
+		struct becore_rect crop;
+		int ret = becore_rgbp_crop(&crop);
 
 		if (ret)
 			return ret;
-		*value = becore_pack_size(x, y);
+		if (index == BECORE_RGBP_CROP_SIZE)
+			*value = becore_pack_size(crop.width, crop.height);
+		else if (index == BECORE_RGBP_CROP_START)
+			*value = becore_pack_size(crop.x, crop.y);
+		else if (index == BECORE_RGBP_SC_H_RATIO)
+			*value = becore_zoom_ratio(crop.width,
+						   becore_rgbp_out_width());
+		else
+			*value = becore_zoom_ratio(crop.height,
+						   becore_rgbp_out_height());
 		break;
 	}
-	case BECORE_RGBP_SC_H_RATIO:
-		*value = becore_zoom_ratio(becore_rgbp_out_width(),
-						becore_rgbp_out_width());
-		break;
-	case BECORE_RGBP_SC_V_RATIO:
-		*value = becore_zoom_ratio(becore_rgbp_out_height(),
-						becore_rgbp_out_height());
-		break;
 	case BECORE_RGBP_INPUT_FORMAT:
 		*value = becore_rgbp_input.data_format;
 		break;

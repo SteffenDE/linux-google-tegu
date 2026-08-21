@@ -7,8 +7,8 @@
  * fixed, relocatable RGBP/YUVP program for offline bring-up; it is deliberately
  * not a camera ABI.  Separate GTNR-startup and MCSC recipes can be normalized
  * into dormant command lists while those downstream stages are brought up.
- * Powering a block down is safe only after all three active processors have
- * accepted a software reset.
+ * Powering a block down is safe only after every owned processor has accepted
+ * a software reset.
  */
 
 #include <linux/completion.h>
@@ -173,6 +173,7 @@ enum becore_block_id {
 	BECORE_RGBP,
 	BECORE_MCFP,
 	BECORE_YUVP,
+	BECORE_MCSC,
 	BECORE_NUM_BLOCKS,
 };
 
@@ -572,8 +573,9 @@ struct becore_device {
 	struct device *dev;
 	struct becore_block blocks[BECORE_NUM_BLOCKS];
 	struct becore_irq irqs[BECORE_NUM_BLOCKS * 2];
-	void __iomem *ssmt[7];
+	void __iomem *ssmt[14];
 	void __iomem *sysreg_rgbp;
+	void __iomem *sysreg_mcsc;
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
 	struct media_device mdev;
@@ -650,12 +652,14 @@ static const char * const becore_pm_domain_names[] = {
 	"yuvp",
 	"rgbp",
 	"gdc",
+	"mcsc",
 };
 
 static const char * const becore_irq_names[] = {
 	"rgbp-int0", "rgbp-int1",
 	"mcfp-int0", "mcfp-int1",
 	"yuvp-int0", "yuvp-int1",
+	"mcsc-int0", "mcsc-int1",
 };
 
 static const char * const becore_ssmt_names[] = {
@@ -666,6 +670,13 @@ static const char * const becore_ssmt_names[] = {
 	"ssmt-mcfp2",
 	"ssmt-mcfp3",
 	"ssmt-mcfp4",
+	"ssmt-mcsc0",
+	"ssmt-mcsc1",
+	"ssmt-mcsc2",
+	"ssmt-mcsc3",
+	"ssmt-mcsc4",
+	"ssmt-mcsc5",
+	"ssmt-mcsc6",
 };
 
 static const struct becore_regval becore_rgbp_init[] = {
@@ -704,6 +715,16 @@ static const struct becore_regval becore_yuvp_init[] = {
 	{ BECORE_STAT_RDMACL_EN, 0x1 },
 	{ BECORE_GLOBAL_ENABLE, 0x1 },
 	{ BECORE_SET_CTRL, 0x0 },
+};
+
+/* MCSC keeps SET_CTRL asserted while its command queue is active. */
+static const struct becore_regval becore_mcsc_init[] = {
+	{ BECORE_SET_CTRL, 0x1 },
+	{ BECORE_GLOBAL_ENABLE_CLEAR, 0x1 },
+	{ BECORE_FRO_GLOBAL_ENABLE, 0x3fffff },
+	{ BECORE_CMDQ_ENABLE, 0x1 },
+	{ BECORE_STAT_RDMACL_EN, 0x1 },
+	{ BECORE_GLOBAL_ENABLE, 0x1 },
 };
 
 static void becore_write_table(struct becore_block *block,
@@ -1837,6 +1858,8 @@ static int becore_runtime_resume(struct device *dev)
 			   ARRAY_SIZE(becore_mcfp_init));
 	becore_write_table(&becore->blocks[BECORE_YUVP], becore_yuvp_init,
 			   ARRAY_SIZE(becore_yuvp_init));
+	becore_write_table(&becore->blocks[BECORE_MCSC], becore_mcsc_init,
+			   ARRAY_SIZE(becore_mcsc_init));
 
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
 		becore_prepare_irqs(&becore->blocks[i]);
@@ -1955,7 +1978,9 @@ static irqreturn_t becore_irq_handler(int irq, void *data)
 static int becore_map_resources(struct platform_device *pdev,
 				struct becore_device *becore)
 {
-	static const char * const block_names[] = { "rgbp", "mcfp", "yuvp" };
+	static const char * const block_names[] = {
+		"rgbp", "mcfp", "yuvp", "mcsc",
+	};
 	struct device *dev = &pdev->dev;
 	unsigned int i;
 
@@ -1981,6 +2006,12 @@ static int becore_map_resources(struct platform_device *pdev,
 	if (IS_ERR(becore->sysreg_rgbp))
 		return dev_err_probe(dev, PTR_ERR(becore->sysreg_rgbp),
 				     "cannot map sysreg-rgbp\n");
+
+	becore->sysreg_mcsc =
+		devm_platform_ioremap_resource_byname(pdev, "sysreg-mcsc");
+	if (IS_ERR(becore->sysreg_mcsc))
+		return dev_err_probe(dev, PTR_ERR(becore->sysreg_mcsc),
+				     "cannot map sysreg-mcsc\n");
 
 	return 0;
 }
@@ -3796,6 +3827,14 @@ static int becore_probe(struct platform_device *pdev)
 		.int0_mask = 0x3fe1fc06,
 		.int1_mask = 0x1ffffff,
 		.cmdq_int_mask = 0xff,
+	};
+	becore->blocks[BECORE_MCSC] = (struct becore_block) {
+		.becore = becore,
+		.name = "MCSC",
+		.int0_mask_prepare = 0x3ffffc02,
+		.int0_mask = 0x3ffffc06,
+		.int1_mask = 0x501,
+		.cmdq_int_mask = 0x1,
 	};
 	platform_set_drvdata(pdev, becore);
 

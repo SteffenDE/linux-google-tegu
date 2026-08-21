@@ -5,10 +5,10 @@
  * The register sequences here are the common processor lifecycle observed on
  * the Pixel 9a vendor stack.  The debugfs diagnostic accepts a structurally
  * fixed, relocatable RGBP/YUVP program for offline bring-up; it is deliberately
- * not a camera ABI.  A separate MCSC recipe can be normalized into a dormant
- * command list while that downstream stage is brought up.  Powering a block
- * down is safe only after all three active processors have accepted a software
- * reset.
+ * not a camera ABI.  Separate GTNR-startup and MCSC recipes can be normalized
+ * into dormant command lists while those downstream stages are brought up.
+ * Powering a block down is safe only after all three active processors have
+ * accepted a software reset.
  */
 
 #include <linux/completion.h>
@@ -39,6 +39,7 @@
 #include <media/videobuf2-vmalloc.h>
 
 #include "exynos-becore-recipe.h"
+#include "exynos-becore-gtnr-recipe.h"
 #include "exynos-becore-mcsc-recipe.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
@@ -86,6 +87,7 @@
 
 #define BECORE_RGBP_PHYS_BASE		0x1c440000
 #define BECORE_YUVP_PHYS_BASE		0x1c840000
+#define BECORE_GTNR_PHYS_BASE		0x1cc40000
 #define BECORE_MCSC_PHYS_BASE		0x1d040000
 
 #define BECORE_RGBP_INPUT_IMAGE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c50)
@@ -112,6 +114,34 @@
 #define BECORE_YUVP_OUTPUT_STRIDE2_REG	(BECORE_YUVP_PHYS_BASE + 0x242c)
 #define BECORE_YUVP_OUTPUT_VOTF_REG	(BECORE_YUVP_PHYS_BASE + 0x243c)
 #define BECORE_YUVP_OUTPUT_BUSINFO_REG	(BECORE_YUVP_PHYS_BASE + 0x244c)
+
+#define BECORE_GTNR_INPUT_PLANE1_REG	(BECORE_GTNR_PHYS_BASE + 0x1e50)
+#define BECORE_GTNR_INPUT_PLANE2_REG	(BECORE_GTNR_PHYS_BASE + 0x1e90)
+#define BECORE_GTNR_INPUT_VOTF_REG	(BECORE_GTNR_PHYS_BASE + 0x1e3c)
+#define BECORE_GTNR_INPUT_FORMAT_REG	(BECORE_GTNR_PHYS_BASE + 0x1e10)
+#define BECORE_GTNR_INPUT_LOSSY_REG	(BECORE_GTNR_PHYS_BASE + 0x1e18)
+#define BECORE_GTNR_INPUT_COMP_REG	(BECORE_GTNR_PHYS_BASE + 0x1e04)
+#define BECORE_GTNR_INPUT_WIDTH_REG	(BECORE_GTNR_PHYS_BASE + 0x1e20)
+#define BECORE_GTNR_INPUT_HEIGHT_REG	(BECORE_GTNR_PHYS_BASE + 0x1e24)
+#define BECORE_GTNR_INPUT_STRIDE1_REG	(BECORE_GTNR_PHYS_BASE + 0x1e28)
+#define BECORE_GTNR_INPUT_STRIDE2_REG	(BECORE_GTNR_PHYS_BASE + 0x1e2c)
+#define BECORE_GTNR_INPUT_BUSINFO_REG	(BECORE_GTNR_PHYS_BASE + 0x1e4c)
+#define BECORE_GTNR_INPUT_MAX_MO_REG	(BECORE_GTNR_PHYS_BASE + 0x1e40)
+#define BECORE_GTNR_INPUT_MAX_BL_REG	(BECORE_GTNR_PHYS_BASE + 0x1e48)
+#define BECORE_GTNR_INPUT_ENABLE_REG	(BECORE_GTNR_PHYS_BASE + 0x1e00)
+#define BECORE_GTNR_OUTPUT_PLANE1_REG	(BECORE_GTNR_PHYS_BASE + 0x3050)
+#define BECORE_GTNR_OUTPUT_PLANE2_REG	(BECORE_GTNR_PHYS_BASE + 0x3090)
+#define BECORE_GTNR_OUTPUT_FORMAT_REG	(BECORE_GTNR_PHYS_BASE + 0x3010)
+#define BECORE_GTNR_OUTPUT_LOSSY_REG	(BECORE_GTNR_PHYS_BASE + 0x3018)
+#define BECORE_GTNR_OUTPUT_COMP_REG	(BECORE_GTNR_PHYS_BASE + 0x3004)
+#define BECORE_GTNR_OUTPUT_WIDTH_REG	(BECORE_GTNR_PHYS_BASE + 0x3020)
+#define BECORE_GTNR_OUTPUT_HEIGHT_REG	(BECORE_GTNR_PHYS_BASE + 0x3024)
+#define BECORE_GTNR_OUTPUT_STRIDE1_REG	(BECORE_GTNR_PHYS_BASE + 0x3028)
+#define BECORE_GTNR_OUTPUT_STRIDE2_REG	(BECORE_GTNR_PHYS_BASE + 0x302c)
+#define BECORE_GTNR_OUTPUT_BUSINFO_REG	(BECORE_GTNR_PHYS_BASE + 0x304c)
+#define BECORE_GTNR_OUTPUT_MAX_MO_REG	(BECORE_GTNR_PHYS_BASE + 0x3040)
+#define BECORE_GTNR_OUTPUT_MAX_BL_REG	(BECORE_GTNR_PHYS_BASE + 0x3048)
+#define BECORE_GTNR_OUTPUT_ENABLE_REG	(BECORE_GTNR_PHYS_BASE + 0x3000)
 
 #define BECORE_MCSC_INPUT_PLANE1_REG	(BECORE_MCSC_PHYS_BASE + 0x1850)
 #define BECORE_MCSC_INPUT_PLANE2_REG	(BECORE_MCSC_PHYS_BASE + 0x1890)
@@ -276,6 +306,106 @@ static const u32 becore_yuvp_output_regs[] = {
 	[BECORE_YUVP_OUTPUT_STRIDE2] = BECORE_YUVP_OUTPUT_STRIDE2_REG,
 	[BECORE_YUVP_OUTPUT_BUSINFO] = BECORE_YUVP_OUTPUT_BUSINFO_REG,
 	[BECORE_YUVP_OUTPUT_ENABLE] = BECORE_YUVP_OUTPUT_ENABLE_REG,
+};
+
+struct becore_gtnr_dma_profile {
+	u32 width;
+	u32 height;
+	u32 data_format;
+	u32 comp_control;
+	u32 lossy_byte32num;
+	u32 votf_enable;
+	u32 stride;
+	u32 businfo;
+	u32 max_mo;
+	u32 max_bl;
+	u32 enable;
+};
+
+/*
+ * The first physical-ultrawide GTNR frame has no temporal inputs or map DMAs.
+ * It reads YUVP's 4160x3120 lossy-SBWC surface and writes a separate surface
+ * with the same bounded layout.  Keep this startup shape dormant until GTNR's
+ * power, reset, interrupt, and cross-block completion lifecycle is established.
+ */
+static const struct becore_gtnr_dma_profile becore_gtnr_input = {
+	.width = 4160,
+	.height = 3120,
+	.data_format = 0x2000,
+	.comp_control = 0xa,
+	.lossy_byte32num = 2,
+	.votf_enable = 1,
+	.stride = 0x2080,
+	.businfo = 1,
+	.max_mo = 0x100,
+	.max_bl = 0x10,
+	.enable = 1,
+};
+
+static const struct becore_gtnr_dma_profile becore_gtnr_output = {
+	.width = 4160,
+	.height = 3120,
+	.data_format = 0x2000,
+	.comp_control = 0xa,
+	.lossy_byte32num = 2,
+	.stride = 0x2080,
+	.businfo = 0,
+	.max_mo = 0x100,
+	.max_bl = 0x10,
+	.enable = 1,
+};
+
+enum becore_gtnr_dma_word {
+	BECORE_GTNR_INPUT_VOTF,
+	BECORE_GTNR_INPUT_FORMAT,
+	BECORE_GTNR_INPUT_LOSSY,
+	BECORE_GTNR_INPUT_COMP,
+	BECORE_GTNR_INPUT_WIDTH,
+	BECORE_GTNR_INPUT_HEIGHT,
+	BECORE_GTNR_INPUT_STRIDE1,
+	BECORE_GTNR_INPUT_STRIDE2,
+	BECORE_GTNR_INPUT_BUSINFO,
+	BECORE_GTNR_INPUT_MAX_MO,
+	BECORE_GTNR_INPUT_MAX_BL,
+	BECORE_GTNR_INPUT_ENABLE,
+	BECORE_GTNR_OUTPUT_FORMAT,
+	BECORE_GTNR_OUTPUT_LOSSY,
+	BECORE_GTNR_OUTPUT_COMP,
+	BECORE_GTNR_OUTPUT_WIDTH,
+	BECORE_GTNR_OUTPUT_HEIGHT,
+	BECORE_GTNR_OUTPUT_STRIDE1,
+	BECORE_GTNR_OUTPUT_STRIDE2,
+	BECORE_GTNR_OUTPUT_BUSINFO,
+	BECORE_GTNR_OUTPUT_MAX_MO,
+	BECORE_GTNR_OUTPUT_MAX_BL,
+	BECORE_GTNR_OUTPUT_ENABLE,
+	BECORE_GTNR_DMA_WORD_COUNT,
+};
+
+static const u32 becore_gtnr_dma_regs[] = {
+	[BECORE_GTNR_INPUT_VOTF] = BECORE_GTNR_INPUT_VOTF_REG,
+	[BECORE_GTNR_INPUT_FORMAT] = BECORE_GTNR_INPUT_FORMAT_REG,
+	[BECORE_GTNR_INPUT_LOSSY] = BECORE_GTNR_INPUT_LOSSY_REG,
+	[BECORE_GTNR_INPUT_COMP] = BECORE_GTNR_INPUT_COMP_REG,
+	[BECORE_GTNR_INPUT_WIDTH] = BECORE_GTNR_INPUT_WIDTH_REG,
+	[BECORE_GTNR_INPUT_HEIGHT] = BECORE_GTNR_INPUT_HEIGHT_REG,
+	[BECORE_GTNR_INPUT_STRIDE1] = BECORE_GTNR_INPUT_STRIDE1_REG,
+	[BECORE_GTNR_INPUT_STRIDE2] = BECORE_GTNR_INPUT_STRIDE2_REG,
+	[BECORE_GTNR_INPUT_BUSINFO] = BECORE_GTNR_INPUT_BUSINFO_REG,
+	[BECORE_GTNR_INPUT_MAX_MO] = BECORE_GTNR_INPUT_MAX_MO_REG,
+	[BECORE_GTNR_INPUT_MAX_BL] = BECORE_GTNR_INPUT_MAX_BL_REG,
+	[BECORE_GTNR_INPUT_ENABLE] = BECORE_GTNR_INPUT_ENABLE_REG,
+	[BECORE_GTNR_OUTPUT_FORMAT] = BECORE_GTNR_OUTPUT_FORMAT_REG,
+	[BECORE_GTNR_OUTPUT_LOSSY] = BECORE_GTNR_OUTPUT_LOSSY_REG,
+	[BECORE_GTNR_OUTPUT_COMP] = BECORE_GTNR_OUTPUT_COMP_REG,
+	[BECORE_GTNR_OUTPUT_WIDTH] = BECORE_GTNR_OUTPUT_WIDTH_REG,
+	[BECORE_GTNR_OUTPUT_HEIGHT] = BECORE_GTNR_OUTPUT_HEIGHT_REG,
+	[BECORE_GTNR_OUTPUT_STRIDE1] = BECORE_GTNR_OUTPUT_STRIDE1_REG,
+	[BECORE_GTNR_OUTPUT_STRIDE2] = BECORE_GTNR_OUTPUT_STRIDE2_REG,
+	[BECORE_GTNR_OUTPUT_BUSINFO] = BECORE_GTNR_OUTPUT_BUSINFO_REG,
+	[BECORE_GTNR_OUTPUT_MAX_MO] = BECORE_GTNR_OUTPUT_MAX_MO_REG,
+	[BECORE_GTNR_OUTPUT_MAX_BL] = BECORE_GTNR_OUTPUT_MAX_BL_REG,
+	[BECORE_GTNR_OUTPUT_ENABLE] = BECORE_GTNR_OUTPUT_ENABLE_REG,
 };
 
 struct becore_mcsc_dma_profile {
@@ -466,17 +596,23 @@ struct becore_device {
 	struct becore_input_slot *run_input;
 	struct becore_dma_buffer grid;
 	struct becore_dma_buffer output;
+	struct becore_dma_buffer gtnr_output;
 	struct becore_dma_buffer mcsc_output;
 	struct exynos_becore_input *input_producer;
 	u64 producer_sequence;
 	u64 input_sequence;
 	struct becore_cmdq_program program[BECORE_NUM_BLOCKS];
+	struct becore_cmdq_program gtnr_program;
 	struct becore_cmdq_program mcsc_program;
 	u8 *recipe;
+	u8 *gtnr_recipe;
 	u8 *mcsc_recipe;
 	size_t recipe_staged_bytes;
+	size_t gtnr_recipe_staged_bytes;
 	size_t mcsc_recipe_staged_bytes;
 	u32 recipe_generation;
+	u32 gtnr_recipe_generation;
+	u32 gtnr_encoded_generation;
 	u32 mcsc_recipe_generation;
 	u32 mcsc_encoded_generation;
 	u32 run_generation;
@@ -852,6 +988,87 @@ static int becore_yuvp_output_value(struct becore_device *becore, u32 index,
 	return 0;
 }
 
+static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
+{
+	if (index >= BECORE_GTNR_DMA_WORD_COUNT ||
+	    reg != becore_gtnr_dma_regs[index])
+		return -EINVAL;
+	if (!value)
+		return 0;
+
+	switch (index) {
+	case BECORE_GTNR_INPUT_VOTF:
+		*value = becore_gtnr_input.votf_enable;
+		break;
+	case BECORE_GTNR_INPUT_FORMAT:
+		*value = becore_gtnr_input.data_format;
+		break;
+	case BECORE_GTNR_INPUT_LOSSY:
+		*value = becore_gtnr_input.lossy_byte32num;
+		break;
+	case BECORE_GTNR_INPUT_COMP:
+		*value = becore_gtnr_input.comp_control;
+		break;
+	case BECORE_GTNR_INPUT_WIDTH:
+		*value = becore_gtnr_input.width;
+		break;
+	case BECORE_GTNR_INPUT_HEIGHT:
+		*value = becore_gtnr_input.height;
+		break;
+	case BECORE_GTNR_INPUT_STRIDE1:
+	case BECORE_GTNR_INPUT_STRIDE2:
+		*value = becore_gtnr_input.stride;
+		break;
+	case BECORE_GTNR_INPUT_BUSINFO:
+		*value = becore_gtnr_input.businfo;
+		break;
+	case BECORE_GTNR_INPUT_MAX_MO:
+		*value = becore_gtnr_input.max_mo;
+		break;
+	case BECORE_GTNR_INPUT_MAX_BL:
+		*value = becore_gtnr_input.max_bl;
+		break;
+	case BECORE_GTNR_INPUT_ENABLE:
+		*value = becore_gtnr_input.enable;
+		break;
+	case BECORE_GTNR_OUTPUT_FORMAT:
+		*value = becore_gtnr_output.data_format;
+		break;
+	case BECORE_GTNR_OUTPUT_LOSSY:
+		*value = becore_gtnr_output.lossy_byte32num;
+		break;
+	case BECORE_GTNR_OUTPUT_COMP:
+		*value = becore_gtnr_output.comp_control;
+		break;
+	case BECORE_GTNR_OUTPUT_WIDTH:
+		*value = becore_gtnr_output.width;
+		break;
+	case BECORE_GTNR_OUTPUT_HEIGHT:
+		*value = becore_gtnr_output.height;
+		break;
+	case BECORE_GTNR_OUTPUT_STRIDE1:
+	case BECORE_GTNR_OUTPUT_STRIDE2:
+		*value = becore_gtnr_output.stride;
+		break;
+	case BECORE_GTNR_OUTPUT_BUSINFO:
+		*value = becore_gtnr_output.businfo;
+		break;
+	case BECORE_GTNR_OUTPUT_MAX_MO:
+		*value = becore_gtnr_output.max_mo;
+		break;
+	case BECORE_GTNR_OUTPUT_MAX_BL:
+		*value = becore_gtnr_output.max_bl;
+		break;
+	case BECORE_GTNR_OUTPUT_ENABLE:
+		*value = becore_gtnr_output.enable;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static size_t becore_mcsc_output_plane2_offset(void)
 {
 	return (size_t)becore_mcsc_output.stride * becore_mcsc_output.height;
@@ -938,6 +1155,39 @@ static int becore_mcsc_dma_value(u32 index, u32 reg, u32 *value)
 	}
 
 	return 0;
+}
+
+static size_t becore_gtnr_surface_plane2_offset(void)
+{
+	const struct becore_yuvp_output_profile *profile =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+
+	return becore_yuvp_output_plane2_offset(profile);
+}
+
+static size_t becore_gtnr_surface_size(void)
+{
+	const struct becore_yuvp_output_profile *profile =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+
+	return becore_yuvp_output_size(profile);
+}
+
+static dma_addr_t becore_gtnr_address_dma(struct becore_device *becore, u32 reg)
+{
+	switch (reg) {
+	case BECORE_GTNR_INPUT_PLANE1_REG:
+		return becore->output.dma;
+	case BECORE_GTNR_INPUT_PLANE2_REG:
+		return becore->output.dma + becore_gtnr_surface_plane2_offset();
+	case BECORE_GTNR_OUTPUT_PLANE1_REG:
+		return becore->gtnr_output.dma;
+	case BECORE_GTNR_OUTPUT_PLANE2_REG:
+		return becore->gtnr_output.dma +
+		       becore_gtnr_surface_plane2_offset();
+	default:
+		return DMA_MAPPING_ERROR;
+	}
 }
 
 static dma_addr_t becore_mcsc_address_dma(struct becore_device *becore, u32 reg)
@@ -1208,6 +1458,167 @@ static int becore_encode_programs(struct becore_device *becore)
 
 	return becore_encode_block(becore, BECORE_YUVP, becore_yuvp_shape,
 				   BECORE_YUVP_HEADER_COUNT);
+}
+
+static int becore_gtnr_recipe_validate(struct becore_device *becore)
+{
+	const u8 *header = becore->gtnr_recipe;
+	const u8 *record = header + BECORE_GTNR_RECIPE_HEADER_BYTES;
+	const struct becore_yuvp_output_profile *input =
+		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+	u32 address_count = 0;
+	u32 typed_count = 0;
+	u32 i;
+
+	if (becore->gtnr_recipe_staged_bytes != BECORE_GTNR_RECIPE_BYTES ||
+	    get_unaligned_le32(header) != BECORE_GTNR_RECIPE_MAGIC ||
+	    get_unaligned_le32(header + 4) != BECORE_GTNR_RECIPE_VERSION ||
+	    get_unaligned_le32(header + 8) != BECORE_GTNR_RECIPE_HEADER_BYTES ||
+	    get_unaligned_le32(header + 12) != BECORE_GTNR_RECIPE_RECORD_BYTES ||
+	    get_unaligned_le32(header + 16) != BECORE_GTNR_HEADER_COUNT ||
+	    get_unaligned_le32(header + 20) != BECORE_GTNR_RECIPE_BYTES ||
+	    get_unaligned_le32(header + 24) || get_unaligned_le32(header + 28))
+		return -EINVAL;
+	if (becore->output.size < becore_gtnr_surface_size() ||
+	    becore->gtnr_output.size != becore_gtnr_surface_size() ||
+	    becore_gtnr_input.width != input->width ||
+	    becore_gtnr_input.height != input->height ||
+	    becore_gtnr_input.stride != becore_yuvp_output_stride(input) ||
+	    becore_gtnr_output.width != input->width ||
+	    becore_gtnr_output.height != input->height ||
+	    becore_gtnr_output.stride != becore_yuvp_output_stride(input))
+		return -EINVAL;
+
+	for (i = 0; i < BECORE_GTNR_HEADER_COUNT;
+	     i++, record += BECORE_GTNR_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &becore_gtnr_shape[i];
+		const u8 *words = record + 12;
+		u16 used_mask;
+		u32 word;
+
+		if (!shape->valid_words || shape->valid_words > 16)
+			return -EINVAL;
+		used_mask = shape->valid_words == 16 ? U16_MAX :
+			    GENMASK(shape->valid_words - 1, 0);
+		if (get_unaligned_le32(record) != shape->mode ||
+		    get_unaligned_le32(record + 4) != shape->target ||
+		    get_unaligned_le32(record + 8) != shape->type_map ||
+		    (shape->address_mask & ~used_mask) ||
+		    (shape->typed_mask & ~used_mask) ||
+		    (shape->fixed_mask & ~used_mask) ||
+		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->fixed_mask) ||
+		    (shape->typed_mask & shape->fixed_mask))
+			return -EINVAL;
+
+		for (word = 0; word < 16; word++) {
+			u32 value = get_unaligned_le32(words + word * 4);
+
+			if (word >= shape->valid_words) {
+				if (value)
+					return -EINVAL;
+				continue;
+			}
+			if (shape->mode == 0x00090000 && !(word & 1)) {
+				if (value != shape->pair_registers[word / 2])
+					return -EINVAL;
+				continue;
+			}
+			if ((shape->fixed_mask & BIT(word)) &&
+			    value != shape->fixed_values[word])
+				return -EINVAL;
+
+			if (shape->typed_mask & BIT(word)) {
+				u32 reg;
+
+				if (shape->mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape->pair_registers[word / 2];
+				if (becore_gtnr_dma_value(typed_count, reg, NULL))
+					return -EINVAL;
+				typed_count++;
+			}
+			if (shape->address_mask & BIT(word)) {
+				u32 reg;
+
+				if (shape->mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape->pair_registers[word / 2];
+				if (becore_gtnr_address_dma(becore, reg) ==
+				    DMA_MAPPING_ERROR)
+					return -EINVAL;
+				address_count++;
+			}
+		}
+	}
+
+	if (address_count != 4 || typed_count != BECORE_GTNR_DMA_WORD_COUNT)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int becore_encode_gtnr(struct becore_device *becore)
+{
+	struct becore_cmdq_program *program = &becore->gtnr_program;
+	const u8 *record = becore->gtnr_recipe +
+			   BECORE_GTNR_RECIPE_HEADER_BYTES;
+	size_t payload_offset = ALIGN((size_t)BECORE_GTNR_HEADER_COUNT *
+				      BECORE_CMDQ_HEADER_BYTES,
+				      BECORE_CMDQ_PAYLOAD_BYTES);
+	u32 typed_count = 0;
+	u32 i;
+
+	if (!program->cpu || program->header_count != BECORE_GTNR_HEADER_COUNT ||
+	    program->size != becore_cmdq_program_size(BECORE_GTNR_HEADER_COUNT) ||
+	    upper_32_bits(program->dma) ||
+	    upper_32_bits(program->dma + program->size - 1))
+		return -EINVAL;
+
+	memset(program->cpu, 0, program->size);
+	for (i = 0; i < BECORE_GTNR_HEADER_COUNT;
+	     i++, record += BECORE_GTNR_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &becore_gtnr_shape[i];
+		u8 *header = (u8 *)program->cpu + i * BECORE_CMDQ_HEADER_BYTES;
+		u8 *payload = (u8 *)program->cpu + payload_offset +
+			      i * BECORE_CMDQ_PAYLOAD_BYTES;
+		dma_addr_t payload_dma = program->dma + payload_offset +
+					 i * BECORE_CMDQ_PAYLOAD_BYTES;
+		u32 word;
+
+		put_unaligned_le32(shape->mode, header);
+		put_unaligned_le32(lower_32_bits(payload_dma), header + 4);
+		put_unaligned_le32(shape->target, header + 8);
+		put_unaligned_le32(shape->type_map, header + 12);
+		memcpy(payload, record + 12, BECORE_CMDQ_PAYLOAD_BYTES);
+
+		for (word = 0; word < shape->valid_words; word++) {
+			dma_addr_t dma;
+			u32 reg;
+			u32 value;
+
+			if (shape->typed_mask & BIT(word)) {
+				reg = shape->pair_registers[word / 2];
+				if (becore_gtnr_dma_value(typed_count, reg, &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
+				typed_count++;
+				continue;
+			}
+			if (!(shape->address_mask & BIT(word)))
+				continue;
+			reg = shape->pair_registers[word / 2];
+			dma = becore_gtnr_address_dma(becore, reg);
+			if (dma == DMA_MAPPING_ERROR || upper_32_bits(dma))
+				return -EINVAL;
+			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
+		}
+	}
+
+	if (typed_count != BECORE_GTNR_DMA_WORD_COUNT)
+		return -EINVAL;
+
+	return 0;
 }
 
 static int becore_mcsc_recipe_validate(struct becore_device *becore)
@@ -1716,6 +2127,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      GFP_KERNEL);
 	if (!becore->recipe)
 		return -ENOMEM;
+	becore->gtnr_recipe = devm_kzalloc(becore->dev,
+					   BECORE_GTNR_RECIPE_BYTES, GFP_KERNEL);
+	if (!becore->gtnr_recipe)
+		return -ENOMEM;
 	becore->mcsc_recipe = devm_kzalloc(becore->dev,
 					   BECORE_MCSC_RECIPE_BYTES, GFP_KERNEL);
 	if (!becore->mcsc_recipe)
@@ -1732,6 +2147,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      output_size, "YUVP output");
 	if (ret)
 		return ret;
+	ret = becore_alloc_dma_buffer(becore, &becore->gtnr_output,
+				      becore_gtnr_surface_size(), "GTNR output");
+	if (ret)
+		return ret;
 	ret = becore_alloc_dma_buffer(becore, &becore->mcsc_output,
 				      becore_mcsc_output_size(), "MCSC output");
 	if (ret)
@@ -1743,6 +2162,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 
 	ret = becore_alloc_cmdq_program(becore, BECORE_YUVP,
 					BECORE_YUVP_HEADER_COUNT);
+	if (ret)
+		return ret;
+	ret = becore_alloc_cmdq_buffer(becore, &becore->gtnr_program,
+				       BECORE_GTNR_HEADER_COUNT, "GTNR startup");
 	if (ret)
 		return ret;
 
@@ -2141,6 +2564,46 @@ static const struct file_operations becore_recipe_fops = {
 	.llseek = default_llseek,
 };
 
+static ssize_t becore_gtnr_recipe_read(struct file *file, char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else
+		ret = simple_read_from_buffer(buf, count, ppos,
+					      becore->gtnr_recipe,
+					      becore->gtnr_recipe_staged_bytes);
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
+static ssize_t becore_gtnr_recipe_write(struct file *file,
+					const char __user *buf, size_t count,
+					loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+
+	return becore_stage_write(becore, buf, count, ppos,
+				  becore->gtnr_recipe, BECORE_GTNR_RECIPE_BYTES,
+				  &becore->gtnr_recipe_staged_bytes,
+				  &becore->gtnr_recipe_generation);
+}
+
+static const struct file_operations becore_gtnr_recipe_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = becore_gtnr_recipe_read,
+	.write = becore_gtnr_recipe_write,
+	.llseek = default_llseek,
+};
+
 static ssize_t becore_mcsc_recipe_read(struct file *file, char __user *buf,
 				       size_t count, loff_t *ppos)
 {
@@ -2291,6 +2754,64 @@ static const struct file_operations becore_yuvp_encoded_fops = {
 	.read = becore_yuvp_encoded_read,
 	.llseek = default_llseek,
 };
+
+static ssize_t becore_gtnr_encoded_read(struct file *file, char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	struct becore_device *becore = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else if (becore->gtnr_recipe_staged_bytes != BECORE_GTNR_RECIPE_BYTES ||
+		 becore->gtnr_encoded_generation != becore->gtnr_recipe_generation)
+		ret = -ENODATA;
+	else
+		ret = simple_read_from_buffer(buf, count, ppos,
+					      becore->gtnr_program.cpu,
+					      becore->gtnr_program.size);
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
+static const struct file_operations becore_gtnr_encoded_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = becore_gtnr_encoded_read,
+	.llseek = default_llseek,
+};
+
+static int becore_gtnr_encode_set(void *data, u64 value)
+{
+	struct becore_device *becore = data;
+	int ret;
+
+	if (value != 1)
+		return -EINVAL;
+
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed) {
+		ret = -EIO;
+	} else if (becore->running || becore->video_streaming) {
+		ret = -EBUSY;
+	} else {
+		ret = becore_gtnr_recipe_validate(becore);
+		if (!ret)
+			ret = becore_encode_gtnr(becore);
+		if (!ret)
+			becore->gtnr_encoded_generation =
+				becore->gtnr_recipe_generation;
+	}
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(becore_gtnr_encode_fops, NULL,
+			 becore_gtnr_encode_set, "%llu\n");
 
 static ssize_t becore_mcsc_encoded_read(struct file *file, char __user *buf,
 					size_t count, loff_t *ppos)
@@ -3019,6 +3540,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "recipe           %zu/%u bytes, generation %u\n",
 		   becore->recipe_staged_bytes, BECORE_RECIPE_BYTES,
 		   becore->recipe_generation);
+	seq_printf(s, "gtnr_recipe      %zu/%u bytes, generation %u, encoded %u\n",
+		   becore->gtnr_recipe_staged_bytes, BECORE_GTNR_RECIPE_BYTES,
+		   becore->gtnr_recipe_generation,
+		   becore->gtnr_encoded_generation);
 	seq_printf(s, "mcsc_recipe      %zu/%u bytes, generation %u, encoded %u\n",
 		   becore->mcsc_recipe_staged_bytes, BECORE_MCSC_RECIPE_BYTES,
 		   becore->mcsc_recipe_generation,
@@ -3066,6 +3591,12 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->program[BECORE_YUVP].size,
 		   becore->program[BECORE_YUVP].header_count,
 		   &becore->program[BECORE_YUVP].dma);
+	seq_printf(s, "gtnr_output      %zu bytes, iova %pad\n",
+		   becore->gtnr_output.size, &becore->gtnr_output.dma);
+	seq_printf(s, "gtnr_cmdq        %zu bytes/%u headers, iova %pad\n",
+		   becore->gtnr_program.size,
+		   becore->gtnr_program.header_count,
+		   &becore->gtnr_program.dma);
 	seq_printf(s, "mcsc_output      %zu bytes, iova %pad\n",
 		   becore->mcsc_output.size, &becore->mcsc_output.dma);
 	seq_printf(s, "mcsc_cmdq        %zu bytes/%u headers, iova %pad\n",
@@ -3189,6 +3720,8 @@ static int becore_debugfs_init(struct becore_device *becore)
 		return PTR_ERR(dir);
 	becore->debugfs = dir;
 	debugfs_create_file("program", 0600, dir, becore, &becore_recipe_fops);
+	debugfs_create_file("gtnr_program", 0600, dir, becore,
+			    &becore_gtnr_recipe_fops);
 	debugfs_create_file("mcsc_program", 0600, dir, becore,
 			    &becore_mcsc_recipe_fops);
 	debugfs_create_file("input", 0200, dir, becore, &becore_input_fops);
@@ -3200,6 +3733,10 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_rgbp_encoded_fops);
 	debugfs_create_file("yuvp_cmdq", 0400, dir, becore,
 			    &becore_yuvp_encoded_fops);
+	debugfs_create_file("gtnr_cmdq", 0400, dir, becore,
+			    &becore_gtnr_encoded_fops);
+	debugfs_create_file("gtnr_encode", 0200, dir, becore,
+			    &becore_gtnr_encode_fops);
 	debugfs_create_file("mcsc_cmdq", 0400, dir, becore,
 			    &becore_mcsc_encoded_fops);
 	debugfs_create_file("mcsc_encode", 0200, dir, becore,

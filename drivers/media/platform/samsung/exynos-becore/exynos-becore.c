@@ -3687,11 +3687,11 @@ static void becore_video_fill_pix(struct v4l2_pix_format *pix)
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = becore_mcsc_output.stride;
 	pix->sizeimage = becore_mcsc_output_active_size();
-	/* The captured recipe does not describe its range or YCbCr matrix. */
+	/* The captured recipe uses a full-range BT.601 RGB-to-YUV matrix. */
 	pix->colorspace = V4L2_COLORSPACE_RAW;
 	pix->flags = 0;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 }
 

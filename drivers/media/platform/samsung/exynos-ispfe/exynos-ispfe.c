@@ -538,6 +538,7 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT_RW(311296, ispfe_pdma_seed_1c980000),
 };
 
+#define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_RGB		10
 #define ISPFE_PDMA_OUTPUT_ML0		11
 #define ISPFE_PDMA_OUTPUT_ML2		12
@@ -5037,6 +5038,20 @@ static const struct file_operations ispfe_lmp_rgb_fops = {
 	.llseek = default_llseek,
 };
 
+static ssize_t ispfe_lmp_awb_stats_read(struct file *file, char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	return ispfe_pdma_output_read(file, buf, count, ppos,
+				      ISPFE_PDMA_OUTPUT_AWB);
+}
+
+static const struct file_operations ispfe_lmp_awb_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_lmp_awb_stats_read,
+	.llseek = default_llseek,
+};
+
 static ssize_t ispfe_lmp_ml0_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
@@ -5120,6 +5135,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("blocks", 0644, d, ispfe, &ispfe_blocks_fops);
 	debugfs_create_file("program_override", 0644, d, ispfe,
 			    &ispfe_program_override_fops);
+	debugfs_create_file("lmp_awb_stats", 0444, d, ispfe,
+			    &ispfe_lmp_awb_stats_fops);
 	debugfs_create_file("lmp_rgb", 0444, d, ispfe, &ispfe_lmp_rgb_fops);
 	debugfs_create_file("lmp_ml0", 0444, d, ispfe, &ispfe_lmp_ml0_fops);
 	debugfs_create_file("lmp_ml2", 0444, d, ispfe, &ispfe_lmp_ml2_fops);

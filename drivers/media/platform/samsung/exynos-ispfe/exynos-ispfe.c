@@ -6326,10 +6326,12 @@ static void ispfe_remove(struct platform_device *pdev)
 	int ret;
 
 	debugfs_remove_recursive(ispfe->debugfs);
+	exynos_becore_input_disconnect(ispfe->backend_input);
 
-	/* A debug queue does not belong to the video device, so stop it first. */
+	/* The shared producer queue does not belong to this video device. */
 	scoped_guard(mutex, &ispfe->lock) {
 		if (ispfe->owner == ISPFE_OWNER_BACKEND) {
+			ispfe->backend_queue_consumer = false;
 			spin_lock_irq(&ispfe->slock);
 			ispfe->backend_queue_active = false;
 			spin_unlock_irq(&ispfe->slock);

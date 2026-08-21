@@ -23,12 +23,14 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <media/exynos-becore.h>
@@ -660,9 +662,15 @@ struct exynos_becore_input {
 	struct device *producer;
 	const struct exynos_becore_input_producer_ops *ops;
 	void *producer_data;
+	refcount_t callback_users;
+	wait_queue_head_t callback_wait;
+	bool disconnected;
 	struct sg_table sgts[BECORE_INPUT_SLOT_COUNT];
 	dma_addr_t dmas[BECORE_INPUT_SLOT_COUNT];
 };
+
+static void becore_video_return_all(struct becore_device *becore,
+				    enum vb2_buffer_state state);
 
 static const char * const becore_pm_domain_names[] = {
 	"yuvp",
@@ -2321,6 +2329,8 @@ exynos_becore_input_map(struct device *backend, struct device *producer,
 	input->producer = get_device(producer);
 	input->ops = ops;
 	input->producer_data = producer_data;
+	refcount_set(&input->callback_users, 1);
+	init_waitqueue_head(&input->callback_wait);
 
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_dma_buffer *slot = &becore->inputs[i].buffer;
@@ -2374,6 +2384,81 @@ err_mappings:
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_map);
 
+/**
+ * exynos_becore_input_disconnect() - sever and join the producer callbacks
+ * @input: attachment returned by exynos_becore_input_map()
+ *
+ * No callback can begin after this returns.  An ordinary BE-core stream is
+ * cancelled and errored, but the caller must still quiesce its DMA before
+ * exynos_becore_input_unmap() releases or retains the shared mappings.
+ */
+void exynos_becore_input_disconnect(struct exynos_becore_input *input)
+{
+	struct becore_device *becore;
+	unsigned long flags;
+	bool cancel = false;
+	bool streaming;
+
+	if (!input)
+		return;
+	becore = input->becore;
+
+	mutex_lock(&becore->lock);
+	if (input->disconnected) {
+		mutex_unlock(&becore->lock);
+		wait_event(input->callback_wait,
+			   refcount_read(&input->callback_users) == 1);
+		return;
+	}
+	if (WARN_ON_ONCE(becore->input_producer != input)) {
+		mutex_unlock(&becore->lock);
+		return;
+	}
+
+	input->disconnected = true;
+	becore->input_producer = NULL;
+	streaming = becore->video_streaming;
+	becore->video_streaming = false;
+	becore->producer_streaming = false;
+	spin_lock_irqsave(&becore->run_lock, flags);
+	if (becore->running) {
+		becore->abort_run = true;
+		cancel = true;
+	}
+	spin_unlock_irqrestore(&becore->run_lock, flags);
+	if (cancel)
+		complete(&becore->run_completion);
+	mutex_unlock(&becore->lock);
+
+	cancel_work_sync(&becore->video_work);
+	if (streaming) {
+		vb2_queue_error(&becore->queue);
+		becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
+	}
+	wait_event(input->callback_wait,
+		   refcount_read(&input->callback_users) == 1);
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_disconnect);
+
+static struct exynos_becore_input *
+becore_input_callback_get(struct becore_device *becore)
+{
+	struct exynos_becore_input *input = becore->input_producer;
+
+	lockdep_assert_held(&becore->lock);
+	if (!input || input->disconnected)
+		return NULL;
+	refcount_inc(&input->callback_users);
+
+	return input;
+}
+
+static void becore_input_callback_put(struct exynos_becore_input *input)
+{
+	refcount_dec(&input->callback_users);
+	wake_up_all(&input->callback_wait);
+}
+
 void exynos_becore_input_unmap(struct exynos_becore_input *input)
 {
 	struct becore_device *becore;
@@ -2382,9 +2467,10 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input)
 	if (!input)
 		return;
 	becore = input->becore;
+	exynos_becore_input_disconnect(input);
 
 	mutex_lock(&becore->lock);
-	if (WARN_ON_ONCE(becore->input_producer != input)) {
+	if (WARN_ON_ONCE(!input->disconnected || becore->input_producer)) {
 		mutex_unlock(&becore->lock);
 		return;
 	}
@@ -2411,7 +2497,6 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input)
 			slot->ready_sequence = 0;
 		}
 	}
-	becore->input_producer = NULL;
 	mutex_unlock(&becore->lock);
 
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
@@ -2420,6 +2505,7 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input)
 		sg_free_table(&input->sgts[i]);
 	}
 	put_device(input->producer);
+	WARN_ON_ONCE(!refcount_dec_and_test(&input->callback_users));
 	kfree(input);
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_unmap);
@@ -3453,13 +3539,15 @@ static void becore_video_stop_producer(struct becore_device *becore)
 	mutex_lock(&becore->lock);
 	if (becore->producer_streaming) {
 		becore->producer_streaming = false;
-		input = becore->input_producer;
+		input = becore_input_callback_get(becore);
 	}
 	mutex_unlock(&becore->lock);
 
-	if (input)
-		input->ops->stop_streaming(input->producer_data);
+	if (!input)
+		return;
+	input->ops->stop_streaming(input->producer_data);
 	becore_video_discard_ready(becore);
+	becore_input_callback_put(input);
 }
 
 static void becore_video_fail(struct becore_device *becore,
@@ -3613,7 +3701,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EIO;
 		goto unlock;
 	}
-	input = becore->input_producer;
+	input = becore_input_callback_get(becore);
 	if (!input) {
 		ret = -ENODEV;
 		goto unlock;
@@ -3628,18 +3716,31 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	ret = input->ops->start_streaming(input->producer_data);
 	if (ret) {
+		becore_input_callback_put(input);
 		mutex_lock(&becore->lock);
 		becore->video_streaming = false;
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
-		becore_video_discard_ready(becore);
 		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
 		return ret;
 	}
 
 	mutex_lock(&becore->lock);
-	becore->producer_streaming = true;
+	if (becore->input_producer == input && !input->disconnected &&
+	    becore->video_streaming) {
+		becore->producer_streaming = true;
+	} else {
+		ret = -ENODEV;
+	}
 	mutex_unlock(&becore->lock);
+	if (ret)
+		input->ops->stop_streaming(input->producer_data);
+	becore_input_callback_put(input);
+	if (ret) {
+		cancel_work_sync(&becore->video_work);
+		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
+		return ret;
+	}
 	schedule_work(&becore->video_work);
 
 	return 0;

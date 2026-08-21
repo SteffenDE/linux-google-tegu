@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
+#include <linux/log2.h>
 #include <linux/math.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -165,6 +166,54 @@
  * which the vendor's own field descriptors state; OUT_POINTS needs a register
  * each because 18 bits do not fit beside anything.
  */
+/*
+ * Three RGBP blocks and one YUVP register whose values are named constants
+ * rather than anyone's tuning.
+ *
+ * RGB_RGBTOYUV is BT.601 at Q13, full range rather than studio, and it is
+ * column-major by input channel -- (Y, U, V) of R, then of G, then of B. Read
+ * row-major, six of the nine coefficients look wrong. The coefficients are
+ * kept as exact rationals of Kr = 299/1000 and Kb = 114/1000 so that no float
+ * reaches a register, and Q13 is deliberately not twice the front end's Q12
+ * copy: the two are independent roundings of the same reals.
+ *
+ * YUV444TO422 is [1, 2, 1] / 4 scaled by 32, the classic chroma decimation
+ * filter, written unconditionally with no tuning import anywhere.
+ *
+ * BYR_DNS's binning is Q10 unity -- this path does not bin -- and its radial
+ * centre is the sensor's full array halved and negated. Samsung's own
+ * rgbp_hw_s_dns_size() writes -(full_width >> 1 & ~1) plus the crop as an
+ * offset; the two agree exactly while the crop is centred, which mainline's
+ * is, and becore_rgbp_input is the full array. A crop that was *not* centred
+ * would need the offset term as well, so this is a statement about the current
+ * geometry rather than a general derivation. The noise curve above it is real
+ * tuning and stays.
+ *
+ * SHARPENHANCER's LPF_NORM is log2 of its three low-pass kernels' sums packed
+ * at bits 0, 8 and 16 -- 16, 512 and 4096, which is what the captured taps
+ * really sum to. Note what is and is not checked: the taps themselves stay in
+ * the recipe and are not read here, so the power-of-two test below is a
+ * property of these three constants and not of the kernels. Deriving the sums
+ * from the tap registers would make it a real check, and would want them out
+ * of the recipe first.
+ */
+#define BECORE_RGBP_DNS_BASE		(BECORE_RGBP_PHYS_BASE + 0x3000)
+#define BECORE_RGBP_DNS_BINNING_REG	(BECORE_RGBP_DNS_BASE + 0x1a4)
+#define BECORE_RGBP_DNS_CENTRE_REG	(BECORE_RGBP_DNS_BASE + 0x1c0)
+#define BECORE_RGBP_DNS_BINNING_UNITY	1024	/* Q10 */
+#define BECORE_RGBP_DNS_CENTRE_MASK	GENMASK(14, 0)
+#define BECORE_RGBP_CSC_BASE		(BECORE_RGBP_PHYS_BASE + 0x3b00)
+#define BECORE_RGBP_CSC_FIRST		(BECORE_RGBP_CSC_BASE + 0x00)
+#define BECORE_RGBP_CSC_LAST		(BECORE_RGBP_CSC_BASE + 0x4c)
+#define BECORE_RGBP_CSC_Q		13
+#define BECORE_RGBP_CSC_FIELD_MASK	GENMASK(13, 0)
+#define BECORE_RGBP_CSC_MAX		0xfff	/* full range, not studio */
+#define BECORE_RGBP_CSC_CHROMA_OFFSET	0x800
+#define BECORE_RGBP_CHROMA_LPF_BASE	(BECORE_RGBP_PHYS_BASE + 0x3c00)
+#define BECORE_RGBP_CHROMA_LPF_CTRL_REG	(BECORE_RGBP_CHROMA_LPF_BASE + 0x00)
+#define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
+#define BECORE_RGBP_CHROMA_LPF_LAST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x0c)
+#define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
 /*
  * RGBP's forward gamma is not a tuning curve: at all 65 of its knots the
  * captured output is round(sqrt(x) * 4096) on a 0..4096 input, an exact
@@ -501,7 +550,11 @@ enum becore_generated_kind {
 	BECORE_GEN_BYPASS,	/* an asserted bypass bit */
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
+	BECORE_GEN_CSC,		/* RGB to YUV: BT.601, full range, Q13 */
+	BECORE_GEN_CHROMA_LPF,	/* 4:4:4 to 4:2:2, a fixed binomial filter */
+	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
+	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
@@ -522,8 +575,8 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	236
-#define BECORE_YUVP_GENERATED_WORDS	270
+#define BECORE_RGBP_GENERATED_WORDS	261
+#define BECORE_YUVP_GENERATED_WORDS	271
 #define BECORE_MCSC_GENERATED_WORDS	63
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -539,6 +592,10 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DNS_BINNING_REG, BECORE_RGBP_DNS_BINNING_REG,
+	  BECORE_GEN_DNS_GEOMETRY },
+	{ BECORE_RGBP_DNS_CENTRE_REG, BECORE_RGBP_DNS_CENTRE_REG,
+	  BECORE_GEN_DNS_GEOMETRY },
 	{ BECORE_RGBP_GAMMA_CTRL_FIRST, BECORE_RGBP_GAMMA_CTRL_LAST,
 	  BECORE_GEN_GAMMA },
 	{ BECORE_RGBP_GAMMA_TBL_FIRST, BECORE_RGBP_GAMMA_TBL_LAST,
@@ -548,6 +605,11 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_GAMMA_X_HIGH_FIRST, BECORE_RGBP_GAMMA_X_HIGH_LAST,
 	  BECORE_GEN_GAMMA },
 	{ BECORE_RGBP_GTM_BASE, BECORE_RGBP_GTM_LAST, BECORE_GEN_GTM },
+	{ BECORE_RGBP_CSC_FIRST, BECORE_RGBP_CSC_LAST, BECORE_GEN_CSC },
+	{ BECORE_RGBP_CHROMA_LPF_CTRL_REG, BECORE_RGBP_CHROMA_LPF_CTRL_REG,
+	  BECORE_GEN_CHROMA_LPF },
+	{ BECORE_RGBP_CHROMA_LPF_FIRST, BECORE_RGBP_CHROMA_LPF_LAST,
+	  BECORE_GEN_CHROMA_LPF },
 	{ BECORE_RGBP_DECOMP_BYPASS_REG, BECORE_RGBP_DECOMP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
 	{ BECORE_RGBP_DECOMP_SIZE_REG, BECORE_RGBP_DECOMP_SIZE_REG,
@@ -569,6 +631,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
+	  BECORE_GEN_LPF_NORM },
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_LUMA_FIRST, BECORE_YUVP_LTM_LUMA_LAST,
@@ -1996,6 +2060,134 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/*
+ * BT.601 as exact rationals, column-major by input channel. Kr is 299/1000 and
+ * Kb 114/1000; the chroma rows are those over 2 * (1 - Kb) and 2 * (1 - Kr),
+ * whose denominators are 1772 and 1402.
+ */
+static const struct becore_csc_coefficient {
+	s32 numerator;
+	s32 denominator;
+} becore_csc_matrix[3][3] = {
+	{ { 299, 1000 }, { -299, 1772 }, { 1, 2 } },
+	{ { 587, 1000 }, { -587, 1772 }, { -587, 1402 } },
+	{ { 114, 1000 }, { 1, 2 }, { -114, 1402 } },
+};
+
+/* [1, 2, 1] / 4 scaled by 32, one byte per tap. */
+static const u8 becore_chroma_lpf_taps[] = { 0, 32, 64, 32, 0 };
+
+/* The sharpener's three low-pass kernels sum to these; all powers of two. */
+static const u32 becore_sharpenhancer_lpf_sums[] = { 16, 512, 4096 };
+
+static u32 becore_csc_coefficient(const struct becore_csc_coefficient *coef)
+{
+	s32 magnitude = coef->numerator < 0 ? -coef->numerator : coef->numerator;
+
+	magnitude = (magnitude * (1 << BECORE_RGBP_CSC_Q) * 2 +
+		     coef->denominator) / (2 * coef->denominator);
+	if (coef->numerator < 0)
+		magnitude = -magnitude;
+
+	return magnitude & BECORE_RGBP_CSC_FIELD_MASK;
+}
+
+static int becore_rgbp_csc_value(u32 offset, u32 *value)
+{
+	if (offset & 3)
+		return -EINVAL;
+	if (offset >= 0x04 && offset < 0x28) {
+		u32 index = (offset - 0x04) / 4;
+
+		*value = becore_csc_coefficient(&becore_csc_matrix[index / 3]
+								 [index % 3]);
+		return 0;
+	}
+
+	switch (offset) {
+	case 0x00:		/* BYPASS: the block runs */
+	case 0x28:		/* YMIN */
+	case 0x30:		/* UMIN */
+	case 0x38:		/* VMIN */
+	case 0x40:		/* LS: no post-matrix shift */
+	case 0x44:		/* YOS: full range puts luma's offset at zero */
+		*value = 0;
+		return 0;
+	case 0x2c:		/* YMAX */
+	case 0x34:		/* UMAX */
+	case 0x3c:		/* VMAX */
+		*value = BECORE_RGBP_CSC_MAX;
+		return 0;
+	case 0x48:		/* UOS */
+	case 0x4c:		/* VOS */
+		*value = BECORE_RGBP_CSC_CHROMA_OFFSET;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int becore_rgbp_chroma_lpf_value(u32 offset, u32 *value)
+{
+	u32 packed = 0;
+	size_t i;
+
+	switch (offset) {
+	case 0x00:		/* ISP_BYPASS: the block runs */
+		*value = 0;
+		return 0;
+	case 0x08:		/* COEFFS: the first four taps, one byte each */
+		for (i = 0; i < 4; i++)
+			packed |= (u32)becore_chroma_lpf_taps[i] << (8 * i);
+		*value = packed;
+		return 0;
+	case 0x0c:		/* COEFFS_1: the fifth */
+		*value = becore_chroma_lpf_taps[4];
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int becore_rgbp_dns_geometry_value(u32 offset, u32 *value)
+{
+	s32 x;
+	s32 y;
+
+	switch (offset) {
+	case 0x1a4:		/* BINNING: Q10, x in [0:13], y in [16:29] */
+		*value = (BECORE_RGBP_DNS_BINNING_UNITY << 16) |
+			 BECORE_RGBP_DNS_BINNING_UNITY;
+		return 0;
+	case 0x1c0:		/* RADIAL_CENTER: 15-bit signed, x low, y high */
+		x = -(s32)((becore_rgbp_input.width >> 1) & ~1u);
+		y = -(s32)((becore_rgbp_input.height >> 1) & ~1u);
+		*value = ((y & BECORE_RGBP_DNS_CENTRE_MASK) << 16) |
+			 (x & BECORE_RGBP_DNS_CENTRE_MASK);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/* log2 of each kernel's sum, packed at bits 0, 8 and 16. */
+static int becore_yuvp_lpf_norm_value(u32 *value)
+{
+	u32 packed = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_sharpenhancer_lpf_sums); i++) {
+		u32 total = becore_sharpenhancer_lpf_sums[i];
+
+		if (!is_power_of_2(total))
+			return -EINVAL;
+		packed |= (u32)(ilog2(total)) << (8 * i);
+	}
+	*value = packed;
+
+	return 0;
+}
+
 /* The x grid: finest where a square root moves fastest, tiling Q12 exactly. */
 static int becore_rgbp_gamma_knot(u32 index, u32 *x)
 {
@@ -2384,6 +2576,26 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_DECOMP_SIZE:
 			result = becore_pack_size(becore_rgbp_input.height,
 						  becore_rgbp_input.width);
+			break;
+		case BECORE_GEN_CSC:
+			if (becore_rgbp_csc_value(reg - BECORE_RGBP_CSC_BASE,
+						  &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_CHROMA_LPF:
+			if (becore_rgbp_chroma_lpf_value(reg -
+						BECORE_RGBP_CHROMA_LPF_BASE,
+						&result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_DNS_GEOMETRY:
+			if (becore_rgbp_dns_geometry_value(reg -
+						BECORE_RGBP_DNS_BASE, &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_LPF_NORM:
+			if (becore_yuvp_lpf_norm_value(&result))
+				return -EINVAL;
 			break;
 		case BECORE_GEN_GAMMA:
 			if (becore_rgbp_gamma_value(reg -

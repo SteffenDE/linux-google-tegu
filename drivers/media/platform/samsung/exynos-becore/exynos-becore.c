@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
+#include <linux/math.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -164,6 +165,41 @@
  * which the vendor's own field descriptors state; OUT_POINTS needs a register
  * each because 18 bits do not fit beside anything.
  */
+/*
+ * RGBP's forward gamma is not a tuning curve: at all 65 of its knots the
+ * captured output is round(sqrt(x) * 4096) on a 0..4096 input, an exact
+ * gamma-2.0 encode. It is there to move linear light into a gamma domain for
+ * the blocks downstream -- YUVP's DEGAMMARGB undoes it with an approximate
+ * square, and YUVP's own forward gamma is where the creative tone curve lives.
+ * So this block needs no values from anywhere.
+ *
+ * The grid it is sampled on is the same 65-point grid the vendor's tone curve
+ * uses -- 8 steps of 8, 12 of 16, 8 of 32, 16 of 64 and 20 of 128 at Q12,
+ * tiling 0..4096 exactly and finest near black, where a square root moves
+ * fastest. It is a sampling choice, not a rendering one, and it is not the
+ * hardware's reset grid, which is coarser below 64.
+ *
+ * Two shapes to know. The table has a genuine four-register hole between
+ * logical points 23 and 24 -- 0x37ec jumps to 0x3800 -- so it is written out
+ * as two runs rather than walked by stride. And the 65th knot of each table
+ * would need 1 << 12 exactly, one past its 12-bit field, so the vendor stores
+ * its distance from the 64th in the register after the table, with the sign in
+ * a _DELTA_SIGN that a rising curve never needs.
+ */
+#define BECORE_RGBP_GAMMA_BASE		(BECORE_RGBP_PHYS_BASE + 0x3600)
+#define BECORE_RGBP_GAMMA_CTRL_FIRST	(BECORE_RGBP_GAMMA_BASE + 0x000)
+#define BECORE_RGBP_GAMMA_CTRL_LAST	(BECORE_RGBP_GAMMA_BASE + 0x004)
+#define BECORE_RGBP_GAMMA_TBL_FIRST	(BECORE_RGBP_GAMMA_BASE + 0x00c)
+#define BECORE_RGBP_GAMMA_TBL_LAST	(BECORE_RGBP_GAMMA_BASE + 0x08c)
+#define BECORE_RGBP_GAMMA_X_LOW_FIRST	(BECORE_RGBP_GAMMA_BASE + 0x1c0)
+#define BECORE_RGBP_GAMMA_X_LOW_LAST	(BECORE_RGBP_GAMMA_BASE + 0x1ec)
+#define BECORE_RGBP_GAMMA_X_HIGH_FIRST	(BECORE_RGBP_GAMMA_BASE + 0x200)
+#define BECORE_RGBP_GAMMA_X_HIGH_LAST	(BECORE_RGBP_GAMMA_BASE + 0x254)
+#define BECORE_RGBP_GAMMA_KNOTS		65
+#define BECORE_RGBP_GAMMA_SEGMENTS	(BECORE_RGBP_GAMMA_KNOTS - 1)
+#define BECORE_RGBP_GAMMA_Q		12
+/* The grid is stored at Q12; the block is told to meet its wider input. */
+#define BECORE_RGBP_GAMMA_X_LSHIFT	5
 #define BECORE_RGBP_GTM_BASE		(BECORE_RGBP_PHYS_BASE + 0x3900)
 #define BECORE_RGBP_GTM_LAST		(BECORE_RGBP_PHYS_BASE + 0x3a94)
 #define BECORE_RGBP_GTM_BYPASS		0x000
@@ -465,6 +501,7 @@ enum becore_generated_kind {
 	BECORE_GEN_BYPASS,	/* an asserted bypass bit */
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
+	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
@@ -485,7 +522,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	167
+#define BECORE_RGBP_GENERATED_WORDS	236
 #define BECORE_YUVP_GENERATED_WORDS	270
 #define BECORE_MCSC_GENERATED_WORDS	63
 
@@ -502,6 +539,14 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_GAMMA_CTRL_FIRST, BECORE_RGBP_GAMMA_CTRL_LAST,
+	  BECORE_GEN_GAMMA },
+	{ BECORE_RGBP_GAMMA_TBL_FIRST, BECORE_RGBP_GAMMA_TBL_LAST,
+	  BECORE_GEN_GAMMA },
+	{ BECORE_RGBP_GAMMA_X_LOW_FIRST, BECORE_RGBP_GAMMA_X_LOW_LAST,
+	  BECORE_GEN_GAMMA },
+	{ BECORE_RGBP_GAMMA_X_HIGH_FIRST, BECORE_RGBP_GAMMA_X_HIGH_LAST,
+	  BECORE_GEN_GAMMA },
 	{ BECORE_RGBP_GTM_BASE, BECORE_RGBP_GTM_LAST, BECORE_GEN_GTM },
 	{ BECORE_RGBP_DECOMP_BYPASS_REG, BECORE_RGBP_DECOMP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
@@ -1951,6 +1996,146 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* The x grid: finest where a square root moves fastest, tiling Q12 exactly. */
+static int becore_rgbp_gamma_knot(u32 index, u32 *x)
+{
+	static const struct {
+		u8 count;
+		u16 step;
+	} segments[] = {
+		{ 8, 8 }, { 12, 16 }, { 8, 32 }, { 16, 64 }, { 20, 128 },
+	};
+	u32 value = 0;
+	size_t i;
+
+	/*
+	 * The grid tiles 0..1 << Q exactly, and index 64 relies on falling out
+	 * of the loop below with nothing left. A miscount here would be silent
+	 * -- the recipe carries zero for these words -- so make it loud.
+	 */
+	static_assert(8 + 12 + 8 + 16 + 20 == BECORE_RGBP_GAMMA_SEGMENTS);
+	static_assert(8 * 8 + 12 * 16 + 8 * 32 + 16 * 64 + 20 * 128 ==
+		      1 << BECORE_RGBP_GAMMA_Q);
+
+	for (i = 0; i < ARRAY_SIZE(segments); i++) {
+		if (index < segments[i].count) {
+			*x = value + index * segments[i].step;
+			return 0;
+		}
+		value += segments[i].count * segments[i].step;
+		index -= segments[i].count;
+	}
+	if (index)
+		return -EINVAL;
+	*x = value;		/* the 65th knot closes the grid at 1 << Q */
+
+	return 0;
+}
+
+/* round(sqrt(x / 4096) * 4096), which is exactly round(sqrt(x << 12)). */
+static u32 becore_rgbp_gamma_encode(u32 x)
+{
+	u32 n = x << BECORE_RGBP_GAMMA_Q;
+	u32 root = int_sqrt(n);
+
+	return n - root * root > root ? root + 1 : root;
+}
+
+static int becore_rgbp_gamma_point(u32 index, bool encode, u32 *value)
+{
+	u32 x;
+	int ret;
+
+	if (index >= BECORE_RGBP_GAMMA_KNOTS)
+		return -EINVAL;
+	ret = becore_rgbp_gamma_knot(index, &x);
+	if (ret)
+		return ret;
+	*value = encode ? becore_rgbp_gamma_encode(x) : x;
+
+	return 0;
+}
+
+/* Two points per register, the lower-numbered one in the low half. */
+static int becore_rgbp_gamma_pair(u32 index, bool encode, u32 *value)
+{
+	u32 low;
+	u32 high;
+	int ret;
+
+	ret = becore_rgbp_gamma_point(index, encode, &low);
+	if (ret)
+		return ret;
+	ret = becore_rgbp_gamma_point(index + 1, encode, &high);
+	if (ret)
+		return ret;
+	*value = (high << 16) | low;
+
+	return 0;
+}
+
+/*
+ * The 65th point, as its distance from the 64th: it does not fit the field.
+ *
+ * The vendor stores a magnitude and puts the direction in a separate
+ * _DELTA_SIGN register. Neither of these curves falls, so that register stays
+ * unwritten -- but take the magnitude rather than the difference anyway, so a
+ * curve that did fall would encode a small number here instead of wrapping.
+ */
+static int becore_rgbp_gamma_delta(bool encode, u32 *value)
+{
+	u32 last;
+	u32 prev;
+	int ret;
+
+	ret = becore_rgbp_gamma_point(BECORE_RGBP_GAMMA_KNOTS - 1, encode, &last);
+	if (ret)
+		return ret;
+	ret = becore_rgbp_gamma_point(BECORE_RGBP_GAMMA_KNOTS - 2, encode, &prev);
+	if (ret)
+		return ret;
+	*value = last > prev ? last - prev : prev - last;
+
+	return 0;
+}
+
+static int becore_rgbp_gamma_value(u32 offset, u32 *value)
+{
+	if (offset & 3)
+		return -EINVAL;
+
+	switch (offset) {
+	case 0x000:		/* BYPASS: the block runs */
+	case 0x004:		/* PEDESTAL_EN */
+		*value = 0;
+		return 0;
+	case 0x08c:		/* R_GAMMA_TBL last-knot delta */
+		return becore_rgbp_gamma_delta(true, value);
+	case 0x250:		/* X_PNTS_TBL last-knot delta */
+		return becore_rgbp_gamma_delta(false, value);
+	case 0x254:		/* X_PNTS_LSHIFT */
+		*value = BECORE_RGBP_GAMMA_X_LSHIFT;
+		return 0;
+	}
+
+	if (offset >= 0x00c && offset < 0x08c)
+		return becore_rgbp_gamma_pair((offset - 0x00c) / 4 * 2, true,
+					      value);
+	if (offset >= 0x1c0 && offset <= 0x1ec)
+		return becore_rgbp_gamma_pair((offset - 0x1c0) / 4 * 2, false,
+					      value);
+	/*
+	 * The four-register hole between points 23 and 24 is 0x1f0..0x1fc. No
+	 * range covers it and the capture writes nothing there, so it is never
+	 * asked for; if it were, the -EINVAL below would reject it.
+	 */
+	if (offset >= 0x200 && offset < 0x250)
+		return becore_rgbp_gamma_pair((offset - 0x200) / 4 * 2 + 24,
+					      false, value);
+
+	return -EINVAL;
+}
+
 static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 {
 	u32 knot;
@@ -2199,6 +2384,12 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_DECOMP_SIZE:
 			result = becore_pack_size(becore_rgbp_input.height,
 						  becore_rgbp_input.width);
+			break;
+		case BECORE_GEN_GAMMA:
+			if (becore_rgbp_gamma_value(reg -
+						    BECORE_RGBP_GAMMA_BASE,
+						    &result))
+				return -EINVAL;
 			break;
 		case BECORE_GEN_GTM:
 			if (becore_rgbp_gtm_value(reg - BECORE_RGBP_GTM_BASE,

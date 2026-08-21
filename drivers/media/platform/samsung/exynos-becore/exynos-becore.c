@@ -197,6 +197,75 @@
  * from the tap registers would make it a real check, and would want them out
  * of the recipe first.
  */
+/*
+ * Two blocks whose captured words are literal constants rather than a scene.
+ *
+ * MCSC's DJAG runs at a neutral profile, and the thirteen words stated here
+ * have three separate provenances -- worth keeping apart, because they are not
+ * equally strong:
+ *
+ *  - Seven are Samsung's init_djag_cfgs in is-hw-djag-v2.c *and* the POR reset
+ *    value is-sfr-mcsc-v10_1.h gives for the same field: the three LFSR seeds,
+ *    the two dither-ramp words, the saturation/dither thresholds and the
+ *    coring threshold. Two independent sources agreeing is the strongest case
+ *    in this file.
+ *  - Three are POR only, because init_djag_cfgs has no such field: both
+ *    pre-scaler phase offsets and the round mode. Samsung's own code writes
+ *    them as hardcoded literals rather than from a setfile.
+ *  - Three are neither, and are stated from what the block is being asked to
+ *    do. CTRL is 0x403 because is_scaler_set_djag_enable() sets exactly bits
+ *    0, 1 and 10 from one enable and every other bit is POR-clear: DJAG, its
+ *    pre-scaler and EZ post are on. RECOM_CTRL and RECOM_WEIGHT are zero
+ *    because the detail-restoration sub-block is off -- and it is off by two
+ *    independent signals, its control clear *and* its weight zero where POR is
+ *    0x400. Two signals rather than one is what makes that a fact rather than
+ *    a hypothesis; a lone enable bit is exactly what misled us about YUVP's
+ *    tone mapping.
+ *
+ * What stays in the recipe is not all "differs from the profile". The
+ * shooting-detection thresholds, the cross-filter weights, CP_ARBI's mode, the
+ * dither white/black guard band and RECOM's biquad shift do differ, and they
+ * are keyed on a scaling ratio we hold one row of. But six of RECOM's radial
+ * registers are already at POR and are left alone only because a disabled
+ * sub-block's radial configuration is not worth a claim.
+ *
+ * RGBP's DMSC is a real demosaic and most of it is tuning. Fourteen registers
+ * are literals GetDefaultDmsc writes *after* the tuning path has run, so they
+ * do not vary with the scene. Three cautions:
+ *
+ *  - Unlike DJAG these are the vendor's compiled-in defaults and not a
+ *    hardware reset state, since RGBP v1.20 publishes no POR values. They are
+ *    a bring-up default under ADR 0009, not a derivation.
+ *  - GetDefaultDmsc writes 23 such literals, not fourteen. The rest are left
+ *    in the recipe; this is a conservative subset, not the whole set.
+ *  - Every one is a read-modify-write. For thirteen the preserved bits are
+ *    reserved and the literal determines every defined field. BASE_CONFIG is
+ *    the exception: it preserves bit 0 and bit 16, and bit 16 is a real field,
+ *    SKIP_BYR2RGB_EN. Its captured 0x36a therefore also asserts that the
+ *    tuning path left those two clear.
+ *
+ * EDGE_DESAT_RED_PRESERVE_GAIN looks like it belongs to that group and does
+ * not: TranslateDmsc computes it as clamp(f * 1023, 0, 0x3ff) into a 10-bit
+ * field, so it is tuning that happens to be 0x100 here. It stays in the
+ * recipe.
+ *
+ * Watch the name: GetDefaultDmsc(DmscRgbpOutput&) is a different function from
+ * the front end's, which takes a DmscOutput& and programs ISPFE.
+ */
+#define BECORE_MCSC_DJAG_BASE		(BECORE_MCSC_PHYS_BASE + 0x4000)
+#define BECORE_MCSC_DJAG_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x000)
+#define BECORE_MCSC_DJAG_PS_FIRST	(BECORE_MCSC_DJAG_BASE + 0x01c)
+#define BECORE_MCSC_DJAG_PS_LAST	(BECORE_MCSC_DJAG_BASE + 0x024)
+#define BECORE_MCSC_DJAG_TUNE_FIRST	(BECORE_MCSC_DJAG_BASE + 0x050)
+#define BECORE_MCSC_DJAG_TUNE_LAST	(BECORE_MCSC_DJAG_BASE + 0x068)
+#define BECORE_MCSC_DJAG_RECOM_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x080)
+#define BECORE_MCSC_DJAG_RECOM_WEIGHT_REG (BECORE_MCSC_DJAG_BASE + 0x088)
+#define BECORE_DJAG_DITHER_FIELD_BITS	6
+#define BECORE_DJAG_SAT_CTRL		5
+#define BECORE_DJAG_DITHER_THRES	5
+#define BECORE_DJAG_DITHER_THRES_SHIFT	14
+#define BECORE_DJAG_CP_HF_THRES		40
+#define BECORE_RGBP_DMSC_BASE		(BECORE_RGBP_PHYS_BASE + 0x3000)
 #define BECORE_RGBP_DNS_BASE		(BECORE_RGBP_PHYS_BASE + 0x3000)
 #define BECORE_RGBP_DNS_BINNING_REG	(BECORE_RGBP_DNS_BASE + 0x1a4)
 #define BECORE_RGBP_DNS_CENTRE_REG	(BECORE_RGBP_DNS_BASE + 0x1c0)
@@ -552,6 +621,8 @@ enum becore_generated_kind {
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
 	BECORE_GEN_CSC,		/* RGB to YUV: BT.601, full range, Q13 */
 	BECORE_GEN_CHROMA_LPF,	/* 4:4:4 to 4:2:2, a fixed binomial filter */
+	BECORE_GEN_DJAG,	/* MCSC DJAG at Samsung's neutral profile */
+	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
@@ -575,9 +646,9 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	261
+#define BECORE_RGBP_GENERATED_WORDS	275
 #define BECORE_YUVP_GENERATED_WORDS	271
-#define BECORE_MCSC_GENERATED_WORDS	63
+#define BECORE_MCSC_GENERATED_WORDS	76
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -592,6 +663,28 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DMSC_BASE + 0x20c, BECORE_RGBP_DMSC_BASE + 0x20c,
+	  BECORE_GEN_DMSC },			/* BASE_CONFIG */
+	{ BECORE_RGBP_DMSC_BASE + 0x238, BECORE_RGBP_DMSC_BASE + 0x238,
+	  BECORE_GEN_DMSC },			/* EXTRACT_COLORS_CONFIG */
+	{ BECORE_RGBP_DMSC_BASE + 0x24c, BECORE_RGBP_DMSC_BASE + 0x250,
+	  BECORE_GEN_DMSC },			/* GREEN_HUE, GREEN_SAT */
+	{ BECORE_RGBP_DMSC_BASE + 0x258, BECORE_RGBP_DMSC_BASE + 0x258,
+	  BECORE_GEN_DMSC },			/* POST_PROCESS_CONFIG */
+	{ BECORE_RGBP_DMSC_BASE + 0x264, BECORE_RGBP_DMSC_BASE + 0x264,
+	  BECORE_GEN_DMSC },			/* DIR_DETECT_SELECTION */
+	{ BECORE_RGBP_DMSC_BASE + 0x26c, BECORE_RGBP_DMSC_BASE + 0x274,
+	  BECORE_GEN_DMSC },			/* ADD_COLORS_GREEN..SHARPENING */
+	{ BECORE_RGBP_DMSC_BASE + 0x288, BECORE_RGBP_DMSC_BASE + 0x288,
+	  BECORE_GEN_DMSC },			/* NEAR_EDGE_DESAT_EN */
+	{ BECORE_RGBP_DMSC_BASE + 0x2a0, BECORE_RGBP_DMSC_BASE + 0x2a0,
+	  BECORE_GEN_DMSC },			/* RED_PRESERVE_EN; its GAIN
+						 * at 0x2a4 is tuning
+						 */
+	{ BECORE_RGBP_DMSC_BASE + 0x2a8, BECORE_RGBP_DMSC_BASE + 0x2ac,
+	  BECORE_GEN_DMSC },			/* RED_PRESERVE_THRES, _LIMIT */
+	{ BECORE_RGBP_DMSC_BASE + 0x2b4, BECORE_RGBP_DMSC_BASE + 0x2b4,
+	  BECORE_GEN_DMSC },			/* ADD_YBLUR */
 	{ BECORE_RGBP_DNS_BINNING_REG, BECORE_RGBP_DNS_BINNING_REG,
 	  BECORE_GEN_DNS_GEOMETRY },
 	{ BECORE_RGBP_DNS_CENTRE_REG, BECORE_RGBP_DNS_CENTRE_REG,
@@ -646,6 +739,16 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 };
 
 static const struct becore_generated_range becore_mcsc_generated[] = {
+	{ BECORE_MCSC_DJAG_CTRL_REG, BECORE_MCSC_DJAG_CTRL_REG,
+	  BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_PS_FIRST, BECORE_MCSC_DJAG_PS_LAST,
+	  BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_TUNE_FIRST, BECORE_MCSC_DJAG_TUNE_LAST,
+	  BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_RECOM_CTRL_REG, BECORE_MCSC_DJAG_RECOM_CTRL_REG,
+	  BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_RECOM_WEIGHT_REG, BECORE_MCSC_DJAG_RECOM_WEIGHT_REG,
+	  BECORE_GEN_DJAG },
 	{ BECORE_MCSC_SC0_SRC_POS_REG, BECORE_MCSC_SC0_SRC_POS_REG,
 	  BECORE_GEN_CHAIN_ORIGIN },
 	{ BECORE_MCSC_SC0_SRC_SIZE_REG, BECORE_MCSC_SC0_DST_SIZE_REG,
@@ -2060,6 +2163,92 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* Samsung's init_djag_cfgs, which is also this field's POR reset value. */
+static const u16 becore_djag_lfsr_seeds[] = { 44257, 4671, 47792 };
+static const u8 becore_djag_dither_ramp[] = { 0, 0, 1, 2, 3, 4, 6, 7, 8 };
+
+/*
+ * The literals GetDefaultDmsc(DmscRgbpOutput&) writes once the tuning path has
+ * run, so they are the same whatever the scene was.
+ */
+static const struct becore_regval becore_dmsc_defaults[] = {
+	{ 0x20c, 0x36a },		/* BASE_CONFIG */
+	{ 0x238, 0x07f },		/* EXTRACT_COLORS_CONFIG */
+	{ 0x24c, 0x00d500b4 },		/* GREEN_HUE: min 0xb4, max 0xd5 */
+	{ 0x250, 0x0dac0046 },		/* GREEN_SAT: min 0x46, max 0xdac */
+	{ 0x258, 0xfff },		/* POST_PROCESS_CONFIG */
+	{ 0x264, 0x508 },		/* DIR_DETECT_SELECTION */
+	{ 0x26c, 0x000600a0 },		/* ADD_COLORS_GREEN */
+	{ 0x270, 0x120 },		/* FALSE_COLORS */
+	{ 0x274, 0x003 },		/* SHARPENING_CONFIG */
+	{ 0x288, 0x001 },		/* NEAR_EDGE_DESAT_EN */
+	{ 0x2a0, 0x001 },		/* EDGE_DESAT_RED_PRESERVE_EN */
+	{ 0x2a8, 0x000 },		/* EDGE_DESAT_RED_PRESERVE_THRES */
+	{ 0x2ac, 0x800 },		/* EDGE_DESAT_RED_PRESERVE_LIMIT */
+	{ 0x2b4, 0x011 },		/* ADD_YBLUR */
+};
+
+static int becore_mcsc_djag_value(u32 offset, u32 *value)
+{
+	u32 packed = 0;
+	u32 first;
+	u32 count;
+	u32 i;
+
+	switch (offset) {
+	case 0x000:		/* CTRL: DJAG, its pre-scaler and EZ post on */
+		*value = BIT(0) | BIT(1) | BIT(10);
+		return 0;
+	case 0x01c:		/* PS_H_INIT_PHASE_OFFSET */
+	case 0x020:		/* PS_V_INIT_PHASE_OFFSET */
+	case 0x080:		/* RECOM_CTRL: detail restoration is off */
+	case 0x088:		/* RECOM_WEIGHT: and off by its weight too */
+		*value = 0;
+		return 0;
+	case 0x024:		/* PS_ROUND_MODE */
+		*value = 1;
+		return 0;
+	case 0x050:		/* LFSR_SEED_0 */
+	case 0x054:		/* LFSR_SEED_1 */
+	case 0x058:		/* LFSR_SEED_2 */
+		*value = becore_djag_lfsr_seeds[(offset - 0x050) / 4];
+		return 0;
+	case 0x05c:		/* DITHER_VALUE_04: five 6-bit steps */
+	case 0x060:		/* DITHER_VALUE_58: the remaining four */
+		first = offset == 0x05c ? 0 : 5;
+		count = offset == 0x05c ? 5 : 4;
+		for (i = 0; i < count; i++)
+			packed |= (u32)becore_djag_dither_ramp[first + i] <<
+				  (BECORE_DJAG_DITHER_FIELD_BITS * i);
+		*value = packed;
+		return 0;
+	case 0x064:		/* DITHER_THRES, which also carries SAT_CTRL */
+		*value = BECORE_DJAG_SAT_CTRL |
+			 BECORE_DJAG_DITHER_THRES <<
+			 BECORE_DJAG_DITHER_THRES_SHIFT;
+		return 0;
+	case 0x068:		/* CP_HF_THRES */
+		*value = BECORE_DJAG_CP_HF_THRES;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int becore_rgbp_dmsc_value(u32 offset, u32 *value)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_dmsc_defaults); i++) {
+		if (becore_dmsc_defaults[i].offset != offset)
+			continue;
+		*value = becore_dmsc_defaults[i].value;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 /*
  * BT.601 as exact rationals, column-major by input channel. Kr is 299/1000 and
  * Kb 114/1000; the chroma rows are those over 2 * (1 - Kb) and 2 * (1 - Kr),
@@ -2576,6 +2765,16 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_DECOMP_SIZE:
 			result = becore_pack_size(becore_rgbp_input.height,
 						  becore_rgbp_input.width);
+			break;
+		case BECORE_GEN_DJAG:
+			if (becore_mcsc_djag_value(reg - BECORE_MCSC_DJAG_BASE,
+						   &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_DMSC:
+			if (becore_rgbp_dmsc_value(reg - BECORE_RGBP_DMSC_BASE,
+						   &result))
+				return -EINVAL;
 			break;
 		case BECORE_GEN_CSC:
 			if (becore_rgbp_csc_value(reg - BECORE_RGBP_CSC_BASE,

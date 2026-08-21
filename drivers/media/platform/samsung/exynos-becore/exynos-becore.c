@@ -84,7 +84,15 @@
 #define BECORE_CMDQ_PAYLOAD_BYTES	64
 #define BECORE_CMDQ_MODE		0x9000
 
-#define BECORE_GRID_SIZE			0x18000
+/* Fixed neutral LTM policy for the proven 4000x3000 processing profile. */
+#define BECORE_LTM_GRID_ROW_BYTES	0x800
+#define BECORE_LTM_GRID_ROWS		48
+#define BECORE_LTM_GRID_CELL_BYTES	0x100
+#define BECORE_LTM_GRID_WIDTH_CELLS	4
+#define BECORE_LTM_GRID_HEIGHT_CELLS	24
+#define BECORE_LTM_UNITY_Q14		BIT(14)
+#define BECORE_GRID_SIZE			(BECORE_LTM_GRID_ROW_BYTES * \
+					 BECORE_LTM_GRID_ROWS)
 #define BECORE_RUN_TIMEOUT_MS		1000
 
 #define BECORE_RGBP_PHYS_BASE		0x1c440000
@@ -522,6 +530,20 @@ struct becore_dma_buffer {
 	struct sg_table *sgt;
 };
 
+struct becore_ltm_gain_offset_group {
+	__le16 gain[4];
+	__le16 offset[4];
+};
+
+#define BECORE_LTM_GRID_GROUPS_PER_CELL \
+	(BECORE_LTM_GRID_CELL_BYTES / \
+	 sizeof(struct becore_ltm_gain_offset_group))
+
+struct becore_ltm_grid_cell {
+	struct becore_ltm_gain_offset_group
+		groups[BECORE_LTM_GRID_GROUPS_PER_CELL];
+};
+
 enum becore_input_slot_state {
 	BECORE_INPUT_FREE,
 	BECORE_INPUT_PRODUCER,
@@ -624,6 +646,7 @@ struct becore_device {
 	u32 gtnr_encoded_generation;
 	u32 mcsc_recipe_generation;
 	u32 mcsc_encoded_generation;
+	u32 grid_generation;
 	u32 run_generation;
 	u32 completed_generation;
 	u32 video_sequence;
@@ -2183,6 +2206,50 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 	return 0;
 }
 
+static int becore_ltm_grid_generate(struct becore_device *becore)
+{
+	struct becore_dma_buffer *grid = &becore->grid;
+	u32 row, column, group, channel;
+
+	static_assert(sizeof(struct becore_ltm_grid_cell) ==
+		      BECORE_LTM_GRID_CELL_BYTES);
+	if (!grid->cpu || grid->size != BECORE_GRID_SIZE ||
+	    BECORE_LTM_GRID_WIDTH_CELLS * BECORE_LTM_GRID_CELL_BYTES >
+		BECORE_LTM_GRID_ROW_BYTES ||
+	    BECORE_LTM_GRID_HEIGHT_CELLS > BECORE_LTM_GRID_ROWS)
+		return -EINVAL;
+
+	/*
+	 * Lyric's LTM translator stores four Q14 gains followed by four signed
+	 * offsets in each 16-byte group.  Unity gains and zero offsets provide a
+	 * neutral policy surface; inactive cells and physical-row padding stay 0.
+	 */
+	memset(grid->cpu, 0, grid->size);
+	for (row = 0; row < BECORE_LTM_GRID_HEIGHT_CELLS; row++) {
+		u8 *row_base = (u8 *)grid->cpu +
+			       row * BECORE_LTM_GRID_ROW_BYTES;
+
+		for (column = 0; column < BECORE_LTM_GRID_WIDTH_CELLS;
+		     column++) {
+			struct becore_ltm_grid_cell *cell =
+				(void *)(row_base +
+					 column * BECORE_LTM_GRID_CELL_BYTES);
+
+			for (group = 0; group < ARRAY_SIZE(cell->groups); group++)
+				for (channel = 0;
+				     channel < ARRAY_SIZE(cell->groups[group].gain);
+				     channel++)
+					cell->groups[group].gain[channel] =
+						cpu_to_le16(BECORE_LTM_UNITY_Q14);
+		}
+	}
+
+	grid->staged_bytes = grid->size;
+	becore->grid_generation = 1;
+
+	return 0;
+}
+
 static void becore_free_shared_input(void *data)
 {
 	struct becore_device *becore = data;
@@ -2300,6 +2367,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      BECORE_GRID_SIZE, "YUVP grid");
 	if (ret)
 		return ret;
+	ret = becore_ltm_grid_generate(becore);
+	if (ret)
+		return dev_err_probe(becore->dev, ret,
+				     "cannot generate neutral YUVP grid\n");
 	ret = becore_alloc_dma_buffer(becore, &becore->output,
 				      output_size, "YUVP output");
 	if (ret)
@@ -2911,7 +2982,8 @@ static ssize_t becore_grid_write(struct file *file, const char __user *buf,
 
 	return becore_stage_write(becore, buf, count, ppos,
 				  becore->grid.cpu, becore->grid.size,
-				  &becore->grid.staged_bytes, NULL);
+				  &becore->grid.staged_bytes,
+				  &becore->grid_generation);
 }
 
 static const struct file_operations becore_grid_fops = {
@@ -4010,8 +4082,9 @@ static int becore_status_show(struct seq_file *s, void *unused)
 				   &becore->input_producer->dmas[i]);
 		seq_putc(s, '\n');
 	}
-	seq_printf(s, "grid             %zu/%zu bytes, iova %pad\n",
+	seq_printf(s, "grid             %zu/%zu bytes, generation %u, iova %pad\n",
 		   becore->grid.staged_bytes, becore->grid.size,
+		   becore->grid_generation,
 		   &becore->grid.dma);
 	seq_printf(s, "output           %zu active/%zu completed/%zu allocated bytes, iova %pad\n",
 		   becore->active_output_size, becore->completed_output_size,

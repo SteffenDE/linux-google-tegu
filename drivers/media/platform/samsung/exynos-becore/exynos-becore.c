@@ -488,9 +488,10 @@
 #define BECORE_YUVP_LTM_UNITY_LAST	(BECORE_YUVP_LTM_BASE + 0x6d4)
 /*
  * The grid is a fixed 32 x 24 x 8 bilateral grid: 32 * 24 * 8 cells of eight
- * shorts is 49152, exactly the array YuvpLtmBlock::ConfigureWith carries. On a
- * 4:3 frame its cells are square, which is why the horizontal and vertical
- * reciprocals below come out equal and why this looked unsolvable.
+ * shorts is 49152, exactly the array YuvpLtmBlock::ConfigureWith carries. It
+ * keeps that shape whatever the frame is, so its cells are square only on a
+ * 4:3 one -- which is why the horizontal and vertical steps below come out
+ * equal here and why this looked like one number for a while.
  */
 #define BECORE_LTM_LUMA_Q12_R		1225
 #define BECORE_LTM_LUMA_Q12_G		2404
@@ -2366,23 +2367,37 @@ static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
  * the luma weights, the grid the frame is divided into and the vendor's own
  * unity fills are all stateable.
  */
+/*
+ * How far the block steps through the grid per raster pixel, at Q16.
+ *
+ * The reciprocal of a cell size is *not* this: the two agree only where the
+ * cells divide the raster exactly, and 32 columns over 2608 gives 804 where
+ * 65536 / (2608 / 32) gives 809. The grid is 32 x 24 x 8 at every readout the
+ * vendor was captured at, 16:9 ones included, so its cells are square only on
+ * a 4:3 frame and the horizontal and vertical steps are independent. The
+ * half-step is the floor of half the step.
+ */
+static int becore_ltm_grid_scale(u32 cells, u32 extent, u32 *scale)
+{
+	u32 step;
+
+	if (!extent)
+		return -EINVAL;
+	step = (u32)DIV_ROUND_CLOSEST_ULL((u64)cells << 16, extent);
+	if (step > U16_MAX)
+		return -ERANGE;
+	*scale = step;
+
+	return 0;
+}
+
 static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 {
-	u32 cell;
+	u32 scale;
+	int ret;
 
 	if (offset & 3)
 		return -EINVAL;
-	/*
-	 * The grid's cells are square on a 4:3 frame, which is why the
-	 * horizontal and vertical reciprocals below come out equal. A geometry
-	 * where they are not would need two of them and would mean the frame
-	 * is no longer 4:3, so refuse the whole block rather than program half
-	 * a grid -- and refuse it here rather than only when a reciprocal is
-	 * asked for, so this matches the generator that checks these values.
-	 */
-	cell = becore_rgbp_out_width() / BECORE_LTM_SLCGRID_COLUMNS;
-	if (!cell || cell != becore_rgbp_out_height() / BECORE_LTM_SLCGRID_ROWS)
-		return -ERANGE;
 
 	switch (offset) {
 	case 0x000:				/* LTM_ENABLE: the block runs */
@@ -2424,15 +2439,23 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 		return 0;
 	}
 
-	/* The remaining four are the reciprocals it steps the grid with. */
+	/* The remaining four are the steps it walks the grid with. */
 	switch (offset) {
 	case 0x134:				/* SLCGRID_GRID_X_SCALE */
-	case 0x13c:				/* SLCGRID_GRID_Y_SCALE */
-		*value = 65536 / cell;
+	case 0x138:				/* ..._X_SCALE_HALF */
+		ret = becore_ltm_grid_scale(BECORE_LTM_SLCGRID_COLUMNS,
+					    becore_rgbp_out_width(), &scale);
+		if (ret)
+			return ret;
+		*value = offset == 0x134 ? scale : scale >> 1;
 		return 0;
-	case 0x138:				/* SLCGRID_GRID_X_SCALE_HALF */
-	case 0x140:				/* SLCGRID_GRID_Y_SCALE_HALF */
-		*value = 32768 / cell;
+	case 0x13c:				/* SLCGRID_GRID_Y_SCALE */
+	case 0x140:				/* ..._Y_SCALE_HALF */
+		ret = becore_ltm_grid_scale(BECORE_LTM_SLCGRID_ROWS,
+					    becore_rgbp_out_height(), &scale);
+		if (ret)
+			return ret;
+		*value = offset == 0x13c ? scale : scale >> 1;
 		return 0;
 	}
 

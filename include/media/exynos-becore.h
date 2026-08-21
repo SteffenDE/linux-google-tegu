@@ -9,8 +9,21 @@ struct device;
 /* Private attachment returned to one camera-front-end producer. */
 struct exynos_becore_input;
 
+#define EXYNOS_BECORE_WBG_GAIN_MIN_Q12		1U
+#define EXYNOS_BECORE_WBG_GAIN_MAX_Q12		32751U
+#define EXYNOS_BECORE_WBG_RED_DEFAULT_Q12	8473U
+#define EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12	6851U
+
+/* Stream-latched semantic policy passed to the attached front end. */
+struct exynos_becore_input_stream_config {
+	/* Unsigned Q12 gains; green channels remain normalized to unity. */
+	u32 red_balance;
+	u32 blue_balance;
+};
+
 struct exynos_becore_input_producer_ops {
-	int (*start_streaming)(void *data);
+	int (*start_streaming)(void *data,
+			       const struct exynos_becore_input_stream_config *config);
 	void (*stop_streaming)(void *data);
 };
 

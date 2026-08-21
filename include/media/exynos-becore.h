@@ -9,6 +9,11 @@ struct device;
 /* Private attachment returned to one camera-front-end producer. */
 struct exynos_becore_input;
 
+struct exynos_becore_input_producer_ops {
+	int (*start_streaming)(void *data);
+	void (*stop_streaming)(void *data);
+};
+
 /* One driver-owned input slot reserved for a front-end producer. */
 struct exynos_becore_input_buffer {
 	dma_addr_t dma;
@@ -18,7 +23,9 @@ struct exynos_becore_input_buffer {
 };
 
 struct exynos_becore_input *
-exynos_becore_input_map(struct device *backend, struct device *producer);
+exynos_becore_input_map(struct device *backend, struct device *producer,
+			const struct exynos_becore_input_producer_ops *ops,
+			void *producer_data);
 void exynos_becore_input_unmap(struct exynos_becore_input *input);
 
 size_t exynos_becore_input_size(struct exynos_becore_input *input);

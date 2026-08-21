@@ -3345,16 +3345,32 @@ static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 }
 
 /*
- * Below DJAG the chain neither crops nor scales, so its stages map the output
- * raster onto itself. Going through the ratio helper rather than writing a
- * literal unity keeps this in the form every other ratio is written in, so a
- * stage that starts scaling shows up as a changed value here -- and takes its
- * filter coefficients with it.
+ * DJAG is the stage that crops and scales on this path, so what it hands down
+ * is already the output raster: there is exactly one raster below it, and
+ * POLY_SC0 and POST_PC0 map that raster onto itself. Their ratio is therefore
+ * unity by construction rather than by measurement, and this cannot be
+ * written as a ratio of two independent extents because there is no second
+ * extent to name.
+ *
+ * Which means the poly-phase filter set below is pinned to x8/8 here whatever
+ * the geometry, since the ratio selects it. That is right for this
+ * configuration and would be wrong for one where DJAG is switched off and
+ * POLY_SC0 does the scaling, which is what the vendor's own 640x480 request
+ * does -- there it runs in the x5/8 band. Making that configuration
+ * expressible means giving the chain a source raster of its own, and until
+ * then the honest thing is to say so rather than to route unity through a
+ * helper that looks like a derivation.
+ *
+ * The one thing that is per axis is which extent the register describes, so
+ * take it from the matching one: a vertical register computed from a width
+ * would be a real defect the moment the two differ.
  */
-static u32 becore_mcsc_chain_ratio(void)
+static u32 becore_mcsc_chain_ratio(bool vertical)
 {
-	return becore_zoom_ratio(becore_mcsc_output.width,
-				 becore_mcsc_output.width);
+	u32 extent = vertical ? becore_mcsc_output.height :
+				becore_mcsc_output.width;
+
+	return becore_zoom_ratio(extent, extent);
 }
 
 /*
@@ -3562,7 +3578,7 @@ static int becore_sc_ratio(enum becore_block_id id, bool vertical, u32 *ratio)
 	}
 	if (id != BECORE_MCSC)
 		return -EINVAL;
-	*ratio = becore_mcsc_chain_ratio();
+	*ratio = becore_mcsc_chain_ratio(vertical);
 
 	return 0;
 }
@@ -3760,9 +3776,14 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			result = becore_pack_size(becore_mcsc_output.width,
 						  becore_mcsc_output.height);
 			break;
-		case BECORE_GEN_CHAIN_RATIO:
-			result = becore_mcsc_chain_ratio();
+		case BECORE_GEN_CHAIN_RATIO: {
+			bool vertical = reg == BECORE_MCSC_SC0_V_RATIO_REG ||
+					reg == BECORE_MCSC_PC0_V_RATIO_REG;
+
+			result = becore_mcsc_chain_ratio(vertical);
 			break;
+		}
+
 		default:
 			return -EINVAL;
 		}

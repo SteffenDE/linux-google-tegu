@@ -10,11 +10,12 @@ maintainers:
   - Steffen Deusch <steffen@deusch.me>
 
 description:
-  The Zumapro camera back-end core contains the RGBP Bayer and RGB processor,
-  the optional MCFP multi-frame processor, and the YUVP YUV processor.  RGBP
-  and YUVP have separate power domains; MCFP resides in the RGBP domain.  The
-  RGBP command loader resides in the GDC power domain, which is consequently a
-  dependency even when GDC receives no per-frame program.
+  The Zumapro camera back-end pipeline contains the RGBP Bayer and RGB
+  processor, the optional MCFP multi-frame processor, the YUVP YUV processor,
+  and the MCSC final scaler.  RGBP, YUVP and MCSC have separate power domains;
+  MCFP resides in the RGBP domain.  The RGBP command loader resides in the GDC
+  power domain, which is consequently a dependency even when GDC receives no
+  per-frame program.
 
 properties:
   compatible:
@@ -33,6 +34,15 @@ properties:
       - description: MCFP system memory stream-attribute mapper D2
       - description: MCFP system memory stream-attribute mapper D3
       - description: MCFP system memory stream-attribute mapper D4
+      - description: MCSC processor
+      - description: MCSC system memory stream-attribute mapper D0
+      - description: MCSC system memory stream-attribute mapper D1
+      - description: MCSC system memory stream-attribute mapper D2
+      - description: MCSC system memory stream-attribute mapper D3
+      - description: MCSC system memory stream-attribute mapper D4
+      - description: MCSC system memory stream-attribute mapper D5
+      - description: MCSC system memory stream-attribute mapper D6
+      - description: MCSC system register controlling internal routing
 
   reg-names:
     items:
@@ -47,6 +57,15 @@ properties:
       - const: ssmt-mcfp2
       - const: ssmt-mcfp3
       - const: ssmt-mcfp4
+      - const: mcsc
+      - const: ssmt-mcsc0
+      - const: ssmt-mcsc1
+      - const: ssmt-mcsc2
+      - const: ssmt-mcsc3
+      - const: ssmt-mcsc4
+      - const: ssmt-mcsc5
+      - const: ssmt-mcsc6
+      - const: sysreg-mcsc
 
   interrupts:
     items:
@@ -56,6 +75,8 @@ properties:
       - description: MCFP secondary interrupt
       - description: YUVP processing and command queue interrupt
       - description: YUVP secondary interrupt
+      - description: MCSC processing and command queue interrupt
+      - description: MCSC secondary interrupt
 
   interrupt-names:
     items:
@@ -65,18 +86,22 @@ properties:
       - const: mcfp-int1
       - const: yuvp-int0
       - const: yuvp-int1
+      - const: mcsc-int0
+      - const: mcsc-int1
 
   power-domains:
     items:
       - description: YUVP power domain
       - description: RGBP and MCFP power domain
       - description: GDC power domain containing the RGBP command loader
+      - description: MCSC power domain
 
   power-domain-names:
     items:
       - const: yuvp
       - const: rgbp
       - const: gdc
+      - const: mcsc
 
   iommus:
     items:
@@ -84,6 +109,7 @@ properties:
       - description: RGBP System MMU S0
       - description: RGBP System MMU S1
       - description: GDC System MMU used by the RGBP command loader
+      - description: MCSC System MMU
 
   samsung,iommu-group:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -119,23 +145,38 @@ examples:
               <0x1c614000 0xe00>,
               <0x1c624000 0xe00>,
               <0x1c634000 0xe00>,
-              <0x1c644000 0xe00>;
+              <0x1c644000 0xe00>,
+              <0x1d040000 0x10000>,
+              <0x1d104000 0xe00>,
+              <0x1d114000 0xe00>,
+              <0x1d124000 0xe00>,
+              <0x1d134000 0xe00>,
+              <0x1d144000 0xe00>,
+              <0x1d154000 0xe00>,
+              <0x1d164000 0xe00>,
+              <0x1d020400 0x4>;
         reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp", "ssmt-yuvp",
                     "sysreg-rgbp", "ssmt-mcfp0", "ssmt-mcfp1",
-                    "ssmt-mcfp2", "ssmt-mcfp3", "ssmt-mcfp4";
+                    "ssmt-mcfp2", "ssmt-mcfp3", "ssmt-mcfp4", "mcsc",
+                    "ssmt-mcsc0", "ssmt-mcsc1", "ssmt-mcsc2",
+                    "ssmt-mcsc3", "ssmt-mcsc4", "ssmt-mcsc5",
+                    "ssmt-mcsc6", "sysreg-mcsc";
         interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 664 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 744 IRQ_TYPE_LEVEL_HIGH 0>,
-                     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>;
+                     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 502 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 503 IRQ_TYPE_LEVEL_HIGH 0>;
         interrupt-names = "rgbp-int0", "rgbp-int1",
                           "mcfp-int0", "mcfp-int1",
-                          "yuvp-int0", "yuvp-int1";
-        power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>;
-        power-domain-names = "yuvp", "rgbp", "gdc";
+                          "yuvp-int0", "yuvp-int1",
+                          "mcsc-int0", "mcsc-int1";
+        power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>, <&pd_mcsc>;
+        power-domain-names = "yuvp", "rgbp", "gdc", "mcsc";
         iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>,
-                 <&sysmmu_gdc>;
+                 <&sysmmu_gdc>, <&sysmmu_mcsc>;
         samsung,iommu-group = <&iommu_group_isp>;
     };
 ...

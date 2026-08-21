@@ -507,6 +507,45 @@
 static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_SLCGRID_ROWS *
 	      BECORE_LTM_SLCGRID_DEPTH * BECORE_LTM_SLCGRID_CELL_SHORTS *
 	      sizeof(__le16) == BECORE_GRID_SIZE);
+/*
+ * The colour LUT above 0x7b00, which Lyric's descriptors call
+ * yuv_diablo_clut_*. Its input stage is three 1D LUTs, one per YUV channel,
+ * each 22 registers at 0x7b50, 0x7ba8 and 0x7c00.
+ *
+ * They carry an exact identity. Google's own packer says how to read them:
+ * clut_packing.h stores three consecutive entries per register as 10-bit
+ * fields, low first, each entry floor(f * 1024) of a float in [0, 1). Twenty-
+ * one registers hold entries 0..62 that way; the twenty-second holds entry 63
+ * and then 1024 minus it, because the curve's last point is 1.0 and does not
+ * fit the field. Entry n is 16 * n at every one of the 64 points, so the LUTs
+ * are the identity ramp over the 10-bit range.
+ *
+ * The array lengths are not a guess from where a captured header stopped:
+ * YuvpClutBlock::ConfigureWith writes each of them as a
+ * std::array<unsigned char, 88>, and 88 bytes is 22 registers.
+ */
+#define BECORE_YUVP_CLUT_BASE		(BECORE_YUVP_PHYS_BASE + 0x7b00)
+#define BECORE_YUVP_CLUT_1DLUT_Y_FIRST	(BECORE_YUVP_CLUT_BASE + 0x050)
+#define BECORE_YUVP_CLUT_1DLUT_U_FIRST	(BECORE_YUVP_CLUT_BASE + 0x0a8)
+#define BECORE_YUVP_CLUT_1DLUT_V_FIRST	(BECORE_YUVP_CLUT_BASE + 0x100)
+/* 64 entries, three per register plus the last one's distance from unity. */
+#define BECORE_CLUT_1DLUT_ENTRIES	64
+#define BECORE_CLUT_1DLUT_PER_REG	3
+#define BECORE_CLUT_1DLUT_REGS		22
+#define BECORE_CLUT_1DLUT_LAST		((BECORE_CLUT_1DLUT_REGS - 1) * 4)
+#define BECORE_CLUT_FIELD_BITS		10
+#define BECORE_CLUT_FIELD_MAX		0x3ff
+#define BECORE_CLUT_ONE			(1 << BECORE_CLUT_FIELD_BITS)
+/* The identity's step: 1024 / 64, so entry 63 is 1008 and its delta is 16. */
+#define BECORE_CLUT_1DLUT_STEP \
+	(BECORE_CLUT_ONE / BECORE_CLUT_1DLUT_ENTRIES)
+
+static_assert((BECORE_CLUT_1DLUT_REGS - 1) * BECORE_CLUT_1DLUT_PER_REG ==
+	      BECORE_CLUT_1DLUT_ENTRIES - 1);
+/* The distance from the last entry to unity has to fit a field of its own. */
+static_assert(BECORE_CLUT_ONE - (BECORE_CLUT_1DLUT_ENTRIES - 1) *
+	      BECORE_CLUT_1DLUT_STEP <= BECORE_CLUT_FIELD_MAX);
+
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
@@ -721,6 +760,7 @@ enum becore_generated_kind {
 	BECORE_GEN_MCSC_INPUT_SIZE,	/* the raster MCSC reads, from YUVP */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
+	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -740,7 +780,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	305
+#define BECORE_YUVP_GENERATED_WORDS	371
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -858,6 +898,15 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_CLUT_1DLUT_Y_FIRST,
+	  BECORE_YUVP_CLUT_1DLUT_Y_FIRST + BECORE_CLUT_1DLUT_LAST,
+	  BECORE_GEN_CLUT_1DLUT },
+	{ BECORE_YUVP_CLUT_1DLUT_U_FIRST,
+	  BECORE_YUVP_CLUT_1DLUT_U_FIRST + BECORE_CLUT_1DLUT_LAST,
+	  BECORE_GEN_CLUT_1DLUT },
+	{ BECORE_YUVP_CLUT_1DLUT_V_FIRST,
+	  BECORE_YUVP_CLUT_1DLUT_V_FIRST + BECORE_CLUT_1DLUT_LAST,
+	  BECORE_GEN_CLUT_1DLUT },
 };
 
 static const struct becore_generated_range becore_mcsc_generated[] = {
@@ -2313,6 +2362,47 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 }
 
 /*
+ * One register of a colour-LUT input curve, by offset from the curve's first.
+ *
+ * The identity is what the block does when nothing is asking it to reshape a
+ * channel, and it is also what the vendor writes: en_config leaves all three
+ * of these curves disabled, so their contents are a default rather than a
+ * tuning choice. Packing is Google's own, from clut_packing.h.
+ */
+static int becore_yuvp_clut_1dlut_value(u32 offset, u32 *value)
+{
+	u32 packed = 0;
+	u32 index;
+	u32 entry;
+	u32 field;
+
+	if (offset & 3 || offset > BECORE_CLUT_1DLUT_LAST)
+		return -EINVAL;
+
+	if (offset == BECORE_CLUT_1DLUT_LAST) {
+		/*
+		 * The curve's last point is 1.0, one past a 10-bit field, so
+		 * the register after entry 63 holds its distance from unity
+		 * instead -- the same trick the gamma tables use for their
+		 * sixty-fifth knot.
+		 */
+		entry = (BECORE_CLUT_1DLUT_ENTRIES - 1) * BECORE_CLUT_1DLUT_STEP;
+		*value = entry | ((BECORE_CLUT_ONE - entry)
+				  << BECORE_CLUT_FIELD_BITS);
+		return 0;
+	}
+
+	index = offset / 4 * BECORE_CLUT_1DLUT_PER_REG;
+	for (field = 0; field < BECORE_CLUT_1DLUT_PER_REG; field++) {
+		entry = (index + field) * BECORE_CLUT_1DLUT_STEP;
+		packed |= entry << (BECORE_CLUT_FIELD_BITS * field);
+	}
+	*value = packed;
+
+	return 0;
+}
+
+/*
  * Read one fixed word back out of the recipe by register address.
  *
  * Every other generated value is a function of the hardware description or of
@@ -3297,6 +3387,11 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_LTM:
 			if (becore_yuvp_ltm_value(reg - BECORE_YUVP_LTM_BASE,
 						  &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_CLUT_1DLUT:
+			if (becore_yuvp_clut_1dlut_value(reg - table[i].first,
+							 &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_SC_V_COEFF:

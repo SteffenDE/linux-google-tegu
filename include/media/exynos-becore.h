@@ -26,6 +26,7 @@ struct exynos_becore_input *
 exynos_becore_input_map(struct device *backend, struct device *producer,
 			const struct exynos_becore_input_producer_ops *ops,
 			void *producer_data);
+void exynos_becore_input_disconnect(struct exynos_becore_input *input);
 void exynos_becore_input_unmap(struct exynos_becore_input *input);
 
 size_t exynos_becore_input_size(struct exynos_becore_input *input);

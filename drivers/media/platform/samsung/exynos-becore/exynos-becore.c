@@ -180,6 +180,21 @@
 #define BECORE_MCSC_OUTPUT_MAX_BL_REG	(BECORE_MCSC_PHYS_BASE + 0x2048)
 #define BECORE_MCSC_OUTPUT_ENABLE_REG	(BECORE_MCSC_PHYS_BASE + 0x2000)
 #define BECORE_MCSC_OUTPUT_DITHER_REG	(BECORE_MCSC_PHYS_BASE + 0x2f00)
+/*
+ * The polynomial scaler's geometry. Each of the first four registers packs two
+ * 16-bit halves with the width in the high one, and the two ratios are the
+ * crop expressed as a 20-bit fixed-point fraction of the destination. That is
+ * what makes this block derivable rather than captured: for the recorded
+ * 3536 x 2652 crop into 4000 x 3000, 3536 * (1 << 20) / 4000 truncates to
+ * exactly the 0x000e24dd the vendor program carries, and so does the vertical.
+ */
+#define BECORE_MCSC_SCALER_SRC_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x4004)
+#define BECORE_MCSC_SCALER_CROP_POS_REG	(BECORE_MCSC_PHYS_BASE + 0x4008)
+#define BECORE_MCSC_SCALER_CROP_SIZE_REG (BECORE_MCSC_PHYS_BASE + 0x400c)
+#define BECORE_MCSC_SCALER_DST_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x4010)
+#define BECORE_MCSC_SCALER_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4014)
+#define BECORE_MCSC_SCALER_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4018)
+#define BECORE_MCSC_SCALER_RATIO_SHIFT	20
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -466,6 +481,24 @@ static const struct becore_mcsc_dma_profile becore_mcsc_output = {
 	.dither = 0x10,
 };
 
+/*
+ * How much of the scaler's input the output is taken from. The captured
+ * program crops 3536 x 2652 out of the 4160 x 3120 YUVP surface and scales it
+ * up to fill 4000 x 3000 -- a margin the vendor reserves for electronic
+ * stabilisation, which this driver does not implement but must reproduce
+ * exactly while the rest of the program is the captured one. The window is
+ * centred, so only its size is a parameter.
+ */
+struct becore_mcsc_scaler_profile {
+	u32 crop_width;
+	u32 crop_height;
+};
+
+static const struct becore_mcsc_scaler_profile becore_mcsc_scaler = {
+	.crop_width = 3536,
+	.crop_height = 2652,
+};
+
 enum becore_mcsc_input_transport {
 	BECORE_MCSC_INPUT_CAPTURED_VOTF,
 	BECORE_MCSC_INPUT_MEMORY,
@@ -483,6 +516,12 @@ enum becore_mcsc_dma_word {
 	BECORE_MCSC_INPUT_BUSINFO,
 	BECORE_MCSC_INPUT_MAX_BL,
 	BECORE_MCSC_INPUT_ENABLE,
+	BECORE_MCSC_SCALER_SRC_SIZE,
+	BECORE_MCSC_SCALER_CROP_POS,
+	BECORE_MCSC_SCALER_CROP_SIZE,
+	BECORE_MCSC_SCALER_DST_SIZE,
+	BECORE_MCSC_SCALER_H_RATIO,
+	BECORE_MCSC_SCALER_V_RATIO,
 	BECORE_MCSC_OUTPUT_FORMAT,
 	BECORE_MCSC_OUTPUT_COMP,
 	BECORE_MCSC_OUTPUT_WIDTH,
@@ -518,6 +557,12 @@ static const u32 becore_mcsc_dma_regs[] = {
 	[BECORE_MCSC_OUTPUT_MAX_BL] = BECORE_MCSC_OUTPUT_MAX_BL_REG,
 	[BECORE_MCSC_OUTPUT_ENABLE] = BECORE_MCSC_OUTPUT_ENABLE_REG,
 	[BECORE_MCSC_OUTPUT_DITHER] = BECORE_MCSC_OUTPUT_DITHER_REG,
+	[BECORE_MCSC_SCALER_SRC_SIZE] = BECORE_MCSC_SCALER_SRC_SIZE_REG,
+	[BECORE_MCSC_SCALER_CROP_POS] = BECORE_MCSC_SCALER_CROP_POS_REG,
+	[BECORE_MCSC_SCALER_CROP_SIZE] = BECORE_MCSC_SCALER_CROP_SIZE_REG,
+	[BECORE_MCSC_SCALER_DST_SIZE] = BECORE_MCSC_SCALER_DST_SIZE_REG,
+	[BECORE_MCSC_SCALER_H_RATIO] = BECORE_MCSC_SCALER_H_RATIO_REG,
+	[BECORE_MCSC_SCALER_V_RATIO] = BECORE_MCSC_SCALER_V_RATIO_REG,
 };
 
 struct becore_device;
@@ -1161,6 +1206,43 @@ static size_t becore_mcsc_output_size(void)
 	return ALIGN(becore_mcsc_output_active_size(), SZ_4K);
 }
 
+/* Pack the scaler's two-halves-in-one-word geometry the way the block reads it. */
+static u32 becore_mcsc_scaler_pair(u32 high, u32 low)
+{
+	return (high << 16) | low;
+}
+
+/*
+ * crop / dst as a 20-bit fixed-point fraction, truncated. The captured program
+ * is the check on the rounding: 3536 << 20 over 4000 is 926941.18, and the
+ * vendor writes 926941.
+ */
+static u32 becore_mcsc_scaler_ratio(u32 crop, u32 dst)
+{
+	if (!dst)
+		return 0;
+
+	return (u32)div_u64((u64)crop << BECORE_MCSC_SCALER_RATIO_SHIFT, dst);
+}
+
+/*
+ * The crop is centred in the scaler's input, so its origin is derived rather
+ * than carried. An odd margin would land the window off a chroma boundary on a
+ * 4:2:0 output, so refuse it instead of silently rounding.
+ */
+static int becore_mcsc_scaler_origin(u32 *x, u32 *y)
+{
+	if (becore_mcsc_scaler.crop_width > becore_mcsc_input.width ||
+	    becore_mcsc_scaler.crop_height > becore_mcsc_input.height)
+		return -ERANGE;
+	*x = (becore_mcsc_input.width - becore_mcsc_scaler.crop_width) / 2;
+	*y = (becore_mcsc_input.height - becore_mcsc_scaler.crop_height) / 2;
+	if ((*x | *y) & 1)
+		return -ERANGE;
+
+	return 0;
+}
+
 static int
 becore_mcsc_dma_value(u32 index, u32 reg,
 		      enum becore_mcsc_input_transport transport, u32 *value)
@@ -1231,6 +1313,35 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		break;
 	case BECORE_MCSC_OUTPUT_DITHER:
 		*value = becore_mcsc_output.dither;
+		break;
+	case BECORE_MCSC_SCALER_SRC_SIZE:
+		*value = becore_mcsc_scaler_pair(becore_mcsc_input.width,
+						 becore_mcsc_input.height);
+		break;
+	case BECORE_MCSC_SCALER_CROP_POS: {
+		u32 x, y;
+		int ret = becore_mcsc_scaler_origin(&x, &y);
+
+		if (ret)
+			return ret;
+		*value = becore_mcsc_scaler_pair(x, y);
+		break;
+	}
+	case BECORE_MCSC_SCALER_CROP_SIZE:
+		*value = becore_mcsc_scaler_pair(becore_mcsc_scaler.crop_width,
+						 becore_mcsc_scaler.crop_height);
+		break;
+	case BECORE_MCSC_SCALER_DST_SIZE:
+		*value = becore_mcsc_scaler_pair(becore_mcsc_output.width,
+						 becore_mcsc_output.height);
+		break;
+	case BECORE_MCSC_SCALER_H_RATIO:
+		*value = becore_mcsc_scaler_ratio(becore_mcsc_scaler.crop_width,
+						  becore_mcsc_output.width);
+		break;
+	case BECORE_MCSC_SCALER_V_RATIO:
+		*value = becore_mcsc_scaler_ratio(becore_mcsc_scaler.crop_height,
+						  becore_mcsc_output.height);
 		break;
 	default:
 		return -EINVAL;

@@ -495,8 +495,8 @@ struct becore_mcsc_scaler_profile {
 };
 
 static const struct becore_mcsc_scaler_profile becore_mcsc_scaler = {
-	.crop_width = 3536,
-	.crop_height = 2652,
+	.crop_width = 4160,
+	.crop_height = 3120,
 };
 
 enum becore_mcsc_input_transport {

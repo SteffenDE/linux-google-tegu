@@ -1009,6 +1009,7 @@ struct ispfe_device {
 	/* Requested and stream-latched processed-output geometry experiment. */
 	u32 lmp_ml0_profile;
 	u32 active_lmp_ml0_profile;
+	struct ispfe_lmp_wbg_profile active_lmp_wbg;
 	/* Select the captured ordinary back-end program for a debugfs run. */
 	u32 backend_recipe;
 	bool active_backend_recipe;
@@ -2173,14 +2174,14 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
  * generated header stays the byte-exact diagnostic oracle, while the built-in
  * program no longer takes these policy values from its opaque payload.
  */
-static int ispfe_pdma_apply_wbg(const struct ispfe_pdma_program *prog,
+static int ispfe_pdma_apply_wbg(struct ispfe_device *ispfe,
 				const struct ispfe_pdma_cmd *cmd,
 				u8 *payload, unsigned int *applied)
 {
-	const struct ispfe_lmp_wbg_profile *wbg = prog->lmp_wbg;
+	const struct ispfe_lmp_wbg_profile *wbg = &ispfe->active_lmp_wbg;
 	unsigned int config;
 
-	if (!wbg)
+	if (!ispfe->prog->lmp_wbg)
 		return 0;
 	if (cmd->reg == ISPFE_LMP_WBG_CONFIG_REG)
 		config = ISPFE_LMP_WBG_CONFIG;
@@ -2201,14 +2202,14 @@ static int ispfe_pdma_apply_wbg(const struct ispfe_pdma_program *prog,
 }
 
 /* DPC consumes rounded Q7 R/B gains from the same live AWB state as WBG. */
-static int ispfe_pdma_apply_dpc(const struct ispfe_pdma_program *prog,
+static int ispfe_pdma_apply_dpc(struct ispfe_device *ispfe,
 				const struct ispfe_pdma_cmd *cmd,
 				u8 *payload, bool *applied)
 {
-	const struct ispfe_lmp_wbg_profile *wbg = prog->lmp_wbg;
+	const struct ispfe_lmp_wbg_profile *wbg = &ispfe->active_lmp_wbg;
 	u64 red, blue;
 
-	if (!wbg || cmd->reg != ISPFE_LMP_DPC_CONFIG_REG)
+	if (!ispfe->prog->lmp_wbg || cmd->reg != ISPFE_LMP_DPC_CONFIG_REG)
 		return 0;
 	if (cmd->len != ISPFE_LMP_DPC_CONFIG_SIZE || *applied)
 		return -EINVAL;
@@ -2724,11 +2725,11 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			       ispfe->pdma_program_staged + at, cmd->len);
 		else {
 			memcpy(program + at, cmd->payload, cmd->len);
-			ret = ispfe_pdma_apply_wbg(prog, cmd, program + at,
+			ret = ispfe_pdma_apply_wbg(ispfe, cmd, program + at,
 						   &lmp_wbg_configs);
 			if (ret)
 				return ret;
-			ret = ispfe_pdma_apply_dpc(prog, cmd, program + at,
+			ret = ispfe_pdma_apply_dpc(ispfe, cmd, program + at,
 						   &lmp_dpc_applied);
 			if (ret)
 				return ret;
@@ -3861,7 +3862,9 @@ static int ispfe_qos_set_active(struct ispfe_device *ispfe)
  * the vendor stack has the same ordering -- the receiver is configured and
  * armed, and the sensor's own stream-on comes last.
  */
-static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
+static int
+ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
+	    const struct exynos_becore_input_stream_config *stream_config)
 {
 	struct platform_device *pdev = to_platform_device(ispfe->dev);
 	struct ispfe_source source = ispfe->src;
@@ -3871,10 +3874,13 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 	u32 lmp_ml0_profile = ispfe->lmp_ml0_profile;
 	u32 backend_recipe = ispfe->backend_recipe;
 	bool pdma_program_override = ispfe->pdma_program_override;
+	struct ispfe_lmp_wbg_profile lmp_wbg = {};
 	int ret;
 
 	/* A new attempt invalidates every result published by an older session. */
 	WRITE_ONCE(ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
+	if (backend_consumer != !!stream_config)
+		return -EINVAL;
 
 	/*
 	 * The geometry the receiver is programmed with is the format on the
@@ -3906,6 +3912,8 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 			source.width, source.height);
 		return -EINVAL;
 	}
+	if (ispfe->prog->lmp_wbg)
+		lmp_wbg = *ispfe->prog->lmp_wbg;
 	if (backend_consumer) {
 		if (!ispfe->prog->backend_recipe ||
 		    !ispfe->prog->fixed_resources)
@@ -3913,6 +3921,17 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 		source.loch = ispfe->prog->required_loch;
 		source.fcctx = ispfe->prog->required_fcctx;
 		fc_axi_max_ost = ispfe->prog->required_fc_axi_max_ost;
+		if (stream_config->red_balance <
+		    EXYNOS_BECORE_WBG_GAIN_MIN_Q12 ||
+		    stream_config->red_balance >
+		    EXYNOS_BECORE_WBG_GAIN_MAX_Q12 ||
+		    stream_config->blue_balance <
+		    EXYNOS_BECORE_WBG_GAIN_MIN_Q12 ||
+		    stream_config->blue_balance >
+		    EXYNOS_BECORE_WBG_GAIN_MAX_Q12)
+			return -ERANGE;
+		lmp_wbg.red = stream_config->red_balance;
+		lmp_wbg.blue = stream_config->blue_balance;
 	}
 
 	/*
@@ -3963,6 +3982,7 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 	ispfe->active = source;
 	ispfe->active_fc_axi_max_ost = fc_axi_max_ost;
 	ispfe->active_lmp_ml0_profile = lmp_ml0_profile;
+	ispfe->active_lmp_wbg = lmp_wbg;
 	ispfe->active_backend_recipe = ispfe->prog->backend_recipe;
 	ispfe->active_pdma_program_override = pdma_program_override;
 	ispfe->active_pdma_program_generation =
@@ -4205,7 +4225,7 @@ static int ispfe_enable_set(void *data, u64 val)
 		return -EBUSY;
 	if (val) {
 		ispfe->owner = ISPFE_OWNER_DEBUGFS;
-		ret = ispfe_start(ispfe, false);
+		ret = ispfe_start(ispfe, false, NULL);
 		if (ret)
 			ispfe->owner = ISPFE_OWNER_NONE;
 	} else {
@@ -4252,7 +4272,7 @@ static int ispfe_capture_set(void *data, u64 val)
 		ret = ispfe_sensor_power(ispfe, true);
 		if (ret)
 			goto err_owner;
-		ret = ispfe_start(ispfe, false);
+		ret = ispfe_start(ispfe, false, NULL);
 		if (ret)
 			goto err_power;
 		ret = v4l2_subdev_enable_streams(&ispfe->sd,
@@ -4344,13 +4364,16 @@ static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
 }
 
 static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
-				     bool consumer)
+	bool consumer,
+	const struct exynos_becore_input_stream_config *stream_config)
 {
 	bool ready;
 	int ret;
 
 	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
 		return -EBUSY;
+	if (consumer != !!stream_config)
+		return -EINVAL;
 	if (!consumer && ispfe->backend_recipe != 1)
 		return -EINVAL;
 
@@ -4363,7 +4386,7 @@ static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
 	ret = ispfe_sensor_power(ispfe, true);
 	if (ret)
 		goto err_queue;
-	ret = ispfe_start(ispfe, consumer);
+	ret = ispfe_start(ispfe, consumer, stream_config);
 	if (ret)
 		goto err_power;
 
@@ -4423,7 +4446,8 @@ static void ispfe_backend_queue_stop(struct ispfe_device *ispfe)
 	ispfe->owner = ISPFE_OWNER_NONE;
 }
 
-static int ispfe_backend_stream_start(void *data)
+static int ispfe_backend_stream_start(void *data,
+				      const struct exynos_becore_input_stream_config *stream_config)
 {
 	struct ispfe_device *ispfe = data;
 	int ret;
@@ -4432,7 +4456,7 @@ static int ispfe_backend_stream_start(void *data)
 	if (ispfe->backend_queue_active)
 		return -EBUSY;
 
-	ret = ispfe_backend_queue_start(ispfe, true);
+	ret = ispfe_backend_queue_start(ispfe, true, stream_config);
 	if (!ret)
 		ispfe->backend_queue_consumer = true;
 
@@ -4469,7 +4493,7 @@ static int ispfe_backend_queue_set(void *data, u64 val)
 	if (!!val == ispfe->backend_queue_active)
 		return 0;
 	if (val)
-		return ispfe_backend_queue_start(ispfe, false);
+		return ispfe_backend_queue_start(ispfe, false, NULL);
 
 	ispfe_backend_queue_stop(ispfe);
 	return 0;
@@ -4868,6 +4892,11 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	seq_printf(s, "lmp_ml0_profile %u requested, %u active\n",
 		   ispfe->lmp_ml0_profile, ispfe->active_lmp_ml0_profile);
+	seq_printf(s, "lmp_wbg       active R/Gr/Gb/B %u/%u/%u/%u Q12\n",
+		   ispfe->active_lmp_wbg.red,
+		   ispfe->active_lmp_wbg.green_red,
+		   ispfe->active_lmp_wbg.green_blue,
+		   ispfe->active_lmp_wbg.blue);
 	seq_printf(s, "fc_axi_max_ost %#x requested, %#x active\n",
 		   ispfe->fc_axi_max_ost, ispfe->active_fc_axi_max_ost);
 	seq_printf(s, "backend_recipe %u requested, %u active\n",
@@ -5632,7 +5661,7 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto err_pipeline;
 
-	ret = ispfe_start(ispfe, false);
+	ret = ispfe_start(ispfe, false, NULL);
 	if (ret)
 		goto err_power;
 

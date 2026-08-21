@@ -187,10 +187,10 @@
  * centre is the sensor's full array halved and negated. Samsung's own
  * rgbp_hw_s_dns_size() writes -(full_width >> 1 & ~1) plus the crop as an
  * offset; the two agree exactly while the crop is centred, which mainline's
- * is, and becore_rgbp_input is the full array. A crop that was *not* centred
- * would need the offset term as well, so this is a statement about the current
- * geometry rather than a general derivation. The noise curve above it is real
- * tuning and stays.
+ * is, and the input profile's raster is the full array. A crop that was *not*
+ * centred would need the offset term as well, so this is a statement about the
+ * current geometry rather than a general derivation. The noise curve above it
+ * is real tuning and stays.
  *
  * SHARPENHANCER's LPF_NORM is log2 of its three low-pass kernels' sums packed
  * at bits 0, 8 and 16 -- 16, 512 and 4096, which is what the captured taps
@@ -762,21 +762,34 @@ struct becore_rgbp_input_profile {
 	u32 businfo;
 };
 
+enum becore_rgbp_input_profile_id {
+	BECORE_RGBP_INPUT_SBWC,
+	BECORE_RGBP_INPUT_PROFILE_COUNT,
+};
+
 /*
  * The active dimensions and DMA fields are from the live ultrawide program.
  * As in Pablo's common DMA API, the payload and header geometry are derived
  * from the image profile.  Lyric additionally writes the 256-pixel-aligned
  * SBWC storage width after enabling the RDMA.
+ *
+ * Every word RGBP's input section programs comes from one of these, and so do
+ * the crop, the scaler ratios and the frame sizes further down the chain, so
+ * the profile is resolved once and passed to each of them rather than read
+ * from module scope -- the shape becore_yuvp_outputs[] already has.
  */
-static const struct becore_rgbp_input_profile becore_rgbp_input = {
-	.width = 4208,
-	.height = 3120,
-	.data_format = 0x18,
-	.comp_control = 0x9,
-	.sbwc_block_width = 256,
-	.bytes_per_pixel = 2,
-	.header_stride = 0x40,
-	.businfo = 0,
+static const struct becore_rgbp_input_profile
+becore_rgbp_inputs[BECORE_RGBP_INPUT_PROFILE_COUNT] = {
+	[BECORE_RGBP_INPUT_SBWC] = {
+		.width = 4208,
+		.height = 3120,
+		.data_format = 0x18,
+		.comp_control = 0x9,
+		.sbwc_block_width = 256,
+		.bytes_per_pixel = 2,
+		.header_stride = 0x40,
+		.businfo = 0,
+	},
 };
 
 enum becore_rgbp_input_word {
@@ -1499,6 +1512,7 @@ struct becore_device {
 	u32 output_first_changed;
 	u32 mcsc_output_changed_bytes;
 	u32 mcsc_output_first_changed;
+	u32 active_input_profile;
 	u32 output_profile;
 	u32 active_output_profile;
 	u32 mcsc_completed_generation;
@@ -1688,30 +1702,33 @@ static const u8 *becore_recipe_records(const struct becore_device *becore,
 	return records;
 }
 
-static u32 becore_rgbp_input_storage_width(void)
+static u32
+becore_rgbp_input_storage_width(const struct becore_rgbp_input_profile *profile)
 {
-	return ALIGN(becore_rgbp_input.width,
-		     becore_rgbp_input.sbwc_block_width);
+	return ALIGN(profile->width, profile->sbwc_block_width);
 }
 
-static u32 becore_rgbp_input_stride(void)
+static u32
+becore_rgbp_input_stride(const struct becore_rgbp_input_profile *profile)
 {
-	return becore_rgbp_input_storage_width() *
-	       becore_rgbp_input.bytes_per_pixel;
+	return becore_rgbp_input_storage_width(profile) *
+	       profile->bytes_per_pixel;
 }
 
-static size_t becore_rgbp_input_image_offset(void)
+static size_t
+becore_rgbp_input_image_offset(const struct becore_rgbp_input_profile *profile)
 {
-	return (size_t)becore_rgbp_input.header_stride *
-	       becore_rgbp_input.height;
+	return (size_t)profile->header_stride * profile->height;
 }
 
-static size_t becore_rgbp_input_size(void)
+static size_t
+becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile)
 {
-	size_t image_bytes = (size_t)becore_rgbp_input_stride() *
-			     becore_rgbp_input.height;
+	size_t image_bytes = (size_t)becore_rgbp_input_stride(profile) *
+			     profile->height;
 
-	return ALIGN(becore_rgbp_input_image_offset() + image_bytes, SZ_4K);
+	return ALIGN(becore_rgbp_input_image_offset(profile) + image_bytes,
+		     SZ_4K);
 }
 
 /*
@@ -1776,10 +1793,11 @@ static u32 becore_rgbp_out_height(void)
  * therefore unreachable by construction and is kept as a guard on that
  * reasoning rather than on the arithmetic.
  */
-static int becore_rgbp_crop(struct becore_rect *crop)
+static int becore_rgbp_crop(const struct becore_rgbp_input_profile *profile,
+			    struct becore_rect *crop)
 {
-	u32 array_w = becore_rgbp_input.width;
-	u32 array_h = becore_rgbp_input.height;
+	u32 array_w = profile->width;
+	u32 array_h = profile->height;
 	u32 out_w = becore_rgbp_out_width();
 	u32 out_h = becore_rgbp_out_height();
 	u32 width;
@@ -1831,7 +1849,8 @@ static int becore_rgbp_crop(struct becore_rect *crop)
  * pass, and short-circuiting it there would mean the four crop-derived words
  * are the only ones never checked before the hardware sees them.
  */
-static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
+static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
+				   u32 index, u32 reg, u32 *value)
 {
 	u32 result;
 
@@ -1841,8 +1860,7 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 
 	switch (index) {
 	case BECORE_RGBP_CHAIN_SRC_SIZE:
-		result = becore_pack_size(becore_rgbp_input.width,
-					  becore_rgbp_input.height);
+		result = becore_pack_size(profile->width, profile->height);
 		break;
 	case BECORE_RGBP_CHAIN_DST_SIZE:
 	case BECORE_RGBP_SC_DST_SIZE:
@@ -1854,7 +1872,7 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 	case BECORE_RGBP_SC_H_RATIO:
 	case BECORE_RGBP_SC_V_RATIO: {
 		struct becore_rect crop;
-		int ret = becore_rgbp_crop(&crop);
+		int ret = becore_rgbp_crop(profile, &crop);
 
 		if (ret)
 			return ret;
@@ -1871,31 +1889,31 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 		break;
 	}
 	case BECORE_RGBP_INPUT_FORMAT:
-		result = becore_rgbp_input.data_format;
+		result = profile->data_format;
 		break;
 	case BECORE_RGBP_INPUT_COMP:
-		result = becore_rgbp_input.comp_control;
+		result = profile->comp_control;
 		break;
 	case BECORE_RGBP_INPUT_ACTIVE_WIDTH:
-		result = becore_rgbp_input.width;
+		result = profile->width;
 		break;
 	case BECORE_RGBP_INPUT_HEIGHT:
-		result = becore_rgbp_input.height;
+		result = profile->height;
 		break;
 	case BECORE_RGBP_INPUT_STRIDE:
-		result = becore_rgbp_input_stride();
+		result = becore_rgbp_input_stride(profile);
 		break;
 	case BECORE_RGBP_INPUT_HEADER_STRIDE:
-		result = becore_rgbp_input.header_stride;
+		result = profile->header_stride;
 		break;
 	case BECORE_RGBP_INPUT_BUSINFO:
-		result = becore_rgbp_input.businfo;
+		result = profile->businfo;
 		break;
 	case BECORE_RGBP_INPUT_ENABLE:
 		result = 1;
 		break;
 	case BECORE_RGBP_INPUT_STORAGE_WIDTH:
-		result = becore_rgbp_input_storage_width();
+		result = becore_rgbp_input_storage_width(profile);
 		break;
 	default:
 		return -EINVAL;
@@ -1905,6 +1923,12 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 		*value = result;
 
 	return 0;
+}
+
+static const struct becore_rgbp_input_profile *
+becore_rgbp_input_profile(const struct becore_device *becore)
+{
+	return &becore_rgbp_inputs[becore->active_input_profile];
 }
 
 static const struct becore_yuvp_output_profile *
@@ -2341,7 +2365,8 @@ static int becore_typed_value(struct becore_device *becore,
 			      u32 *value)
 {
 	if (id == BECORE_RGBP)
-		return becore_rgbp_input_value(index, reg, value);
+		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
+					       index, reg, value);
 	if (id == BECORE_YUVP)
 		return becore_yuvp_output_value(becore, index, reg, value);
 
@@ -3126,7 +3151,9 @@ static int becore_rgbp_chroma_lpf_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
-static int becore_rgbp_dns_geometry_value(u32 offset, u32 *value)
+static int
+becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
+			       u32 offset, u32 *value)
 {
 	s32 x;
 	s32 y;
@@ -3137,8 +3164,8 @@ static int becore_rgbp_dns_geometry_value(u32 offset, u32 *value)
 			 BECORE_RGBP_DNS_BINNING_UNITY;
 		return 0;
 	case 0x1c0:		/* RADIAL_CENTER: 15-bit signed, x low, y high */
-		x = -(s32)((becore_rgbp_input.width >> 1) & ~1u);
-		y = -(s32)((becore_rgbp_input.height >> 1) & ~1u);
+		x = -(s32)((profile->width >> 1) & ~1u);
+		y = -(s32)((profile->height >> 1) & ~1u);
 		*value = ((y & BECORE_RGBP_DNS_CENTRE_MASK) << 16) |
 			 (x & BECORE_RGBP_DNS_CENTRE_MASK);
 		return 0;
@@ -3580,14 +3607,16 @@ static int becore_sc_coeff_value(bool vertical, u32 ratio, u32 index,
  * from the same place the driver takes the value it writes into the ratio
  * register, so the filter and the ratio cannot describe different scalings.
  */
-static int becore_sc_ratio(enum becore_block_id id, bool vertical, u32 *ratio)
+static int becore_sc_ratio(const struct becore_device *becore,
+			   enum becore_block_id id, bool vertical, u32 *ratio)
 {
 	u32 index;
 
 	if (id == BECORE_RGBP) {
 		index = vertical ? BECORE_RGBP_SC_V_RATIO :
 				   BECORE_RGBP_SC_H_RATIO;
-		return becore_rgbp_input_value(index,
+		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
+					       index,
 					       becore_rgbp_input_regs[index],
 					       ratio);
 	}
@@ -3656,8 +3685,11 @@ static int becore_generated_tables_validate(struct device *dev)
 	return 0;
 }
 
-static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
+static int becore_generated_value(const struct becore_device *becore,
+				  enum becore_block_id id, u32 reg, u32 *value)
 {
+	const struct becore_rgbp_input_profile *input =
+		becore_rgbp_input_profile(becore);
 	const struct becore_generated_range *table;
 	size_t count;
 	size_t i;
@@ -3691,8 +3723,7 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			result = 0;
 			break;
 		case BECORE_GEN_DECOMP_SIZE:
-			result = becore_pack_size(becore_rgbp_input.height,
-						  becore_rgbp_input.width);
+			result = becore_pack_size(input->height, input->width);
 			break;
 		case BECORE_GEN_NOISE_SLOPE:
 		case BECORE_GEN_NOISE_SHIFT:
@@ -3735,11 +3766,14 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 						&result))
 				return -EINVAL;
 			break;
-		case BECORE_GEN_DNS_GEOMETRY:
-			if (becore_rgbp_dns_geometry_value(reg -
-						BECORE_RGBP_DNS_BASE, &result))
+		case BECORE_GEN_DNS_GEOMETRY: {
+			u32 offset = reg - BECORE_RGBP_DNS_BASE;
+
+			if (becore_rgbp_dns_geometry_value(input, offset,
+							   &result))
 				return -EINVAL;
 			break;
+		}
 		case BECORE_GEN_LPF_NORM:
 			if (becore_yuvp_lpf_norm_value(&result))
 				return -EINVAL;
@@ -3776,7 +3810,7 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			bool vertical = table[i].kind == BECORE_GEN_SC_V_COEFF;
 			u32 ratio;
 
-			if (becore_sc_ratio(id, vertical, &ratio))
+			if (becore_sc_ratio(becore, id, vertical, &ratio))
 				return -EINVAL;
 			if (becore_sc_coeff_value(vertical, ratio,
 						  (reg - table[i].first) / 4,
@@ -3831,11 +3865,13 @@ static int becore_recipe_header_validate(const struct becore_device *becore)
 
 static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 {
+	const struct becore_rgbp_input_profile *profile =
+		becore_rgbp_input_profile(becore);
 	struct becore_dma_buffer *input = &becore->run_input->buffer;
 
 	switch (reg) {
 	case BECORE_RGBP_INPUT_IMAGE_REG:
-		return input->dma + becore_rgbp_input_image_offset();
+		return input->dma + becore_rgbp_input_image_offset(profile);
 	case BECORE_RGBP_INPUT_HEADER_REG:
 		return input->dma;
 	case BECORE_YUVP_GRID_REG:
@@ -3941,7 +3977,7 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 				u32 reg;
 
 				if (becore_shape_register(&shape[i], word, &reg) ||
-				    becore_generated_value(id, reg, NULL))
+				    becore_generated_value(becore, id, reg, NULL))
 					return -EINVAL;
 				generated_count++;
 			}
@@ -3999,7 +4035,8 @@ static int becore_recipe_validate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *input = &becore->run_input->buffer;
 
-	if (input->size != becore_rgbp_input_size() ||
+	if (input->size !=
+	    becore_rgbp_input_size(becore_rgbp_input_profile(becore)) ||
 	    input->staged_bytes != input->size ||
 	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
 		return -EINVAL;
@@ -4060,7 +4097,7 @@ static int becore_encode_block(struct becore_device *becore,
 
 			if (shape[i].generated_mask & BIT(word)) {
 				if (becore_shape_register(&shape[i], word, &reg) ||
-				    becore_generated_value(id, reg, &value))
+				    becore_generated_value(becore, id, reg, &value))
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
 				generated_count++;
@@ -4465,7 +4502,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 				u32 reg;
 
 				if (becore_shape_register(shape, word, &reg) ||
-				    becore_generated_value(BECORE_MCSC, reg,
+				    becore_generated_value(becore, BECORE_MCSC, reg,
 							   NULL))
 					return -EINVAL;
 				generated_count++;
@@ -4545,7 +4582,7 @@ becore_encode_mcsc(struct becore_device *becore,
 
 			if (shape->generated_mask & BIT(word)) {
 				if (becore_shape_register(shape, word, &reg) ||
-				    becore_generated_value(BECORE_MCSC, reg,
+				    becore_generated_value(becore, BECORE_MCSC, reg,
 							   &value))
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
@@ -4909,7 +4946,8 @@ static int becore_alloc_shared_input(struct becore_device *becore)
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_dma_buffer *input = &becore->inputs[i].buffer;
 
-		input->size = becore_rgbp_input_size();
+		input->size =
+			becore_rgbp_input_size(becore_rgbp_input_profile(becore));
 		input->sgt = dma_alloc_noncontiguous(becore->dev, input->size,
 						     DMA_BIDIRECTIONAL,
 						     GFP_KERNEL, 0);
@@ -6993,6 +7031,7 @@ static int becore_probe(struct platform_device *pdev)
 	INIT_WORK(&becore->video_work, becore_video_work);
 	becore->output_first_changed = U32_MAX;
 	becore->mcsc_output_first_changed = U32_MAX;
+	becore->active_input_profile = BECORE_RGBP_INPUT_SBWC;
 	becore->active_output_profile = BECORE_YUVP_OUTPUT_SBWCL;
 	becore->active_output_size = becore_active_output_size(becore);
 	becore->active_capture_size = becore_mcsc_output_active_size();

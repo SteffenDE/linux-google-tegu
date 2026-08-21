@@ -976,9 +976,11 @@ struct ispfe_device {
 	 * one IMX712 alone was measured writing; the ultrawide with a
 	 * phase-detect stream beside it wrote 0x88 and the main camera 0x6c.
 	 * The register's purpose is known, but not how the value is packed, so
-	 * it remains a knob rather than a constant.
+	 * it remains a knob for diagnostic/raw streams.  A fixed BE-core
+	 * consumer selects and latches its profile-owned value instead.
 	 */
 	u32 fc_axi_max_ost;
+	u32 active_fc_axi_max_ost;
 	/* Requested and stream-latched processed-output geometry experiment. */
 	u32 lmp_ml0_profile;
 	u32 active_lmp_ml0_profile;
@@ -3000,7 +3002,7 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 	writel_relaxed(FC_LMP_IDMA_AXI_THRE_LOW_VAL,
 		       core + FC_LMP_IDMA1 +
 		       FC_LMP_IDMA_AXI_THRE(ispfe->active.fcctx) + 4);
-	writel_relaxed(READ_ONCE(ispfe->fc_axi_max_ost),
+	writel_relaxed(ispfe->active_fc_axi_max_ost,
 		       idma0 + FC_LMP_IDMA_AXI_MAX_OST);
 	writel_relaxed(FC_LMP_IDMA1_AXI_MAX_OST_VAL,
 		       core + FC_LMP_IDMA1 + FC_LMP_IDMA_AXI_MAX_OST);
@@ -3711,11 +3713,16 @@ static int ispfe_qos_set_active(struct ispfe_device *ispfe)
  * the vendor stack has the same ordering -- the receiver is configured and
  * armed, and the sensor's own stream-on comes last.
  */
-static int ispfe_start(struct ispfe_device *ispfe)
+static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 {
 	struct platform_device *pdev = to_platform_device(ispfe->dev);
+	struct ispfe_source source = ispfe->src;
 	struct v4l2_subdev_state *state;
 	const struct v4l2_mbus_framefmt *fmt;
+	u32 fc_axi_max_ost = ispfe->fc_axi_max_ost;
+	u32 lmp_ml0_profile = ispfe->lmp_ml0_profile;
+	u32 backend_recipe = ispfe->backend_recipe;
+	bool pdma_program_override = ispfe->pdma_program_override;
 	int ret;
 
 	/*
@@ -3725,9 +3732,37 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	 */
 	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
 	fmt = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
-	ispfe->src.width = fmt->width;
-	ispfe->src.height = fmt->height;
+	source.width = fmt->width;
+	source.height = fmt->height;
 	v4l2_subdev_unlock_state(state);
+
+	/*
+	 * The attached BE-core consumer is a fixed in-kernel pipeline, not a
+	 * debugfs experiment.  Select its already validated producer profile
+	 * here so the recipe-specific diagnostic knobs cannot change it.
+	 */
+	if (backend_consumer) {
+		backend_recipe = 1;
+		lmp_ml0_profile = ISPFE_LMP_ML0_PROFILE_CAPTURED;
+		pdma_program_override = false;
+	}
+
+	ispfe->prog = ispfe_program_for(source.width, source.height,
+					backend_recipe);
+	if (!ispfe->prog) {
+		dev_err(ispfe->dev,
+			"no PDMA recipe captured for %ux%u\n",
+			source.width, source.height);
+		return -EINVAL;
+	}
+	if (backend_consumer) {
+		if (!ispfe->prog->backend_recipe ||
+		    !ispfe->prog->fixed_resources)
+			return -EINVAL;
+		source.loch = ispfe->prog->required_loch;
+		source.fcctx = ispfe->prog->required_fcctx;
+		fc_axi_max_ost = ispfe->prog->required_fc_axi_max_ost;
+	}
 
 	/*
 	 * Validate, then snapshot.  Every one of these ends up as an array
@@ -3735,31 +3770,21 @@ static int ispfe_start(struct ispfe_device *ispfe)
 	 * stream is up -- so checking them and then reading them again later
 	 * would leave the check meaning nothing.
 	 */
-	if (ispfe->src.link >= CSIS_NUM_LINKS ||
-	    ispfe->src.phy >= PHY_NUM_INSTANCES ||
-	    ispfe->src.lanes < 1 ||
-	    ispfe->src.lanes > ispfe_phy_lanes(ispfe->src.phy) ||
-	    ispfe->src.loch >= LOCH_COUNT ||
-	    ispfe->src.fcctx >= FC_NUM_CTX ||
-	    ispfe->lmp_ml0_profile >= ISPFE_LMP_ML0_PROFILE_COUNT ||
-	    ispfe->backend_recipe > 1 ||
-	    ispfe->src.width - 1 >= U16_MAX || ispfe->src.height - 1 >= U16_MAX)
+	if (source.link >= CSIS_NUM_LINKS ||
+	    source.phy >= PHY_NUM_INSTANCES ||
+	    source.lanes < 1 ||
+	    source.lanes > ispfe_phy_lanes(source.phy) ||
+	    source.loch >= LOCH_COUNT || source.fcctx >= FC_NUM_CTX ||
+	    lmp_ml0_profile >= ISPFE_LMP_ML0_PROFILE_COUNT ||
+	    backend_recipe > 1 || source.width - 1 >= U16_MAX ||
+	    source.height - 1 >= U16_MAX)
 		return -EINVAL;
-
-	ispfe->prog = ispfe_program_for(ispfe->src.width, ispfe->src.height,
-					ispfe->backend_recipe);
-	if (!ispfe->prog) {
-		dev_err(ispfe->dev,
-			"no PDMA recipe captured for %ux%u\n",
-			ispfe->src.width, ispfe->src.height);
-		return -EINVAL;
-	}
 	if (ispfe->prog->backend_recipe && ispfe->owner == ISPFE_OWNER_V4L2)
 		return -EOPNOTSUPP;
 	if (ispfe->prog->fixed_resources &&
-	    (ispfe->src.loch != ispfe->prog->required_loch ||
-	     ispfe->src.fcctx != ispfe->prog->required_fcctx ||
-	     ispfe->fc_axi_max_ost != ispfe->prog->required_fc_axi_max_ost)) {
+	    (source.loch != ispfe->prog->required_loch ||
+	     source.fcctx != ispfe->prog->required_fcctx ||
+	     fc_axi_max_ost != ispfe->prog->required_fc_axi_max_ost)) {
 		dev_err(ispfe->dev,
 			"PDMA recipe needs loch %u, FC %u, AXI max OST %#x\n",
 			ispfe->prog->required_loch, ispfe->prog->required_fcctx,
@@ -3767,27 +3792,28 @@ static int ispfe_start(struct ispfe_device *ispfe)
 		return -EINVAL;
 	}
 	if (ispfe->prog->backend_recipe &&
-	    ispfe->lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
+	    lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
 		return -EINVAL;
-	if (ispfe->pdma_program_override) {
+	if (pdma_program_override) {
 		if (ispfe->prog->backend_recipe)
 			return -EINVAL;
 		/* A staged program already contains its final profile payload. */
-		if (ispfe->lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
+		if (lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
 			return -EINVAL;
 		ret = ispfe_pdma_staged_validate(ispfe);
 		if (ret) {
 			dev_err(ispfe->dev,
 				"staged PDMA program does not match the %ux%u recipe\n",
-				ispfe->src.width, ispfe->src.height);
+				source.width, source.height);
 			return ret;
 		}
 	}
 
-	ispfe->active = ispfe->src;
-	ispfe->active_lmp_ml0_profile = ispfe->lmp_ml0_profile;
+	ispfe->active = source;
+	ispfe->active_fc_axi_max_ost = fc_axi_max_ost;
+	ispfe->active_lmp_ml0_profile = lmp_ml0_profile;
 	ispfe->active_backend_recipe = ispfe->prog->backend_recipe;
-	ispfe->active_pdma_program_override = ispfe->pdma_program_override;
+	ispfe->active_pdma_program_override = pdma_program_override;
 	ispfe->active_pdma_program_generation =
 		ispfe->active_pdma_program_override ?
 		ispfe->pdma_program_staged_generation : 0;
@@ -4029,7 +4055,7 @@ static int ispfe_enable_set(void *data, u64 val)
 		return -EBUSY;
 	if (val) {
 		ispfe->owner = ISPFE_OWNER_DEBUGFS;
-		ret = ispfe_start(ispfe);
+		ret = ispfe_start(ispfe, false);
 		if (ret)
 			ispfe->owner = ISPFE_OWNER_NONE;
 	} else {
@@ -4076,7 +4102,7 @@ static int ispfe_capture_set(void *data, u64 val)
 		ret = ispfe_sensor_power(ispfe, true);
 		if (ret)
 			goto err_owner;
-		ret = ispfe_start(ispfe);
+		ret = ispfe_start(ispfe, false);
 		if (ret)
 			goto err_power;
 		ret = v4l2_subdev_enable_streams(&ispfe->sd,
@@ -4167,14 +4193,15 @@ static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
 	spin_unlock_irq(&ispfe->slock);
 }
 
-static int ispfe_backend_queue_start(struct ispfe_device *ispfe)
+static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
+				     bool consumer)
 {
 	bool ready;
 	int ret;
 
 	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
 		return -EBUSY;
-	if (ispfe->backend_recipe != 1)
+	if (!consumer && ispfe->backend_recipe != 1)
 		return -EINVAL;
 
 	ispfe->owner = ISPFE_OWNER_BACKEND;
@@ -4186,7 +4213,7 @@ static int ispfe_backend_queue_start(struct ispfe_device *ispfe)
 	ret = ispfe_sensor_power(ispfe, true);
 	if (ret)
 		goto err_queue;
-	ret = ispfe_start(ispfe);
+	ret = ispfe_start(ispfe, consumer);
 	if (ret)
 		goto err_power;
 
@@ -4255,7 +4282,7 @@ static int ispfe_backend_stream_start(void *data)
 	if (ispfe->backend_queue_active)
 		return -EBUSY;
 
-	ret = ispfe_backend_queue_start(ispfe);
+	ret = ispfe_backend_queue_start(ispfe, true);
 	if (!ret)
 		ispfe->backend_queue_consumer = true;
 
@@ -4292,7 +4319,7 @@ static int ispfe_backend_queue_set(void *data, u64 val)
 	if (!!val == ispfe->backend_queue_active)
 		return 0;
 	if (val)
-		return ispfe_backend_queue_start(ispfe);
+		return ispfe_backend_queue_start(ispfe, false);
 
 	ispfe_backend_queue_stop(ispfe);
 	return 0;
@@ -4691,6 +4718,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "phy_bypass   %u\n", ispfe->phy_isolation_bypass);
 	seq_printf(s, "lmp_ml0_profile %u requested, %u active\n",
 		   ispfe->lmp_ml0_profile, ispfe->active_lmp_ml0_profile);
+	seq_printf(s, "fc_axi_max_ost %#x requested, %#x active\n",
+		   ispfe->fc_axi_max_ost, ispfe->active_fc_axi_max_ost);
 	seq_printf(s, "backend_recipe %u requested, %u active\n",
 		   ispfe->backend_recipe, ispfe->active_backend_recipe);
 	seq_printf(s, "pdma_override %u requested, %u active\n",
@@ -5378,7 +5407,7 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto err_pipeline;
 
-	ret = ispfe_start(ispfe);
+	ret = ispfe_start(ispfe, false);
 	if (ret)
 		goto err_power;
 

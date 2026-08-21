@@ -764,6 +764,7 @@ struct becore_rgbp_input_profile {
 
 enum becore_rgbp_input_profile_id {
 	BECORE_RGBP_INPUT_SBWC,
+	BECORE_RGBP_INPUT_LINEAR,
 	BECORE_RGBP_INPUT_PROFILE_COUNT,
 };
 
@@ -788,6 +789,32 @@ becore_rgbp_inputs[BECORE_RGBP_INPUT_PROFILE_COUNT] = {
 		.sbwc_block_width = 256,
 		.bytes_per_pixel = 2,
 		.header_stride = 0x40,
+		.businfo = 0,
+	},
+	/*
+	 * The same image without compression, so that a frame chosen rather
+	 * than captured can be put through the offline loop.  Lyric's own
+	 * BuildFormatConfig picks between the two formats and writes 0x1a when
+	 * it is not compressing -- a three-instruction branch, `tst` on
+	 * IsSbwcBufferCompression and a `csel` of 0x18 against 0x1a -- so this
+	 * is the vendor's own counterpart of the profile above rather than a
+	 * guess: same signedness, same depth, one 16-bit little-endian sample
+	 * per pixel right-aligned in the low twelve bits.
+	 *
+	 * An SBWC block width of one makes the storage width the active width,
+	 * which is what an uncompressed stride is, and there is no header
+	 * plane.  Only the offline loop may select it: the live producer writes
+	 * compressed Bayer, so reading its pages under this profile would
+	 * decode payload as pixels.
+	 */
+	[BECORE_RGBP_INPUT_LINEAR] = {
+		.width = 4208,
+		.height = 3120,
+		.data_format = 0x1a,
+		.comp_control = 0,
+		.sbwc_block_width = 1,
+		.bytes_per_pixel = 2,
+		.header_stride = 0,
 		.businfo = 0,
 	},
 };
@@ -1512,6 +1539,7 @@ struct becore_device {
 	u32 output_first_changed;
 	u32 mcsc_output_changed_bytes;
 	u32 mcsc_output_first_changed;
+	u32 input_profile;
 	u32 active_input_profile;
 	u32 output_profile;
 	u32 active_output_profile;
@@ -1729,6 +1757,43 @@ becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile)
 
 	return ALIGN(becore_rgbp_input_image_offset(profile) + image_bytes,
 		     SZ_4K);
+}
+
+/*
+ * Every input slot is sized for the live path, because that is what fills
+ * them: ISPFE writes SBWC-compressed main Bayer straight into a slot, and its
+ * own probe checks the size it is handed.  A harness profile therefore has to
+ * fit inside that allocation rather than resize it, which is what
+ * becore_input_profiles_validate() checks once at probe.
+ */
+static size_t becore_input_allocation_size(void)
+{
+	return becore_rgbp_input_size(&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC]);
+}
+
+static int becore_input_profiles_validate(struct device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < BECORE_RGBP_INPUT_PROFILE_COUNT; i++) {
+		const struct becore_rgbp_input_profile *profile =
+			&becore_rgbp_inputs[i];
+
+		if (!profile->width || !profile->height ||
+		    !profile->bytes_per_pixel ||
+		    !is_power_of_2(profile->sbwc_block_width))
+			return dev_err_probe(dev, -EINVAL,
+					     "input profile %u is degenerate\n",
+					     i);
+		if (becore_rgbp_input_size(profile) >
+		    becore_input_allocation_size())
+			return dev_err_probe(dev, -EINVAL,
+					     "input profile %u wants %zu bytes, the slot holds %zu\n",
+					     i, becore_rgbp_input_size(profile),
+					     becore_input_allocation_size());
+	}
+
+	return 0;
 }
 
 /*
@@ -3872,6 +3937,12 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 	switch (reg) {
 	case BECORE_RGBP_INPUT_IMAGE_REG:
 		return input->dma + becore_rgbp_input_image_offset(profile);
+	/*
+	 * A profile with no header plane leaves the image at offset zero, so
+	 * these two name the same page.  That is the right answer rather than
+	 * a collision: with compression off the RDMA has no header to fetch,
+	 * and the register still has to hold a mapped address.
+	 */
 	case BECORE_RGBP_INPUT_HEADER_REG:
 		return input->dma;
 	case BECORE_YUVP_GRID_REG:
@@ -4034,10 +4105,16 @@ static int becore_recipe_records_validate(struct becore_device *becore,
 static int becore_recipe_validate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *input = &becore->run_input->buffer;
+	size_t wanted =
+		becore_rgbp_input_size(becore_rgbp_input_profile(becore));
 
-	if (input->size !=
-	    becore_rgbp_input_size(becore_rgbp_input_profile(becore)) ||
-	    input->staged_bytes != input->size ||
+	/*
+	 * The staged length is the check that the frame and the profile agree.
+	 * A slot the producer filled always holds a whole allocation, so it
+	 * only ever matches the live profile -- which is the second half of
+	 * refusing a producer frame under the linear profile.
+	 */
+	if (wanted > input->size || input->staged_bytes != wanted ||
 	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
 		return -EINVAL;
 
@@ -4946,8 +5023,7 @@ static int becore_alloc_shared_input(struct becore_device *becore)
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_dma_buffer *input = &becore->inputs[i].buffer;
 
-		input->size =
-			becore_rgbp_input_size(becore_rgbp_input_profile(becore));
+		input->size = becore_input_allocation_size();
 		input->sgt = dma_alloc_noncontiguous(becore->dev, input->size,
 						     DMA_BIDIRECTIONAL,
 						     GFP_KERNEL, 0);
@@ -5015,6 +5091,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	int ret;
 
 	ret = becore_generated_tables_validate(becore->dev);
+	if (ret)
+		return ret;
+	ret = becore_input_profiles_validate(becore->dev);
 	if (ret)
 		return ret;
 	ret = becore_noise_knots_resolve(becore->dev);
@@ -6013,9 +6092,10 @@ becore_next_input(struct becore_device *becore, bool allow_staged)
 	return NULL;
 }
 
-static int becore_run_frame(struct becore_device *becore, u32 output_profile,
-			    bool ready_only, void *capture_output,
-			    bool packed_output, bool run_mcsc)
+static int becore_run_frame(struct becore_device *becore, u32 input_profile,
+			    u32 output_profile, bool ready_only,
+			    void *capture_output, bool packed_output,
+			    bool run_mcsc)
 {
 	unsigned long flags;
 	bool diagnostic_output = !capture_output;
@@ -6041,7 +6121,8 @@ static int becore_run_frame(struct becore_device *becore, u32 output_profile,
 		ret = -EIO;
 		goto record_error;
 	}
-	if (output_profile >= BECORE_YUVP_OUTPUT_PROFILE_COUNT) {
+	if (output_profile >= BECORE_YUVP_OUTPUT_PROFILE_COUNT ||
+	    input_profile >= BECORE_RGBP_INPUT_PROFILE_COUNT) {
 		ret = -EINVAL;
 		goto record_error;
 	}
@@ -6063,6 +6144,18 @@ static int becore_run_frame(struct becore_device *becore, u32 output_profile,
 		ret = -EBUSY;
 		goto record_error;
 	}
+	/*
+	 * Only a diagnostic run over the staged slot may take an input profile
+	 * other than the live one: the producer writes SBWC-compressed Bayer,
+	 * and a slot it completed carries a non-zero ready sequence where the
+	 * staged slot zero is handed out from FREE and carries none.
+	 */
+	if (input_profile != BECORE_RGBP_INPUT_SBWC &&
+	    (!diagnostic_output || becore->run_input->ready_sequence)) {
+		ret = -EINVAL;
+		goto record_error;
+	}
+	becore->active_input_profile = input_profile;
 	becore->active_output_profile = output_profile;
 	becore->active_output_packed = packed_output;
 	becore->active_output_dma = becore->output.dma;
@@ -6233,7 +6326,8 @@ static int becore_run_set(void *data, u64 value)
 	if (READ_ONCE(becore->video_streaming))
 		return -EBUSY;
 
-	return becore_run_frame(becore, READ_ONCE(becore->output_profile),
+	return becore_run_frame(becore, READ_ONCE(becore->input_profile),
+				READ_ONCE(becore->output_profile),
 				false, NULL, false, false);
 }
 
@@ -6259,7 +6353,8 @@ static int becore_mcsc_run_set(void *data, u64 value)
 	if (READ_ONCE(becore->video_streaming))
 		return -EBUSY;
 
-	return becore_run_frame(becore, BECORE_YUVP_OUTPUT_SBWCL,
+	return becore_run_frame(becore, READ_ONCE(becore->input_profile),
+				BECORE_YUVP_OUTPUT_SBWCL,
 				false, NULL, false, true);
 }
 DEFINE_DEBUGFS_ATTRIBUTE(becore_mcsc_run_fops, NULL, becore_mcsc_run_set,
@@ -6427,7 +6522,8 @@ static void becore_video_work(struct work_struct *work)
 			becore_video_fail(becore, buf);
 			return;
 		}
-		ret = becore_run_frame(becore, BECORE_YUVP_OUTPUT_SBWCL,
+		ret = becore_run_frame(becore, BECORE_RGBP_INPUT_SBWC,
+				       BECORE_YUVP_OUTPUT_SBWCL,
 				       true, vaddr, false, true);
 		if (ret == -ENODATA || ret == -EBUSY) {
 			spin_lock_irq(&becore->queue_lock);
@@ -6801,6 +6897,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   &becore->output.dma);
 	seq_printf(s, "capture_size     %zu bytes\n",
 		   becore->active_capture_size);
+	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
+		   READ_ONCE(becore->input_profile),
+		   becore->active_input_profile,
+		   becore_rgbp_input_size(becore_rgbp_input_profile(becore)));
 	seq_printf(s, "output_profile   %u requested, %u active\n",
 		   READ_ONCE(becore->output_profile),
 		   becore->active_output_profile);
@@ -6980,6 +7080,8 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_mcsc_recipe_fops);
 	debugfs_create_file("input", 0200, dir, becore, &becore_input_fops);
 	debugfs_create_file("grid", 0200, dir, becore, &becore_grid_fops);
+	debugfs_create_u32("input_profile", 0644, dir,
+			   &becore->input_profile);
 	debugfs_create_u32("output_profile", 0644, dir,
 			   &becore->output_profile);
 	debugfs_create_file("output", 0400, dir, becore, &becore_output_fops);

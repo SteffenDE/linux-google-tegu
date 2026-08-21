@@ -2161,6 +2161,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
 #define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
 #define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
+#define ISPFE_LMP_DPC_GAIN_MAX		GENMASK(9, 0)
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
 #define ISPFE_LMP_WBG_CONFIG		BIT(0)
 #define ISPFE_LMP_ALSC_WBG_CONFIG	BIT(1)
@@ -2205,20 +2206,21 @@ static int ispfe_pdma_apply_dpc(const struct ispfe_pdma_program *prog,
 				u8 *payload, bool *applied)
 {
 	const struct ispfe_lmp_wbg_profile *wbg = prog->lmp_wbg;
-	u32 red, blue;
+	u64 red, blue;
 
 	if (!wbg || cmd->reg != ISPFE_LMP_DPC_CONFIG_REG)
 		return 0;
 	if (cmd->len != ISPFE_LMP_DPC_CONFIG_SIZE || *applied)
 		return -EINVAL;
 
-	red = DIV_ROUND_CLOSEST(wbg->red, 1U << 5);
-	blue = DIV_ROUND_CLOSEST(wbg->blue, 1U << 5);
-	if (red > U16_MAX || blue > U16_MAX)
+	red = DIV_ROUND_CLOSEST_ULL((u64)wbg->red, 1U << 5);
+	blue = DIV_ROUND_CLOSEST_ULL((u64)wbg->blue, 1U << 5);
+	if (red > ISPFE_LMP_DPC_GAIN_MAX ||
+	    blue > ISPFE_LMP_DPC_GAIN_MAX)
 		return -ERANGE;
 
-	put_unaligned_le16(red, payload + 0x04);
-	put_unaligned_le16(blue, payload + 0x06);
+	put_unaligned_le16((u16)red, payload + 0x04);
+	put_unaligned_le16((u16)blue, payload + 0x06);
 	*applied = true;
 
 	return 0;

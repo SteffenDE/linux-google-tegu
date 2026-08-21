@@ -1786,6 +1786,13 @@ static int becore_rgbp_crop(struct becore_rect *crop)
 
 	if (!out_w || !out_h || !array_w || !array_h)
 		return -EINVAL;
+	/*
+	 * Widening the margin to a multiple of four keeps the crop's sizes
+	 * even only while the array's own dimensions are, and a Bayer array
+	 * with an odd dimension has no whole last quad in any case.
+	 */
+	if ((array_w | array_h) & 1)
+		return -EINVAL;
 
 	width = 2 * (u32)DIV_ROUND_CLOSEST_ULL((u64)array_h * out_w,
 					       2 * out_h);

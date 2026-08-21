@@ -2283,6 +2283,10 @@
 	status = "okay";
 };
 
+&pd_mcsc {
+	status = "okay";
+};
+
 &pd_rgbp {
 	status = "okay";
 };
@@ -2292,6 +2296,10 @@
 };
 
 &sysmmu_gdc {
+	status = "okay";
+};
+
+&sysmmu_mcsc {
 	status = "okay";
 };
 

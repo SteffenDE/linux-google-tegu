@@ -35,6 +35,7 @@
 
 #include <media/exynos-becore.h>
 #include <media/media-device.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
@@ -609,6 +610,9 @@ struct becore_device {
 	struct dentry *debugfs;
 	struct media_device mdev;
 	struct v4l2_device v4l2_dev;
+	struct v4l2_ctrl_handler ctrl_handler;
+	struct v4l2_ctrl *red_balance;
+	struct v4l2_ctrl *blue_balance;
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct vb2_queue queue;
@@ -694,6 +698,7 @@ struct exynos_becore_input {
 
 static void becore_video_return_all(struct becore_device *becore,
 				    enum vb2_buffer_state state);
+static void becore_video_controls_ungrab(struct becore_device *becore);
 
 static const char * const becore_pm_domain_names[] = {
 	"yuvp",
@@ -2627,6 +2632,7 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 
 	cancel_work_sync(&becore->video_work);
 	if (streaming) {
+		becore_video_controls_ungrab(becore);
 		vb2_queue_error(&becore->queue);
 		becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
 	}
@@ -3711,6 +3717,25 @@ static void becore_video_return_all(struct becore_device *becore,
 	}
 }
 
+static void becore_video_controls_snapshot(struct becore_device *becore,
+					   struct exynos_becore_input_stream_config *config)
+{
+	v4l2_ctrl_lock(becore->red_balance);
+	config->red_balance = becore->red_balance->val;
+	config->blue_balance = becore->blue_balance->val;
+	__v4l2_ctrl_grab(becore->red_balance, true);
+	__v4l2_ctrl_grab(becore->blue_balance, true);
+	v4l2_ctrl_unlock(becore->red_balance);
+}
+
+static void becore_video_controls_ungrab(struct becore_device *becore)
+{
+	v4l2_ctrl_lock(becore->red_balance);
+	__v4l2_ctrl_grab(becore->red_balance, false);
+	__v4l2_ctrl_grab(becore->blue_balance, false);
+	v4l2_ctrl_unlock(becore->red_balance);
+}
+
 static void becore_video_discard_ready(struct becore_device *becore)
 {
 	unsigned int i;
@@ -3754,6 +3779,7 @@ static void becore_video_fail(struct becore_device *becore,
 	mutex_unlock(&becore->lock);
 
 	becore_video_stop_producer(becore);
+	becore_video_controls_ungrab(becore);
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	vb2_queue_error(&becore->queue);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
@@ -3875,6 +3901,7 @@ static void becore_buf_queue(struct vb2_buffer *vb)
 static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct becore_device *becore = vb2_get_drv_priv(q);
+	struct exynos_becore_input_stream_config stream_config;
 	struct exynos_becore_input *input;
 	int ret;
 
@@ -3907,16 +3934,18 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	/* The shared driver-owned output now becomes the video bounce buffer. */
 	becore->completed_generation = 0;
 	becore->completed_output_size = 0;
+	becore_video_controls_snapshot(becore, &stream_config);
 	becore->video_streaming = true;
 	mutex_unlock(&becore->lock);
 
-	ret = input->ops->start_streaming(input->producer_data);
+	ret = input->ops->start_streaming(input->producer_data, &stream_config);
 	if (ret) {
 		becore_input_callback_put(input);
 		mutex_lock(&becore->lock);
 		becore->video_streaming = false;
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
+		becore_video_controls_ungrab(becore);
 		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
 		return ret;
 	}
@@ -3934,6 +3963,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	becore_input_callback_put(input);
 	if (ret) {
 		cancel_work_sync(&becore->video_work);
+		becore_video_controls_ungrab(becore);
 		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
 		return ret;
 	}
@@ -3967,6 +3997,7 @@ static void becore_stop_streaming(struct vb2_queue *q)
 
 	cancel_work_sync(&becore->video_work);
 	becore_video_stop_producer(becore);
+	becore_video_controls_ungrab(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
 }
 
@@ -4224,12 +4255,14 @@ static void becore_video_unregister(void *data)
 	vb2_video_unregister_device(&becore->vdev);
 	media_device_unregister(&becore->mdev);
 	media_entity_cleanup(&becore->vdev.entity);
+	v4l2_ctrl_handler_free(&becore->ctrl_handler);
 	v4l2_device_unregister(&becore->v4l2_dev);
 	media_device_cleanup(&becore->mdev);
 }
 
 static int becore_video_register(struct becore_device *becore)
 {
+	struct v4l2_ctrl_handler *handler = &becore->ctrl_handler;
 	struct vb2_queue *q = &becore->queue;
 	int ret;
 
@@ -4243,6 +4276,24 @@ static int becore_video_register(struct becore_device *becore)
 	if (ret)
 		goto err_mdev;
 
+	ret = v4l2_ctrl_handler_init(handler, 2);
+	if (ret)
+		goto err_v4l2;
+	becore->red_balance =
+		v4l2_ctrl_new_std(handler, NULL, V4L2_CID_RED_BALANCE,
+				  EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
+				  EXYNOS_BECORE_WBG_GAIN_MAX_Q12, 1,
+				  EXYNOS_BECORE_WBG_RED_DEFAULT_Q12);
+	becore->blue_balance =
+		v4l2_ctrl_new_std(handler, NULL, V4L2_CID_BLUE_BALANCE,
+				  EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
+				  EXYNOS_BECORE_WBG_GAIN_MAX_Q12, 1,
+				  EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12);
+	if (handler->error) {
+		ret = handler->error;
+		goto err_ctrl;
+	}
+
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP;
 	q->dev = becore->dev;
@@ -4255,10 +4306,11 @@ static int becore_video_register(struct becore_device *becore)
 	q->lock = &becore->video_lock;
 	ret = vb2_queue_init(q);
 	if (ret)
-		goto err_v4l2;
+		goto err_ctrl;
 
 	becore->vdev = becore_video_template;
 	becore->vdev.v4l2_dev = &becore->v4l2_dev;
+	becore->vdev.ctrl_handler = &becore->ctrl_handler;
 	becore->vdev.queue = q;
 	becore->vdev.lock = &becore->video_lock;
 	becore->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
@@ -4268,7 +4320,7 @@ static int becore_video_register(struct becore_device *becore)
 	ret = media_entity_pads_init(&becore->vdev.entity, 1,
 				     &becore->vdev_pad);
 	if (ret)
-		goto err_v4l2;
+		goto err_ctrl;
 
 	ret = video_register_device(&becore->vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
@@ -4285,6 +4337,8 @@ err_vdev:
 	video_unregister_device(&becore->vdev);
 err_entity:
 	media_entity_cleanup(&becore->vdev.entity);
+err_ctrl:
+	v4l2_ctrl_handler_free(&becore->ctrl_handler);
 err_v4l2:
 	v4l2_device_unregister(&becore->v4l2_dev);
 err_mdev:

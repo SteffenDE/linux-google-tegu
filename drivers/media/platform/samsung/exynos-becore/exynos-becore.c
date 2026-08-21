@@ -639,6 +639,7 @@ struct becore_device {
 	enum becore_mcsc_input_transport mcsc_encoded_transport;
 	dma_addr_t active_output_dma;
 	size_t active_output_size;
+	size_t active_capture_size;
 	size_t completed_output_size;
 	int last_run_result;
 	bool running;
@@ -1107,12 +1108,17 @@ static size_t becore_mcsc_output_plane2_offset(void)
 	return (size_t)becore_mcsc_output.stride * becore_mcsc_output.height;
 }
 
-static size_t becore_mcsc_output_size(void)
+static size_t becore_mcsc_output_active_size(void)
 {
 	size_t chroma = (size_t)becore_mcsc_output.stride *
 			DIV_ROUND_UP(becore_mcsc_output.height, 2);
 
-	return ALIGN(becore_mcsc_output_plane2_offset() + chroma, SZ_4K);
+	return becore_mcsc_output_plane2_offset() + chroma;
+}
+
+static size_t becore_mcsc_output_size(void)
+{
+	return ALIGN(becore_mcsc_output_active_size(), SZ_4K);
 }
 
 static int
@@ -3127,6 +3133,8 @@ static int becore_run_frame(struct becore_device *becore, u32 output_profile,
 	becore->active_output_packed = packed_output;
 	becore->active_output_dma = becore->output.dma;
 	becore->active_output_size = becore_active_output_size(becore);
+	becore->active_capture_size = run_mcsc ?
+		becore_mcsc_output_active_size() : becore->active_output_size;
 	if (!becore->active_output_dma ||
 	    upper_32_bits(becore->active_output_dma) ||
 	    upper_32_bits(becore->active_output_dma +
@@ -3237,8 +3245,9 @@ static int becore_run_frame(struct becore_device *becore, u32 output_profile,
 	if (pm_ret >= 0)
 		dma_rmb();
 	if (capture_output && !ret && pm_ret >= 0)
-		memcpy(capture_output, becore->output.cpu,
-		       becore->active_output_size);
+		memcpy(capture_output,
+		       run_mcsc ? becore->mcsc_output.cpu : becore->output.cpu,
+		       becore->active_capture_size);
 	if (diagnostic_output && pm_ret >= 0) {
 		becore_measure_buffer(&becore->output,
 				      &becore->output_changed_bytes,
@@ -3350,20 +3359,16 @@ static int becore_cancel_set(void *data, u64 value)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(becore_cancel_fops, NULL, becore_cancel_set, "%llu\n");
 
-/* ---- processed P010 capture queue -------------------------------------- */
+/* ---- processed NV21 capture queue -------------------------------------- */
 
 static void becore_video_fill_pix(struct v4l2_pix_format *pix)
 {
-	const struct becore_yuvp_output_profile *profile =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_P010];
-
-	pix->width = profile->width;
-	pix->height = profile->height;
-	pix->pixelformat = V4L2_PIX_FMT_P010;
+	pix->width = becore_mcsc_output.width;
+	pix->height = becore_mcsc_output.height;
+	pix->pixelformat = V4L2_PIX_FMT_NV21;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = becore_yuvp_output_stride(profile);
-	/* Single-planar P010 places UV immediately after the luma rows. */
-	pix->sizeimage = becore_yuvp_packed_output_size(profile);
+	pix->bytesperline = becore_mcsc_output.stride;
+	pix->sizeimage = becore_mcsc_output_active_size();
 	/* The captured recipe does not describe its range or YCbCr matrix. */
 	pix->colorspace = V4L2_COLORSPACE_RAW;
 	pix->flags = 0;
@@ -3432,8 +3437,8 @@ static void becore_video_work(struct work_struct *work)
 			becore_video_fail(becore, buf);
 			return;
 		}
-		ret = becore_run_frame(becore, BECORE_YUVP_OUTPUT_P010,
-				       true, vaddr, true, false);
+		ret = becore_run_frame(becore, BECORE_YUVP_OUTPUT_SBWCL,
+				       true, vaddr, false, true);
 		if (ret == -ENODATA || ret == -EBUSY) {
 			spin_lock_irq(&becore->queue_lock);
 			list_add(&buf->list, &becore->queued_outputs);
@@ -3461,7 +3466,7 @@ static void becore_video_work(struct work_struct *work)
 		mutex_unlock(&becore->lock);
 		buf->vb.field = V4L2_FIELD_NONE;
 		vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
-				      becore->active_output_size);
+				      becore->active_capture_size);
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
 }
@@ -3526,6 +3531,9 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = becore_recipe_header_validate(becore);
 	if (ret)
 		goto unlock;
+	ret = becore_mcsc_recipe_validate(becore);
+	if (ret)
+		goto unlock;
 	if (becore->grid.staged_bytes != BECORE_GRID_SIZE) {
 		ret = -EINVAL;
 		goto unlock;
@@ -3585,7 +3593,7 @@ static int becore_querycap(struct file *file, void *priv,
 			   struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, "exynos-becore", sizeof(cap->driver));
-	strscpy(cap->card, "zumapro BE-core P010", sizeof(cap->card));
+	strscpy(cap->card, "zumapro BE-core MCSC NV21", sizeof(cap->card));
 
 	return 0;
 }
@@ -3596,7 +3604,7 @@ static int becore_enum_fmt(struct file *file, void *priv,
 	if (f->index)
 		return -EINVAL;
 
-	f->pixelformat = V4L2_PIX_FMT_P010;
+	f->pixelformat = V4L2_PIX_FMT_NV21;
 
 	return 0;
 }
@@ -3623,15 +3631,12 @@ static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 static int becore_enum_framesizes(struct file *file, void *priv,
 				  struct v4l2_frmsizeenum *fsize)
 {
-	const struct becore_yuvp_output_profile *profile =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_P010];
-
-	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_P010)
+	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_NV21)
 		return -EINVAL;
 
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = profile->width;
-	fsize->discrete.height = profile->height;
+	fsize->discrete.width = becore_mcsc_output.width;
+	fsize->discrete.height = becore_mcsc_output.height;
 
 	return 0;
 }
@@ -3664,7 +3669,7 @@ static const struct v4l2_file_operations becore_fops = {
 };
 
 static const struct video_device becore_video_template = {
-	.name = "exynos-becore P010 capture",
+	.name = "exynos-becore MCSC NV21 capture",
 	.fops = &becore_fops,
 	.ioctl_ops = &becore_ioctl_ops,
 	.release = video_device_release_empty,
@@ -3759,6 +3764,8 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->active_output_size, becore->completed_output_size,
 		   becore->output.size,
 		   &becore->output.dma);
+	seq_printf(s, "capture_size     %zu bytes\n",
+		   becore->active_capture_size);
 	seq_printf(s, "output_profile   %u requested, %u active\n",
 		   READ_ONCE(becore->output_profile),
 		   becore->active_output_profile);
@@ -3968,6 +3975,7 @@ static int becore_probe(struct platform_device *pdev)
 	becore->mcsc_output_first_changed = U32_MAX;
 	becore->active_output_profile = BECORE_YUVP_OUTPUT_SBWCL;
 	becore->active_output_size = becore_active_output_size(becore);
+	becore->active_capture_size = becore_mcsc_output_active_size();
 	becore->blocks[BECORE_RGBP] = (struct becore_block) {
 		.becore = becore,
 		.name = "RGBP",

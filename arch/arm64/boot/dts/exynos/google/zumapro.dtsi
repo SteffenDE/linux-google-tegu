@@ -4101,9 +4101,10 @@
 		 * Camera back-end processing core.  Source: downstream
 		 * lwis_be_core@1C440000 in research/dumped.dts:13101.  The three
 		 * processor windows, seven SSMT windows and RGBP routing register
-		 * preserve the downstream resource order.  CMDQ shares each block's
-		 * INT0 GIC line, so the downstream nine interrupt entries reduce to
-		 * the six unique physical lines below.
+		 * preserve the downstream resource order.  The appended MCSC processor,
+		 * seven SSMTs and routing register are downstream lwis_mcsc@1D040000.
+		 * CMDQ shares each block's INT0 GIC line, so duplicate downstream
+		 * interrupt entries reduce to the unique physical lines below.
 		 *
 		 * RGBP's command loader resides in BLK_GDC.  Consequently all three
 		 * domains and GDC's System MMU are dependencies even though the first
@@ -4122,24 +4123,40 @@
 			      <0x1c614000 0xe00>,
 			      <0x1c624000 0xe00>,
 			      <0x1c634000 0xe00>,
-			      <0x1c644000 0xe00>;
+			      <0x1c644000 0xe00>,
+			      <0x1d040000 0x10000>,
+			      <0x1d104000 0xe00>,
+			      <0x1d114000 0xe00>,
+			      <0x1d124000 0xe00>,
+			      <0x1d134000 0xe00>,
+			      <0x1d144000 0xe00>,
+			      <0x1d154000 0xe00>,
+			      <0x1d164000 0xe00>,
+			      <0x1d020400 0x4>;
 			reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp",
 				    "ssmt-yuvp", "sysreg-rgbp", "ssmt-mcfp0",
 				    "ssmt-mcfp1", "ssmt-mcfp2", "ssmt-mcfp3",
-				    "ssmt-mcfp4";
+				    "ssmt-mcfp4", "mcsc", "ssmt-mcsc0",
+				    "ssmt-mcsc1", "ssmt-mcsc2", "ssmt-mcsc3",
+				    "ssmt-mcsc4", "ssmt-mcsc5", "ssmt-mcsc6",
+				    "sysreg-mcsc";
 			interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 664 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 744 IRQ_TYPE_LEVEL_HIGH 0>,
-				     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>;
+				     <GIC_SPI 745 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 502 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 503 IRQ_TYPE_LEVEL_HIGH 0>;
 			interrupt-names = "rgbp-int0", "rgbp-int1",
 					  "mcfp-int0", "mcfp-int1",
-					  "yuvp-int0", "yuvp-int1";
-			power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>;
-			power-domain-names = "yuvp", "rgbp", "gdc";
+					  "yuvp-int0", "yuvp-int1",
+					  "mcsc-int0", "mcsc-int1";
+			power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>,
+					<&pd_mcsc>;
+			power-domain-names = "yuvp", "rgbp", "gdc", "mcsc";
 			iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>,
-				 <&sysmmu_rgbp_s1>, <&sysmmu_gdc>;
+				 <&sysmmu_rgbp_s1>, <&sysmmu_gdc>, <&sysmmu_mcsc>;
 			samsung,iommu-group = <&iommu_group_isp>;
 			status = "disabled";
 		};

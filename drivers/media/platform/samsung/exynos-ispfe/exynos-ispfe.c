@@ -1114,6 +1114,16 @@ struct ispfe_device {
 	dma_addr_t tnr_pyramid_dma;
 	bool backend_producing;
 	bool backend_handed_off;
+	/*
+	 * Whether a recipe that was captured without one is asked to carry the
+	 * LMP main-Bayer side output for a back-end consumer.  The back-end
+	 * recipe carries its own and ignores this; the raw recipe's is a graft,
+	 * and a full-mode raw stream carrying it produces no LMP event at all
+	 * (see ispfe_pdma_apply_backend_output()).  Off by default, so an
+	 * ordinary raw capture programs only the destination it was asked for.
+	 */
+	bool backend_side_output;
+	bool active_backend_side_output;
 	u32 backend_image_lo;
 	u32 backend_image_hi;
 	u32 backend_header_lo;
@@ -2234,7 +2244,8 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 					   u32 *image_lo, u32 *image_hi,
 					   u32 *header_lo, u32 *header_hi)
 {
-	if (!ispfe->prog->patch_backend_output)
+	if (!ispfe->prog->patch_backend_output ||
+	    !ispfe->active_backend_side_output)
 		return 0;
 
 	switch (cmd->reg) {
@@ -2792,7 +2803,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
 		return -EINVAL;
 	}
-	if (prog->backend_output &&
+	if (ispfe->active_backend_side_output &&
 	    (!backend_image_lo || !backend_image_hi ||
 	     !backend_header_lo || !backend_header_hi)) {
 		dev_err(ispfe->dev, "PDMA recipe has no back-end output addresses\n");
@@ -3350,7 +3361,7 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 			put_unaligned_le32(upper_32_bits(ispfe->spare_frame_dma),
 					   program + ispfe->bayer_hi);
 		}
-		if (ispfe->prog->backend_output) {
+		if (ispfe->active_backend_side_output) {
 			if (WARN_ON_ONCE(!ispfe->backend_image_lo ||
 					 !ispfe->backend_header_lo)) {
 				cmpxchg(&ispfe->snapshot_state,
@@ -3603,7 +3614,7 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
 	    !ispfe->programs || !ispfe->blocks || !ispfe->awb_spare)
 		return false;
-	if (ispfe->prog->backend_output && !ispfe->tnr_pyramid)
+	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
 		return false;
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
 		if (!ispfe->pdma_output[i].cpu)
@@ -3680,7 +3691,7 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
-	if (ispfe->prog->backend_output) {
+	if (ispfe->active_backend_side_output) {
 		ispfe->tnr_pyramid = dma_alloc_coherent(
 			ispfe->dev, ISPFE_TNR_PYRAMID_SIZE,
 			&ispfe->tnr_pyramid_dma, GFP_KERNEL);
@@ -3984,6 +3995,16 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->active_lmp_ml0_profile = lmp_ml0_profile;
 	ispfe->active_lmp_wbg = lmp_wbg;
 	ispfe->active_backend_recipe = ispfe->prog->backend_recipe;
+	/*
+	 * A recipe that was captured with the LMP main-Bayer side output keeps
+	 * it: that is the back-end producer's own program.  Grafting one onto a
+	 * recipe captured without it is a diagnostic, and it is not free -- the
+	 * full-mode raw recipe carrying it receives frames but never completes
+	 * an LMP one, so an ordinary raw capture must not pay for it.
+	 */
+	ispfe->active_backend_side_output = ispfe->prog->backend_output &&
+		(!ispfe->prog->patch_backend_output ||
+		 ispfe->backend_side_output);
 	ispfe->active_pdma_program_override = pdma_program_override;
 	ispfe->active_pdma_program_generation =
 		ispfe->active_pdma_program_override ?
@@ -4002,7 +4023,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->link_irq = ret;
 
 	/* Reserve the exact slot whose IOVA the program encoder will publish. */
-	if (ispfe->prog->backend_output &&
+	if (ispfe->active_backend_side_output &&
 	    ispfe->owner != ISPFE_OWNER_BACKEND) {
 		ret = exynos_becore_input_producer_acquire(ispfe->backend_input,
 							   &ispfe->backend_buffer);
@@ -4901,6 +4922,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		   ispfe->fc_axi_max_ost, ispfe->active_fc_axi_max_ost);
 	seq_printf(s, "backend_recipe %u requested, %u active\n",
 		   ispfe->backend_recipe, ispfe->active_backend_recipe);
+	seq_printf(s, "backend_side_output %u requested, %u active\n",
+		   ispfe->backend_side_output,
+		   ispfe->active_backend_side_output);
 	seq_printf(s, "pdma_override %u requested, %u active\n",
 		   ispfe->pdma_program_override,
 		   ispfe->active_pdma_program_override);
@@ -5349,6 +5373,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			   &ispfe->lmp_ml0_profile);
 	debugfs_create_u32("backend_recipe", 0644, d,
 			   &ispfe->backend_recipe);
+	debugfs_create_bool("backend_side_output", 0644, d,
+			    &ispfe->backend_side_output);
 	debugfs_create_u32("credit_latency", 0644, d, &ispfe->credit_latency);
 	debugfs_create_x32("pdma_cmd", 0644, d, &ispfe->pdma_cmd);
 	debugfs_create_x32("pdma_addr", 0644, d, &ispfe->pdma_addr);

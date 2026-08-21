@@ -53,7 +53,7 @@ struct exynos_pm_domain {
 	void __iomem *cmu;
 	void __iomem *cmu_option;
 	void __iomem *bus;
-	void __iomem *s2mpu[2];
+	void __iomem *s2mpu[3];
 	phys_addr_t base_addr;
 	struct generic_pm_domain pd;
 	const struct exynos_pm_domain_restore *restore;
@@ -240,9 +240,10 @@ static const struct exynos_pm_domain_config zumapro_cfg = {
 
 /*
  * These are the values restored by downstream PMUCAL on every BLK_GDC,
- * BLK_RGBP and BLK_YUVP power-up, corroborated by the Pixel 9a camera startup
- * trace.  The Q-channel ranges include the System MMUs, so the restore belongs
- * here in genpd: an IOMMU resumes before the camera device whose DMA it serves.
+ * BLK_RGBP, BLK_TNR, BLK_MCSC and BLK_YUVP power-up, corroborated by the Pixel
+ * 9a camera startup trace.  The Q-channel ranges include the System MMUs, so
+ * the restore belongs here in genpd: an IOMMU resumes before the camera device
+ * whose DMA it serves.
  */
 static const struct exynos_pm_domain_restore zumapro_gdc_restore = {
 	.divider_offset	= 0x1800,
@@ -284,6 +285,32 @@ static const struct exynos_pm_domain_restore zumapro_yuvp_restore = {
 	.num_s2mpus	= 1,
 };
 
+static const struct exynos_pm_domain_restore zumapro_tnr_restore = {
+	.divider_offset	= 0x1800,
+	.mux_offsets	= { 0x600, 0x610 },
+	.num_muxes	= 2,
+	.qch_first	= 0x3028,
+	.qch_last	= 0x311c,
+	.qch_hole	= U32_MAX,
+	.bus_drcg	= 0xffffffff,
+	.bus_drcg1_offset = 0x10c,
+	.bus_drcg1	= 0xffffffff,
+	.bus_memclk_offset = 0x108,
+	.num_s2mpus	= 3,
+};
+
+static const struct exynos_pm_domain_restore zumapro_mcsc_restore = {
+	.divider_offset	= 0x1800,
+	.mux_offsets	= { 0x610 },
+	.num_muxes	= 1,
+	.qch_first	= 0x3014,
+	.qch_last	= 0x309c,
+	.qch_hole	= U32_MAX,
+	.bus_drcg	= 0x03ffffff,
+	.bus_memclk_offset = 0x108,
+	.num_s2mpus	= 1,
+};
+
 static const struct exynos_pm_domain_config zumapro_gdc_cfg = {
 	.local_pwr_cfg	= BIT(0),
 	.secure_pmu	= true,
@@ -305,6 +332,20 @@ static const struct exynos_pm_domain_config zumapro_yuvp_cfg = {
 	.restore	= &zumapro_yuvp_restore,
 };
 
+static const struct exynos_pm_domain_config zumapro_tnr_cfg = {
+	.local_pwr_cfg	= BIT(0),
+	.secure_pmu	= true,
+	.wait_us	= 5000,
+	.restore	= &zumapro_tnr_restore,
+};
+
+static const struct exynos_pm_domain_config zumapro_mcsc_cfg = {
+	.local_pwr_cfg	= BIT(0),
+	.secure_pmu	= true,
+	.wait_us	= 5000,
+	.restore	= &zumapro_mcsc_restore,
+};
+
 static const struct of_device_id exynos_pm_domain_of_match[] = {
 	{
 		.compatible = "samsung,exynos4210-pd",
@@ -324,6 +365,12 @@ static const struct of_device_id exynos_pm_domain_of_match[] = {
 	}, {
 		.compatible = "google,zumapro-yuvp-pd",
 		.data = &zumapro_yuvp_cfg,
+	}, {
+		.compatible = "google,zumapro-tnr-pd",
+		.data = &zumapro_tnr_cfg,
+	}, {
+		.compatible = "google,zumapro-mcsc-pd",
+		.data = &zumapro_mcsc_cfg,
 	},
 	{ },
 };

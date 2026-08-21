@@ -692,11 +692,22 @@ static_assert((BECORE_YUVP_CLUT_MATRIX_LAST - BECORE_YUVP_CLUT_MATRIX_FIRST) /
 #define BECORE_MCSC_SC0_H_COEFF_FIRST	(BECORE_MCSC_PHYS_BASE + 0x506c)
 #define BECORE_MCSC_SC0_H_COEFF_LAST	(BECORE_MCSC_PHYS_BASE + 0x50f8)
 #define BECORE_SC_PHASES		9
+#define BECORE_SC_SETS			7
+
+/* The ratio bands the seven sets are selected by, x8/8 first. */
+enum becore_sc_set {
+	BECORE_SC_SET_X8_8,
+	BECORE_SC_SET_X7_8,
+	BECORE_SC_SET_X6_8,
+	BECORE_SC_SET_X5_8,
+	BECORE_SC_SET_X4_8,
+	BECORE_SC_SET_X3_8,
+	BECORE_SC_SET_X2_8,
+};
+static_assert(BECORE_SC_SET_X2_8 + 1 == BECORE_SC_SETS);
 #define BECORE_SC_V_TAPS		4
 #define BECORE_SC_H_TAPS		8
-#define BECORE_SC_COEFF_SUM		512
 #define BECORE_SC_COEFF_MASK		GENMASK(10, 0)
-#define BECORE_SC_RATIO_X8_8		(1U << BECORE_RATIO_SHIFT)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -3323,62 +3334,185 @@ static u32 becore_mcsc_chain_ratio(void)
  * Samsung publishes its poly-phase coefficients because they are a function of
  * the scaling ratio rather than of the scene: get_scaler_coef_ver2() picks one
  * of seven sets by comparing the ratio against x8/8, x7/8 and so on down to
- * x2/8. Both scalers here run at unity, which selects x8/8, and x8/8 is the
- * only set carried -- any other ratio makes the encode fail rather than
- * quietly programming the wrong filter for it.
+ * x2/8. All seven are here because a scaler that downscales needs whichever
+ * one its ratio selects -- the rear ultrawide and the rear camera run at
+ * unity, the front camera at 4096/4000 and its 640x480 mode at exactly 2x.
  *
- * These are Samsung's numbers verbatim, indexed [tap][phase], from
- * is-hw-api-rgbp-v1_20.c. Zuma's fields hold a quarter of that precision, so
- * a phase sums to 512 rather than 2048 and the last tap takes up the
- * remainder. That is not cosmetic: Samsung's own x8/8 horizontal phase 7 sums
- * to 2052, and the captured program carries the renormalised value.
+ * These are Samsung's numbers verbatim from is-hw-api-mcscaler-v9_1.c, indexed
+ * [set][tap][phase]. The MCSC table rather than the RGBP one, although the two
+ * publish the same coefficients: RGBP's are at 2048 and Zuma's fields hold
+ * 512, and quartering them reproduces two transcription errors that the
+ * hardware contradicts -- horizontal x7/8 tap 0 phase 1, where Samsung's row
+ * breaks its own monotone run, and horizontal x5/8 tap 0 phase 0, where it has
+ * the wrong sign. Each error also corrupts whichever tap absorbs the
+ * renormalisation, so each costs two words. MCSC publishes them already at
+ * 512, so nothing is scaled or renormalised here and there is no residual.
+ *
+ * Checked against every capture: 54 coefficient words in each of eighteen
+ * captured RGBP programs, over three cameras and seven sensor readouts,
+ * exercising x8/8, x7/8, x5/8 and x4/8, all matching bit for bit.
  */
-static const s16 becore_sc_h_coeff_x8_8[BECORE_SC_H_TAPS][BECORE_SC_PHASES] = {
-	{    0,   -8,  -16,  -20,  -24,  -24,  -24,  -24,  -20 },
-	{    0,   32,   56,   80,   92,  100,  104,  100,   92 },
-	{    0, -100, -184, -248, -292, -320, -332, -328, -312 },
-	{ 2048, 2036, 1996, 1928, 1832, 1716, 1580, 1428, 1264 },
-	{    0,  120,  256,  404,  568,  740,  912, 1092, 1264 },
-	{    0,  -36,  -76, -120, -164, -212, -252, -284, -312 },
-	{    0,    8,   20,   32,   48,   60,   76,   84,   92 },
-	{    0,   -4,   -4,   -8,  -12,  -12,  -16,  -16,  -20 },
+static const s16 becore_sc_v_coeff[BECORE_SC_SETS][BECORE_SC_V_TAPS][BECORE_SC_PHASES] = {
+	[BECORE_SC_SET_X8_8] = {
+		{     0,   -15,   -25,   -31,   -33,   -33,   -31,   -27,   -23 },
+		{   512,   508,   495,   473,   443,   408,   367,   324,   279 },
+		{     0,    20,    45,    75,   110,   148,   190,   234,   279 },
+		{     0,    -1,    -3,    -5,    -8,   -11,   -14,   -19,   -23 },
+	},
+	[BECORE_SC_SET_X7_8] = {
+		{    32,    17,     3,    -7,   -14,   -18,   -20,   -20,   -19 },
+		{   448,   446,   437,   421,   399,   373,   343,   310,   275 },
+		{    32,    55,    79,   107,   138,   170,   204,   240,   275 },
+		{     0,    -6,    -7,    -9,   -11,   -13,   -15,   -18,   -19 },
+	},
+	[BECORE_SC_SET_X6_8] = {
+		{    61,    46,    31,    19,     9,     2,    -3,    -7,    -9 },
+		{   390,   390,   383,   371,   356,   337,   315,   291,   265 },
+		{    61,    83,   106,   130,   156,   183,   210,   238,   265 },
+		{     0,    -7,    -8,    -8,    -9,   -10,   -10,   -10,    -9 },
+	},
+	[BECORE_SC_SET_X5_8] = {
+		{    85,    71,    56,    43,    32,    23,    16,     9,     5 },
+		{   341,   341,   336,   328,   317,   304,   288,   271,   251 },
+		{    86,   105,   124,   145,   166,   187,   209,   231,   251 },
+		{     0,    -5,    -4,    -4,    -3,    -2,    -1,     1,     5 },
+	},
+	[BECORE_SC_SET_X4_8] = {
+		{   104,    89,    76,    63,    52,    42,    33,    26,    20 },
+		{   304,   302,   298,   293,   285,   275,   264,   251,   236 },
+		{   104,   120,   136,   153,   170,   188,   205,   221,   236 },
+		{     0,     1,     2,     3,     5,     7,    10,    14,    20 },
+	},
+	[BECORE_SC_SET_X3_8] = {
+		{   118,   103,    90,    78,    67,    57,    48,    40,    33 },
+		{   276,   273,   270,   266,   260,   253,   244,   234,   223 },
+		{   118,   129,   143,   157,   171,   185,   199,   211,   223 },
+		{     0,     7,     9,    11,    14,    17,    21,    27,    33 },
+	},
+	[BECORE_SC_SET_X2_8] = {
+		{   127,   111,   100,    88,    78,    68,    59,    50,    43 },
+		{   258,   252,   250,   247,   242,   237,   230,   222,   213 },
+		{   127,   135,   147,   159,   171,   182,   193,   204,   213 },
+		{     0,    14,    15,    18,    21,    25,    30,    36,    43 },
+	},
 };
 
-static const s16 becore_sc_v_coeff_x8_8[BECORE_SC_V_TAPS][BECORE_SC_PHASES] = {
-	{    0,  -60, -100, -124, -132, -132, -124, -108,  -92 },
-	{ 2048, 2032, 1980, 1892, 1772, 1632, 1468, 1296, 1116 },
-	{    0,   80,  180,  300,  440,  592,  760,  936, 1116 },
-	{    0,   -4,  -12,  -20,  -32,  -44,  -56,  -76,  -92 },
+static const s16 becore_sc_h_coeff[BECORE_SC_SETS][BECORE_SC_H_TAPS][BECORE_SC_PHASES] = {
+	[BECORE_SC_SET_X8_8] = {
+		{     0,    -2,    -4,    -5,    -6,    -6,    -6,    -6,    -5 },
+		{     0,     8,    14,    20,    23,    25,    26,    25,    23 },
+		{     0,   -25,   -46,   -62,   -73,   -80,   -83,   -82,   -78 },
+		{   512,   509,   499,   482,   458,   429,   395,   357,   316 },
+		{     0,    30,    64,   101,   142,   185,   228,   273,   316 },
+		{     0,    -9,   -19,   -30,   -41,   -53,   -63,   -71,   -78 },
+		{     0,     2,     5,     8,    12,    15,    19,    21,    23 },
+		{     0,    -1,    -1,    -2,    -3,    -3,    -4,    -5,    -5 },
+	},
+	[BECORE_SC_SET_X7_8] = {
+		{    12,     9,     7,     5,     3,     2,     1,     0,    -1 },
+		{   -32,   -24,   -16,    -9,    -3,     2,     7,    10,    13 },
+		{    56,    29,     6,   -14,   -30,   -43,   -53,   -60,   -65 },
+		{   444,   445,   438,   426,   410,   390,   365,   338,   309 },
+		{    52,    82,   112,   144,   177,   211,   244,   277,   309 },
+		{   -32,   -39,   -46,   -52,   -58,   -63,   -66,   -66,   -65 },
+		{    12,    13,    14,    15,    16,    16,    16,    15,    13 },
+		{     0,    -3,    -3,    -3,    -3,    -3,    -2,    -2,    -1 },
+	},
+	[BECORE_SC_SET_X6_8] = {
+		{     8,     9,     8,     8,     8,     7,     7,     5,     5 },
+		{   -44,   -40,   -36,   -32,   -27,   -22,   -18,   -13,    -9 },
+		{   100,    77,    57,    38,    20,     5,    -9,   -20,   -30 },
+		{   384,   382,   377,   369,   358,   344,   329,   310,   290 },
+		{   100,   123,   147,   171,   196,   221,   245,   268,   290 },
+		{   -44,   -47,   -49,   -49,   -48,   -47,   -43,   -37,   -30 },
+		{     8,     8,     7,     5,     3,     1,    -2,    -5,    -9 },
+		{     0,     0,     1,     2,     2,     3,     3,     4,     5 },
+	},
+	[BECORE_SC_SET_X5_8] = {
+		{    -3,    -3,    -1,     0,     1,     2,     2,     3,     3 },
+		{   -31,   -32,   -33,   -32,   -31,   -30,   -28,   -25,   -23 },
+		{   130,   113,    97,    81,    66,    52,    38,    26,    15 },
+		{   320,   319,   315,   311,   304,   296,   286,   274,   261 },
+		{   130,   147,   165,   182,   199,   216,   232,   247,   261 },
+		{   -31,   -29,   -26,   -22,   -17,   -11,    -3,     5,    15 },
+		{    -3,    -6,    -8,   -11,   -13,   -16,   -18,   -21,   -23 },
+		{     0,     3,     3,     3,     3,     3,     3,     3,     3 },
+	},
+	[BECORE_SC_SET_X4_8] = {
+		{   -11,   -10,    -9,    -8,    -7,    -6,    -5,    -5,    -4 },
+		{     0,    -4,    -7,   -10,   -12,   -14,   -15,   -16,   -17 },
+		{   140,   129,   117,   106,    95,    85,    74,    64,    55 },
+		{   255,   254,   253,   250,   246,   241,   236,   229,   222 },
+		{   140,   151,   163,   174,   185,   195,   204,   214,   222 },
+		{     0,     5,    10,    16,    22,    29,    37,    46,    55 },
+		{   -12,   -13,   -14,   -15,   -16,   -16,   -17,   -17,   -17 },
+		{     0,     0,    -1,    -1,    -1,    -2,    -2,    -3,    -4 },
+	},
+	[BECORE_SC_SET_X3_8] = {
+		{    -5,    -5,    -5,    -5,    -5,    -5,    -5,    -5,    -5 },
+		{    31,    27,    23,    19,    16,    12,    10,     7,     5 },
+		{   133,   126,   119,   112,   105,    98,    91,    84,    78 },
+		{   195,   195,   194,   193,   191,   189,   185,   182,   178 },
+		{   133,   139,   146,   152,   158,   163,   169,   174,   178 },
+		{    31,    37,    41,    47,    53,    59,    65,    71,    78 },
+		{    -6,    -4,    -3,    -2,    -2,     0,     1,     3,     5 },
+		{     0,    -3,    -3,    -4,    -4,    -4,    -4,    -4,    -5 },
+	},
+	[BECORE_SC_SET_X2_8] = {
+		{    10,     9,     7,     6,     5,     4,     4,     3,     2 },
+		{    52,    48,    45,    41,    38,    35,    31,    29,    26 },
+		{   118,   114,   110,   106,   102,    98,    94,    89,    85 },
+		{   152,   152,   151,   150,   149,   148,   146,   145,   143 },
+		{   118,   122,   125,   129,   132,   135,   138,   140,   143 },
+		{    52,    56,    60,    64,    68,    72,    77,    81,    85 },
+		{    10,    11,    13,    15,    17,    19,    21,    23,    26 },
+		{     0,     0,     1,     1,     1,     1,     1,     2,     2 },
+	},
 };
 
-static s32 becore_sc_coeff(const s16 (*table)[BECORE_SC_PHASES], u32 taps,
-			   u32 tap, u32 phase)
+/*
+ * The set get_scaler_coef_ver2() selects for a ratio. Its bands are
+ * is-hw-api-mcscaler-v3.h's RATIO_X*_8: at or below the first is x8/8, and
+ * anything past the last saturates at x2/8 rather than failing, because the
+ * filter is a best fit and not a description of the scaling.
+ */
+static const u32 becore_sc_ratio_bands[BECORE_SC_SETS] = {
+	1048576, 1198373, 1398101, 1677722, 2097152, 2796203, 4194304,
+};
+
+static u32 becore_sc_coeff_set(u32 ratio)
 {
-	s32 sum = 0;
-	u32 i;
+	u32 set;
 
-	if (tap + 1 < taps)
-		return table[tap][phase] / 4;
-	for (i = 0; i + 1 < taps; i++)
-		sum += table[i][phase] / 4;
+	for (set = 0; set + 1 < BECORE_SC_SETS; set++)
+		if (ratio <= becore_sc_ratio_bands[set])
+			break;
 
-	return BECORE_SC_COEFF_SUM - sum;
+	return set;
 }
 
 /* Two taps of one phase, the lower-numbered one in the low half. */
-static int becore_sc_coeff_value(const s16 (*table)[BECORE_SC_PHASES],
-				 u32 taps, u32 ratio, u32 index, u32 *value)
+static int becore_sc_coeff_value(bool vertical, u32 ratio, u32 index,
+				 u32 *value)
 {
+	u32 set = becore_sc_coeff_set(ratio);
+	u32 taps = vertical ? BECORE_SC_V_TAPS : BECORE_SC_H_TAPS;
 	u32 pairs = taps / 2;
 	u32 phase = index / pairs;
 	u32 pair = index % pairs;
+	s16 low, high;
 
-	if (ratio != BECORE_SC_RATIO_X8_8 || phase >= BECORE_SC_PHASES)
+	if (phase >= BECORE_SC_PHASES)
 		return -EINVAL;
-	*value = (((u32)becore_sc_coeff(table, taps, pair * 2 + 1, phase) &
-		   BECORE_SC_COEFF_MASK) << 16) |
-		 ((u32)becore_sc_coeff(table, taps, pair * 2, phase) &
-		  BECORE_SC_COEFF_MASK);
+	if (vertical) {
+		low = becore_sc_v_coeff[set][pair * 2][phase];
+		high = becore_sc_v_coeff[set][pair * 2 + 1][phase];
+	} else {
+		low = becore_sc_h_coeff[set][pair * 2][phase];
+		high = becore_sc_h_coeff[set][pair * 2 + 1][phase];
+	}
+	*value = (((u32)high & BECORE_SC_COEFF_MASK) << 16) |
+		 ((u32)low & BECORE_SC_COEFF_MASK);
 
 	return 0;
 }
@@ -3586,12 +3720,7 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 
 			if (becore_sc_ratio(id, vertical, &ratio))
 				return -EINVAL;
-			if (becore_sc_coeff_value(vertical ?
-						  becore_sc_v_coeff_x8_8 :
-						  becore_sc_h_coeff_x8_8,
-						  vertical ? BECORE_SC_V_TAPS :
-							     BECORE_SC_H_TAPS,
-						  ratio,
+			if (becore_sc_coeff_value(vertical, ratio,
 						  (reg - table[i].first) / 4,
 						  &result))
 				return -EINVAL;

@@ -1314,10 +1314,24 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 	}
 }
 
+static bool becore_address_reg_valid(u32 reg)
+{
+	switch (reg) {
+	case BECORE_RGBP_INPUT_IMAGE_REG:
+	case BECORE_RGBP_INPUT_HEADER_REG:
+	case BECORE_YUVP_GRID_REG:
+	case BECORE_YUVP_OUTPUT_PLANE1_REG:
+	case BECORE_YUVP_OUTPUT_PLANE2_REG:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int becore_recipe_block_validate(struct becore_device *becore,
 					enum becore_block_id id,
 					const struct becore_cmdq_shape *shape,
-					u32 header_count)
+					u32 header_count, bool validate_dma)
 {
 	const u8 *record = becore_recipe_records(becore, id);
 	u32 address_count = 0;
@@ -1383,8 +1397,10 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 				if (shape[i].mode != 0x00090000 || !(word & 1))
 					return -EINVAL;
 				reg = shape[i].pair_registers[word / 2];
-				if (becore_address_dma(becore, reg) ==
-				    DMA_MAPPING_ERROR)
+				if (!becore_address_reg_valid(reg) ||
+				    (validate_dma &&
+				     becore_address_dma(becore, reg) ==
+				     DMA_MAPPING_ERROR))
 					return -EINVAL;
 				address_count++;
 			}
@@ -1400,28 +1416,38 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	return 0;
 }
 
-static int becore_recipe_validate(struct becore_device *becore)
+static int becore_recipe_records_validate(struct becore_device *becore,
+					  bool validate_dma)
 {
-	struct becore_dma_buffer *input = &becore->run_input->buffer;
 	int ret;
 
 	ret = becore_recipe_header_validate(becore);
 	if (ret)
 		return ret;
-	if (input->size != becore_rgbp_input_size() ||
-	    input->staged_bytes != input->size ||
-	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
-		return -EINVAL;
 
 	ret = becore_recipe_block_validate(becore, BECORE_RGBP,
 					   becore_rgbp_shape,
-					   BECORE_RGBP_HEADER_COUNT);
+					   BECORE_RGBP_HEADER_COUNT,
+					   validate_dma);
 	if (ret)
 		return ret;
 
 	return becore_recipe_block_validate(becore, BECORE_YUVP,
 					    becore_yuvp_shape,
-					    BECORE_YUVP_HEADER_COUNT);
+					    BECORE_YUVP_HEADER_COUNT,
+					    validate_dma);
+}
+
+static int becore_recipe_validate(struct becore_device *becore)
+{
+	struct becore_dma_buffer *input = &becore->run_input->buffer;
+
+	if (input->size != becore_rgbp_input_size() ||
+	    input->staged_bytes != input->size ||
+	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
+		return -EINVAL;
+
+	return becore_recipe_records_validate(becore, true);
 }
 
 static int becore_encode_block(struct becore_device *becore,
@@ -3528,7 +3554,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EBUSY;
 		goto unlock;
 	}
-	ret = becore_recipe_header_validate(becore);
+	ret = becore_recipe_records_validate(becore, false);
 	if (ret)
 		goto unlock;
 	ret = becore_mcsc_recipe_validate(becore);

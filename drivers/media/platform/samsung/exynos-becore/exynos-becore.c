@@ -191,17 +191,28 @@
  * from Samsung YUVP v1.20: DTP asserts its own BYPASS -- it is a test-pattern
  * generator, and nothing wants one -- and COUTFIFO0 is left disabled.
  *
- * DRCDIST is deliberately absent, and it is the interesting absence. Its first
- * register reads as RGB_DRCDIST_BYPASS = 1 in every published YUVP table,
- * which looks like a licence to drop the dynamic-range block's 359 table words
- * outright, 21% of the captured program. It is not one. Zeroing them produces
- * a completely black frame, and so does zeroing them while keeping the block's
- * grid geometry, step multipliers and CONFIG words -- the obvious explanation,
- * measured and refuted [HW 2026-08-21]. Nor is the block idle: the vendor
- * rewrites 52 to 64 of those words every frame, and four of them track the
- * chain geometry between the rear and front cameras. So the block is running,
- * that register does not mean what its name says here, and its tables are live
- * tuning rather than dead bytes.
+ * The third candidate was 0x6000..0x65fc, which Samsung's tables call DRCDIST
+ * and whose first register reads as RGB_DRCDIST_BYPASS = 1 -- 359 table words,
+ * 21% of the captured program, apparently switched off. They are not. Zeroing
+ * them produces a completely black frame, and so does zeroing them while
+ * keeping the block's grid geometry, step multipliers and CONFIG words, which
+ * was the obvious explanation [HW 2026-08-21].
+ *
+ * It is not a dynamic-range block with a bypass. It is **local tone mapping**,
+ * and the captured words say so on their own: 0x6014..0x601c hold 1225, 2404
+ * and 467, the BT.601 luma weights in Q12; 0x6020..0x611c hold 128 strictly
+ * monotone samples rising to 32737 of 32768; and 0x64e0..0x65fc hold 144 cells
+ * of 0x0100, unity in Q8. The block takes RGB, forms a luma, looks up a tone
+ * curve and applies a gain grid. Zeroing a tone curve is why the frame went
+ * black. Vendor code agrees: it has a YuvpLtmBlock whose CMDQ configuration
+ * takes the image size -- which is why four of these words track the chain
+ * geometry between cameras -- and which carries a hardware-backed array of
+ * 49152 shorts, exactly the 96 KiB LTM grid this driver already generates as
+ * an identity.
+ *
+ * So the block runs, its tables are live per-frame tuning, and none of it is
+ * stated here. Retiring it wants the same treatment GTM got -- an identity
+ * curve rather than an assumption that it is off.
  */
 #define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
 #define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)

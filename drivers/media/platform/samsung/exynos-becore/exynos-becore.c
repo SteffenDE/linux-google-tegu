@@ -112,11 +112,13 @@
 #define BECORE_RGBP_INPUT_FORMAT_REG	(BECORE_RGBP_PHYS_BASE + 0x1c10)
 /*
  * RGBP's chain geometry and the crop that narrows it, named from Samsung
- * RGBP v1.20. The Bayer input is the sensor's full 4208 x 3120 and RGBP hands
- * 4160 x 3120 to YUVP, so DMSCCROP removes 48 columns; the captured start of
- * (24, 0) is exactly centred. SC downstream of the crop then runs at unity,
- * which is what makes its x8/8 filter coefficients correct and lets them stay
- * fixed.
+ * RGBP v1.20. All seven derive from three rasters: the sensor's Bayer array,
+ * the window DMSCCROP takes out of it, and what the chain hands YUVP. At the
+ * shipped profile that is 4208 x 3120, a centred 4160 x 3120 at (24, 0), and
+ * 4160 x 3120 -- so the crop removes 48 columns and the scaler below it runs
+ * at unity. None of those numbers is a constant here: the scaler's ratios are
+ * the crop over the destination, and they select its filter coefficients as
+ * well as its scaling.
  */
 #define BECORE_RGBP_CHAIN_SRC_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x0200)
 #define BECORE_RGBP_CHAIN_DST_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x0204)
@@ -472,7 +474,7 @@
  * GetDefaultLtm fills the luma and gain LUTs with 0x0100 and clears the
  * saturation LUT, so the two identity fills are the vendor's own and not an
  * artefact of the scene this was captured from -- and neither differs between
- * the rear and front cameras, where the four grid reciprocals do.
+ * the rear and front cameras, where the four grid steps do.
  */
 #define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
 #define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)
@@ -642,16 +644,16 @@ static_assert((BECORE_YUVP_CLUT_MATRIX_LAST - BECORE_YUVP_CLUT_MATRIX_FIRST) /
 /*
  * DJAG's pre-scaler geometry -- Samsung MCSC v10.1 names these
  * YUV_DJAG_IMG_SIZE, YUV_DJAG_PS_SRC_POS/SRC_SIZE/DST_SIZE and
- * YUV_DJAG_PS_H/V_RATIO. This is the block that crops and scales; POLY_SC0
- * downstream of it runs at unity on this recipe, which is why its x8/8 filter
- * coefficients are correct and unaffected by the ratio here.
+ * YUV_DJAG_PS_H/V_RATIO. This is the block that crops and scales, and
+ * POLY_SC0 downstream of it therefore maps the output raster onto itself.
  *
  * Each of the first four registers packs two 16-bit halves with the width in
  * the high one, and the two ratios are the crop as a 20-bit fixed-point
  * fraction of the destination -- Samsung's own GET_ZOOM_RATIO(in, out), which
- * is ((in) << MCSC_PRECISION) / (out) with MCSC_PRECISION 20. For the recorded
- * 3536 x 2652 crop into 4000 x 3000 that truncates to exactly the 0x000e24dd
- * the vendor program carries, and so does the vertical.
+ * is ((in) << MCSC_PRECISION) / (out) with MCSC_PRECISION 20. This driver
+ * crops the whole 4160 x 3120 raster into 4000 x 3000, which truncates to
+ * 0x0010a3d7 on both axes; the vendor cropped 3536 x 2652 out of it and
+ * carried 0x000e24dd, spending the difference on stabilisation.
  */
 #define BECORE_MCSC_DJAG_IMG_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x4004)
 #define BECORE_MCSC_DJAG_PS_SRC_POS_REG	(BECORE_MCSC_PHYS_BASE + 0x4008)
@@ -714,18 +716,20 @@ static_assert(BECORE_SC_SET_X2_8 + 1 == BECORE_SC_SETS);
  * becore_sc_coeff_value() turns a register's index within its range into a
  * (phase, tap pair), which is only right while each range is exactly one
  * register per tap pair per phase. Both blocks carry both scalers, so say it
- * once for all four ranges rather than trusting four address literals.
+ * once for all four ranges rather than trusting four address literals. The
+ * span is the byte distance between a range's first and last register, which
+ * is one register short of the count.
  */
-#define BECORE_SC_COEFF_REGS(taps) \
+#define BECORE_SC_COEFF_SPAN(taps) \
 	((taps) / 2 * BECORE_SC_PHASES * 4 - 4)
 static_assert(BECORE_RGBP_SC_V_COEFF_LAST - BECORE_RGBP_SC_V_COEFF_FIRST ==
-	      BECORE_SC_COEFF_REGS(BECORE_SC_V_TAPS));
+	      BECORE_SC_COEFF_SPAN(BECORE_SC_V_TAPS));
 static_assert(BECORE_RGBP_SC_H_COEFF_LAST - BECORE_RGBP_SC_H_COEFF_FIRST ==
-	      BECORE_SC_COEFF_REGS(BECORE_SC_H_TAPS));
+	      BECORE_SC_COEFF_SPAN(BECORE_SC_H_TAPS));
 static_assert(BECORE_MCSC_SC0_V_COEFF_LAST - BECORE_MCSC_SC0_V_COEFF_FIRST ==
-	      BECORE_SC_COEFF_REGS(BECORE_SC_V_TAPS));
+	      BECORE_SC_COEFF_SPAN(BECORE_SC_V_TAPS));
 static_assert(BECORE_MCSC_SC0_H_COEFF_LAST - BECORE_MCSC_SC0_H_COEFF_FIRST ==
-	      BECORE_SC_COEFF_REGS(BECORE_SC_H_TAPS));
+	      BECORE_SC_COEFF_SPAN(BECORE_SC_H_TAPS));
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -738,6 +742,13 @@ enum becore_block_id {
 struct becore_regval {
 	u32 offset;
 	u32 value;
+};
+
+struct becore_rect {
+	u32 x;
+	u32 y;
+	u32 width;
+	u32 height;
 };
 
 struct becore_rgbp_input_profile {
@@ -1263,12 +1274,12 @@ static const struct becore_mcsc_dma_profile becore_mcsc_output = {
 };
 
 /*
- * How much of DJAG's input the output is taken from. The captured
- * program crops 3536 x 2652 out of the 4160 x 3120 YUVP surface and scales it
- * up to fill 4000 x 3000 -- a margin the vendor reserves for electronic
- * stabilisation, which this driver does not implement but must reproduce
- * exactly while the rest of the program is the captured one. The window is
- * centred, so only its size is a parameter.
+ * How much of DJAG's input the output is taken from. The captured program
+ * crops 3536 x 2652 out of the 4160 x 3120 YUVP surface and scales that up to
+ * fill 4000 x 3000, reserving a margin the vendor spends on electronic
+ * stabilisation. This driver has no stabilisation to spend it on, so it takes
+ * the whole raster and downscales instead, covering the full field. The
+ * window is centred, so only its size is a parameter.
  */
 struct becore_mcsc_djag_profile {
 	u32 crop_width;
@@ -1759,16 +1770,12 @@ static u32 becore_rgbp_out_height(void)
  * holds bit-exactly on all eighteen captured programs where taking the array
  * would be right only where the two coincide.
  *
- * Both sizes are kept even and the origin refused if it is odd, because a
- * window on the wrong Bayer phase swaps the colours silently.
+ * Both sizes are kept even, and the margin is widened to a multiple of four so
+ * that the centred origin lands on an even pixel: a window on the wrong Bayer
+ * phase swaps the colours with no other symptom. The odd-origin test below is
+ * therefore unreachable by construction and is kept as a guard on that
+ * reasoning rather than on the arithmetic.
  */
-struct becore_rect {
-	u32 x;
-	u32 y;
-	u32 width;
-	u32 height;
-};
-
 static int becore_rgbp_crop(struct becore_rect *crop)
 {
 	u32 array_w = becore_rgbp_input.width;
@@ -1786,9 +1793,10 @@ static int becore_rgbp_crop(struct becore_rect *crop)
 		crop->width = width;
 		crop->height = array_h;
 	} else {
+		u64 fit = (u64)array_w * out_h;
+
 		crop->width = array_w;
-		crop->height = 2 * (u32)DIV_ROUND_CLOSEST_ULL(
-			(u64)array_w * out_h, 2 * out_w);
+		crop->height = 2 * (u32)DIV_ROUND_CLOSEST_ULL(fit, 2 * out_w);
 	}
 	if (crop->height > array_h || !crop->width || !crop->height)
 		return -ERANGE;
@@ -3783,7 +3791,6 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			result = becore_mcsc_chain_ratio(vertical);
 			break;
 		}
-
 		default:
 			return -EINVAL;
 		}

@@ -293,6 +293,23 @@
 #define BECORE_MCSC_DJAG_PS_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4014)
 #define BECORE_MCSC_DJAG_PS_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4018)
 #define BECORE_RATIO_SHIFT		20
+/*
+ * MCSC's chain below DJAG, named from Samsung MCSC v10.1. DJAG has already
+ * produced the output raster, so the POLY_SC0 scaler and the POST_PC0 chroma
+ * converter each map that raster onto itself: neither crops and neither
+ * scales. Carried as constants these did not move when the output geometry
+ * did, and 4000 x 3000 happened to be right; derived, they cannot disagree
+ * with the surface MCSC writes.
+ */
+#define BECORE_MCSC_SC0_SRC_POS_REG	(BECORE_MCSC_PHYS_BASE + 0x5004)
+#define BECORE_MCSC_SC0_SRC_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x5008)
+#define BECORE_MCSC_SC0_DST_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x500c)
+#define BECORE_MCSC_SC0_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x5010)
+#define BECORE_MCSC_SC0_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x5014)
+#define BECORE_MCSC_PC0_IMG_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x6004)
+#define BECORE_MCSC_PC0_DST_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x6008)
+#define BECORE_MCSC_PC0_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x600c)
+#define BECORE_MCSC_PC0_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x6010)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -369,6 +386,9 @@ enum becore_generated_kind {
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
+	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
+	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
+	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
 };
 
 struct becore_generated_range {
@@ -384,6 +404,7 @@ struct becore_generated_range {
  */
 #define BECORE_RGBP_GENERATED_WORDS	113
 #define BECORE_YUVP_GENERATED_WORDS	2
+#define BECORE_MCSC_GENERATED_WORDS	9
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -416,6 +437,19 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+};
+
+static const struct becore_generated_range becore_mcsc_generated[] = {
+	{ BECORE_MCSC_SC0_SRC_POS_REG, BECORE_MCSC_SC0_SRC_POS_REG,
+	  BECORE_GEN_CHAIN_ORIGIN },
+	{ BECORE_MCSC_SC0_SRC_SIZE_REG, BECORE_MCSC_SC0_DST_SIZE_REG,
+	  BECORE_GEN_CHAIN_SIZE },
+	{ BECORE_MCSC_SC0_H_RATIO_REG, BECORE_MCSC_SC0_V_RATIO_REG,
+	  BECORE_GEN_CHAIN_RATIO },
+	{ BECORE_MCSC_PC0_IMG_SIZE_REG, BECORE_MCSC_PC0_DST_SIZE_REG,
+	  BECORE_GEN_CHAIN_SIZE },
+	{ BECORE_MCSC_PC0_H_RATIO_REG, BECORE_MCSC_PC0_V_RATIO_REG,
+	  BECORE_GEN_CHAIN_RATIO },
 };
 
 static const u32 becore_rgbp_input_regs[] = {
@@ -1794,6 +1828,8 @@ static u32 becore_generated_word_count(enum becore_block_id id)
 		return BECORE_RGBP_GENERATED_WORDS;
 	if (id == BECORE_YUVP)
 		return BECORE_YUVP_GENERATED_WORDS;
+	if (id == BECORE_MCSC)
+		return BECORE_MCSC_GENERATED_WORDS;
 
 	return 0;
 }
@@ -1810,6 +1846,9 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 	} else if (id == BECORE_YUVP) {
 		table = becore_yuvp_generated;
 		count = ARRAY_SIZE(becore_yuvp_generated);
+	} else if (id == BECORE_MCSC) {
+		table = becore_mcsc_generated;
+		count = ARRAY_SIZE(becore_mcsc_generated);
 	} else {
 		return -EINVAL;
 	}
@@ -1837,6 +1876,23 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			if (becore_rgbp_gtm_value(reg - BECORE_RGBP_GTM_BASE,
 						  &result))
 				return -EINVAL;
+			break;
+		case BECORE_GEN_CHAIN_ORIGIN:
+			result = becore_pack_size(0, 0);
+			break;
+		case BECORE_GEN_CHAIN_SIZE:
+			result = becore_pack_size(becore_mcsc_output.width,
+						  becore_mcsc_output.height);
+			break;
+		case BECORE_GEN_CHAIN_RATIO:
+			/*
+			 * Source and destination are the same raster, which
+			 * is the statement; going through the ratio helper
+			 * keeps it in the form every other ratio is written
+			 * in, so a stage that starts scaling shows up here.
+			 */
+			result = becore_zoom_ratio(becore_mcsc_output.width,
+						   becore_mcsc_output.width);
 			break;
 		default:
 			return -EINVAL;
@@ -2429,6 +2485,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
 	u32 address_count = 0;
 	u32 typed_count = 0;
+	u32 generated_count = 0;
 	u32 i;
 
 	if (becore->mcsc_recipe_staged_bytes != BECORE_MCSC_RECIPE_BYTES ||
@@ -2458,13 +2515,16 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 		if (get_unaligned_le32(record) != shape->mode ||
 		    get_unaligned_le32(record + 4) != shape->target ||
 		    get_unaligned_le32(record + 8) != shape->type_map ||
-		    shape->generated_mask ||
 		    (shape->address_mask & ~used_mask) ||
 		    (shape->typed_mask & ~used_mask) ||
+		    (shape->generated_mask & ~used_mask) ||
 		    (shape->fixed_mask & ~used_mask) ||
 		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->generated_mask) ||
 		    (shape->address_mask & shape->fixed_mask) ||
-		    (shape->typed_mask & shape->fixed_mask))
+		    (shape->typed_mask & shape->generated_mask) ||
+		    (shape->typed_mask & shape->fixed_mask) ||
+		    (shape->generated_mask & shape->fixed_mask))
 			return -EINVAL;
 
 		for (word = 0; word < 16; word++) {
@@ -2496,6 +2556,16 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 					return -EINVAL;
 				typed_count++;
 			}
+
+			if (shape->generated_mask & BIT(word)) {
+				u32 reg;
+
+				if (becore_shape_register(shape, word, &reg) ||
+				    becore_generated_value(BECORE_MCSC, reg,
+							   NULL))
+					return -EINVAL;
+				generated_count++;
+			}
 			if (shape->address_mask & BIT(word)) {
 				u32 reg;
 
@@ -2510,7 +2580,8 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 		}
 	}
 
-	if (address_count != 4 || typed_count != BECORE_MCSC_DMA_WORD_COUNT)
+	if (address_count != 4 || typed_count != BECORE_MCSC_DMA_WORD_COUNT ||
+	    generated_count != BECORE_MCSC_GENERATED_WORDS)
 		return -EINVAL;
 
 	return 0;
@@ -2527,6 +2598,7 @@ becore_encode_mcsc(struct becore_device *becore,
 				      BECORE_CMDQ_HEADER_BYTES,
 				      BECORE_CMDQ_PAYLOAD_BYTES);
 	u32 typed_count = 0;
+	u32 generated_count = 0;
 	u32 i;
 
 	if (!program->cpu || program->header_count != BECORE_MCSC_HEADER_COUNT ||
@@ -2566,6 +2638,17 @@ becore_encode_mcsc(struct becore_device *becore,
 				typed_count++;
 				continue;
 			}
+
+			if (shape->generated_mask & BIT(word)) {
+				if (becore_shape_register(shape, word, &reg) ||
+				    becore_generated_value(BECORE_MCSC, reg,
+							   &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
+				generated_count++;
+				continue;
+			}
+
 			if (!(shape->address_mask & BIT(word)))
 				continue;
 			reg = shape->pair_registers[word / 2];
@@ -2576,7 +2659,8 @@ becore_encode_mcsc(struct becore_device *becore,
 		}
 	}
 
-	if (typed_count != BECORE_MCSC_DMA_WORD_COUNT)
+	if (typed_count != BECORE_MCSC_DMA_WORD_COUNT ||
+	    generated_count != BECORE_MCSC_GENERATED_WORDS)
 		return -EINVAL;
 
 	return 0;

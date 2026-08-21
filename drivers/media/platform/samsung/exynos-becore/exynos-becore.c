@@ -693,8 +693,11 @@ static_assert((BECORE_YUVP_CLUT_MATRIX_LAST - BECORE_YUVP_CLUT_MATRIX_FIRST) /
 #define BECORE_MCSC_SC0_H_COEFF_LAST	(BECORE_MCSC_PHYS_BASE + 0x50f8)
 #define BECORE_SC_PHASES		9
 #define BECORE_SC_SETS			7
+#define BECORE_SC_V_TAPS		4
+#define BECORE_SC_H_TAPS		8
+#define BECORE_SC_COEFF_MASK		GENMASK(10, 0)
 
-/* The ratio bands the seven sets are selected by, x8/8 first. */
+/* Samsung's seven tap sets, in the order the ratio bands select them. */
 enum becore_sc_set {
 	BECORE_SC_SET_X8_8,
 	BECORE_SC_SET_X7_8,
@@ -704,10 +707,25 @@ enum becore_sc_set {
 	BECORE_SC_SET_X3_8,
 	BECORE_SC_SET_X2_8,
 };
+
 static_assert(BECORE_SC_SET_X2_8 + 1 == BECORE_SC_SETS);
-#define BECORE_SC_V_TAPS		4
-#define BECORE_SC_H_TAPS		8
-#define BECORE_SC_COEFF_MASK		GENMASK(10, 0)
+
+/*
+ * becore_sc_coeff_value() turns a register's index within its range into a
+ * (phase, tap pair), which is only right while each range is exactly one
+ * register per tap pair per phase. Both blocks carry both scalers, so say it
+ * once for all four ranges rather than trusting four address literals.
+ */
+#define BECORE_SC_COEFF_REGS(taps) \
+	((taps) / 2 * BECORE_SC_PHASES * 4 - 4)
+static_assert(BECORE_RGBP_SC_V_COEFF_LAST - BECORE_RGBP_SC_V_COEFF_FIRST ==
+	      BECORE_SC_COEFF_REGS(BECORE_SC_V_TAPS));
+static_assert(BECORE_RGBP_SC_H_COEFF_LAST - BECORE_RGBP_SC_H_COEFF_FIRST ==
+	      BECORE_SC_COEFF_REGS(BECORE_SC_H_TAPS));
+static_assert(BECORE_MCSC_SC0_V_COEFF_LAST - BECORE_MCSC_SC0_V_COEFF_FIRST ==
+	      BECORE_SC_COEFF_REGS(BECORE_SC_V_TAPS));
+static_assert(BECORE_MCSC_SC0_H_COEFF_LAST - BECORE_MCSC_SC0_H_COEFF_FIRST ==
+	      BECORE_SC_COEFF_REGS(BECORE_SC_H_TAPS));
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -1792,23 +1810,29 @@ static int becore_rgbp_crop(struct becore_rect *crop)
 	return 0;
 }
 
+/*
+ * Every word RGBP's typed input profile supplies, computed whether or not the
+ * caller wants the value: passing a null pointer is the probe-time validation
+ * pass, and short-circuiting it there would mean the four crop-derived words
+ * are the only ones never checked before the hardware sees them.
+ */
 static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 {
+	u32 result;
+
 	if (index >= BECORE_RGBP_INPUT_WORD_COUNT ||
 	    reg != becore_rgbp_input_regs[index])
 		return -EINVAL;
-	if (!value)
-		return 0;
 
 	switch (index) {
 	case BECORE_RGBP_CHAIN_SRC_SIZE:
-		*value = becore_pack_size(becore_rgbp_input.width,
-					       becore_rgbp_input.height);
+		result = becore_pack_size(becore_rgbp_input.width,
+					  becore_rgbp_input.height);
 		break;
 	case BECORE_RGBP_CHAIN_DST_SIZE:
 	case BECORE_RGBP_SC_DST_SIZE:
-		*value = becore_pack_size(becore_rgbp_out_width(),
-					       becore_rgbp_out_height());
+		result = becore_pack_size(becore_rgbp_out_width(),
+					  becore_rgbp_out_height());
 		break;
 	case BECORE_RGBP_CROP_SIZE:
 	case BECORE_RGBP_CROP_START:
@@ -1820,47 +1844,50 @@ static int becore_rgbp_input_value(u32 index, u32 reg, u32 *value)
 		if (ret)
 			return ret;
 		if (index == BECORE_RGBP_CROP_SIZE)
-			*value = becore_pack_size(crop.width, crop.height);
+			result = becore_pack_size(crop.width, crop.height);
 		else if (index == BECORE_RGBP_CROP_START)
-			*value = becore_pack_size(crop.x, crop.y);
+			result = becore_pack_size(crop.x, crop.y);
 		else if (index == BECORE_RGBP_SC_H_RATIO)
-			*value = becore_zoom_ratio(crop.width,
+			result = becore_zoom_ratio(crop.width,
 						   becore_rgbp_out_width());
 		else
-			*value = becore_zoom_ratio(crop.height,
+			result = becore_zoom_ratio(crop.height,
 						   becore_rgbp_out_height());
 		break;
 	}
 	case BECORE_RGBP_INPUT_FORMAT:
-		*value = becore_rgbp_input.data_format;
+		result = becore_rgbp_input.data_format;
 		break;
 	case BECORE_RGBP_INPUT_COMP:
-		*value = becore_rgbp_input.comp_control;
+		result = becore_rgbp_input.comp_control;
 		break;
 	case BECORE_RGBP_INPUT_ACTIVE_WIDTH:
-		*value = becore_rgbp_input.width;
+		result = becore_rgbp_input.width;
 		break;
 	case BECORE_RGBP_INPUT_HEIGHT:
-		*value = becore_rgbp_input.height;
+		result = becore_rgbp_input.height;
 		break;
 	case BECORE_RGBP_INPUT_STRIDE:
-		*value = becore_rgbp_input_stride();
+		result = becore_rgbp_input_stride();
 		break;
 	case BECORE_RGBP_INPUT_HEADER_STRIDE:
-		*value = becore_rgbp_input.header_stride;
+		result = becore_rgbp_input.header_stride;
 		break;
 	case BECORE_RGBP_INPUT_BUSINFO:
-		*value = becore_rgbp_input.businfo;
+		result = becore_rgbp_input.businfo;
 		break;
 	case BECORE_RGBP_INPUT_ENABLE:
-		*value = 1;
+		result = 1;
 		break;
 	case BECORE_RGBP_INPUT_STORAGE_WIDTH:
-		*value = becore_rgbp_input_storage_width();
+		result = becore_rgbp_input_storage_width();
 		break;
 	default:
 		return -EINVAL;
 	}
+
+	if (value)
+		*value = result;
 
 	return 0;
 }

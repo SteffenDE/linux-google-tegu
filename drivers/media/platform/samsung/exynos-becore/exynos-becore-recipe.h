@@ -6679,7 +6679,8 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
+		.generated_mask = 0xa800,
+		.fixed_mask = 0x02aa,
 		.pair_registers = {
 			0x1c847a24, 0x1c847a28, 0x1c847a2c, 0x1c847a30,
 			0x1c843e00, 0x1c843e04, 0x1c843e08, 0x1c843e0c,
@@ -6687,7 +6688,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 		.fixed_values = {
 			0x00000000, 0x00000ebc, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x02020224, 0x00000000, 0x00000400,
+			0x00000000, 0x02020224, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
@@ -6697,15 +6698,16 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
+		.generated_mask = 0x0aaa,
+		.fixed_mask = 0xa000,
 		.pair_registers = {
 			0x1c843e10, 0x1c843e14, 0x1c843e18, 0x1c843e1c,
 			0x1c843e20, 0x1c843e24, 0x1c843f00, 0x1c843f04,
 		},
 		.fixed_values = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000400,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000400,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},

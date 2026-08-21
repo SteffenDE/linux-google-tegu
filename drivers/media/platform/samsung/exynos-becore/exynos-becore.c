@@ -1375,15 +1375,20 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	for (i = 0; i < header_count; i++, record += BECORE_RECIPE_RECORD_BYTES) {
 		const u8 *words = record + 12;
 		u16 used_mask;
+		u16 value_mask;
 		u32 word;
 
 		if (!shape[i].valid_words || shape[i].valid_words > 16)
 			return -EINVAL;
 		used_mask = shape[i].valid_words == 16 ? U16_MAX :
 			    GENMASK(shape[i].valid_words - 1, 0);
+		value_mask = shape[i].mode == 0x00090000 ?
+			     used_mask & 0xaaaa : used_mask;
 		if (get_unaligned_le32(record) != shape[i].mode ||
 		    get_unaligned_le32(record + 4) != shape[i].target ||
 		    get_unaligned_le32(record + 8) != shape[i].type_map ||
+		    (shape[i].address_mask | shape[i].typed_mask |
+		     shape[i].fixed_mask) != value_mask ||
 		    (shape[i].address_mask & ~used_mask) ||
 		    (shape[i].typed_mask & ~used_mask) ||
 		    (shape[i].fixed_mask & ~used_mask) ||

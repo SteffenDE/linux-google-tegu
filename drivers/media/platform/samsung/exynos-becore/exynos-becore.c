@@ -1964,6 +1964,52 @@ static u32 becore_generated_word_count(enum becore_block_id id)
 	return 0;
 }
 
+/*
+ * The by-register class is only unambiguous while the ranges are. A first
+ * match wins below, so an overlap would silently hand a register the wrong
+ * intent -- and these ranges are wide enough that an overlap is an easy edit
+ * to make. Check the tables once, at probe, rather than trusting the reader.
+ */
+static int becore_generated_tables_validate(struct device *dev)
+{
+	static const struct becore_generated_range *tables[] = {
+		becore_rgbp_generated,
+		becore_yuvp_generated,
+		becore_mcsc_generated,
+	};
+	static const size_t counts[] = {
+		ARRAY_SIZE(becore_rgbp_generated),
+		ARRAY_SIZE(becore_yuvp_generated),
+		ARRAY_SIZE(becore_mcsc_generated),
+	};
+	size_t block;
+	size_t i;
+	size_t j;
+
+	for (block = 0; block < ARRAY_SIZE(tables); block++) {
+		for (i = 0; i < counts[block]; i++) {
+			const struct becore_generated_range *a =
+				&tables[block][i];
+
+			if (a->first > a->last)
+				return dev_err_probe(dev, -EINVAL,
+						     "generated range %zu:%zu is inverted\n",
+						     block, i);
+			for (j = 0; j < i; j++) {
+				const struct becore_generated_range *b =
+					&tables[block][j];
+
+				if (a->first <= b->last && b->first <= a->last)
+					return dev_err_probe(dev, -EINVAL,
+							     "generated ranges %zu:%zu and %zu:%zu overlap\n",
+							     block, j, block, i);
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 {
 	const struct becore_generated_range *table;
@@ -3213,6 +3259,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	size_t output_size = becore_yuvp_output_allocation_size();
 	int ret;
 
+	ret = becore_generated_tables_validate(becore->dev);
+	if (ret)
+		return ret;
 	becore->recipe = devm_kzalloc(becore->dev, BECORE_RECIPE_BYTES,
 				      GFP_KERNEL);
 	if (!becore->recipe)

@@ -34,8 +34,10 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 #include <media/exynos-becore.h>
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
@@ -494,6 +496,11 @@ struct ispfe_pdma_output {
 	enum dma_data_direction direction;
 	const u8 *seed;
 	size_t seed_size;
+};
+
+struct ispfe_awb_snapshot_file {
+	void *data;
+	size_t size;
 };
 
 #define PDMA_OUTPUT(_size) { \
@@ -1061,6 +1068,11 @@ struct ispfe_device {
 	 */
 	u32 bayer_lo;
 	u32 bayer_hi;
+	/* AWB statistics are redirected here before their snapshot is published. */
+	void *awb_spare;
+	dma_addr_t awb_spare_dma;
+	u32 awb_lo;
+	u32 awb_hi;
 	/* Full-mode LMP main-Bayer output shared with the camera back end. */
 	struct exynos_becore_input *backend_input;
 	struct exynos_becore_input_buffer backend_buffer;
@@ -2554,6 +2566,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
 	const struct ispfe_pdma_reloc *last = prog->relocs + prog->num_relocs;
 	u32 bayer_lo = 0, bayer_hi = 0;
+	u32 awb_lo = 0, awb_hi = 0;
 	u32 backend_image_lo = 0, backend_image_hi = 0;
 	u32 backend_header_lo = 0, backend_header_hi = 0;
 	unsigned int i;
@@ -2655,6 +2668,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			if (reloc->buffer == ISPFE_BUF_BAYER) {
 				bayer_lo = at + reloc->lo;
 				bayer_hi = at + reloc->hi;
+			} else if (reloc->buffer ==
+				   ISPFE_BUF_OUTPUT(ISPFE_PDMA_OUTPUT_AWB)) {
+				awb_lo = at + reloc->lo;
+				awb_hi = at + reloc->hi;
 			} else if (reloc->buffer == ISPFE_BUF_BACKEND_IMAGE) {
 				backend_image_lo = at + reloc->lo;
 				backend_image_hi = at + reloc->hi;
@@ -2671,7 +2688,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 * Relocations are emitted in command order, so anything left over names
 	 * a command the recipe no longer has.
 	 */
-	if (reloc != last || (prog->raw_output && !bayer_lo)) {
+	if (reloc != last || !awb_lo || !awb_hi ||
+	    (prog->raw_output && !bayer_lo)) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
 		return -EINVAL;
 	}
@@ -2691,6 +2709,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 */
 	ispfe->bayer_lo = bayer_lo;
 	ispfe->bayer_hi = bayer_hi;
+	ispfe->awb_lo = awb_lo;
+	ispfe->awb_hi = awb_hi;
 	ispfe->backend_image_lo = backend_image_lo;
 	ispfe->backend_image_hi = backend_image_hi;
 	ispfe->backend_header_lo = backend_header_lo;
@@ -2825,7 +2845,9 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_MAX_BLOCKS_BYTES - 1) ||
 	    upper_32_bits(ispfe->programs_dma + PDMA_PROGRAMS_SIZE - 1) ||
 	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1) ||
-	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1))
+	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1) ||
+	    upper_32_bits(ispfe->awb_spare_dma +
+			  ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size - 1))
 		return -ERANGE;
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
@@ -3209,6 +3231,15 @@ static void ispfe_snapshot_complete(struct ispfe_device *ispfe)
 	 */
 	if (cmpxchg(&ispfe->snapshot_state, ISPFE_SNAPSHOT_ARMED,
 		    ISPFE_SNAPSHOT_REDIRECTING) == ISPFE_SNAPSHOT_ARMED) {
+		if (WARN_ON_ONCE(!ispfe->awb_lo || !ispfe->awb_hi)) {
+			cmpxchg(&ispfe->snapshot_state,
+				ISPFE_SNAPSHOT_REDIRECTING, ISPFE_SNAPSHOT_IDLE);
+			return;
+		}
+		put_unaligned_le32(lower_32_bits(ispfe->awb_spare_dma),
+				   program + ispfe->awb_lo);
+		put_unaligned_le32(upper_32_bits(ispfe->awb_spare_dma),
+				   program + ispfe->awb_hi);
 		if (ispfe->prog->raw_output && WARN_ON_ONCE(!ispfe->bayer_lo)) {
 			cmpxchg(&ispfe->snapshot_state,
 				ISPFE_SNAPSHOT_REDIRECTING, ISPFE_SNAPSHOT_IDLE);
@@ -3393,6 +3424,12 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
+	if (ispfe->awb_spare) {
+		dma_free_coherent(ispfe->dev,
+				  ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size,
+				  ispfe->awb_spare, ispfe->awb_spare_dma);
+		ispfe->awb_spare = NULL;
+	}
 	if (ispfe->tnr_pyramid) {
 		dma_free_coherent(ispfe->dev, ISPFE_TNR_PYRAMID_SIZE,
 				  ispfe->tnr_pyramid, ispfe->tnr_pyramid_dma);
@@ -3412,6 +3449,8 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 		ispfe->programs = NULL;
 		ispfe->bayer_lo = 0;
 		ispfe->bayer_hi = 0;
+		ispfe->awb_lo = 0;
+		ispfe->awb_hi = 0;
 		ispfe->backend_image_lo = 0;
 		ispfe->backend_image_hi = 0;
 		ispfe->backend_header_lo = 0;
@@ -3444,6 +3483,8 @@ static void ispfe_pdma_outputs_reset(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
+	memset(ispfe->awb_spare, 0,
+	       ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size);
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		const struct ispfe_pdma_output *output = &ispfe_pdma_outputs[i];
 
@@ -3461,7 +3502,7 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 	unsigned int i;
 
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
-	    !ispfe->programs || !ispfe->blocks)
+	    !ispfe->programs || !ispfe->blocks || !ispfe->awb_spare)
 		return false;
 	if (ispfe->prog->backend_output && !ispfe->tnr_pyramid)
 		return false;
@@ -3481,6 +3522,7 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 {
 	size_t size = size_mul(ispfe->prog->stride, ispfe->active.height);
+	size_t awb_size = ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size;
 	unsigned int i;
 	int ret;
 
@@ -3529,6 +3571,13 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	ispfe->programs = dma_alloc_coherent(ispfe->dev, PDMA_PROGRAMS_SIZE,
 					     &ispfe->programs_dma, GFP_KERNEL);
 	if (!ispfe->programs) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
+	ispfe->awb_spare =
+		dma_alloc_coherent(ispfe->dev, awb_size,
+				   &ispfe->awb_spare_dma, GFP_KERNEL);
+	if (!ispfe->awb_spare) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
@@ -3726,6 +3775,9 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 	bool pdma_program_override = ispfe->pdma_program_override;
 	int ret;
 
+	/* A new attempt invalidates every result published by an older session. */
+	WRITE_ONCE(ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
+
 	/*
 	 * The geometry the receiver is programmed with is the format on the
 	 * subdev's source pad, read once here so that a later S_FMT cannot move
@@ -3852,7 +3904,6 @@ static int ispfe_start(struct ispfe_device *ispfe, bool backend_consumer)
 	atomic_set(&ispfe->core_events, 0);
 	atomic_set(&ispfe->lmp_events, 0);
 	atomic_set(&ispfe->pdma_events, 0);
-	WRITE_ONCE(ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
@@ -4764,6 +4815,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		   ISPFE_PDMA_RECIPE_BYTES);
 	seq_printf(s, "bayer_reloc  %#x/%#x\n", ispfe->bayer_lo,
 		   ispfe->bayer_hi);
+	seq_printf(s, "awb_reloc    %#x/%#x, spare %pad\n", ispfe->awb_lo,
+		   ispfe->awb_hi, &ispfe->awb_spare_dma);
 	seq_printf(s,
 		   "backend      input %pad, spare %pad, size %zu, producing %u, handed_off %u\n",
 		   &backend_dma,
@@ -4999,10 +5052,11 @@ DEFINE_DEBUGFS_ATTRIBUTE(ispfe_program_override_fops,
 			 ispfe_program_override_set, "%llu\n");
 
 /*
- * The captured program already enables three memory-backed processed outputs.
- * Keep this diagnostic read-only and require the stream to be stopped: unlike
- * the per-frame Bayer queue, these buffers are shared and hardware overwrites
- * them continuously while streaming.
+ * The captured program already enables memory-backed statistics and processed
+ * outputs. Keep these diagnostics read-only and require the stream to be
+ * stopped: unlike the per-frame Bayer queue, the allocations are shared and
+ * hardware overwrites them continuously while streaming. AWB additionally
+ * requires the two-EOF snapshot handoff that retargets its future writes.
  */
 static ssize_t ispfe_pdma_output_read(struct file *file, char __user *buf,
 				      size_t count, loff_t *ppos,
@@ -5038,17 +5092,73 @@ static const struct file_operations ispfe_lmp_rgb_fops = {
 	.llseek = default_llseek,
 };
 
+static int ispfe_lmp_awb_stats_open(struct inode *inode, struct file *file)
+{
+	struct ispfe_device *ispfe = inode->i_private;
+	struct ispfe_awb_snapshot_file *snapshot;
+	int ret = 0;
+
+	snapshot = kzalloc_obj(*snapshot, GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+	snapshot->size = ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size;
+	snapshot->data = vmalloc(snapshot->size);
+	if (!snapshot->data) {
+		kfree(snapshot);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&ispfe->lock);
+	if (ispfe->streaming) {
+		ret = -EBUSY;
+	} else {
+		/* Pairs with the EOF-side publication of the drained snapshot. */
+		if (smp_load_acquire(&ispfe->snapshot_state) !=
+		    ISPFE_SNAPSHOT_READY)
+			ret = -EAGAIN;
+		else if (!ispfe->pdma_output[ISPFE_PDMA_OUTPUT_AWB].cpu)
+			ret = -ENODATA;
+		else
+			memcpy(snapshot->data,
+			       ispfe->pdma_output[ISPFE_PDMA_OUTPUT_AWB].cpu,
+			       snapshot->size);
+	}
+	mutex_unlock(&ispfe->lock);
+
+	if (ret) {
+		vfree(snapshot->data);
+		kfree(snapshot);
+		return ret;
+	}
+	file->private_data = snapshot;
+
+	return 0;
+}
+
 static ssize_t ispfe_lmp_awb_stats_read(struct file *file, char __user *buf,
 					size_t count, loff_t *ppos)
 {
-	return ispfe_pdma_output_read(file, buf, count, ppos,
-				      ISPFE_PDMA_OUTPUT_AWB);
+	struct ispfe_awb_snapshot_file *snapshot = file->private_data;
+
+	return simple_read_from_buffer(buf, count, ppos, snapshot->data,
+				       snapshot->size);
+}
+
+static int ispfe_lmp_awb_stats_release(struct inode *inode, struct file *file)
+{
+	struct ispfe_awb_snapshot_file *snapshot = file->private_data;
+
+	vfree(snapshot->data);
+	kfree(snapshot);
+
+	return 0;
 }
 
 static const struct file_operations ispfe_lmp_awb_stats_fops = {
 	.owner = THIS_MODULE,
-	.open = simple_open,
+	.open = ispfe_lmp_awb_stats_open,
 	.read = ispfe_lmp_awb_stats_read,
+	.release = ispfe_lmp_awb_stats_release,
 	.llseek = default_llseek,
 };
 

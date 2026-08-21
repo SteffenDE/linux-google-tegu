@@ -310,6 +310,26 @@
 #define BECORE_MCSC_PC0_DST_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x6008)
 #define BECORE_MCSC_PC0_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x600c)
 #define BECORE_MCSC_PC0_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x6010)
+/*
+ * The two poly-phase scalers' filter coefficients. RGBP's SC and MCSC's
+ * POLY_SC0 carry bit-identical tables, at 0x4500/0x4548 and 0x5024/0x506c
+ * respectively: nine phases of four vertical and eight horizontal taps, two
+ * taps to a register with the lower-numbered one in the low half.
+ */
+#define BECORE_RGBP_SC_V_COEFF_FIRST	(BECORE_RGBP_PHYS_BASE + 0x4500)
+#define BECORE_RGBP_SC_V_COEFF_LAST	(BECORE_RGBP_PHYS_BASE + 0x4544)
+#define BECORE_RGBP_SC_H_COEFF_FIRST	(BECORE_RGBP_PHYS_BASE + 0x4548)
+#define BECORE_RGBP_SC_H_COEFF_LAST	(BECORE_RGBP_PHYS_BASE + 0x45d4)
+#define BECORE_MCSC_SC0_V_COEFF_FIRST	(BECORE_MCSC_PHYS_BASE + 0x5024)
+#define BECORE_MCSC_SC0_V_COEFF_LAST	(BECORE_MCSC_PHYS_BASE + 0x5068)
+#define BECORE_MCSC_SC0_H_COEFF_FIRST	(BECORE_MCSC_PHYS_BASE + 0x506c)
+#define BECORE_MCSC_SC0_H_COEFF_LAST	(BECORE_MCSC_PHYS_BASE + 0x50f8)
+#define BECORE_SC_PHASES		9
+#define BECORE_SC_V_TAPS		4
+#define BECORE_SC_H_TAPS		8
+#define BECORE_SC_COEFF_SUM		512
+#define BECORE_SC_COEFF_MASK		GENMASK(10, 0)
+#define BECORE_SC_RATIO_X8_8		(1U << BECORE_RATIO_SHIFT)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -389,6 +409,8 @@ enum becore_generated_kind {
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
+	BECORE_GEN_SC_V_COEFF,	/* poly-phase vertical taps, from the ratio */
+	BECORE_GEN_SC_H_COEFF,	/* poly-phase horizontal taps, from the ratio */
 };
 
 struct becore_generated_range {
@@ -402,9 +424,9 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	113
+#define BECORE_RGBP_GENERATED_WORDS	167
 #define BECORE_YUVP_GENERATED_WORDS	2
-#define BECORE_MCSC_GENERATED_WORDS	9
+#define BECORE_MCSC_GENERATED_WORDS	63
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -430,6 +452,10 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_GAMMAHR_BYPASS_REG, BECORE_RGBP_GAMMAHR_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_RGBP_SC_V_COEFF_FIRST, BECORE_RGBP_SC_V_COEFF_LAST,
+	  BECORE_GEN_SC_V_COEFF },
+	{ BECORE_RGBP_SC_H_COEFF_FIRST, BECORE_RGBP_SC_H_COEFF_LAST,
+	  BECORE_GEN_SC_H_COEFF },
 };
 
 static const struct becore_generated_range becore_yuvp_generated[] = {
@@ -450,6 +476,10 @@ static const struct becore_generated_range becore_mcsc_generated[] = {
 	  BECORE_GEN_CHAIN_SIZE },
 	{ BECORE_MCSC_PC0_H_RATIO_REG, BECORE_MCSC_PC0_V_RATIO_REG,
 	  BECORE_GEN_CHAIN_RATIO },
+	{ BECORE_MCSC_SC0_V_COEFF_FIRST, BECORE_MCSC_SC0_V_COEFF_LAST,
+	  BECORE_GEN_SC_V_COEFF },
+	{ BECORE_MCSC_SC0_H_COEFF_FIRST, BECORE_MCSC_SC0_H_COEFF_LAST,
+	  BECORE_GEN_SC_H_COEFF },
 };
 
 static const u32 becore_rgbp_input_regs[] = {
@@ -1822,6 +1852,106 @@ static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/*
+ * Below DJAG the chain neither crops nor scales, so its stages map the output
+ * raster onto itself. Going through the ratio helper rather than writing a
+ * literal unity keeps this in the form every other ratio is written in, so a
+ * stage that starts scaling shows up as a changed value here -- and takes its
+ * filter coefficients with it.
+ */
+static u32 becore_mcsc_chain_ratio(void)
+{
+	return becore_zoom_ratio(becore_mcsc_output.width,
+				 becore_mcsc_output.width);
+}
+
+/*
+ * Samsung publishes its poly-phase coefficients because they are a function of
+ * the scaling ratio rather than of the scene: get_scaler_coef_ver2() picks one
+ * of seven sets by comparing the ratio against x8/8, x7/8 and so on down to
+ * x2/8. Both scalers here run at unity, which selects x8/8, and x8/8 is the
+ * only set carried -- any other ratio makes the encode fail rather than
+ * quietly programming the wrong filter for it.
+ *
+ * These are Samsung's numbers verbatim, indexed [tap][phase], from
+ * is-hw-api-rgbp-v1_20.c. Zuma's fields hold a quarter of that precision, so
+ * a phase sums to 512 rather than 2048 and the last tap takes up the
+ * remainder. That is not cosmetic: Samsung's own x8/8 horizontal phase 7 sums
+ * to 2052, and the captured program carries the renormalised value.
+ */
+static const s16 becore_sc_h_coeff_x8_8[BECORE_SC_H_TAPS][BECORE_SC_PHASES] = {
+	{    0,   -8,  -16,  -20,  -24,  -24,  -24,  -24,  -20 },
+	{    0,   32,   56,   80,   92,  100,  104,  100,   92 },
+	{    0, -100, -184, -248, -292, -320, -332, -328, -312 },
+	{ 2048, 2036, 1996, 1928, 1832, 1716, 1580, 1428, 1264 },
+	{    0,  120,  256,  404,  568,  740,  912, 1092, 1264 },
+	{    0,  -36,  -76, -120, -164, -212, -252, -284, -312 },
+	{    0,    8,   20,   32,   48,   60,   76,   84,   92 },
+	{    0,   -4,   -4,   -8,  -12,  -12,  -16,  -16,  -20 },
+};
+
+static const s16 becore_sc_v_coeff_x8_8[BECORE_SC_V_TAPS][BECORE_SC_PHASES] = {
+	{    0,  -60, -100, -124, -132, -132, -124, -108,  -92 },
+	{ 2048, 2032, 1980, 1892, 1772, 1632, 1468, 1296, 1116 },
+	{    0,   80,  180,  300,  440,  592,  760,  936, 1116 },
+	{    0,   -4,  -12,  -20,  -32,  -44,  -56,  -76,  -92 },
+};
+
+static s32 becore_sc_coeff(const s16 (*table)[BECORE_SC_PHASES], u32 taps,
+			   u32 tap, u32 phase)
+{
+	s32 sum = 0;
+	u32 i;
+
+	if (tap + 1 < taps)
+		return table[tap][phase] / 4;
+	for (i = 0; i + 1 < taps; i++)
+		sum += table[i][phase] / 4;
+
+	return BECORE_SC_COEFF_SUM - sum;
+}
+
+/* Two taps of one phase, the lower-numbered one in the low half. */
+static int becore_sc_coeff_value(const s16 (*table)[BECORE_SC_PHASES],
+				 u32 taps, u32 ratio, u32 index, u32 *value)
+{
+	u32 pairs = taps / 2;
+	u32 phase = index / pairs;
+	u32 pair = index % pairs;
+
+	if (ratio != BECORE_SC_RATIO_X8_8 || phase >= BECORE_SC_PHASES)
+		return -EINVAL;
+	*value = (((u32)becore_sc_coeff(table, taps, pair * 2 + 1, phase) &
+		   BECORE_SC_COEFF_MASK) << 16) |
+		 ((u32)becore_sc_coeff(table, taps, pair * 2, phase) &
+		  BECORE_SC_COEFF_MASK);
+
+	return 0;
+}
+
+/*
+ * The ratio the scaler these coefficients belong to is programmed with. Taken
+ * from the same place the driver takes the value it writes into the ratio
+ * register, so the filter and the ratio cannot describe different scalings.
+ */
+static int becore_sc_ratio(enum becore_block_id id, bool vertical, u32 *ratio)
+{
+	u32 index;
+
+	if (id == BECORE_RGBP) {
+		index = vertical ? BECORE_RGBP_SC_V_RATIO :
+				   BECORE_RGBP_SC_H_RATIO;
+		return becore_rgbp_input_value(index,
+					       becore_rgbp_input_regs[index],
+					       ratio);
+	}
+	if (id != BECORE_MCSC)
+		return -EINVAL;
+	*ratio = becore_mcsc_chain_ratio();
+
+	return 0;
+}
+
 static u32 becore_generated_word_count(enum becore_block_id id)
 {
 	if (id == BECORE_RGBP)
@@ -1877,6 +2007,24 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 						  &result))
 				return -EINVAL;
 			break;
+		case BECORE_GEN_SC_V_COEFF:
+		case BECORE_GEN_SC_H_COEFF: {
+			bool vertical = table[i].kind == BECORE_GEN_SC_V_COEFF;
+			u32 ratio;
+
+			if (becore_sc_ratio(id, vertical, &ratio))
+				return -EINVAL;
+			if (becore_sc_coeff_value(vertical ?
+						  becore_sc_v_coeff_x8_8 :
+						  becore_sc_h_coeff_x8_8,
+						  vertical ? BECORE_SC_V_TAPS :
+							     BECORE_SC_H_TAPS,
+						  ratio,
+						  (reg - table[i].first) / 4,
+						  &result))
+				return -EINVAL;
+			break;
+		}
 		case BECORE_GEN_CHAIN_ORIGIN:
 			result = becore_pack_size(0, 0);
 			break;
@@ -1885,14 +2033,7 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 						  becore_mcsc_output.height);
 			break;
 		case BECORE_GEN_CHAIN_RATIO:
-			/*
-			 * Source and destination are the same raster, which
-			 * is the statement; going through the ratio helper
-			 * keeps it in the form every other ratio is written
-			 * in, so a stage that starts scaling shows up here.
-			 */
-			result = becore_zoom_ratio(becore_mcsc_output.width,
-						   becore_mcsc_output.width);
+			result = becore_mcsc_chain_ratio();
 			break;
 		default:
 			return -EINVAL;

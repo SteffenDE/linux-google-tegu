@@ -21,7 +21,9 @@ allOf:
           enum:
             - google,zumapro-pd
             - google,zumapro-gdc-pd
+            - google,zumapro-mcsc-pd
             - google,zumapro-rgbp-pd
+            - google,zumapro-tnr-pd
             - google,zumapro-yuvp-pd
     then:
       properties:
@@ -61,6 +63,30 @@ allOf:
   - if:
       properties:
         compatible:
+          const: google,zumapro-tnr-pd
+    then:
+      properties:
+        reg:
+          minItems: 6
+          maxItems: 6
+        reg-names:
+          minItems: 6
+          maxItems: 6
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-mcsc-pd
+    then:
+      properties:
+        reg:
+          minItems: 4
+          maxItems: 4
+        reg-names:
+          minItems: 4
+          maxItems: 4
+  - if:
+      properties:
+        compatible:
           const: google,zumapro-yuvp-pd
     then:
       properties:
@@ -86,14 +112,16 @@ properties:
     enum:
       - google,zumapro-pd
       - google,zumapro-gdc-pd
+      - google,zumapro-mcsc-pd
       - google,zumapro-rgbp-pd
+      - google,zumapro-tnr-pd
       - google,zumapro-yuvp-pd
       - samsung,exynos4210-pd
       - samsung,exynos5433-pd
 
   reg:
     minItems: 1
-    maxItems: 5
+    maxItems: 6
 
   reg-names:
     minItems: 1
@@ -103,6 +131,7 @@ properties:
       - const: bus
       - const: s2mpu0
       - const: s2mpu1
+      - const: s2mpu2
 
   clocks:
     deprecated: true

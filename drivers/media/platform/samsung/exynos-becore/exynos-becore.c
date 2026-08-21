@@ -1700,6 +1700,60 @@ static int becore_encode_gtnr(struct becore_device *becore)
 	return 0;
 }
 
+static int becore_mcsc_recipe_generate(struct becore_device *becore)
+{
+	u8 *header = becore->mcsc_recipe;
+	u8 *record = header + BECORE_MCSC_RECIPE_HEADER_BYTES;
+	u32 i;
+
+	memset(header, 0, BECORE_MCSC_RECIPE_BYTES);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_MAGIC, header);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_VERSION, header + 4);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_HEADER_BYTES, header + 8);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_RECORD_BYTES, header + 12);
+	put_unaligned_le32(BECORE_MCSC_HEADER_COUNT, header + 16);
+	put_unaligned_le32(BECORE_MCSC_RECIPE_BYTES, header + 20);
+
+	for (i = 0; i < BECORE_MCSC_HEADER_COUNT;
+	     i++, record += BECORE_MCSC_RECIPE_RECORD_BYTES) {
+		const struct becore_cmdq_shape *shape = &becore_mcsc_shape[i];
+		u16 used_mask;
+		u16 value_mask;
+		u32 word;
+
+		if (!shape->valid_words || shape->valid_words > 16 ||
+		    shape->mode != 0x00090000)
+			return -EINVAL;
+		used_mask = shape->valid_words == 16 ? U16_MAX :
+			    GENMASK(shape->valid_words - 1, 0);
+		value_mask = used_mask & 0xaaaa;
+		if ((shape->address_mask | shape->typed_mask |
+		     shape->fixed_mask) != value_mask ||
+		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->fixed_mask) ||
+		    (shape->typed_mask & shape->fixed_mask))
+			return -EINVAL;
+
+		put_unaligned_le32(shape->mode, record);
+		put_unaligned_le32(shape->target, record + 4);
+		put_unaligned_le32(shape->type_map, record + 8);
+		for (word = 0; word < shape->valid_words; word++) {
+			u32 value = 0;
+
+			if (!(word & 1))
+				value = shape->pair_registers[word / 2];
+			else if (shape->fixed_mask & BIT(word))
+				value = shape->fixed_values[word];
+			put_unaligned_le32(value, record + 12 + word * 4);
+		}
+	}
+
+	becore->mcsc_recipe_staged_bytes = BECORE_MCSC_RECIPE_BYTES;
+	becore->mcsc_recipe_generation = 1;
+
+	return 0;
+}
+
 static int becore_mcsc_recipe_validate(struct becore_device *becore)
 {
 	const u8 *header = becore->mcsc_recipe;
@@ -2234,6 +2288,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 					   BECORE_MCSC_RECIPE_BYTES, GFP_KERNEL);
 	if (!becore->mcsc_recipe)
 		return -ENOMEM;
+	ret = becore_mcsc_recipe_generate(becore);
+	if (ret)
+		return dev_err_probe(becore->dev, ret,
+				     "invalid built-in MCSC recipe\n");
 
 	ret = becore_alloc_shared_input(becore);
 	if (ret)

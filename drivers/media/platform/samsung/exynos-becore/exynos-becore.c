@@ -122,6 +122,35 @@
 #define BECORE_RGBP_SC_DST_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x441c)
 #define BECORE_RGBP_SC_H_RATIO_REG	(BECORE_RGBP_PHYS_BASE + 0x4420)
 #define BECORE_RGBP_SC_V_RATIO_REG	(BECORE_RGBP_PHYS_BASE + 0x4424)
+/*
+ * Ten registers that say which RGBP blocks run, named from Samsung RGBP v1.20.
+ * None needs a value from the capture: an enable the program leaves clear is
+ * zero and an asserted bypass is one.
+ *
+ * OTF_CROP_CTRL is the one that reads backwards. Its only field is
+ * RGB_DMSCCROP_BYPASS, whose vendor default is 1, and the capture clears it --
+ * so zero here is what keeps the 48-column demosaic crop above *running*.
+ * Do not fold it in with the asserted bypasses.
+ *
+ * UPSC_CTRL0 is a control word rather than a bare enable: bit 0 enables, bit 8
+ * bypasses and two more disable clock gates. Zero leaves the upscaler neither
+ * enabled nor bypassed, which is what the capture does.
+ *
+ * DECOMP's frame size is not a tuning either. It is the Bayer input's, packed
+ * with the height in the high half: RGBP v1.20 gives DECOMP width bits [13:0]
+ * and height bits [29:16], the other way round from CHAIN_SRC_IMG_SIZE.
+ */
+#define BECORE_RGBP_CINFIFO_FRAME_IN_REG (BECORE_RGBP_PHYS_BASE + 0x0084)
+#define BECORE_RGBP_SATFLAG_ENABLE_REG	(BECORE_RGBP_PHYS_BASE + 0x0218)
+#define BECORE_RGBP_DMSCCROP_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x0230)
+#define BECORE_RGBP_WDMADECOMP_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2000)
+#define BECORE_RGBP_WDMAY_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2400)
+#define BECORE_RGBP_WDMAUV_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2600)
+#define BECORE_RGBP_DECOMP_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3e00)
+#define BECORE_RGBP_DECOMP_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x3e08)
+#define BECORE_RGBP_GAMMALR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4600)
+#define BECORE_RGBP_UPSC_CTRL0_REG	(BECORE_RGBP_PHYS_BASE + 0x4800)
+#define BECORE_RGBP_GAMMAHR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4a00)
 #define BECORE_RGBP_INPUT_WIDTH_REG	(BECORE_RGBP_PHYS_BASE + 0x1c20)
 #define BECORE_RGBP_INPUT_HEIGHT_REG	(BECORE_RGBP_PHYS_BASE + 0x1c24)
 #define BECORE_RGBP_INPUT_STRIDE_REG	(BECORE_RGBP_PHYS_BASE + 0x1c28)
@@ -276,6 +305,60 @@ enum becore_rgbp_input_word {
 	BECORE_RGBP_INPUT_ENABLE,
 	BECORE_RGBP_INPUT_STORAGE_WIDTH,
 	BECORE_RGBP_INPUT_WORD_COUNT,
+};
+
+/*
+ * A value the driver generates from what the block it programs is *for*.
+ *
+ * Unlike a typed word, which is matched to its register by its position in the
+ * program, one of these is resolved by register address alone -- so an entry
+ * cannot drift onto a neighbouring word, and a range can cover a whole block
+ * without naming each of its registers.
+ */
+enum becore_generated_kind {
+	BECORE_GEN_OFF,		/* an enable the program leaves clear */
+	BECORE_GEN_BYPASS,	/* an asserted bypass bit */
+	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
+	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
+};
+
+struct becore_generated_range {
+	u32 first;		/* physical register, inclusive */
+	u32 last;		/* inclusive; equal to first for one register */
+	u32 kind;
+};
+
+/*
+ * How many words each block hands to becore_generated_value(). Held here
+ * rather than in the generated table so that a recipe which quietly stopped
+ * carrying one of them fails validation instead of programming the capture.
+ */
+#define BECORE_RGBP_GENERATED_WORDS	11
+#define BECORE_YUVP_GENERATED_WORDS	0
+
+static const struct becore_generated_range becore_rgbp_generated[] = {
+	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_SATFLAG_ENABLE_REG, BECORE_RGBP_SATFLAG_ENABLE_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DMSCCROP_BYPASS_REG, BECORE_RGBP_DMSCCROP_BYPASS_REG,
+	  BECORE_GEN_RUNNING },
+	{ BECORE_RGBP_WDMADECOMP_EN_REG, BECORE_RGBP_WDMADECOMP_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_WDMAY_EN_REG, BECORE_RGBP_WDMAY_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DECOMP_BYPASS_REG, BECORE_RGBP_DECOMP_BYPASS_REG,
+	  BECORE_GEN_BYPASS },
+	{ BECORE_RGBP_DECOMP_SIZE_REG, BECORE_RGBP_DECOMP_SIZE_REG,
+	  BECORE_GEN_DECOMP_SIZE },
+	{ BECORE_RGBP_GAMMALR_BYPASS_REG, BECORE_RGBP_GAMMALR_BYPASS_REG,
+	  BECORE_GEN_BYPASS },
+	{ BECORE_RGBP_UPSC_CTRL0_REG, BECORE_RGBP_UPSC_CTRL0_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_GAMMAHR_BYPASS_REG, BECORE_RGBP_GAMMAHR_BYPASS_REG,
+	  BECORE_GEN_BYPASS },
 };
 
 static const u32 becore_rgbp_input_regs[] = {
@@ -1530,6 +1613,81 @@ static int becore_typed_value(struct becore_device *becore,
 	return -EINVAL;
 }
 
+/*
+ * The register a value word programs. Pair-mode headers carry it beside the
+ * value; sequential-mode ones step from the header's target.
+ */
+static int becore_shape_register(const struct becore_cmdq_shape *shape,
+				 u32 word, u32 *reg)
+{
+	if (word >= 16)
+		return -EINVAL;
+	if (shape->mode == 0x00090000) {
+		if (!(word & 1))
+			return -EINVAL;
+		*reg = shape->pair_registers[word / 2];
+		return 0;
+	}
+	if (shape->mode == 0x00080000) {
+		*reg = shape->target + word * 4;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static u32 becore_generated_word_count(enum becore_block_id id)
+{
+	if (id == BECORE_RGBP)
+		return BECORE_RGBP_GENERATED_WORDS;
+	if (id == BECORE_YUVP)
+		return BECORE_YUVP_GENERATED_WORDS;
+
+	return 0;
+}
+
+static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
+{
+	const struct becore_generated_range *table;
+	size_t count;
+	size_t i;
+
+	if (id != BECORE_RGBP)
+		return -EINVAL;
+	table = becore_rgbp_generated;
+	count = ARRAY_SIZE(becore_rgbp_generated);
+
+	for (i = 0; i < count; i++) {
+		u32 result;
+
+		if (reg < table[i].first || reg > table[i].last)
+			continue;
+		switch (table[i].kind) {
+		case BECORE_GEN_OFF:
+			result = 0;
+			break;
+		case BECORE_GEN_BYPASS:
+			result = 1;
+			break;
+		case BECORE_GEN_RUNNING:
+			result = 0;
+			break;
+		case BECORE_GEN_DECOMP_SIZE:
+			result = becore_pack_size(becore_rgbp_input.height,
+						  becore_rgbp_input.width);
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (value)
+			*value = result;
+
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int becore_recipe_header_validate(const struct becore_device *becore)
 {
 	const u8 *header = becore->recipe;
@@ -1592,6 +1750,7 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	const u8 *record = becore_recipe_records(becore, id);
 	u32 address_count = 0;
 	u32 typed_count = 0;
+	u32 generated_count = 0;
 	u32 i;
 
 	for (i = 0; i < header_count; i++, record += BECORE_RECIPE_RECORD_BYTES) {
@@ -1610,13 +1769,18 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 		    get_unaligned_le32(record + 4) != shape[i].target ||
 		    get_unaligned_le32(record + 8) != shape[i].type_map ||
 		    (shape[i].address_mask | shape[i].typed_mask |
-		     shape[i].fixed_mask) != value_mask ||
+		     shape[i].generated_mask | shape[i].fixed_mask) !=
+		     value_mask ||
 		    (shape[i].address_mask & ~used_mask) ||
 		    (shape[i].typed_mask & ~used_mask) ||
+		    (shape[i].generated_mask & ~used_mask) ||
 		    (shape[i].fixed_mask & ~used_mask) ||
 		    (shape[i].address_mask & shape[i].typed_mask) ||
+		    (shape[i].address_mask & shape[i].generated_mask) ||
 		    (shape[i].address_mask & shape[i].fixed_mask) ||
-		    (shape[i].typed_mask & shape[i].fixed_mask))
+		    (shape[i].typed_mask & shape[i].generated_mask) ||
+		    (shape[i].typed_mask & shape[i].fixed_mask) ||
+		    (shape[i].generated_mask & shape[i].fixed_mask))
 			return -EINVAL;
 
 		for (word = 0; word < 16; word++) {
@@ -1651,6 +1815,15 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 				typed_count++;
 			}
 
+			if (shape[i].generated_mask & BIT(word)) {
+				u32 reg;
+
+				if (becore_shape_register(&shape[i], word, &reg) ||
+				    becore_generated_value(id, reg, NULL))
+					return -EINVAL;
+				generated_count++;
+			}
+
 			if (shape[i].address_mask & BIT(word)) {
 				u32 reg;
 
@@ -1671,7 +1844,8 @@ static int becore_recipe_block_validate(struct becore_device *becore,
 	if ((id == BECORE_RGBP && address_count != 2) ||
 	    (id == BECORE_YUVP && address_count != 3))
 		return -EINVAL;
-	if (typed_count != becore_typed_word_count(id))
+	if (typed_count != becore_typed_word_count(id) ||
+	    generated_count != becore_generated_word_count(id))
 		return -EINVAL;
 
 	return 0;
@@ -1723,6 +1897,7 @@ static int becore_encode_block(struct becore_device *becore,
 				      BECORE_CMDQ_PAYLOAD_BYTES);
 	u32 i;
 	u32 typed_count = 0;
+	u32 generated_count = 0;
 
 	if (!program->cpu || program->header_count != header_count ||
 	    program->size != becore_cmdq_program_size(header_count) ||
@@ -1761,6 +1936,15 @@ static int becore_encode_block(struct becore_device *becore,
 				continue;
 			}
 
+			if (shape[i].generated_mask & BIT(word)) {
+				if (becore_shape_register(&shape[i], word, &reg) ||
+				    becore_generated_value(id, reg, &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
+				generated_count++;
+				continue;
+			}
+
 			if (!(shape[i].address_mask & BIT(word)))
 				continue;
 			reg = shape[i].pair_registers[word / 2];
@@ -1770,7 +1954,8 @@ static int becore_encode_block(struct becore_device *becore,
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
 	}
-	if (typed_count != becore_typed_word_count(id))
+	if (typed_count != becore_typed_word_count(id) ||
+	    generated_count != becore_generated_word_count(id))
 		return -EINVAL;
 
 	return 0;
@@ -1832,6 +2017,7 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 		if (get_unaligned_le32(record) != shape->mode ||
 		    get_unaligned_le32(record + 4) != shape->target ||
 		    get_unaligned_le32(record + 8) != shape->type_map ||
+		    shape->generated_mask ||
 		    (shape->address_mask & ~used_mask) ||
 		    (shape->typed_mask & ~used_mask) ||
 		    (shape->fixed_mask & ~used_mask) ||
@@ -1973,19 +2159,31 @@ static int becore_recipe_records_generate(u8 *record,
 			if (shape->valid_words & 1)
 				return -EINVAL;
 			value_mask = used_mask & 0xaaaa;
-		} else if (shape->mode == 0x00080000 ||
-			   shape->mode == 0x000b0000) {
+		} else if (shape->mode == 0x00080000) {
 			if (shape->address_mask || shape->typed_mask)
+				return -EINVAL;
+			value_mask = used_mask;
+		} else if (shape->mode == 0x000b0000) {
+			/*
+			 * Every word of a repeated-target header names the
+			 * same register, so a by-register class cannot say
+			 * which value belongs where.
+			 */
+			if (shape->address_mask || shape->typed_mask ||
+			    shape->generated_mask)
 				return -EINVAL;
 			value_mask = used_mask;
 		} else {
 			return -EINVAL;
 		}
 		if ((shape->address_mask | shape->typed_mask |
-		     shape->fixed_mask) != value_mask ||
+		     shape->generated_mask | shape->fixed_mask) != value_mask ||
 		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->generated_mask) ||
 		    (shape->address_mask & shape->fixed_mask) ||
-		    (shape->typed_mask & shape->fixed_mask))
+		    (shape->typed_mask & shape->generated_mask) ||
+		    (shape->typed_mask & shape->fixed_mask) ||
+		    (shape->generated_mask & shape->fixed_mask))
 			return -EINVAL;
 
 		put_unaligned_le32(shape->mode, record);
@@ -2098,6 +2296,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 		if (get_unaligned_le32(record) != shape->mode ||
 		    get_unaligned_le32(record + 4) != shape->target ||
 		    get_unaligned_le32(record + 8) != shape->type_map ||
+		    shape->generated_mask ||
 		    (shape->address_mask & ~used_mask) ||
 		    (shape->typed_mask & ~used_mask) ||
 		    (shape->fixed_mask & ~used_mask) ||

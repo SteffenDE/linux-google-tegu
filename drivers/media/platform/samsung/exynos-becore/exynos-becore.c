@@ -186,6 +186,25 @@
 #define BECORE_RGBP_INPUT_HEADER_STRIDE_REG \
 	(BECORE_RGBP_PHYS_BASE + 0x1c34)
 #define BECORE_RGBP_INPUT_BUSINFO_REG	(BECORE_RGBP_PHYS_BASE + 0x1c4c)
+/*
+ * Two gates YUVP leaves in a state that does not depend on the scene, named
+ * from Samsung YUVP v1.20: DTP asserts its own BYPASS -- it is a test-pattern
+ * generator, and nothing wants one -- and COUTFIFO0 is left disabled.
+ *
+ * DRCDIST is deliberately absent, and it is the interesting absence. Its first
+ * register reads as RGB_DRCDIST_BYPASS = 1 in every published YUVP table,
+ * which looks like a licence to drop the dynamic-range block's 359 table words
+ * outright, 21% of the captured program. It is not one. Zeroing them produces
+ * a completely black frame, and so does zeroing them while keeping the block's
+ * grid geometry, step multipliers and CONFIG words -- the obvious explanation,
+ * measured and refuted [HW 2026-08-21]. Nor is the block idle: the vendor
+ * rewrites 52 to 64 of those words every frame, and four of them track the
+ * chain geometry between the rear and front cameras. So the block is running,
+ * that register does not mean what its name says here, and its tables are live
+ * tuning rather than dead bytes.
+ */
+#define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
+#define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
@@ -364,7 +383,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	113
-#define BECORE_YUVP_GENERATED_WORDS	0
+#define BECORE_YUVP_GENERATED_WORDS	2
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -389,6 +408,13 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_UPSC_CTRL0_REG, BECORE_RGBP_UPSC_CTRL0_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_GAMMAHR_BYPASS_REG, BECORE_RGBP_GAMMAHR_BYPASS_REG,
+	  BECORE_GEN_BYPASS },
+};
+
+static const struct becore_generated_range becore_yuvp_generated[] = {
+	{ BECORE_YUVP_COUTFIFO0_EN_REG, BECORE_YUVP_COUTFIFO0_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
 };
 
@@ -1778,10 +1804,15 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 	size_t count;
 	size_t i;
 
-	if (id != BECORE_RGBP)
+	if (id == BECORE_RGBP) {
+		table = becore_rgbp_generated;
+		count = ARRAY_SIZE(becore_rgbp_generated);
+	} else if (id == BECORE_YUVP) {
+		table = becore_yuvp_generated;
+		count = ARRAY_SIZE(becore_yuvp_generated);
+	} else {
 		return -EINVAL;
-	table = becore_rgbp_generated;
-	count = ARRAY_SIZE(becore_rgbp_generated);
+	}
 
 	for (i = 0; i < count; i++) {
 		u32 result;

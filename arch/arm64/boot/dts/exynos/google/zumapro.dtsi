@@ -970,6 +970,49 @@
 	};
 
 	/*
+	 * BLK_MCSC is the final scaler/output domain in the camera back end.
+	 * Source: downstream pd-mcsc@15462000 and the Pixel 9a camera startup
+	 * trace.  Its dedicated compatible restores the CMU/Q-channel state and
+	 * opens the S2MPU before the MCSC System MMU resumes.  Keep it passive
+	 * until BE-core owns the MCSC reset and interrupt lifecycle.
+	 */
+	pd_mcsc: power-domain@15462000 {
+		compatible = "google,zumapro-mcsc-pd";
+		reg = <0x0 0x15462000 0x20>,
+		      <0x0 0x1d000000 0x10000>,
+		      <0x0 0x1d020000 0x10c>,
+		      <0x0 0x1d0d0000 0x10000>;
+		reg-names = "pmu", "cmu", "bus", "s2mpu0";
+		samsung,secure-pd-id = <0x1d010204>;
+		#power-domain-cells = <0>;
+		label = "MCSC";
+		status = "disabled";
+	};
+
+	/*
+	 * BLK_TNR contains the GTNR merge and align blocks.  Source: downstream
+	 * pd-tnr@15462180 and the Pixel 9a camera startup trace.  All three
+	 * S2MPUs reset closed with the shared domain, so restore them together
+	 * even though the initial spatial GTNR path only consumes merge S0/S1.
+	 * Keep the domain passive until BE-core owns the GTNR lifecycle.
+	 */
+	pd_tnr: power-domain@15462180 {
+		compatible = "google,zumapro-tnr-pd";
+		reg = <0x0 0x15462180 0x20>,
+		      <0x0 0x1cc00000 0x10000>,
+		      <0x0 0x1cc20000 0x110>,
+		      <0x0 0x1ccb0000 0x10000>,
+		      <0x0 0x1ccf0000 0x10000>,
+		      <0x0 0x1cd30000 0x10000>;
+		reg-names = "pmu", "cmu", "bus", "s2mpu0", "s2mpu1",
+			    "s2mpu2";
+		samsung,secure-pd-id = <0x1cc10204>;
+		#power-domain-cells = <0>;
+		label = "TNR";
+		status = "disabled";
+	};
+
+	/*
 	 * Camera back-end processing domains.  Source: downstream Zumapro
 	 * pd-rgbp@15462100 and pd-yuvp@15462200.  MCFP lives in BLK_RGBP;
 	 * YUVP is a separate domain.  Their dedicated compatibles replay the

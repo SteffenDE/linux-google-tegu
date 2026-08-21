@@ -210,12 +210,61 @@
  * 49152 shorts, exactly the 96 KiB LTM grid this driver already generates as
  * an identity.
  *
- * So the block runs, its tables are live per-frame tuning, and none of it is
- * stated here. Retiring it wants the same treatment GTM got -- an identity
- * curve rather than an assumption that it is off.
+ * So the block runs. Its two curves and its CONFIG words are live per-frame
+ * tuning and stay in the recipe; the gate, the luma weights, the grid geometry
+ * and the vendor's own identity fills are stated below.
+ *
+ * Lyric's embedded register descriptors name the whole range rgb_diablo_ltm_*,
+ * and that is what fixes where each stated run ends: the gain LUT does not
+ * stop at 0x65fc -- that is only where the captured program's header ended --
+ * it runs to 0x66d4, which is where 122 more unity entries put it.
+ *
+ *   0x6000  ltm_enable                    the block runs
+ *   0x6014  lumacalc_rgby_coeff_r/g/b     BT.601 luma at Q12
+ *   0x6120  slcgrid_*                     9 words, from the image size
+ *   0x62dc  crecon_satctrl_lut            258 entries, all zero
+ *   0x64e0  crecon_luma_lut               130 entries of unity Q8
+ *   0x65e4  crecon_gain_lut               122 entries of unity Q8
+ *
+ * GetDefaultLtm fills the luma and gain LUTs with 0x0100 and clears the
+ * saturation LUT, so the two identity fills are the vendor's own and not an
+ * artefact of the scene this was captured from -- and neither differs between
+ * the rear and front cameras, where the four grid reciprocals do.
  */
 #define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
 #define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)
+#define BECORE_YUVP_LTM_BASE		(BECORE_YUVP_PHYS_BASE + 0x6000)
+#define BECORE_YUVP_LTM_ENABLE_REG	(BECORE_YUVP_LTM_BASE + 0x000)
+#define BECORE_YUVP_LTM_LUMA_FIRST	(BECORE_YUVP_LTM_BASE + 0x014)
+#define BECORE_YUVP_LTM_LUMA_LAST	(BECORE_YUVP_LTM_BASE + 0x01c)
+#define BECORE_YUVP_LTM_GRID_FIRST	(BECORE_YUVP_LTM_BASE + 0x120)
+#define BECORE_YUVP_LTM_GRID_LAST	(BECORE_YUVP_LTM_BASE + 0x140)
+#define BECORE_YUVP_LTM_SATCTRL_FIRST	(BECORE_YUVP_LTM_BASE + 0x2dc)
+#define BECORE_YUVP_LTM_SATCTRL_LAST	(BECORE_YUVP_LTM_BASE + 0x4dc)
+#define BECORE_YUVP_LTM_UNITY_FIRST	(BECORE_YUVP_LTM_BASE + 0x4e0)
+#define BECORE_YUVP_LTM_UNITY_LAST	(BECORE_YUVP_LTM_BASE + 0x6d4)
+/*
+ * The grid is a fixed 32 x 24 x 8 bilateral grid: 32 * 24 * 8 cells of eight
+ * shorts is 49152, exactly the array YuvpLtmBlock::ConfigureWith carries. On a
+ * 4:3 frame its cells are square, which is why the horizontal and vertical
+ * reciprocals below come out equal and why this looked unsolvable.
+ */
+#define BECORE_LTM_LUMA_Q12_R		1225
+#define BECORE_LTM_LUMA_Q12_G		2404
+#define BECORE_LTM_LUMA_Q12_B		467
+#define BECORE_LTM_SLCGRID_COLUMNS	32
+#define BECORE_LTM_SLCGRID_ROWS		24
+#define BECORE_LTM_SLCGRID_DEPTH	8
+#define BECORE_LTM_SLCGRID_CELL_SHORTS	8
+#define BECORE_LTM_UNITY_Q8_PAIR	0x01000100
+/*
+ * The register block and the 96 KiB buffer are two halves of one thing, and
+ * nothing else in this driver says so: state it where both are in scope, so a
+ * future edit to either has to answer for the other.
+ */
+static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_SLCGRID_ROWS *
+	      BECORE_LTM_SLCGRID_DEPTH * BECORE_LTM_SLCGRID_CELL_SHORTS *
+	      sizeof(__le16) == BECORE_GRID_SIZE);
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
@@ -417,6 +466,7 @@ enum becore_generated_kind {
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
+	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -436,7 +486,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	167
-#define BECORE_YUVP_GENERATED_WORDS	2
+#define BECORE_YUVP_GENERATED_WORDS	270
 #define BECORE_MCSC_GENERATED_WORDS	63
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -474,6 +524,16 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_LUMA_FIRST, BECORE_YUVP_LTM_LUMA_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_GRID_FIRST, BECORE_YUVP_LTM_GRID_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_SATCTRL_FIRST, BECORE_YUVP_LTM_SATCTRL_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
+	  BECORE_GEN_LTM },
 };
 
 static const struct becore_generated_range becore_mcsc_generated[] = {
@@ -1810,6 +1870,87 @@ static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
 }
 
 /* The identity itself: out[i] == in[i] << 5 at every knot. */
+/*
+ * YUVP local tone mapping, by offset from BECORE_YUVP_LTM_BASE. What the block
+ * is for, rather than what one scene wanted from it: it forms a guide luma
+ * from RGB, looks that up in a tone curve and applies a spatial gain grid. The
+ * curve and the CONFIG words are the tuning and stay in the recipe; the gate,
+ * the luma weights, the grid the frame is divided into and the vendor's own
+ * unity fills are all stateable.
+ */
+static int becore_yuvp_ltm_value(u32 offset, u32 *value)
+{
+	u32 cell;
+
+	if (offset & 3)
+		return -EINVAL;
+	/*
+	 * The grid's cells are square on a 4:3 frame, which is why the
+	 * horizontal and vertical reciprocals below come out equal. A geometry
+	 * where they are not would need two of them and would mean the frame
+	 * is no longer 4:3, so refuse the whole block rather than program half
+	 * a grid -- and refuse it here rather than only when a reciprocal is
+	 * asked for, so this matches the generator that checks these values.
+	 */
+	cell = becore_rgbp_out_width() / BECORE_LTM_SLCGRID_COLUMNS;
+	if (!cell || cell != becore_rgbp_out_height() / BECORE_LTM_SLCGRID_ROWS)
+		return -ERANGE;
+
+	switch (offset) {
+	case 0x000:				/* LTM_ENABLE: the block runs */
+		*value = 1;
+		return 0;
+	case 0x014:				/* LUMACALC_RGBY_COEFF_R */
+		*value = BECORE_LTM_LUMA_Q12_R;
+		return 0;
+	case 0x018:				/* ..._COEFF_G */
+		*value = BECORE_LTM_LUMA_Q12_G;
+		return 0;
+	case 0x01c:				/* ..._COEFF_B */
+		*value = BECORE_LTM_LUMA_Q12_B;
+		return 0;
+	case 0x120:				/* SLCGRID_START_X_POS */
+	case 0x124:				/* SLCGRID_START_Y_POS */
+		*value = 0;
+		return 0;
+	case 0x128:				/* SLCGRID_GRID_DEPTH */
+		*value = BECORE_LTM_SLCGRID_DEPTH;
+		return 0;
+	case 0x12c:				/* SLCGRID_GRID_WIDTH */
+		*value = BECORE_LTM_SLCGRID_COLUMNS;
+		return 0;
+	case 0x130:				/* SLCGRID_GRID_HEIGHT */
+		*value = BECORE_LTM_SLCGRID_ROWS;
+		return 0;
+	}
+
+	if (offset >= 0x2dc && offset <= 0x4dc) {
+		/* CRECON_SATCTRL_LUT: saturation control contributes nothing. */
+		*value = 0;
+		return 0;
+	}
+
+	if (offset >= 0x4e0 && offset <= 0x6d4) {
+		/* CRECON_LUMA_LUT and _GAIN_LUT: unity, as GetDefaultLtm fills them. */
+		*value = BECORE_LTM_UNITY_Q8_PAIR;
+		return 0;
+	}
+
+	/* The remaining four are the reciprocals it steps the grid with. */
+	switch (offset) {
+	case 0x134:				/* SLCGRID_GRID_X_SCALE */
+	case 0x13c:				/* SLCGRID_GRID_Y_SCALE */
+		*value = 65536 / cell;
+		return 0;
+	case 0x138:				/* SLCGRID_GRID_X_SCALE_HALF */
+	case 0x140:				/* SLCGRID_GRID_Y_SCALE_HALF */
+		*value = 32768 / cell;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 {
 	u32 knot;
@@ -2061,6 +2202,11 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 			break;
 		case BECORE_GEN_GTM:
 			if (becore_rgbp_gtm_value(reg - BECORE_RGBP_GTM_BASE,
+						  &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_LTM:
+			if (becore_yuvp_ltm_value(reg - BECORE_YUVP_LTM_BASE,
 						  &result))
 				return -EINVAL;
 			break;

@@ -1073,6 +1073,7 @@ struct ispfe_device {
 	u32 backend_dropped;
 	int backend_queue_error;
 	bool backend_queue_active;
+	bool backend_queue_consumer;
 	void *backend_spare;
 	dma_addr_t backend_spare_dma;
 	size_t backend_input_size;
@@ -4166,71 +4167,45 @@ static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
 	spin_unlock_irq(&ispfe->slock);
 }
 
-static int ispfe_backend_queue_set(void *data, u64 val)
+static int ispfe_backend_queue_start(struct ispfe_device *ispfe)
 {
-	struct ispfe_device *ispfe = data;
 	bool ready;
 	int ret;
 
-	if (val > 1)
+	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+		return -EBUSY;
+	if (ispfe->backend_recipe != 1)
 		return -EINVAL;
 
-	guard(mutex)(&ispfe->lock);
-	if (!!val == ispfe->backend_queue_active)
-		return 0;
-	if (val) {
-		if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
-			return -EBUSY;
-		if (ispfe->backend_recipe != 1)
-			return -EINVAL;
+	ispfe->owner = ISPFE_OWNER_BACKEND;
+	ispfe_backend_queue_reset(ispfe);
+	spin_lock_irq(&ispfe->slock);
+	ispfe->backend_queue_active = true;
+	spin_unlock_irq(&ispfe->slock);
 
-		ispfe->owner = ISPFE_OWNER_BACKEND;
-		ispfe_backend_queue_reset(ispfe);
-		spin_lock_irq(&ispfe->slock);
-		ispfe->backend_queue_active = true;
-		spin_unlock_irq(&ispfe->slock);
+	ret = ispfe_sensor_power(ispfe, true);
+	if (ret)
+		goto err_queue;
+	ret = ispfe_start(ispfe);
+	if (ret)
+		goto err_power;
 
-		ret = ispfe_sensor_power(ispfe, true);
-		if (ret)
-			goto err_queue;
-		ret = ispfe_start(ispfe);
-		if (ret)
-			goto err_power;
-
-		ispfe_backend_queue_fill(ispfe);
-		spin_lock_irq(&ispfe->slock);
-		ready = !list_empty(&ispfe->backend_ready);
-		ret = ispfe->backend_queue_error;
-		spin_unlock_irq(&ispfe->slock);
-		if (ret || !ready) {
-			if (!ret)
-				ret = -ENOBUFS;
-			goto err_stop;
-		}
-
-		ret = v4l2_subdev_enable_streams(&ispfe->sd,
-						 ISPFE_PAD_SOURCE, BIT_ULL(0));
-		if (ret)
-			goto err_stop;
-		ispfe->sensor_streaming = true;
-		return 0;
+	ispfe_backend_queue_fill(ispfe);
+	spin_lock_irq(&ispfe->slock);
+	ready = !list_empty(&ispfe->backend_ready);
+	ret = ispfe->backend_queue_error;
+	spin_unlock_irq(&ispfe->slock);
+	if (ret || !ready) {
+		if (!ret)
+			ret = -ENOBUFS;
+		goto err_stop;
 	}
 
-	spin_lock_irq(&ispfe->slock);
-	ispfe->backend_queue_active = false;
-	spin_unlock_irq(&ispfe->slock);
-	cancel_work_sync(&ispfe->backend_fill_work);
-	ispfe_stop(ispfe);
-	cancel_work_sync(&ispfe->backend_fill_work);
-	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
-					  BIT_ULL(0));
+	ret = v4l2_subdev_enable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					 BIT_ULL(0));
 	if (ret)
-		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
-	ispfe_sensor_power(ispfe, false);
-	ispfe->sensor_streaming = false;
-	ispfe_backend_queue_abort_all(ispfe);
-	ispfe->owner = ISPFE_OWNER_NONE;
-
+		goto err_stop;
+	ispfe->sensor_streaming = true;
 	return 0;
 
 err_stop:
@@ -4249,6 +4224,78 @@ err_queue:
 	spin_unlock_irq(&ispfe->slock);
 	ispfe->owner = ISPFE_OWNER_NONE;
 	return ret;
+}
+
+static void ispfe_backend_queue_stop(struct ispfe_device *ispfe)
+{
+	int ret;
+
+	spin_lock_irq(&ispfe->slock);
+	ispfe->backend_queue_active = false;
+	spin_unlock_irq(&ispfe->slock);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ispfe_stop(ispfe);
+	cancel_work_sync(&ispfe->backend_fill_work);
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+					  BIT_ULL(0));
+	if (ret)
+		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
+	ispfe_sensor_power(ispfe, false);
+	ispfe->sensor_streaming = false;
+	ispfe_backend_queue_abort_all(ispfe);
+	ispfe->owner = ISPFE_OWNER_NONE;
+}
+
+static int ispfe_backend_stream_start(void *data)
+{
+	struct ispfe_device *ispfe = data;
+	int ret;
+
+	guard(mutex)(&ispfe->lock);
+	if (ispfe->backend_queue_active)
+		return -EBUSY;
+
+	ret = ispfe_backend_queue_start(ispfe);
+	if (!ret)
+		ispfe->backend_queue_consumer = true;
+
+	return ret;
+}
+
+static void ispfe_backend_stream_stop(void *data)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	if (!ispfe->backend_queue_consumer)
+		return;
+
+	ispfe->backend_queue_consumer = false;
+	ispfe_backend_queue_stop(ispfe);
+}
+
+static const struct exynos_becore_input_producer_ops ispfe_backend_ops = {
+	.start_streaming = ispfe_backend_stream_start,
+	.stop_streaming = ispfe_backend_stream_stop,
+};
+
+static int ispfe_backend_queue_set(void *data, u64 val)
+{
+	struct ispfe_device *ispfe = data;
+
+	if (val > 1)
+		return -EINVAL;
+
+	guard(mutex)(&ispfe->lock);
+	if (ispfe->backend_queue_consumer)
+		return -EBUSY;
+	if (!!val == ispfe->backend_queue_active)
+		return 0;
+	if (val)
+		return ispfe_backend_queue_start(ispfe);
+
+	ispfe_backend_queue_stop(ispfe);
+	return 0;
 }
 
 static int ispfe_backend_queue_get(void *data, u64 *val)
@@ -4624,10 +4671,11 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "queue        %u in flight, slots %#lx, seq %u\n",
 		   flight, slots, ispfe->sequence);
 	seq_printf(s,
-		   "backend_queue active %u, ready %u, flight %u, done %u, programs %#lx, credits %llu, completed %u, dropped %u, error %d\n",
-		   backend_active, backend_ready, backend_flight, backend_done,
-		   backend_programs, backend_credits, backend_completed,
-		   backend_dropped, backend_error);
+		   "backend_queue active %u, consumer %u, ready %u, flight %u, done %u, programs %#lx, credits %llu, completed %u, dropped %u, error %d\n",
+		   backend_active, ispfe->backend_queue_consumer, backend_ready,
+		   backend_flight, backend_done, backend_programs,
+		   backend_credits, backend_completed, backend_dropped,
+		   backend_error);
 	seq_printf(s, "snapshot_state %u\n", READ_ONCE(ispfe->snapshot_state));
 	seq_printf(s, "snapshot_armed %u\n",
 		   READ_ONCE(ispfe->snapshot_state) == ISPFE_SNAPSHOT_ARMED);
@@ -6079,7 +6127,8 @@ static int ispfe_backend_init(struct ispfe_device *ispfe)
 		return -EPROBE_DEFER;
 
 	ispfe->backend_input =
-		exynos_becore_input_map(&backend->dev, ispfe->dev);
+		exynos_becore_input_map(&backend->dev, ispfe->dev,
+					&ispfe_backend_ops, ispfe);
 	put_device(&backend->dev);
 	if (IS_ERR(ispfe->backend_input)) {
 		ret = PTR_ERR(ispfe->backend_input);

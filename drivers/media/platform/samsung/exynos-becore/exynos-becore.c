@@ -652,11 +652,14 @@ struct becore_device {
 	bool active_mcsc;
 	bool output_quarantined;
 	bool video_streaming;
+	bool producer_streaming;
 };
 
 struct exynos_becore_input {
 	struct becore_device *becore;
 	struct device *producer;
+	const struct exynos_becore_input_producer_ops *ops;
+	void *producer_data;
 	struct sg_table sgts[BECORE_INPUT_SLOT_COUNT];
 	dma_addr_t dmas[BECORE_INPUT_SLOT_COUNT];
 };
@@ -2287,20 +2290,25 @@ static int becore_clone_sgtable(struct sg_table *dst,
  * exynos_becore_input_map() - map the BE-core input into its producer domain
  * @backend: BE-core platform device
  * @producer: device which will write the compressed Bayer object
+ * @ops: producer lifetime operations for an ordinary processed stream
+ * @producer_data: producer-private callback argument
  *
  * Each producer_acquire() returns one generation-tagged slot and its address
  * in @producer's DMA domain.  BE-core retains distinct mappings of the same
  * pages and never exposes those IOVAs to the producer.
  */
 struct exynos_becore_input *
-exynos_becore_input_map(struct device *backend, struct device *producer)
+exynos_becore_input_map(struct device *backend, struct device *producer,
+			const struct exynos_becore_input_producer_ops *ops,
+			void *producer_data)
 {
 	struct becore_device *becore;
 	struct exynos_becore_input *input;
 	unsigned int i;
 	int ret;
 
-	if (!backend || !producer)
+	if (!backend || !producer || !ops || !ops->start_streaming ||
+	    !ops->stop_streaming)
 		return ERR_PTR(-EINVAL);
 	becore = dev_get_drvdata(backend);
 	if (!becore || !becore->inputs[0].buffer.sgt)
@@ -2311,6 +2319,8 @@ exynos_becore_input_map(struct device *backend, struct device *producer)
 		return ERR_PTR(-ENOMEM);
 	input->becore = becore;
 	input->producer = get_device(producer);
+	input->ops = ops;
+	input->producer_data = producer_data;
 
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_dma_buffer *slot = &becore->inputs[i].buffer;
@@ -2521,7 +2531,7 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
 	slot->state = BECORE_INPUT_READY;
-	if (becore->video_streaming)
+	if (becore->video_streaming && becore->producer_streaming)
 		schedule_work(&becore->video_work);
 
 unlock:
@@ -3419,6 +3429,39 @@ static void becore_video_return_all(struct becore_device *becore,
 	}
 }
 
+static void becore_video_discard_ready(struct becore_device *becore)
+{
+	unsigned int i;
+
+	mutex_lock(&becore->lock);
+	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
+		struct becore_input_slot *slot = &becore->inputs[i];
+
+		if (slot->state != BECORE_INPUT_READY)
+			continue;
+		slot->state = BECORE_INPUT_FREE;
+		slot->buffer.staged_bytes = 0;
+		slot->ready_sequence = 0;
+	}
+	mutex_unlock(&becore->lock);
+}
+
+static void becore_video_stop_producer(struct becore_device *becore)
+{
+	struct exynos_becore_input *input = NULL;
+
+	mutex_lock(&becore->lock);
+	if (becore->producer_streaming) {
+		becore->producer_streaming = false;
+		input = becore->input_producer;
+	}
+	mutex_unlock(&becore->lock);
+
+	if (input)
+		input->ops->stop_streaming(input->producer_data);
+	becore_video_discard_ready(becore);
+}
+
 static void becore_video_fail(struct becore_device *becore,
 			      struct becore_video_buffer *buf)
 {
@@ -3426,6 +3469,7 @@ static void becore_video_fail(struct becore_device *becore,
 	becore->video_streaming = false;
 	mutex_unlock(&becore->lock);
 
+	becore_video_stop_producer(becore);
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	vb2_queue_error(&becore->queue);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
@@ -3547,6 +3591,7 @@ static void becore_buf_queue(struct vb2_buffer *vb)
 static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct becore_device *becore = vb2_get_drv_priv(q);
+	struct exynos_becore_input *input;
 	int ret;
 
 	mutex_lock(&becore->lock);
@@ -3568,12 +3613,32 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EIO;
 		goto unlock;
 	}
+	input = becore->input_producer;
+	if (!input) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	becore->video_sequence = 0;
 	/* The shared driver-owned output now becomes the video bounce buffer. */
 	becore->completed_generation = 0;
 	becore->completed_output_size = 0;
 	becore->video_streaming = true;
+	mutex_unlock(&becore->lock);
+
+	ret = input->ops->start_streaming(input->producer_data);
+	if (ret) {
+		mutex_lock(&becore->lock);
+		becore->video_streaming = false;
+		mutex_unlock(&becore->lock);
+		cancel_work_sync(&becore->video_work);
+		becore_video_discard_ready(becore);
+		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
+		return ret;
+	}
+
+	mutex_lock(&becore->lock);
+	becore->producer_streaming = true;
 	mutex_unlock(&becore->lock);
 	schedule_work(&becore->video_work);
 
@@ -3604,6 +3669,7 @@ static void becore_stop_streaming(struct vb2_queue *q)
 	mutex_unlock(&becore->lock);
 
 	cancel_work_sync(&becore->video_work);
+	becore_video_stop_producer(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
 }
 
@@ -3740,8 +3806,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	spin_unlock_irqrestore(&becore->queue_lock, flags);
 	video_streaming = becore->video_streaming;
 	seq_printf(s, "running          %u\n", running);
-	seq_printf(s, "video_queue      streaming %u, queued %u, sequence %u\n",
-		   video_streaming, queued_outputs, becore->video_sequence);
+	seq_printf(s,
+		   "video_queue      streaming %u, producer %u, queued %u, sequence %u\n",
+		   video_streaming, becore->producer_streaming, queued_outputs,
+		   becore->video_sequence);
 	seq_printf(s, "runtime          %s\n",
 		   pm_runtime_status_suspended(becore->dev) ? "suspended" : "active");
 	seq_printf(s, "recipe           %zu/%u bytes, generation %u\n",

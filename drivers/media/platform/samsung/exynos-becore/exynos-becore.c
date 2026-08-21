@@ -252,6 +252,48 @@
  * Watch the name: GetDefaultDmsc(DmscRgbpOutput&) is a different function from
  * the front end's, which takes a DmscOutput& and programs ISPFE.
  */
+/*
+ * RGBP's BYR_DNS and YUVP's YUVNR carry the same object: an eight-knot
+ * piecewise-linear curve of noise standard deviation against pixel level, one
+ * curve for luma and one for chroma. The knots are genuine tuning and stay in
+ * the recipe. What follows from them is the eight slopes, the shift they are
+ * taken at, and -- because the chroma curve is measured on the same domain as
+ * the luma one -- the chroma domain itself.
+ *
+ * A slope is (dY << 11) / dX, and the eighth field repeats the seventh because
+ * there are eight fields for seven segments. The trap is the rounding: **DNS
+ * rounds to nearest and YUVNR truncates**. Both were verified on both channels
+ * of both blocks. Using one rule for the other block still reproduces every
+ * exact division and misses by one everywhere else, so a spot check on a
+ * couple of knots passes and the curve is quietly wrong in between.
+ *
+ * These are the first values that are not a function of the geometry or of a
+ * constant, but of the block's own neighbouring registers, which is why
+ * becore_recipe_fixed_value() exists.
+ */
+#define BECORE_RGBP_DNS_X_G_REG		(BECORE_RGBP_DNS_BASE + 0x110)
+#define BECORE_RGBP_DNS_Y_G_REG		(BECORE_RGBP_DNS_BASE + 0x120)
+#define BECORE_RGBP_DNS_SLOPE_G_REG	(BECORE_RGBP_DNS_BASE + 0x130)
+#define BECORE_RGBP_DNS_SHIFT_G_REG	(BECORE_RGBP_DNS_BASE + 0x140)
+#define BECORE_RGBP_DNS_X_RB_REG	(BECORE_RGBP_DNS_BASE + 0x144)
+#define BECORE_RGBP_DNS_Y_RB_REG	(BECORE_RGBP_DNS_BASE + 0x154)
+#define BECORE_RGBP_DNS_SLOPE_RB_REG	(BECORE_RGBP_DNS_BASE + 0x164)
+#define BECORE_RGBP_DNS_SHIFT_RB_REG	(BECORE_RGBP_DNS_BASE + 0x174)
+#define BECORE_YUVP_NR_BASE		(BECORE_YUVP_PHYS_BASE + 0x3000)
+#define BECORE_YUVP_NR_X_Y_REG		(BECORE_YUVP_NR_BASE + 0x220)
+#define BECORE_YUVP_NR_Y_Y_REG		(BECORE_YUVP_NR_BASE + 0x230)
+#define BECORE_YUVP_NR_SLOPE_Y_REG	(BECORE_YUVP_NR_BASE + 0x240)
+#define BECORE_YUVP_NR_SHIFT_Y_REG	(BECORE_YUVP_NR_BASE + 0x260)
+#define BECORE_YUVP_NR_X_UV_REG		(BECORE_YUVP_NR_BASE + 0x274)
+#define BECORE_YUVP_NR_Y_UV_REG		(BECORE_YUVP_NR_BASE + 0x284)
+#define BECORE_YUVP_NR_SLOPE_UV_REG	(BECORE_YUVP_NR_BASE + 0x2a4)
+#define BECORE_YUVP_NR_SHIFT_UV_REG	(BECORE_YUVP_NR_BASE + 0x2b4)
+#define BECORE_NOISE_KNOTS		8
+#define BECORE_NOISE_TABLE_REGS		(BECORE_NOISE_KNOTS / 2)
+#define BECORE_NOISE_TABLE_LAST		((BECORE_NOISE_TABLE_REGS - 1) * 4)
+#define BECORE_NOISE_SLOPE_SHIFT	11
+#define BECORE_NOISE_SLOPE_MASK		GENMASK(12, 0)
+#define BECORE_NOISE_SHIFT_NIBBLES	8
 #define BECORE_MCSC_DJAG_BASE		(BECORE_MCSC_PHYS_BASE + 0x4000)
 #define BECORE_MCSC_DJAG_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x000)
 #define BECORE_MCSC_DJAG_PS_FIRST	(BECORE_MCSC_DJAG_BASE + 0x01c)
@@ -626,6 +668,9 @@ enum becore_generated_kind {
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
+	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
+	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
+	BECORE_GEN_NOISE_DOMAIN,	/* a chroma domain repeating the luma one */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
 	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
@@ -646,8 +691,8 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	275
-#define BECORE_YUVP_GENERATED_WORDS	271
+#define BECORE_RGBP_GENERATED_WORDS	289
+#define BECORE_YUVP_GENERATED_WORDS	285
 #define BECORE_MCSC_GENERATED_WORDS	76
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -663,6 +708,19 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DNS_SLOPE_G_REG,
+	  BECORE_RGBP_DNS_SLOPE_G_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_SLOPE },
+	{ BECORE_RGBP_DNS_SHIFT_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG,
+	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_RGBP_DNS_X_RB_REG,
+	  BECORE_RGBP_DNS_X_RB_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_DOMAIN },
+	{ BECORE_RGBP_DNS_SLOPE_RB_REG,
+	  BECORE_RGBP_DNS_SLOPE_RB_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_SLOPE },
+	{ BECORE_RGBP_DNS_SHIFT_RB_REG, BECORE_RGBP_DNS_SHIFT_RB_REG,
+	  BECORE_GEN_NOISE_SHIFT },
 	{ BECORE_RGBP_DMSC_BASE + 0x20c, BECORE_RGBP_DMSC_BASE + 0x20c,
 	  BECORE_GEN_DMSC },			/* BASE_CONFIG */
 	{ BECORE_RGBP_DMSC_BASE + 0x238, BECORE_RGBP_DMSC_BASE + 0x238,
@@ -724,6 +782,19 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_YUVP_NR_SLOPE_Y_REG,
+	  BECORE_YUVP_NR_SLOPE_Y_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_SLOPE },
+	{ BECORE_YUVP_NR_SHIFT_Y_REG, BECORE_YUVP_NR_SHIFT_Y_REG,
+	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_YUVP_NR_X_UV_REG,
+	  BECORE_YUVP_NR_X_UV_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_DOMAIN },
+	{ BECORE_YUVP_NR_SLOPE_UV_REG,
+	  BECORE_YUVP_NR_SLOPE_UV_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_SLOPE },
+	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
+	  BECORE_GEN_NOISE_SHIFT },
 	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
 	  BECORE_GEN_LPF_NORM },
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
@@ -2081,7 +2152,6 @@ static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
 	return -EINVAL;
 }
 
-/* The identity itself: out[i] == in[i] << 5 at every knot. */
 /*
  * YUVP local tone mapping, by offset from BECORE_YUVP_LTM_BASE. What the block
  * is for, rather than what one scene wanted from it: it forms a guide luma
@@ -2161,6 +2231,292 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	}
 
 	return -EINVAL;
+}
+
+/*
+ * Read one fixed word back out of the recipe by register address.
+ *
+ * Every other generated value is a function of the hardware description or of
+ * a constant, and resolves from the register alone. A noise curve's slopes are
+ * a function of its knots, which are tuning and stay in the recipe -- so
+ * resolving one means finding a sibling register's value.
+ *
+ * What makes that safe is not the order this runs in: it reads the
+ * compiled-in table, so its answer does not depend on validation having run.
+ * It is that the two ends agree by construction. Validation refuses any staged
+ * recipe whose fixed words differ from these, and encode copies the staged
+ * payload and then overwrites only address, typed and generated words -- so a
+ * knot that is programmed is always the knot a slope was derived from.
+ *
+ * A command list's last write to a register is the one the hardware keeps, and
+ * this recipe really does write one YUVP register twice with two values, so
+ * take the last match rather than the first. A register carried only by a
+ * repeated-target header, or one that is not a fixed word at all, is invisible
+ * here and returns -EINVAL, which fails the encode rather than guessing.
+ */
+static int becore_recipe_fixed_value(enum becore_block_id id, u32 reg,
+				     u32 *value)
+{
+	const struct becore_cmdq_shape *shape;
+	bool found = false;
+	u32 count;
+	u32 i;
+	u32 word;
+
+	switch (id) {
+	case BECORE_RGBP:
+		shape = becore_rgbp_shape;
+		count = BECORE_RGBP_HEADER_COUNT;
+		break;
+	case BECORE_YUVP:
+		shape = becore_yuvp_shape;
+		count = BECORE_YUVP_HEADER_COUNT;
+		break;
+	case BECORE_MCSC:
+		shape = becore_mcsc_shape;
+		count = BECORE_MCSC_HEADER_COUNT;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	for (i = 0; i < count; i++) {
+		for (word = 0; word < shape[i].valid_words; word++) {
+			u32 candidate;
+
+			if (!(shape[i].fixed_mask & BIT(word)))
+				continue;
+			if (becore_shape_register(&shape[i], word, &candidate) ||
+			    candidate != reg)
+				continue;
+			*value = shape[i].fixed_values[word];
+			found = true;
+		}
+	}
+
+	return found ? 0 : -EINVAL;
+}
+
+/*
+ * Each entry names the knots its slopes come from, so a chroma curve whose own
+ * domain registers this table generates points at the luma copy it repeats
+ * rather than at itself -- those would read back as zero.
+ */
+struct becore_noise_curve {
+	enum becore_block_id block;
+	u32 x_first;
+	u32 y_first;
+	u32 slope_first;
+	u32 shift_reg;
+	u32 domain_first;	/* 0 when the curve owns its own domain */
+	bool round;		/* to nearest; false truncates */
+};
+
+static const struct becore_noise_curve becore_noise_curves[] = {
+	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_G_REG,
+	  BECORE_RGBP_DNS_SLOPE_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG, 0, true },
+	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_RB_REG,
+	  BECORE_RGBP_DNS_SLOPE_RB_REG, BECORE_RGBP_DNS_SHIFT_RB_REG,
+	  BECORE_RGBP_DNS_X_RB_REG, true },
+	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_Y_REG,
+	  BECORE_YUVP_NR_SLOPE_Y_REG, BECORE_YUVP_NR_SHIFT_Y_REG, 0, false },
+	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_UV_REG,
+	  BECORE_YUVP_NR_SLOPE_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
+	  BECORE_YUVP_NR_X_UV_REG, false },
+};
+
+static int becore_noise_curve_for(enum becore_block_id id, u32 reg, u32 kind,
+				  size_t *found)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
+		const struct becore_noise_curve *curve = &becore_noise_curves[i];
+		u32 first;
+		u32 regs;
+
+		if (curve->block != id)
+			continue;
+		if (kind == BECORE_GEN_NOISE_SLOPE) {
+			first = curve->slope_first;
+			regs = BECORE_NOISE_TABLE_REGS;
+		} else if (kind == BECORE_GEN_NOISE_DOMAIN) {
+			first = curve->domain_first;
+			regs = BECORE_NOISE_TABLE_REGS;
+		} else {
+			first = curve->shift_reg;
+			regs = 1;
+		}
+		if (first && reg >= first && reg < first + regs * 4) {
+			*found = i;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+/*
+ * The knots resolved once, rather than scanned for on every frame.
+ *
+ * The recipe's fixed words are compile-time constants, so a curve's knots are
+ * too, but finding one means walking every header of its block. That walk is
+ * cheap once and expensive per frame -- the encode path runs it for all 396
+ * headers of a submission -- so it happens at probe and the result is what the
+ * per-frame arithmetic reads.
+ */
+struct becore_noise_knots {
+	s32 x[BECORE_NOISE_KNOTS];
+	s32 y[BECORE_NOISE_KNOTS];
+};
+
+static struct becore_noise_knots
+	becore_noise_knots[ARRAY_SIZE(becore_noise_curves)];
+static bool becore_noise_knots_ready;
+
+/* Knot `index` of an eight-knot table: two 16-bit knots per register. */
+static int becore_noise_read_knot(enum becore_block_id id, u32 first,
+				  u32 index, s32 *knot)
+{
+	u32 word;
+	int ret;
+
+	if (index >= BECORE_NOISE_KNOTS)
+		return -EINVAL;
+	ret = becore_recipe_fixed_value(id, first + (index / 2) * 4, &word);
+	if (ret)
+		return ret;
+	*knot = (index & 1) ? (word >> 16) & 0xffff : word & 0xffff;
+
+	return 0;
+}
+
+/*
+ * Resolve every curve's knots, and check each domain rises while we are here.
+ * A curve that cannot be resolved is a wiring mistake in the table above --
+ * most likely a chroma curve pointed at its own generated domain instead of
+ * the luma copy it repeats -- and it is worth failing probe over rather than
+ * discovering at the first STREAMON.
+ */
+static int becore_noise_knots_resolve(struct device *dev)
+{
+	size_t i;
+	u32 index;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
+		const struct becore_noise_curve *curve = &becore_noise_curves[i];
+
+		for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
+			ret = becore_noise_read_knot(curve->block,
+						     curve->x_first, index,
+						     &becore_noise_knots[i].x[index]);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "noise curve %zu has no knot domain\n",
+						     i);
+			ret = becore_noise_read_knot(curve->block,
+						     curve->y_first, index,
+						     &becore_noise_knots[i].y[index]);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "noise curve %zu has no knot range\n",
+						     i);
+		}
+		for (index = 1; index < BECORE_NOISE_KNOTS; index++) {
+			if (becore_noise_knots[i].x[index] <=
+			    becore_noise_knots[i].x[index - 1])
+				return dev_err_probe(dev, -ERANGE,
+						     "noise curve %zu's domain does not rise\n",
+						     i);
+		}
+	}
+	becore_noise_knots_ready = true;
+
+	return 0;
+}
+
+/*
+ * One segment's slope. There are eight slope fields for seven segments, so the
+ * eighth repeats the seventh: past the last knot the curve does not turn.
+ */
+static int becore_noise_slope(size_t curve_index, u32 index, u32 *slope)
+{
+	const struct becore_noise_curve *curve =
+		&becore_noise_curves[curve_index];
+	const struct becore_noise_knots *knots =
+		&becore_noise_knots[curve_index];
+	s32 magnitude;
+	s32 quotient;
+	s32 delta;
+	s32 dx;
+
+	if (index >= BECORE_NOISE_KNOTS - 1)
+		index = BECORE_NOISE_KNOTS - 2;
+	dx = knots->x[index + 1] - knots->x[index];
+	if (dx <= 0)
+		return -ERANGE;
+	delta = knots->y[index + 1] - knots->y[index];
+	magnitude = (delta < 0 ? -delta : delta) << BECORE_NOISE_SLOPE_SHIFT;
+	if (curve->round)
+		quotient = (2 * magnitude + dx) / (2 * dx);
+	else
+		quotient = magnitude / dx;
+	if (delta < 0)
+		quotient = -quotient;
+	if (quotient > (s32)(BECORE_NOISE_SLOPE_MASK >> 1) ||
+	    quotient < -(s32)(BECORE_NOISE_SLOPE_MASK >> 1) - 1)
+		return -ERANGE;
+	*slope = (u32)quotient & BECORE_NOISE_SLOPE_MASK;
+
+	return 0;
+}
+
+static int becore_noise_value(enum becore_block_id id, u32 reg, u32 kind,
+			      u32 *value)
+{
+	size_t curve_index;
+	u32 packed = 0;
+	u32 index;
+	u32 high;
+	u32 low;
+	u32 i;
+	int ret;
+
+	if (!becore_noise_knots_ready)
+		return -EINVAL;
+	ret = becore_noise_curve_for(id, reg, kind, &curve_index);
+	if (ret)
+		return ret;
+	if (kind == BECORE_GEN_NOISE_SHIFT) {
+		for (i = 0; i < BECORE_NOISE_SHIFT_NIBBLES; i++)
+			packed |= (u32)BECORE_NOISE_SLOPE_SHIFT << (4 * i);
+		*value = packed;
+		return 0;
+	}
+	if (kind == BECORE_GEN_NOISE_DOMAIN) {
+		const struct becore_noise_knots *knots =
+			&becore_noise_knots[curve_index];
+
+		index = (reg - becore_noise_curves[curve_index].domain_first) /
+			4 * 2;
+		if (index + 1 >= BECORE_NOISE_KNOTS)
+			return -EINVAL;
+		*value = (((u32)knots->x[index + 1] & 0xffff) << 16) |
+			 ((u32)knots->x[index] & 0xffff);
+		return 0;
+	}
+
+	index = (reg - becore_noise_curves[curve_index].slope_first) / 4 * 2;
+	ret = becore_noise_slope(curve_index, index, &low);
+	if (ret)
+		return ret;
+	ret = becore_noise_slope(curve_index, index + 1, &high);
+	if (ret)
+		return ret;
+	*value = (high << 16) | low;
+
+	return 0;
 }
 
 /* Samsung's init_djag_cfgs, which is also this field's POR reset value. */
@@ -2517,6 +2873,7 @@ static int becore_rgbp_gamma_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* The identity itself: out[i] == in[i] << 5 at every knot. */
 static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 {
 	u32 knot;
@@ -2765,6 +3122,12 @@ static int becore_generated_value(enum becore_block_id id, u32 reg, u32 *value)
 		case BECORE_GEN_DECOMP_SIZE:
 			result = becore_pack_size(becore_rgbp_input.height,
 						  becore_rgbp_input.width);
+			break;
+		case BECORE_GEN_NOISE_SLOPE:
+		case BECORE_GEN_NOISE_SHIFT:
+		case BECORE_GEN_NOISE_DOMAIN:
+			if (becore_noise_value(id, reg, table[i].kind, &result))
+				return -EINVAL;
 			break;
 		case BECORE_GEN_DJAG:
 			if (becore_mcsc_djag_value(reg - BECORE_MCSC_DJAG_BASE,
@@ -4019,6 +4382,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	int ret;
 
 	ret = becore_generated_tables_validate(becore->dev);
+	if (ret)
+		return ret;
+	ret = becore_noise_knots_resolve(becore->dev);
 	if (ret)
 		return ret;
 	becore->recipe = devm_kzalloc(becore->dev, BECORE_RECIPE_BYTES,

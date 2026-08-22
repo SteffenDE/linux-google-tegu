@@ -22,6 +22,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
+#include <linux/media/samsung/exynos-ispfe-config.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -48,6 +49,7 @@
 #include <media/v4l2-subdev.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
+#include <media/videobuf2-vmalloc.h>
 
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-program-binned.h"
@@ -546,9 +548,83 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 };
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
+#define ISPFE_PDMA_OUTPUT_AE		9
 #define ISPFE_PDMA_OUTPUT_RGB		10
 #define ISPFE_PDMA_OUTPUT_ML0		11
 #define ISPFE_PDMA_OUTPUT_ML2		12
+
+/*
+ * Where one frame's statistics land while the metadata node is streaming.
+ *
+ * The shared allocations above are rewritten every frame, which is why the
+ * debug drain needs a two-frame handoff to read one of them without tearing.
+ * A per-frame node cannot pay that: it needs somewhere that is quiescent the
+ * moment its frame retires.  So a slot that a queue has paired with a buffer
+ * writes its statistics into one of these instead, chosen when the slot's
+ * program is encoded and released again once the result has been copied out.
+ * The dump slot and the debugfs diagnostic keep the shared allocations, so
+ * neither changes behaviour.
+ *
+ * They are private, and userspace never sees one.  The hardware only ever
+ * writes memory this driver owns, and a statistics buffer is a copy taken
+ * after the frame that filled it was retired -- which is the same boundary
+ * the drained snapshot uses, and is why a node can be stopped at any time
+ * without proving anything about what the front end is doing.
+ */
+struct ispfe_stats_area {
+	struct list_head list;
+	void *grid[2];
+	dma_addr_t dma[2];
+	u64 timestamp;
+	u32 sequence;
+};
+
+/* Indices into ispfe_stats_area.grid, in the order the buffer carries them. */
+#define ISPFE_STATS_GRID_AWB		0
+#define ISPFE_STATS_GRID_AE		1
+#define ISPFE_STATS_GRIDS		2
+
+/*
+ * One per slot a queue can arm, and one more so that a frame retiring while
+ * all four are armed still has somewhere to be copied from.  Running out
+ * costs that frame's statistics and nothing else.
+ */
+#define ISPFE_STATS_AREAS		(PDMA_BUF_SLOTS + 1)
+
+/*
+ * A grid is the hardware's 64-byte metadata area followed by 64 x 48 records
+ * of 0x60 bytes, which is what the statistics writers bound themselves to.
+ * The allocation is larger -- it is the vendor's own allocation class -- and
+ * the rest of it is not copied out.
+ */
+#define ISPFE_STATS_GRID_BYTES		0x48040
+
+/*
+ * Each grid a statistics buffer carries: the auxiliary output the hardware
+ * writes it to, where it goes in the buffer, and the flag that says it was
+ * written.  The two sizes are asserted against each other rather than assumed,
+ * because the copy length is the interface's and the destination is the
+ * hardware's.
+ */
+static const struct ispfe_stats_grid {
+	unsigned int output;
+	size_t offset;
+	u32 flag;
+} ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
+	[ISPFE_STATS_GRID_AWB] = {
+		.output = ISPFE_PDMA_OUTPUT_AWB,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, awb),
+		.flag = EXYNOS_ISPFE_STATS_AWB,
+	},
+	[ISPFE_STATS_GRID_AE] = {
+		.output = ISPFE_PDMA_OUTPUT_AE,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, ae),
+		.flag = EXYNOS_ISPFE_STATS_AE,
+	},
+};
+
+static_assert(sizeof(struct exynos_ispfe_stats_awb) == ISPFE_STATS_GRID_BYTES);
+static_assert(sizeof(struct exynos_ispfe_stats_ae) == ISPFE_STATS_GRID_BYTES);
 
 /*
  * ML output 0 is fed by the three-output scaler whose input is 1052x780 in
@@ -1162,6 +1238,36 @@ struct ispfe_device {
 	struct v4l2_pix_format fmt;
 	struct work_struct fill_work;
 	u32 sequence;
+	/* The statistics metadata node, and the private areas that feed it. */
+	struct video_device stats_vdev;
+	struct media_pad stats_pad;
+	struct vb2_queue stats_queue;
+	/*
+	 * The statistics queue's own lock, because that queue can be started
+	 * and stopped while the capture queue holds ispfe->lock for the whole
+	 * of its own start.
+	 */
+	struct mutex stats_lock;
+	struct work_struct stats_work;
+	struct ispfe_stats_area stats_areas[ISPFE_STATS_AREAS];
+	struct ispfe_stats_area *stats_slot[PDMA_BUF_SLOTS];
+	struct list_head stats_pending;
+	struct list_head stats_free;
+	struct list_head stats_captured;
+	bool stats_streaming;
+	u32 stats_published;
+	u32 stats_empty;
+	u32 stats_dropped;
+	/*
+	 * This node's own buffer counter, not the front end's frame counter.
+	 * A buffer that carries no frame still has to be numbered, and the
+	 * raw node's start_streaming resets the frame counter -- so numbering
+	 * buffers with it would step backwards both at the start of a session
+	 * and whenever a raw capture is restarted under a consumer that kept
+	 * streaming.  Which frame a buffer describes is said by its timestamp
+	 * and by frame_sequence in the buffer itself.
+	 */
+	u32 stats_sequence;
 	/*
 	 * How many frame boundaries pass between a ring record being credited
 	 * and the frame it governs finishing.  Measured rather than assumed,
@@ -1822,6 +1928,119 @@ static struct ispfe_buffer *to_ispfe_buffer(struct vb2_v4l2_buffer *vbuf)
 	return container_of(vbuf, struct ispfe_buffer, vb);
 }
 
+/* ---- per-frame statistics areas ----------------------------------------- */
+
+/*
+ * Put an area back where a slot can take it again.  A detached node is always
+ * list_del_init()ed, so "not on a list" is the same test as "empty", and a
+ * reset that has already reclaimed this area cannot be undone by a late put.
+ */
+static void ispfe_stats_area_put_locked(struct ispfe_device *ispfe,
+					struct ispfe_stats_area *area)
+{
+	if (list_empty(&area->list))
+		list_add_tail(&area->list, &ispfe->stats_free);
+}
+
+/*
+ * Take an area for a slot that is about to be encoded, and clear the metadata
+ * header of each grid in it so that a grid the hardware does not write this
+ * frame reports no geometry rather than the last frame's.
+ *
+ * Nothing is taken while the metadata node is not streaming: an ordinary
+ * capture then keeps writing its statistics into the shared allocations, which
+ * is exactly what it did before this node existed.
+ */
+static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
+						 unsigned int slot)
+{
+	struct ispfe_stats_area *area;
+	unsigned int grid;
+
+	if (WARN_ON_ONCE(slot >= PDMA_BUF_SLOTS))
+		return NULL;
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		if (!ispfe->stats_streaming ||
+		    WARN_ON_ONCE(ispfe->stats_slot[slot]))
+			return NULL;
+		area = list_first_entry_or_null(&ispfe->stats_free,
+						struct ispfe_stats_area, list);
+		if (!area) {
+			ispfe->stats_dropped++;
+			return NULL;
+		}
+		list_del_init(&area->list);
+		ispfe->stats_slot[slot] = area;
+	}
+
+	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++)
+		memset(area->grid[grid], 0,
+		       sizeof(struct exynos_ispfe_stats_grid_header));
+
+	return area;
+}
+
+/* Detach a slot's area without publishing it. */
+static void ispfe_stats_untake_locked(struct ispfe_device *ispfe,
+				      unsigned int slot)
+{
+	struct ispfe_stats_area *area;
+
+	if (WARN_ON_ONCE(slot >= PDMA_BUF_SLOTS))
+		return;
+	area = ispfe->stats_slot[slot];
+	if (!area)
+		return;
+	ispfe->stats_slot[slot] = NULL;
+	ispfe_stats_area_put_locked(ispfe, area);
+}
+
+static void ispfe_stats_untake(struct ispfe_device *ispfe, unsigned int slot)
+{
+	guard(spinlock_irqsave)(&ispfe->slock);
+	ispfe_stats_untake_locked(ispfe, slot);
+}
+
+/* Every armed area at once, for a stream that is not going to finish them. */
+static void ispfe_stats_untake_all_locked(struct ispfe_device *ispfe)
+{
+	unsigned int slot;
+
+	for (slot = 0; slot < PDMA_BUF_SLOTS; slot++)
+		ispfe_stats_untake_locked(ispfe, slot);
+}
+
+/*
+ * A frame has retired, so the area its slot was writing into is quiescent by
+ * exactly the argument that lets its image buffer be handed back: the credit
+ * that placed the frame has been followed by enough later ones to have
+ * finished it, and nothing credits the slot again until it has been encoded
+ * afresh.  Detach it for the work item to copy out.
+ *
+ * Returns whether there is now something for that work item to do.
+ */
+static bool ispfe_stats_capture_locked(struct ispfe_device *ispfe,
+				       unsigned int slot, u64 timestamp,
+				       u32 sequence)
+{
+	struct ispfe_stats_area *area;
+
+	if (WARN_ON_ONCE(slot >= PDMA_BUF_SLOTS))
+		return false;
+	area = ispfe->stats_slot[slot];
+	if (!area)
+		return false;
+	ispfe->stats_slot[slot] = NULL;
+	/* Pairs with the writes the retired frame made into this area. */
+	dma_rmb();
+	area->timestamp = timestamp;
+	area->sequence = sequence;
+	list_add_tail(&area->list, &ispfe->stats_captured);
+
+	return true;
+}
+
 /*
  * Hand the ring one program, at a frame start.  PDMA fetches a credited record
  * almost immediately but only applies it at the following frame boundary, so
@@ -1861,6 +2080,8 @@ static void ispfe_queue_credit(struct ispfe_device *ispfe)
 static void ispfe_queue_complete(struct ispfe_device *ispfe)
 {
 	struct ispfe_buffer *buf = NULL;
+	u64 timestamp = ktime_get_ns();
+	bool captured = false;
 
 	spin_lock(&ispfe->slock);
 	/*
@@ -1873,9 +2094,15 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 				       list);
 		list_del(&buf->list);
 		ispfe->flight_count--;
+		captured = ispfe_stats_capture_locked(ispfe, buf->slot,
+						      timestamp,
+						      ispfe->sequence);
 		__clear_bit(buf->slot, &ispfe->slots_used);
 	}
 	spin_unlock(&ispfe->slock);
+
+	if (captured)
+		schedule_work(&ispfe->stats_work);
 
 	if (!buf)
 		return;
@@ -1885,9 +2112,10 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	 * landed in the dump slot because nothing was queued then show up as a
 	 * gap, which is what a sequence number is for.  The timestamp is this
 	 * end-of-frame, so it trails the buffer's own frame by the credit
-	 * latency.
+	 * latency.  A statistics buffer for the same frame carries both, which
+	 * is what pairs the two.
 	 */
-	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	buf->vb.vb2_buf.timestamp = timestamp;
 	buf->vb.sequence = ispfe->sequence;
 	buf->vb.field = V4L2_FIELD_NONE;
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, ispfe->fmt.sizeimage);
@@ -1934,6 +2162,8 @@ static void ispfe_backend_queue_credit(struct ispfe_device *ispfe)
 static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 {
 	struct ispfe_backend_buffer *buf = NULL;
+	u64 timestamp = ktime_get_ns();
+	bool captured = false;
 
 	spin_lock(&ispfe->slock);
 	/* Dump credits age a real buffer too; they are backpressure, not a stall. */
@@ -1944,12 +2174,24 @@ static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 			list_move_tail(&buf->list, &ispfe->backend_done);
 			buf->state = ISPFE_BACKEND_BUFFER_DONE;
 			ispfe->backend_flight_count--;
+			/*
+			 * The program slot is not released until the fill work
+			 * has handed the frame on, so nothing re-encodes it in
+			 * between and its statistics stay where they were
+			 * written.
+			 */
+			captured = ispfe_stats_capture_locked(ispfe,
+							      buf->program_slot,
+							      timestamp,
+							      ispfe->sequence);
 		} else {
 			buf = NULL;
 		}
 	}
 	spin_unlock(&ispfe->slock);
 
+	if (captured)
+		schedule_work(&ispfe->stats_work);
 	if (buf)
 		schedule_work(&ispfe->backend_fill_work);
 }
@@ -2121,14 +2363,33 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
 }
 
 /*
+ * Which grid of a statistics area an auxiliary output feeds, or -1 for an
+ * output that is not one of them.
+ */
+static int ispfe_stats_grid_of_output(unsigned int index)
+{
+	unsigned int grid;
+
+	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++)
+		if (ispfe_stats_grids[grid].output == index)
+			return grid;
+
+	return -1;
+}
+
+/*
  * What the recipe's buffer names resolve to for this driver's allocations.  The
  * frame destination is per program rather than per driver, because each program
- * aims one frame at one buffer.
+ * aims one frame at one buffer.  So are the statistics, when a queue has given
+ * this slot an area to write them into: @stats is NULL for the dump slot and
+ * for the debugfs diagnostic, which keep the shared allocations.
  */
 static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
-				    dma_addr_t bayer, dma_addr_t backend)
+				    dma_addr_t bayer, dma_addr_t backend,
+				    const struct ispfe_stats_area *stats)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
+	int grid;
 
 	switch (ISPFE_BUF_TO_KIND(buffer)) {
 	case ISPFE_BUF_KIND_BAYER:
@@ -2139,9 +2400,12 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 			       ispfe->prog->inputs[index].area_offset;
 		break;
 	case ISPFE_BUF_KIND_OUTPUT:
-		if (index < ARRAY_SIZE(ispfe_pdma_outputs))
-			return ispfe->pdma_output[index].dma;
-		break;
+		if (index >= ARRAY_SIZE(ispfe_pdma_outputs))
+			break;
+		grid = ispfe_stats_grid_of_output(index);
+		if (stats && grid >= 0)
+			return stats->dma[grid];
+		return ispfe->pdma_output[index].dma;
 	case ISPFE_BUF_KIND_BACKEND:
 		switch (index) {
 		case 0:
@@ -2657,7 +2921,8 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
  * to stay inside the program area.
  */
 static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
-			     dma_addr_t bayer, dma_addr_t backend)
+			     dma_addr_t bayer, dma_addr_t backend,
+			     const struct ispfe_stats_area *stats)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
@@ -2697,7 +2962,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			continue;
 		case ISPFE_PDMA_INDIRECT_BURST:
 			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer,
-						backend);
+						backend, stats);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			/*
@@ -2764,7 +3029,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			     reloc->hi + 4 > cmd->len))
 				return -EINVAL;
 			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer,
-						backend);
+						backend, stats);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma),
@@ -2865,6 +3130,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 	}
 
 	for (;;) {
+		const struct ispfe_stats_area *stats = NULL;
 		struct ispfe_backend_buffer *buf = NULL;
 		unsigned int program_slot;
 		unsigned int i;
@@ -2902,9 +3168,12 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 							   &buf->ticket);
 		if (!ret) {
 			acquired = true;
+			stats = ispfe_stats_take(ispfe, program_slot);
 			ret = ispfe_pdma_encode(ispfe, program_slot,
 						ispfe->frame_dma,
-						buf->ticket.dma);
+						buf->ticket.dma, stats);
+			if (ret)
+				ispfe_stats_untake(ispfe, program_slot);
 		}
 		if (ret && acquired)
 			exynos_becore_input_producer_abort(ispfe->backend_input,
@@ -2912,6 +3181,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 
 		spin_lock_irq(&ispfe->slock);
 		if (ret || !ispfe->backend_queue_active) {
+			ispfe_stats_untake_locked(ispfe, program_slot);
 			__clear_bit(program_slot,
 				    &ispfe->backend_programs_used);
 			buf->state = ISPFE_BACKEND_BUFFER_IDLE;
@@ -2986,13 +3256,19 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 			return ret;
 	}
 
+	/*
+	 * No statistics area: this is where every slot starts, and it is the
+	 * whole of what the debugfs diagnostic and the dump slot ever use, so
+	 * both keep writing into the shared allocations the drained snapshot
+	 * reads.  A queue chooses an area when it encodes a slot for a buffer.
+	 */
 	memset(ispfe->programs, 0, PDMA_PROGRAMS_SIZE);
 	for (i = 0; i < PDMA_SLOTS; i++) {
 		ret = ispfe_pdma_encode(ispfe, i,
 					i == PDMA_DUMP_SLOT ?
 					ispfe->spare_frame_dma :
 					ispfe->frame_dma,
-					backend);
+					backend, NULL);
 		if (ret)
 			return ret;
 	}
@@ -3530,10 +3806,96 @@ static irqreturn_t ispfe_pdma_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Freed only while the front end is stopped, and only after the work item that
+ * copies out of them has been waited for -- it takes no lock this path holds,
+ * so waiting here is safe and is what makes the lists below unreachable.
+ */
+static void ispfe_stats_areas_free(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+	unsigned int grid;
+
+	cancel_work_sync(&ispfe->stats_work);
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		INIT_LIST_HEAD(&ispfe->stats_free);
+		INIT_LIST_HEAD(&ispfe->stats_captured);
+		memset(ispfe->stats_slot, 0, sizeof(ispfe->stats_slot));
+	}
+
+	for (i = 0; i < ARRAY_SIZE(ispfe->stats_areas); i++) {
+		struct ispfe_stats_area *area = &ispfe->stats_areas[i];
+
+		for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
+			unsigned int output = ispfe_stats_grids[grid].output;
+
+			if (!area->grid[grid])
+				continue;
+			dma_free_coherent(ispfe->dev,
+					  ispfe_pdma_outputs[output].size,
+					  area->grid[grid], area->dma[grid]);
+			area->grid[grid] = NULL;
+		}
+		INIT_LIST_HEAD(&area->list);
+	}
+
+	/*
+	 * The cancel above can have swallowed a schedule that buf_queue made,
+	 * and the start this reallocation belongs to may still fail -- in
+	 * which case nothing would wake the node until the next QBUF.  Put it
+	 * back, so a buffer queued a moment ago is answered either way.
+	 */
+	if (READ_ONCE(ispfe->stats_streaming))
+		schedule_work(&ispfe->stats_work);
+}
+
+/*
+ * One allocation per grid per area, of the same size the shared allocation for
+ * that output has: only the described part is ever copied out, but the writer
+ * is the hardware's and this driver does not get to decide where it stops.
+ */
+static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+	unsigned int grid;
+
+	if (ispfe->stats_areas[0].grid[0])
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe->stats_areas); i++) {
+		struct ispfe_stats_area *area = &ispfe->stats_areas[i];
+
+		for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
+			unsigned int output = ispfe_stats_grids[grid].output;
+			size_t size = ispfe_pdma_outputs[output].size;
+
+			if (size < ISPFE_STATS_GRID_BYTES)
+				return -EINVAL;
+			area->grid[grid] =
+				dma_alloc_coherent(ispfe->dev, size,
+						   &area->dma[grid],
+						   GFP_KERNEL);
+			if (!area->grid[grid])
+				return -ENOMEM;
+			if (upper_32_bits(area->dma[grid] + size - 1))
+				return -ERANGE;
+		}
+	}
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		for (i = 0; i < ARRAY_SIZE(ispfe->stats_areas); i++)
+			list_add_tail(&ispfe->stats_areas[i].list,
+				      &ispfe->stats_free);
+
+	return 0;
+}
+
 static void ispfe_buffers_free(struct ispfe_device *ispfe)
 {
 	unsigned int i;
 
+	ispfe_stats_areas_free(ispfe);
 	if (ispfe->awb_spare) {
 		dma_free_coherent(ispfe->dev,
 				  ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_AWB].size,
@@ -3612,7 +3974,8 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 	unsigned int i;
 
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
-	    !ispfe->programs || !ispfe->blocks || !ispfe->awb_spare)
+	    !ispfe->programs || !ispfe->blocks || !ispfe->awb_spare ||
+	    !ispfe->stats_areas[0].grid[0])
 		return false;
 	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
 		return false;
@@ -3690,6 +4053,11 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	if (!ispfe->awb_spare) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
+	}
+	ret = ispfe_stats_areas_alloc(ispfe);
+	if (ret) {
+		ispfe_buffers_free(ispfe);
+		return ret;
 	}
 	if (ispfe->active_backend_side_output) {
 		ispfe->tnr_pyramid = dma_alloc_coherent(
@@ -4216,6 +4584,15 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	if (ispfe_qos_disable(ispfe))
 		dev_err(ispfe->dev, "cannot restore camera QoS after stop\n");
 	ispfe->streaming = false;
+	/*
+	 * The interrupts are gone, so an area a slot was still writing into
+	 * will never be finished by a frame.  Release those and wake the
+	 * metadata node: without a frame to wait for, a buffer queued to it is
+	 * completed rather than held.
+	 */
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		ispfe_stats_untake_all_locked(ispfe);
+	schedule_work(&ispfe->stats_work);
 	pm_runtime_put(ispfe->dev);
 }
 
@@ -4351,6 +4728,7 @@ static void ispfe_backend_queue_reset(struct ispfe_device *ispfe)
 	ispfe->backend_completed = 0;
 	ispfe->backend_dropped = 0;
 	ispfe->backend_queue_error = 0;
+	ispfe_stats_untake_all_locked(ispfe);
 	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++) {
 		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
 		ispfe->backend_buffers[i].state = ISPFE_BACKEND_BUFFER_IDLE;
@@ -4377,6 +4755,7 @@ static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
 	ispfe->backend_programs_used = 0;
 	ispfe->backend_flight_count = 0;
 	ispfe->backend_credit_count = 0;
+	ispfe_stats_untake_all_locked(ispfe);
 	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++) {
 		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
 		ispfe->backend_buffers[i].state = ISPFE_BACKEND_BUFFER_IDLE;
@@ -4969,6 +5348,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "awb_reloc    %#x/%#x, spare %pad\n", ispfe->awb_lo,
 		   ispfe->awb_hi, &ispfe->awb_spare_dma);
 	seq_printf(s,
+		   "stats        streaming %u, published %u, empty %u, dropped %u\n",
+		   READ_ONCE(ispfe->stats_streaming), ispfe->stats_published,
+		   ispfe->stats_empty, ispfe->stats_dropped);
+	seq_printf(s,
 		   "backend      input %pad, spare %pad, size %zu, producing %u, handed_off %u\n",
 		   &backend_dma,
 		   &ispfe->backend_spare_dma, ispfe->backend_input_size,
@@ -5507,6 +5890,7 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
 		list_splice_tail_init(&ispfe->pending, &done);
 		ispfe->flight_count = 0;
 		ispfe->slots_used = 0;
+		ispfe_stats_untake_all_locked(ispfe);
 	}
 
 	list_for_each_entry_safe(buf, tmp, &done, list) {
@@ -5523,6 +5907,7 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
 static void ispfe_queue_fill(struct ispfe_device *ispfe)
 {
 	for (;;) {
+		const struct ispfe_stats_area *stats;
 		struct ispfe_buffer *buf;
 		unsigned int slot;
 		dma_addr_t dma;
@@ -5543,11 +5928,14 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		}
 
 		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+		stats = ispfe_stats_take(ispfe, slot);
 		ret = ispfe_pdma_encode(ispfe, slot, dma,
-					ispfe->backend_buffer.dma);
+					ispfe->backend_buffer.dma, stats);
 		if (ret) {
-			scoped_guard(spinlock_irqsave, &ispfe->slock)
+			scoped_guard(spinlock_irqsave, &ispfe->slock) {
+				ispfe_stats_untake_locked(ispfe, slot);
 				__clear_bit(slot, &ispfe->slots_used);
+			}
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 			continue;
 		}
@@ -5928,6 +6316,358 @@ static int ispfe_vdev_link_validate(struct media_link *link)
 static const struct media_entity_operations ispfe_vdev_entity_ops = {
 	.link_validate = ispfe_vdev_link_validate,
 };
+
+/* ---- the statistics metadata node --------------------------------------- */
+
+/*
+ * LMP meters every frame the front end receives, and until now those results
+ * only left the driver through a debugfs drain that stops the stream to get
+ * one untorn frame out.  This is the per-frame form of the same thing: one
+ * buffer per frame, on a V4L2_BUF_TYPE_META_CAPTURE node, carrying the grids
+ * in the units the hardware measured them in.
+ *
+ * It does not own the front end and cannot start one.  Statistics belong to
+ * whichever frame is being captured, so this node is fed by whatever is
+ * running -- the raw capture node or the back end's consumer -- and produces
+ * nothing of its own when nothing is.
+ */
+
+struct ispfe_stats_buffer {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+};
+
+static struct ispfe_stats_buffer *
+to_ispfe_stats_buffer(struct vb2_v4l2_buffer *vbuf)
+{
+	return container_of(vbuf, struct ispfe_stats_buffer, vb);
+}
+
+/*
+ * Copy one frame's grids into a buffer and hand it back.  @area is NULL when
+ * there was no frame -- the buffer then says so with no measurement flags set,
+ * rather than being held for a frame nobody is going to run.
+ *
+ * A grid is only published when the hardware's own metadata says it metered
+ * the geometry this block meters.  The header is cleared before the frame is
+ * armed, so a grid that was not written this frame reports nothing and a stale
+ * result cannot be presented as a fresh one.
+ */
+static void ispfe_stats_publish(struct ispfe_device *ispfe,
+				struct ispfe_stats_buffer *buf,
+				const struct ispfe_stats_area *area)
+{
+	struct exynos_ispfe_stats_buffer *out =
+		vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+	size_t used = offsetof(struct exynos_ispfe_stats_buffer, awb);
+	unsigned int grid;
+
+	out->version = EXYNOS_ISPFE_STATS_VERSION_V1;
+	out->stats_type = 0;
+	out->frame_sequence = area ? area->sequence : 0;
+	out->reserved = 0;
+
+	for (grid = 0; area && grid < ISPFE_STATS_GRIDS; grid++) {
+		const struct ispfe_stats_grid *desc = &ispfe_stats_grids[grid];
+		const struct exynos_ispfe_stats_grid_header *header =
+			area->grid[grid];
+
+		if (header->columns != EXYNOS_ISPFE_STATS_COLUMNS ||
+		    header->rows != EXYNOS_ISPFE_STATS_ROWS)
+			continue;
+
+		memcpy((u8 *)out + desc->offset, area->grid[grid],
+		       ISPFE_STATS_GRID_BYTES);
+		out->stats_type |= desc->flag;
+		used = max(used, desc->offset + ISPFE_STATS_GRID_BYTES);
+	}
+
+	buf->vb.vb2_buf.timestamp = area ? area->timestamp : ktime_get_ns();
+	buf->vb.sequence = ispfe->stats_sequence++;
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, used);
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
+/*
+ * Whether a frame that could carry statistics for this node is coming.  Not
+ * simply "the front end is streaming": the debugfs diagnostic arms the
+ * receiver with no queue behind it, so it never pairs a slot with an area and
+ * a buffer waiting for one of its frames would wait for ever.
+ */
+static bool ispfe_stats_producing(const struct ispfe_device *ispfe)
+{
+	enum ispfe_owner owner = READ_ONCE(ispfe->owner);
+
+	return READ_ONCE(ispfe->streaming) &&
+	       (owner == ISPFE_OWNER_V4L2 || owner == ISPFE_OWNER_BACKEND);
+}
+
+/*
+ * From a work item rather than from the interrupt that retires the frame,
+ * because a grid is a quarter of a megabyte and copying it is not something a
+ * hard interrupt handler should be doing -- and rather than from QBUF, because
+ * a buffer that comes back DONE inside the call that queued it is not what a
+ * caller expects.
+ */
+static void ispfe_stats_work_fn(struct work_struct *work)
+{
+	struct ispfe_device *ispfe =
+		container_of(work, struct ispfe_device, stats_work);
+
+	for (;;) {
+		struct ispfe_stats_buffer *buf = NULL;
+		struct ispfe_stats_area *area = NULL;
+
+		scoped_guard(spinlock_irqsave, &ispfe->slock) {
+			if (!ispfe->stats_streaming)
+				return;
+			area = list_first_entry_or_null(&ispfe->stats_captured,
+							struct ispfe_stats_area,
+							list);
+			if (area) {
+				list_del_init(&area->list);
+			} else if (ispfe_stats_producing(ispfe)) {
+				/*
+				 * Nothing metered yet: wait for the frame that
+				 * will schedule this again.  Only when there is
+				 * no frame coming at all is an empty buffer the
+				 * right answer.
+				 */
+				return;
+			}
+			buf = list_first_entry_or_null(&ispfe->stats_pending,
+						       struct ispfe_stats_buffer,
+						       list);
+			if (buf)
+				list_del(&buf->list);
+			else if (!area)
+				return;
+		}
+
+		/*
+		 * A frame with nobody to give it to is dropped rather than
+		 * queued: statistics describe the frame that has just gone
+		 * past, and an old one is worse than none.
+		 */
+		if (buf)
+			ispfe_stats_publish(ispfe, buf, area);
+
+		guard(spinlock_irqsave)(&ispfe->slock);
+		if (buf && area)
+			ispfe->stats_published++;
+		else if (buf)
+			ispfe->stats_empty++;
+		else
+			ispfe->stats_dropped++;
+		if (area)
+			ispfe_stats_area_put_locked(ispfe, area);
+	}
+}
+
+static void ispfe_stats_return_all(struct ispfe_device *ispfe,
+				   enum vb2_buffer_state state)
+{
+	struct ispfe_stats_buffer *buf;
+	struct ispfe_stats_buffer *tmp;
+
+	guard(spinlock_irqsave)(&ispfe->slock);
+	list_for_each_entry_safe(buf, tmp, &ispfe->stats_pending, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+}
+
+static int ispfe_stats_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
+				   unsigned int *nplanes, unsigned int sizes[],
+				   struct device *alloc_devs[])
+{
+	if (*nplanes) {
+		if (*nplanes != 1 ||
+		    sizes[0] < sizeof(struct exynos_ispfe_stats_buffer))
+			return -EINVAL;
+		return 0;
+	}
+
+	*nplanes = 1;
+	sizes[0] = sizeof(struct exynos_ispfe_stats_buffer);
+
+	return 0;
+}
+
+static int ispfe_stats_buf_prepare(struct vb2_buffer *vb)
+{
+	if (vb2_plane_size(vb, 0) < sizeof(struct exynos_ispfe_stats_buffer))
+		return -EINVAL;
+
+	return 0;
+}
+
+static void ispfe_stats_buf_queue(struct vb2_buffer *vb)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(vb->vb2_queue);
+	struct ispfe_stats_buffer *buf =
+		to_ispfe_stats_buffer(to_vb2_v4l2_buffer(vb));
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		list_add_tail(&buf->list, &ispfe->stats_pending);
+
+	/*
+	 * Unconditionally, and the work decides: whether a frame is coming is
+	 * the front end's business and it can change under this call, so the
+	 * one place that answers it is the one place that acts on the answer.
+	 */
+	schedule_work(&ispfe->stats_work);
+}
+
+/*
+ * The front end may already be streaming, in which case the slots it has
+ * armed are writing into the shared allocations and only pick up an area of
+ * their own as they are encoded afresh -- which happens once per frame.  So
+ * statistics begin within a few frames of STREAMON rather than at it, and
+ * nothing has to be re-encoded under a running stream to arrange it.
+ */
+static int ispfe_stats_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		ispfe->stats_streaming = true;
+		ispfe->stats_sequence = 0;
+	}
+	schedule_work(&ispfe->stats_work);
+
+	return 0;
+}
+
+static void ispfe_stats_stop_streaming(struct vb2_queue *q)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	/*
+	 * Clear the flag first, then wait for the work: it takes a buffer off
+	 * the pending list and completes it later, so returning buffers while
+	 * it ran could leave one active past this function, which is the one
+	 * thing vb2 forbids here.  A frame retiring after the cancel can
+	 * schedule it again, and it does nothing because the flag is clear.
+	 */
+	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		ispfe->stats_streaming = false;
+		ispfe_stats_untake_all_locked(ispfe);
+		list_splice_tail_init(&ispfe->stats_captured,
+				      &ispfe->stats_free);
+	}
+	cancel_work_sync(&ispfe->stats_work);
+	ispfe_stats_return_all(ispfe, VB2_BUF_STATE_ERROR);
+}
+
+static const struct vb2_ops ispfe_stats_vb2_ops = {
+	.queue_setup = ispfe_stats_queue_setup,
+	.buf_prepare = ispfe_stats_buf_prepare,
+	.buf_queue = ispfe_stats_buf_queue,
+	.start_streaming = ispfe_stats_start_streaming,
+	.stop_streaming = ispfe_stats_stop_streaming,
+};
+
+static int ispfe_stats_querycap(struct file *file, void *priv,
+				struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, "exynos-ispfe", sizeof(cap->driver));
+	strscpy(cap->card, "zumapro ISPFE statistics", sizeof(cap->card));
+
+	return 0;
+}
+
+static int ispfe_stats_g_fmt(struct file *file, void *priv,
+			     struct v4l2_format *f)
+{
+	memset(&f->fmt.meta, 0, sizeof(f->fmt.meta));
+	f->fmt.meta.dataformat = V4L2_META_FMT_ISPFE_STATS;
+	f->fmt.meta.buffersize = sizeof(struct exynos_ispfe_stats_buffer);
+
+	return 0;
+}
+
+static int ispfe_stats_enum_fmt(struct file *file, void *priv,
+				struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_META_FMT_ISPFE_STATS;
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops ispfe_stats_ioctl_ops = {
+	.vidioc_querycap = ispfe_stats_querycap,
+	.vidioc_enum_fmt_meta_cap = ispfe_stats_enum_fmt,
+	.vidioc_g_fmt_meta_cap = ispfe_stats_g_fmt,
+	.vidioc_s_fmt_meta_cap = ispfe_stats_g_fmt,
+	.vidioc_try_fmt_meta_cap = ispfe_stats_g_fmt,
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static const struct video_device ispfe_stats_template = {
+	.name = "exynos-ispfe statistics",
+	.fops = &ispfe_fops,
+	.ioctl_ops = &ispfe_stats_ioctl_ops,
+	.release = video_device_release_empty,
+	.device_caps = V4L2_CAP_META_CAPTURE | V4L2_CAP_STREAMING,
+	.vfl_dir = VFL_DIR_RX,
+};
+
+/*
+ * No link into the graph.  The pad the capture node hangs off carries Bayer to
+ * that node, and a second enabled link from it would put this node into the
+ * pipeline every capture starts -- which it is not part of.  What produces
+ * statistics is LMP, which the graph does not model as an entity, so the
+ * honest description is an entity with a pad and nothing claiming to feed it.
+ */
+static int ispfe_stats_register(struct ispfe_device *ispfe)
+{
+	struct vb2_queue *q = &ispfe->stats_queue;
+	int ret;
+
+	q->type = V4L2_BUF_TYPE_META_CAPTURE;
+	q->io_modes = VB2_MMAP;
+	q->dev = ispfe->dev;
+	q->drv_priv = ispfe;
+	q->ops = &ispfe_stats_vb2_ops;
+	q->mem_ops = &vb2_vmalloc_memops;
+	q->buf_struct_size = sizeof(struct ispfe_stats_buffer);
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->lock = &ispfe->stats_lock;
+	ret = vb2_queue_init(q);
+	if (ret)
+		return ret;
+
+	ispfe->stats_vdev = ispfe_stats_template;
+	ispfe->stats_vdev.v4l2_dev = &ispfe->v4l2_dev;
+	ispfe->stats_vdev.queue = q;
+	ispfe->stats_vdev.lock = &ispfe->stats_lock;
+	ispfe->stats_vdev.entity.function = MEDIA_ENT_F_IO_V4L;
+	video_set_drvdata(&ispfe->stats_vdev, ispfe);
+
+	ispfe->stats_pad.flags = MEDIA_PAD_FL_SINK;
+	ret = media_entity_pads_init(&ispfe->stats_vdev.entity, 1,
+				     &ispfe->stats_pad);
+	if (ret)
+		return ret;
+
+	ret = video_register_device(&ispfe->stats_vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		media_entity_cleanup(&ispfe->stats_vdev.entity);
+
+	return ret;
+}
 
 /* ---- the receiver subdevice -------------------------------------------- */
 
@@ -6348,6 +7088,10 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_vdev;
 
+	ret = ispfe_stats_register(ispfe);
+	if (ret)
+		goto err_vdev;
+
 	v4l2_async_nf_init(&ispfe->notifier, &ispfe->v4l2_dev);
 	asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
 					      struct v4l2_async_connection);
@@ -6367,6 +7111,9 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 
 err_nf:
 	v4l2_async_nf_cleanup(&ispfe->notifier);
+	/* Releases the queue too, which a bare unregister would not. */
+	vb2_video_unregister_device(&ispfe->stats_vdev);
+	media_entity_cleanup(&ispfe->stats_vdev.entity);
 err_vdev:
 	video_unregister_device(&ispfe->vdev);
 err_vdev_entity:
@@ -6389,16 +7136,21 @@ err_ep:
 static void ispfe_media_unregister(struct ispfe_device *ispfe)
 {
 	/*
-	 * The video device goes first, because it is the only thing that can be
-	 * streaming and stopping the stream needs the sensor still bound.  It
-	 * also releases the queue, unlike a bare video_unregister_device(),
-	 * which would leave the fill work running over the program area freed
-	 * afterwards.
+	 * The capture device goes first, because it is what can be driving the
+	 * front end and stopping that needs the sensor still bound.  It also
+	 * releases the queue, unlike a bare video_unregister_device(), which
+	 * would leave the fill work running over the program area freed
+	 * afterwards.  The statistics node follows it: stopping the front end
+	 * is what releases the areas it is fed from.
 	 */
 	vb2_video_unregister_device(&ispfe->vdev);
+	vb2_video_unregister_device(&ispfe->stats_vdev);
+	/* The capture teardown above can have scheduled it one last time. */
+	cancel_work_sync(&ispfe->stats_work);
 	v4l2_async_nf_unregister(&ispfe->notifier);
 	v4l2_async_nf_cleanup(&ispfe->notifier);
 	media_device_unregister(&ispfe->mdev);
+	media_entity_cleanup(&ispfe->stats_vdev.entity);
 	media_entity_cleanup(&ispfe->vdev.entity);
 	v4l2_device_unregister_subdev(&ispfe->sd);
 	v4l2_subdev_cleanup(&ispfe->sd);
@@ -6517,6 +7269,9 @@ static int ispfe_probe(struct platform_device *pdev)
 	ret = devm_mutex_init(dev, &ispfe->lock);
 	if (ret)
 		return ret;
+	ret = devm_mutex_init(dev, &ispfe->stats_lock);
+	if (ret)
+		return ret;
 
 	spin_lock_init(&ispfe->slock);
 	INIT_LIST_HEAD(&ispfe->pending);
@@ -6529,6 +7284,12 @@ static int ispfe_probe(struct platform_device *pdev)
 	INIT_WORK(&ispfe->backend_fill_work, ispfe_backend_fill_work);
 	for (i = 0; i < ARRAY_SIZE(ispfe->backend_buffers); i++)
 		INIT_LIST_HEAD(&ispfe->backend_buffers[i].list);
+	INIT_LIST_HEAD(&ispfe->stats_pending);
+	INIT_LIST_HEAD(&ispfe->stats_free);
+	INIT_LIST_HEAD(&ispfe->stats_captured);
+	for (i = 0; i < ARRAY_SIZE(ispfe->stats_areas); i++)
+		INIT_LIST_HEAD(&ispfe->stats_areas[i].list);
+	INIT_WORK(&ispfe->stats_work, ispfe_stats_work_fn);
 	ispfe->credit_latency = ISPFE_CREDIT_LATENCY_DEFAULT;
 
 	/*

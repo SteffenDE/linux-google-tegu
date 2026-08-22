@@ -1636,6 +1636,56 @@ to_becore_video_buffer(struct vb2_v4l2_buffer *vb)
 	return container_of(vb, struct becore_video_buffer, vb);
 }
 
+/*
+ * Where a run's wall clock goes.  The phases tile the whole of a run without
+ * overlapping, so they sum to BECORE_TIMING_FRAME: each mark is taken once, at
+ * the boundary between two phases, and hands its timestamp to the next.
+ */
+enum becore_timing_phase {
+	BECORE_TIMING_RESUME,
+	BECORE_TIMING_ENCODE,
+	BECORE_TIMING_ARM,
+	BECORE_TIMING_STAGE1,
+	BECORE_TIMING_STAGE2,
+	BECORE_TIMING_CRC,
+	BECORE_TIMING_SUSPEND,
+	BECORE_TIMING_COPY,
+	BECORE_TIMING_FRAME,
+	BECORE_TIMING_PHASE_COUNT,
+};
+
+static const char * const becore_timing_names[BECORE_TIMING_PHASE_COUNT] = {
+	[BECORE_TIMING_RESUME] = "resume",
+	[BECORE_TIMING_ENCODE] = "encode",
+	[BECORE_TIMING_ARM] = "arm",
+	[BECORE_TIMING_STAGE1] = "stage1",
+	[BECORE_TIMING_STAGE2] = "stage2",
+	[BECORE_TIMING_CRC] = "crc",
+	[BECORE_TIMING_SUSPEND] = "suspend",
+	[BECORE_TIMING_COPY] = "copy",
+	[BECORE_TIMING_FRAME] = "frame",
+};
+
+struct becore_timing {
+	u64 last_ns;
+	u64 total_ns;
+};
+
+/*
+ * One phase boundary.  The caller passes the previous boundary and receives
+ * this one, so a phase costs a single clock read and no phase can be counted
+ * twice or missed.
+ */
+static ktime_t becore_timing_mark(u64 *phase_ns, enum becore_timing_phase phase,
+				  ktime_t since)
+{
+	ktime_t now = ktime_get();
+
+	phase_ns[phase] = ktime_to_ns(ktime_sub(now, since));
+
+	return now;
+}
+
 struct becore_device {
 	struct device *dev;
 	struct becore_block blocks[BECORE_NUM_BLOCKS];
@@ -1739,6 +1789,9 @@ struct becore_device {
 	bool output_quarantined;
 	bool video_streaming;
 	bool producer_streaming;
+	/* Written only by a completed run, read under the same lock. */
+	struct becore_timing timing[BECORE_TIMING_PHASE_COUNT];
+	u32 timing_runs;
 };
 
 struct exynos_becore_input {
@@ -6883,6 +6936,9 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	unsigned long flags;
 	bool diagnostic_output = !capture_output;
 	bool input_claimed = false;
+	u64 phase_ns[BECORE_TIMING_PHASE_COUNT] = {};
+	ktime_t start;
+	ktime_t mark;
 	int pm_ret;
 	int ret;
 	u32 i;
@@ -6964,7 +7020,9 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	becore->run_input->state = BECORE_INPUT_BACKEND;
 	input_claimed = true;
 
+	start = ktime_get();
 	ret = pm_runtime_resume_and_get(becore->dev);
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_RESUME, start);
 	if (ret)
 		goto record_error;
 	if (becore->reset_failed) {
@@ -6994,6 +7052,7 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		becore->mcsc_encoded_generation = becore->mcsc_recipe_generation;
 		becore->mcsc_encoded_transport = BECORE_MCSC_INPUT_MEMORY;
 	}
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_ENCODE, mark);
 
 	if (diagnostic_output) {
 		memset(becore->output.cpu, 0xa5, becore->output.size);
@@ -7030,9 +7089,13 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	/* Move staged or producer-written Bayer pages into RGBP's DMA domain. */
 	dma_sync_sgtable_for_device(becore->dev, becore->run_input->buffer.sgt,
 				    DMA_TO_DEVICE);
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_ARM, mark);
 	ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS);
-	if (!ret && run_mcsc)
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
+	if (!ret && run_mcsc) {
 		ret = becore_run_stage(becore, BIT(BECORE_MCSC));
+		mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE2, mark);
+	}
 
 	/* A failed run's CRCs say how far the stream got, so read them too. */
 	becore_stream_crc_capture(becore);
@@ -7040,6 +7103,7 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	spin_lock_irqsave(&becore->run_lock, flags);
 	becore->running = false;
 	spin_unlock_irqrestore(&becore->run_lock, flags);
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_CRC, mark);
 
 	/* runtime_suspend synchronizes IRQs and resets all four processors. */
 	pm_ret = pm_runtime_put_sync(becore->dev);
@@ -7070,10 +7134,19 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	input_claimed = false;
 	if (pm_ret >= 0)
 		dma_rmb();
+	mark = becore_timing_mark(phase_ns, BECORE_TIMING_SUSPEND, mark);
 	if (capture_output && !ret && pm_ret >= 0)
 		memcpy(capture_output,
 		       run_mcsc ? becore->mcsc_output.cpu : becore->output.cpu,
 		       becore->active_capture_size);
+	becore_timing_mark(phase_ns, BECORE_TIMING_COPY, mark);
+	phase_ns[BECORE_TIMING_FRAME] =
+		ktime_to_ns(ktime_sub(ktime_get(), start));
+	for (i = 0; i < BECORE_TIMING_PHASE_COUNT; i++) {
+		becore->timing[i].last_ns = phase_ns[i];
+		becore->timing[i].total_ns += phase_ns[i];
+	}
+	becore->timing_runs++;
 	if (diagnostic_output && pm_ret >= 0) {
 		becore_measure_buffer(&becore->output,
 				      &becore->output_changed_bytes,
@@ -7754,6 +7827,12 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->mcsc_completed_output_size, becore->mcsc_output.size,
 		   &becore->mcsc_output.dma);
 	becore_status_program(s, "mcsc_cmdq", &becore->mcsc_program);
+	seq_printf(s, "timing_runs      %u\n", becore->timing_runs);
+	for (i = 0; i < BECORE_TIMING_PHASE_COUNT; i++)
+		seq_printf(s, "timing_%-9s %llu us last, %llu us total\n",
+			   becore_timing_names[i],
+			   becore->timing[i].last_ns / NSEC_PER_USEC,
+			   becore->timing[i].total_ns / NSEC_PER_USEC);
 	seq_printf(s, "run_generation   %u\n", becore->run_generation);
 	seq_printf(s, "completed         %u\n", becore->completed_generation);
 	seq_printf(s, "last_result       %d\n", becore->last_run_result);

@@ -1557,9 +1557,18 @@ enum becore_input_slot_state {
 	BECORE_INPUT_QUARANTINED,
 };
 
+/*
+ * A slot's pages are written by ISPFE's DMA and read by RGBP's, and both are
+ * non-coherent masters that go to DRAM: the CPU is not part of that exchange,
+ * so it needs no cache maintenance between them.  The one thing that does is
+ * the debugfs staging path, which writes a slot through the cached vmap
+ * dma_vmap_noncontiguous() returns.  cpu_dirty says a slot is in that state
+ * and is the only reason a sync is issued.
+ */
 struct becore_input_slot {
 	struct becore_dma_buffer buffer;
 	enum becore_input_slot_state state;
+	bool cpu_dirty;
 	u64 producer_cookie;
 	u64 ready_sequence;
 };
@@ -6252,9 +6261,6 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input)
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_input_slot *slot = &becore->inputs[i];
 
-		if (slot->state == BECORE_INPUT_PRODUCER)
-			dma_sync_sgtable_for_cpu(input->producer,
-						 &input->sgts[i], DMA_FROM_DEVICE);
 		if (slot->state != BECORE_INPUT_BACKEND) {
 			slot->state = BECORE_INPUT_FREE;
 			slot->buffer.staged_bytes = 0;
@@ -6330,11 +6336,17 @@ int exynos_becore_input_producer_acquire(struct exynos_becore_input *input,
 		goto unlock;
 	}
 
-	/* Discard any cached CPU copy before the front end overwrites it. */
-	dma_sync_sgtable_for_device(becore->dev, slot->buffer.sgt,
-				    DMA_BIDIRECTIONAL);
-	dma_sync_sgtable_for_device(input->producer, &input->sgts[i],
-				    DMA_FROM_DEVICE);
+	/*
+	 * Only a slot the debugfs path staged can hold dirty lines that would
+	 * otherwise land on top of what the front end is about to write.  In an
+	 * ordinary capture this is never taken, which is the point: the sweep
+	 * costs 2.3 ms over a 27 MB slot and used to run on every frame.
+	 */
+	if (slot->cpu_dirty) {
+		dma_sync_sgtable_for_device(becore->dev, slot->buffer.sgt,
+					    DMA_BIDIRECTIONAL);
+		slot->cpu_dirty = false;
+	}
 	slot->buffer.staged_bytes = 0;
 	slot->ready_sequence = 0;
 	cookie = ++becore->producer_sequence;
@@ -6373,11 +6385,11 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 		goto unlock;
 	}
 
-	/* The caller has quiesced the producer at a completed-frame boundary. */
-	dma_sync_sgtable_for_cpu(input->producer, &input->sgts[buffer->slot],
-				 DMA_FROM_DEVICE);
-	dma_sync_sgtable_for_device(becore->dev, slot->buffer.sgt,
-				    DMA_TO_DEVICE);
+	/*
+	 * The caller has quiesced the producer at a completed-frame boundary.
+	 * Nothing is synced: ISPFE wrote these pages to DRAM and RGBP will read
+	 * them from DRAM, and no CPU mapping was read or written in between.
+	 */
 	slot->buffer.staged_bytes = slot->buffer.size;
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
@@ -6402,9 +6414,6 @@ void exynos_becore_input_producer_abort(struct exynos_becore_input *input,
 		slot = becore_input_ticket(input, buffer);
 		if (!slot)
 			goto unlock;
-		dma_sync_sgtable_for_cpu(input->producer,
-					 &input->sgts[buffer->slot],
-					 DMA_FROM_DEVICE);
 		slot->buffer.staged_bytes = 0;
 		slot->producer_cookie = 0;
 		slot->ready_sequence = 0;
@@ -6416,10 +6425,18 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_producer_abort);
 
+/*
+ * @slot is the input slot @staged belongs to, or NULL for the objects that are
+ * not slots.  It is passed rather than recovered from @staged because a stage
+ * has to be recorded as having dirtied the slot, and recognising the slot by
+ * comparing pointers would silently record the wrong one -- or none -- the day
+ * a second slot gains a staging file.
+ */
 static ssize_t becore_stage_write(struct becore_device *becore,
 				  const char __user *buf, size_t count,
 				  loff_t *ppos, void *staged, size_t capacity,
-				  size_t *staged_bytes, u32 *generation)
+				  size_t *staged_bytes, u32 *generation,
+				  struct becore_input_slot *slot)
 {
 	ssize_t ret = count;
 
@@ -6439,8 +6456,7 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		ret = -EBUSY;
 		goto unlock;
 	}
-	if (staged == becore->inputs[0].buffer.cpu &&
-	    becore->inputs[0].state != BECORE_INPUT_FREE) {
+	if (slot && slot->state != BECORE_INPUT_FREE) {
 		ret = -EBUSY;
 		goto unlock;
 	}
@@ -6458,6 +6474,14 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		ret = -ESPIPE;
 		goto unlock;
 	}
+	/*
+	 * Before the copy, not after: copy_from_user() can fault having already
+	 * written part of the buffer, and that path returns without reaching
+	 * anything below.  Lines left dirty with the slot recorded clean would
+	 * write back over what the front end DMAs into it next.
+	 */
+	if (slot)
+		slot->cpu_dirty = true;
 	if (copy_from_user((u8 *)staged + *staged_bytes, buf, count)) {
 		/* A real partial replacement is never considered a valid stage. */
 		*staged_bytes = 0;
@@ -6502,7 +6526,7 @@ static ssize_t becore_recipe_write(struct file *file, const char __user *buf,
 	return becore_stage_write(becore, buf, count, ppos, becore->recipe,
 				  BECORE_RECIPE_BYTES,
 				  &becore->recipe_staged_bytes,
-				  &becore->recipe_generation);
+				  &becore->recipe_generation, NULL);
 }
 
 static const struct file_operations becore_recipe_fops = {
@@ -6542,7 +6566,7 @@ static ssize_t becore_gtnr_recipe_write(struct file *file,
 	return becore_stage_write(becore, buf, count, ppos,
 				  becore->gtnr_recipe, BECORE_GTNR_RECIPE_BYTES,
 				  &becore->gtnr_recipe_staged_bytes,
-				  &becore->gtnr_recipe_generation);
+				  &becore->gtnr_recipe_generation, NULL);
 }
 
 static const struct file_operations becore_gtnr_recipe_fops = {
@@ -6582,7 +6606,7 @@ static ssize_t becore_mcsc_recipe_write(struct file *file,
 	return becore_stage_write(becore, buf, count, ppos,
 				  becore->mcsc_recipe, BECORE_MCSC_RECIPE_BYTES,
 				  &becore->mcsc_recipe_staged_bytes,
-				  &becore->mcsc_recipe_generation);
+				  &becore->mcsc_recipe_generation, NULL);
 }
 
 static const struct file_operations becore_mcsc_recipe_fops = {
@@ -6601,7 +6625,8 @@ static ssize_t becore_input_write(struct file *file, const char __user *buf,
 
 	return becore_stage_write(becore, buf, count, ppos,
 				  input->cpu, input->size,
-				  &input->staged_bytes, NULL);
+				  &input->staged_bytes, NULL,
+				  &becore->inputs[0]);
 }
 
 static const struct file_operations becore_input_fops = {
@@ -6619,7 +6644,7 @@ static ssize_t becore_grid_write(struct file *file, const char __user *buf,
 	return becore_stage_write(becore, buf, count, ppos,
 				  becore->grid.cpu, becore->grid.size,
 				  &becore->grid.staged_bytes,
-				  &becore->grid_generation);
+				  &becore->grid_generation, NULL);
 }
 
 static const struct file_operations becore_grid_fops = {
@@ -7196,9 +7221,17 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 
 	becore_stream_crc_arm(becore);
 
-	/* Move staged or producer-written Bayer pages into RGBP's DMA domain. */
-	dma_sync_sgtable_for_device(becore->dev, becore->run_input->buffer.sgt,
-				    DMA_TO_DEVICE);
+	/*
+	 * A staged slot was filled through the cached vmap, so its lines have
+	 * to reach DRAM before RGBP reads them.  A producer-written slot was
+	 * never touched by the CPU and needs nothing.
+	 */
+	if (becore->run_input->cpu_dirty) {
+		dma_sync_sgtable_for_device(becore->dev,
+					    becore->run_input->buffer.sgt,
+					    DMA_TO_DEVICE);
+		becore->run_input->cpu_dirty = false;
+	}
 	mark = becore_timing_mark(phase_ns, BECORE_TIMING_ARM, mark);
 	ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS);
 	mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
@@ -7243,9 +7276,6 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		if (!ret)
 			ret = pm_ret;
 	} else {
-		dma_sync_sgtable_for_cpu(becore->dev,
-					 becore->run_input->buffer.sgt,
-					 DMA_TO_DEVICE);
 		becore->run_input->state = BECORE_INPUT_FREE;
 		becore->run_input->ready_sequence = 0;
 	}

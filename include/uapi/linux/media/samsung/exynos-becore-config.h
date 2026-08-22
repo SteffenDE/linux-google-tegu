@@ -20,18 +20,22 @@
  *	:c:type:`exynos_becore_params_ltm_curve`
  * @EXYNOS_BECORE_PARAM_BLOCK_CLUT: The colour LUT's chroma lattice,
  *	:c:type:`exynos_becore_params_clut`
+ * @EXYNOS_BECORE_PARAM_BLOCK_GAMMA: The output tone curve, one per channel,
+ *	:c:type:`exynos_becore_params_gamma`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
- * balance's own output, the curve is the exposure estimate's, and the lattice
- * comes from a tuning tree indexed by the illuminant estimate. What none of
- * them carries is a register address or a program: userspace supplies values
- * in the units the block is specified in, and the driver encodes them.
+ * balance's own output, the guide curve is the exposure estimate's, the
+ * lattice comes from a tuning tree indexed by the illuminant estimate, and the
+ * tone curve is the grade a calibration ships. What none of them carries is a
+ * register address or a program: userspace supplies values in the units the
+ * block is specified in, and the driver encodes them.
  */
 enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_CCM = 0,
 	EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE,
 	EXYNOS_BECORE_PARAM_BLOCK_CLUT,
+	EXYNOS_BECORE_PARAM_BLOCK_GAMMA,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -137,6 +141,54 @@ struct exynos_becore_params_clut {
 	__u16 lut_v[EXYNOS_BECORE_CLUT_NODES];
 } __attribute__((aligned(8)));
 
+#define EXYNOS_BECORE_GAMMA_POINTS		65
+#define EXYNOS_BECORE_GAMMA_CHANNELS		3
+
+/*
+ * Q14 over the unit interval. The hardware field is fourteen bits, so only the
+ * last knot may reach unity: it is the one the block stores as a distance from
+ * its neighbour rather than as a value, precisely because it does not fit.
+ */
+#define EXYNOS_BECORE_GAMMA_ONE			16384
+#define EXYNOS_BECORE_GAMMA_MAX			(EXYNOS_BECORE_GAMMA_ONE - 1)
+
+/**
+ * struct exynos_becore_params_gamma - The output tone curve
+ *
+ * @header: The parameters block header
+ * @curve: 65 Q14 samples per channel, red, green and blue in that order,
+ *	each non-decreasing
+ *
+ * This is the grade: the curve that takes the scene's linear light to the
+ * output's tone. It is the last thing in the chain that shapes luma, and the
+ * hardware holds one table per channel, so a white balance or a creative
+ * split-tone can be carried here as well as a plain gamma.
+ *
+ * **The 65 samples are not evenly spaced.** The block samples a curve on a
+ * fixed non-uniform grid, finest where a curve moves fastest: from zero, eight
+ * steps of 32, then twelve of 64, eight of 128, sixteen of 256 and twenty of
+ * 512, which reaches %EXYNOS_BECORE_GAMMA_ONE exactly at the sixty-fifth knot.
+ * Sample the curve at those inputs. The grid is the hardware's rather than the
+ * curve's and the driver states it; it does not resample what arrives here.
+ *
+ * Every sample must be at most %EXYNOS_BECORE_GAMMA_MAX except the last, which
+ * may reach %EXYNOS_BECORE_GAMMA_ONE, and no channel may decrease. A tone
+ * curve that goes backwards inverts contrast over that interval, and the
+ * hardware could not encode it in any case: the last knot's direction lives in
+ * a sign register the driver does not write. The last knot also reaches the
+ * hardware as its distance from the one before it rather than as a value, and
+ * that distance has to fit the same field, so a curve may not do almost all of
+ * its rise in its final segment.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the curve to
+ * whatever the driver's own default is rather than switching the stage off:
+ * the block has no bypass this driver ever asserts.
+ */
+struct exynos_becore_params_gamma {
+	struct v4l2_isp_params_block_header header;
+	__u16 curve[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_BECORE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -146,6 +198,7 @@ struct exynos_becore_params_clut {
 #define EXYNOS_BECORE_PARAMS_MAX_SIZE \
 	(sizeof(struct exynos_becore_params_ccm) + \
 	 sizeof(struct exynos_becore_params_ltm_curve) + \
-	 sizeof(struct exynos_becore_params_clut))
+	 sizeof(struct exynos_becore_params_clut) + \
+	 sizeof(struct exynos_becore_params_gamma))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

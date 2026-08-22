@@ -21,13 +21,16 @@ populate the type member with a value from
 A buffer carries only what changed. A block that is not present leaves that
 part of the configuration as it was, so a steady scene needs no buffer at all,
 and a block sent with ``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns that part to
-the driver's own default rather than switching the hardware stage off.
+the driver's own default. For most blocks that default is the value the driver
+would have programmed anyway; for the colour LUT it is bypass, because a
+lattice is the whole of what that stage does and there is no neutral one.
 
 The driver rejects a buffer at :c:func:`VIDIOC_QBUF` if a block is
 inconsistent, so a mistake is reported against the buffer that carried it:
 every row of the colour matrix must sum to
-``EXYNOS_BECORE_CCM_ONE``, which is what makes the matrix preserve neutrals,
-and the tone curve must not decrease.
+``EXYNOS_BECORE_CCM_ONE``, which is what makes the matrix preserve neutrals;
+the tone curve must not decrease; and the colour LUT's samples must fit
+``EXYNOS_BECORE_CLUT_MAX`` with both ends of its grey axis neutral.
 
 .. code-block:: c
 
@@ -56,6 +59,32 @@ and the tone curve must not decrease.
 
 The ``bytesused`` field of the queued buffer must be the size of
 :c:type:`v4l2_isp_params_buffer` plus ``data_size``.
+
+The colour LUT is the one block whose hardware stage does not run at all until
+a buffer carries it, and it is by far the largest, so a pipeline with no
+lattice to send should leave it out rather than fill one in. Sending one looks
+like this::
+
+	struct exynos_becore_params_clut *clut =
+		(struct exynos_becore_params_clut *)data;
+
+	clut->header.type = EXYNOS_BECORE_PARAM_BLOCK_CLUT;
+	clut->header.flags |= V4L2_ISP_PARAMS_FL_BLOCK_ENABLE;
+	clut->header.size = sizeof(struct exynos_becore_params_clut);
+
+	for (unsigned int r = 0; r < EXYNOS_BECORE_CLUT_AXIS_NODES; r++)
+		for (unsigned int g = 0; g < EXYNOS_BECORE_CLUT_AXIS_NODES; g++)
+			for (unsigned int b = 0; b < EXYNOS_BECORE_CLUT_AXIS_NODES; b++) {
+				unsigned int node =
+					(r * EXYNOS_BECORE_CLUT_AXIS_NODES + g) *
+					EXYNOS_BECORE_CLUT_AXIS_NODES + b;
+
+				clut->lut_u[node] = chroma_u(r, g, b);
+				clut->lut_v[node] = chroma_v(r, g, b);
+			}
+
+	data += sizeof(struct exynos_becore_params_clut);
+	params->data_size += sizeof(struct exynos_becore_params_clut);
 
 zumapro BE-core uAPI data types
 ===============================

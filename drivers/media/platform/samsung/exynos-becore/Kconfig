@@ -7,6 +7,7 @@ config VIDEO_EXYNOS_BECORE
 	depends on PM
 	depends on VIDEO_DEV
 	select MEDIA_CONTROLLER
+	select V4L2_ISP
 	select VIDEOBUF2_VMALLOC
 	help
 	  Bring-up driver for the RGBP, MCFP and YUVP image processors in

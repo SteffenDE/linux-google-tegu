@@ -1515,10 +1515,22 @@ struct becore_input_slot {
 	u64 ready_sequence;
 };
 
+/*
+ * A CMDQ program's allocation and its contents are two different lengths. The
+ * allocation is sized once, for the longest program the block can be asked to
+ * run; the header count is what the last encode emitted, and it is what
+ * CMDQ_QUE_CMD_M tells the hardware to execute.
+ *
+ * The payload area starts after the header list, so the two lengths also give
+ * two different layouts -- which is why the debugfs readback returns the
+ * encoded length rather than the allocation. A reader handed the allocation
+ * would look for the payloads in the wrong place.
+ */
 struct becore_cmdq_program {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+	u32 capacity;
 	u32 header_count;
 };
 
@@ -1945,6 +1957,12 @@ static size_t becore_cmdq_program_size(u32 header_count)
 	return ALIGN((size_t)header_count * BECORE_CMDQ_HEADER_BYTES,
 		     BECORE_CMDQ_PAYLOAD_BYTES) +
 	       (size_t)header_count * BECORE_CMDQ_PAYLOAD_BYTES;
+}
+
+/* The bytes the last encode filled, which is not the allocation. */
+static size_t becore_cmdq_encoded_size(const struct becore_cmdq_program *program)
+{
+	return becore_cmdq_program_size(program->header_count);
 }
 
 static const u8 *becore_recipe_records(const struct becore_device *becore,
@@ -4605,8 +4623,10 @@ static int becore_encode_block(struct becore_device *becore,
 	u32 typed_count = 0;
 	u32 generated_count = 0;
 
-	if (!program->cpu || program->header_count != header_count ||
-	    program->size != becore_cmdq_program_size(header_count) ||
+	/* An encode produces a whole program or none of one. */
+	program->header_count = 0;
+	if (!program->cpu || program->capacity != header_count ||
+	    program->size != becore_cmdq_program_size(program->capacity) ||
 	    upper_32_bits(program->dma) ||
 	    upper_32_bits(program->dma + program->size - 1))
 		return -EINVAL;
@@ -4665,6 +4685,7 @@ static int becore_encode_block(struct becore_device *becore,
 	if (typed_count != becore_typed_word_count(id) ||
 	    generated_count != becore_generated_word_count(id))
 		return -EINVAL;
+	program->header_count = header_count;
 
 	return 0;
 }
@@ -4792,8 +4813,10 @@ static int becore_encode_gtnr(struct becore_device *becore)
 	u32 typed_count = 0;
 	u32 i;
 
-	if (!program->cpu || program->header_count != BECORE_GTNR_HEADER_COUNT ||
-	    program->size != becore_cmdq_program_size(BECORE_GTNR_HEADER_COUNT) ||
+	/* An encode produces a whole program or none of one. */
+	program->header_count = 0;
+	if (!program->cpu || program->capacity != BECORE_GTNR_HEADER_COUNT ||
+	    program->size != becore_cmdq_program_size(program->capacity) ||
 	    upper_32_bits(program->dma) ||
 	    upper_32_bits(program->dma + program->size - 1))
 		return -EINVAL;
@@ -4840,6 +4863,7 @@ static int becore_encode_gtnr(struct becore_device *becore)
 
 	if (typed_count != BECORE_GTNR_DMA_WORD_COUNT)
 		return -EINVAL;
+	program->header_count = BECORE_GTNR_HEADER_COUNT;
 
 	return 0;
 }
@@ -5091,8 +5115,10 @@ becore_encode_mcsc(struct becore_device *becore,
 	u32 generated_count = 0;
 	u32 i;
 
-	if (!program->cpu || program->header_count != BECORE_MCSC_HEADER_COUNT ||
-	    program->size != becore_cmdq_program_size(BECORE_MCSC_HEADER_COUNT) ||
+	/* An encode produces a whole program or none of one. */
+	program->header_count = 0;
+	if (!program->cpu || program->capacity != BECORE_MCSC_HEADER_COUNT ||
+	    program->size != becore_cmdq_program_size(program->capacity) ||
 	    upper_32_bits(program->dma) ||
 	    upper_32_bits(program->dma + program->size - 1))
 		return -EINVAL;
@@ -5154,6 +5180,7 @@ becore_encode_mcsc(struct becore_device *becore,
 	if (typed_count != BECORE_MCSC_DMA_WORD_COUNT ||
 	    generated_count != BECORE_MCSC_GENERATED_WORDS)
 		return -EINVAL;
+	program->header_count = BECORE_MCSC_HEADER_COUNT;
 
 	return 0;
 }
@@ -5534,7 +5561,7 @@ static int becore_alloc_cmdq_buffer(struct becore_device *becore,
 				    struct becore_cmdq_program *program,
 				    u32 header_count, const char *name)
 {
-	program->header_count = header_count;
+	program->capacity = header_count;
 	program->size = becore_cmdq_program_size(header_count);
 	program->cpu = dmam_alloc_coherent(becore->dev, program->size,
 					   &program->dma, GFP_KERNEL);
@@ -6304,7 +6331,7 @@ static ssize_t becore_encoded_read(struct file *file, char __user *buf,
 		ret = -ENODATA;
 	else
 		ret = simple_read_from_buffer(buf, count, ppos, program->cpu,
-					      program->size);
+					      becore_cmdq_encoded_size(program));
 	mutex_unlock(&becore->lock);
 
 	return ret;
@@ -6353,7 +6380,7 @@ static ssize_t becore_gtnr_encoded_read(struct file *file, char __user *buf,
 	else
 		ret = simple_read_from_buffer(buf, count, ppos,
 					      becore->gtnr_program.cpu,
-					      becore->gtnr_program.size);
+					      becore_cmdq_encoded_size(&becore->gtnr_program));
 	mutex_unlock(&becore->lock);
 
 	return ret;
@@ -6411,7 +6438,7 @@ static ssize_t becore_mcsc_encoded_read(struct file *file, char __user *buf,
 	else
 		ret = simple_read_from_buffer(buf, count, ppos,
 					      becore->mcsc_program.cpu,
-					      becore->mcsc_program.size);
+					      becore_cmdq_encoded_size(&becore->mcsc_program));
 	mutex_unlock(&becore->lock);
 
 	return ret;
@@ -7377,6 +7404,15 @@ static const struct video_device becore_video_template = {
 	.vfl_dir = VFL_DIR_RX,
 };
 
+/* One CMDQ program: what the last encode filled, and what it was sized for. */
+static void becore_status_program(struct seq_file *s, const char *name,
+				  const struct becore_cmdq_program *program)
+{
+	seq_printf(s, "%-16s %zu encoded/%zu allocated bytes, %u/%u headers, iova %pad\n",
+		   name, becore_cmdq_encoded_size(program), program->size,
+		   program->header_count, program->capacity, &program->dma);
+}
+
 static int becore_status_show(struct seq_file *s, void *unused)
 {
 	static const char * const input_state_names[] = {
@@ -7481,27 +7517,15 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->active_output_profile);
 	seq_printf(s, "active_path      %s\n",
 		   becore->active_mcsc ? "YUVP-memory-to-MCSC" : "YUVP");
-	seq_printf(s, "rgbp_cmdq        %zu bytes/%u headers, iova %pad\n",
-		   becore->program[BECORE_RGBP].size,
-		   becore->program[BECORE_RGBP].header_count,
-		   &becore->program[BECORE_RGBP].dma);
-	seq_printf(s, "yuvp_cmdq        %zu bytes/%u headers, iova %pad\n",
-		   becore->program[BECORE_YUVP].size,
-		   becore->program[BECORE_YUVP].header_count,
-		   &becore->program[BECORE_YUVP].dma);
+	becore_status_program(s, "rgbp_cmdq", &becore->program[BECORE_RGBP]);
+	becore_status_program(s, "yuvp_cmdq", &becore->program[BECORE_YUVP]);
 	seq_printf(s, "gtnr_output      %zu bytes, iova %pad\n",
 		   becore->gtnr_output.size, &becore->gtnr_output.dma);
-	seq_printf(s, "gtnr_cmdq        %zu bytes/%u headers, iova %pad\n",
-		   becore->gtnr_program.size,
-		   becore->gtnr_program.header_count,
-		   &becore->gtnr_program.dma);
+	becore_status_program(s, "gtnr_cmdq", &becore->gtnr_program);
 	seq_printf(s, "mcsc_output      %u completed/%zu allocated bytes, iova %pad\n",
 		   becore->mcsc_completed_output_size, becore->mcsc_output.size,
 		   &becore->mcsc_output.dma);
-	seq_printf(s, "mcsc_cmdq        %zu bytes/%u headers, iova %pad\n",
-		   becore->mcsc_program.size,
-		   becore->mcsc_program.header_count,
-		   &becore->mcsc_program.dma);
+	becore_status_program(s, "mcsc_cmdq", &becore->mcsc_program);
 	seq_printf(s, "run_generation   %u\n", becore->run_generation);
 	seq_printf(s, "completed         %u\n", becore->completed_generation);
 	seq_printf(s, "last_result       %d\n", becore->last_run_result);

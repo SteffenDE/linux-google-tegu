@@ -1332,7 +1332,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	479
+#define BECORE_YUVP_GENERATED_WORDS	578
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1465,6 +1465,14 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_GAMMA_GATE_FIRST, BECORE_YUVP_GAMMA_GATE_LAST,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_R_FIRST, BECORE_YUVP_GAMMA_R_DELTA_REG,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_G_LOW_FIRST, BECORE_YUVP_GAMMA_G_LOW_LAST,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_G_HIGH_FIRST, BECORE_YUVP_GAMMA_G_DELTA_REG,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_B_FIRST, BECORE_YUVP_GAMMA_B_DELTA_REG,
 	  BECORE_GEN_YUVP_GAMMA },
 	{ BECORE_YUVP_GAMMA_X_LOW_FIRST, BECORE_YUVP_GAMMA_X_LOW_LAST,
 	  BECORE_GEN_YUVP_GAMMA },
@@ -4486,12 +4494,102 @@ static int becore_yuvp_gamma_x_delta(u32 *value)
 }
 
 /*
- * The two gates and the grid.  The three per-channel tables between them are
- * the tone curve itself and are not answered here: they stay whatever the
- * recipe carries until a parameters block replaces them.
+ * Where each channel's tone-curve table is, and which knot its first register
+ * carries.
+ *
+ * Three things make this a table rather than arithmetic. The green table has a
+ * four-register reserved hole in the middle of it, so it takes two entries and
+ * the second one starts at knot 40. The last knot of every table is stored in
+ * a register of its own, as its distance from the knot before it, because a
+ * value of 1 << Q does not fit the field. And the three tables are not evenly
+ * spaced, so nothing derives one from another.
  */
-static int becore_yuvp_gamma_value(u32 offset, u32 *value)
+struct becore_yuvp_gamma_range {
+	u32 first;		/* physical register, inclusive */
+	u32 last;		/* inclusive; equal to first for one register */
+	u8 channel;
+	u8 knot;		/* the knot this range's first register holds */
+	bool delta;		/* the last knot, as a distance */
+};
+
+#define BECORE_YUVP_GAMMA_LAST_KNOT	(EXYNOS_BECORE_GAMMA_POINTS - 1)
+
+static const struct becore_yuvp_gamma_range becore_yuvp_gamma_tables[] = {
+	{ BECORE_YUVP_GAMMA_R_FIRST, BECORE_YUVP_GAMMA_R_LAST, 0, 0, false },
+	{ BECORE_YUVP_GAMMA_R_DELTA_REG, BECORE_YUVP_GAMMA_R_DELTA_REG, 0,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+	{ BECORE_YUVP_GAMMA_G_LOW_FIRST, BECORE_YUVP_GAMMA_G_LOW_LAST, 1, 0,
+	  false },
+	{ BECORE_YUVP_GAMMA_G_HIGH_FIRST, BECORE_YUVP_GAMMA_G_HIGH_LAST, 1,
+	  BECORE_YUVP_GAMMA_G_SPLIT_KNOT, false },
+	{ BECORE_YUVP_GAMMA_G_DELTA_REG, BECORE_YUVP_GAMMA_G_DELTA_REG, 1,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+	{ BECORE_YUVP_GAMMA_B_FIRST, BECORE_YUVP_GAMMA_B_LAST, 2, 0, false },
+	{ BECORE_YUVP_GAMMA_B_DELTA_REG, BECORE_YUVP_GAMMA_B_DELTA_REG, 2,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+};
+
+/* Which table a register belongs to, and which knot it carries. */
+static const struct becore_yuvp_gamma_range *
+becore_yuvp_gamma_lookup(u32 reg, u32 *knot)
 {
+	size_t i;
+
+	if (reg & 3)
+		return NULL;
+
+	for (i = 0; i < ARRAY_SIZE(becore_yuvp_gamma_tables); i++) {
+		const struct becore_yuvp_gamma_range *range =
+			&becore_yuvp_gamma_tables[i];
+
+		if (reg < range->first || reg > range->last)
+			continue;
+		*knot = range->delta ? range->knot :
+			range->knot + (reg - range->first) / 4 *
+			BECORE_GAMMA_KNOTS_PER_REG;
+		return range;
+	}
+
+	return NULL;
+}
+
+/*
+ * One register of the identity curve: out[i] == in[i] at every knot, which
+ * for this block is the same table as the grid.
+ *
+ * This is what the block does when userspace has sent nothing, and it is a
+ * claim about the block rather than a convenient fill.  Unlike the colour LUT,
+ * whose entries *are* its output and whose neutral table therefore produces
+ * grey, a gamma table maps an input to an output: every knot sits on y = x and
+ * the interpolation between two of them is a straight line through both, so
+ * the stage passes its input through as an asserted bypass would.  What it
+ * does not do is look good -- what arrives here is very nearly linear light,
+ * and the curve that makes it a picture is the one an IPA sends.
+ */
+static int becore_yuvp_gamma_identity(u32 reg, u32 *value)
+{
+	const struct becore_yuvp_gamma_range *range;
+	u32 knot;
+
+	range = becore_yuvp_gamma_lookup(reg, &knot);
+	if (!range)
+		return -EINVAL;
+	if (range->delta)
+		return becore_yuvp_gamma_x_delta(value);
+
+	return becore_yuvp_gamma_x_pair(knot, value);
+}
+
+/*
+ * The block's gates, its grid, and -- when no parameters block has carried a
+ * curve -- the identity in its three tables.  A curve that has arrived is
+ * substituted over this by becore_params_apply(), which runs after every
+ * generated word is written.
+ */
+static int becore_yuvp_gamma_value(u32 reg, u32 *value)
+{
+	u32 offset = reg - BECORE_YUVP_GAMMA_BASE;
+
 	if (offset & 3)
 		return -EINVAL;
 
@@ -4514,6 +4612,9 @@ static int becore_yuvp_gamma_value(u32 offset, u32 *value)
 	if (offset >= 0x200 && offset < 0x250)
 		return becore_yuvp_gamma_x_pair((offset - 0x200) / 4 * 2 + 24,
 						value);
+	if (reg >= BECORE_YUVP_GAMMA_R_FIRST &&
+	    reg <= BECORE_YUVP_GAMMA_B_DELTA_REG)
+		return becore_yuvp_gamma_identity(reg, value);
 
 	return -EINVAL;
 }
@@ -4990,9 +5091,7 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		case BECORE_GEN_YUVP_GAMMA:
-			if (becore_yuvp_gamma_value(reg -
-						    BECORE_YUVP_GAMMA_BASE,
-						    &result))
+			if (becore_yuvp_gamma_value(reg, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_GTM:
@@ -5350,42 +5449,6 @@ static int becore_override_check(u32 reg)
 }
 
 /*
- * Where each channel's tone-curve table is, and which knot its first register
- * carries.
- *
- * Three things make this a table rather than arithmetic. The green table has a
- * four-register reserved hole in the middle of it, so it takes two entries and
- * the second one starts at knot 40. The last knot of every table is stored in
- * a register of its own, as its distance from the knot before it, because a
- * value of 1 << Q does not fit the field. And the three tables are not evenly
- * spaced, so nothing derives one from another.
- */
-struct becore_yuvp_gamma_range {
-	u32 first;		/* physical register, inclusive */
-	u32 last;		/* inclusive; equal to first for one register */
-	u8 channel;
-	u8 knot;		/* the knot this range's first register holds */
-	bool delta;		/* the last knot, as a distance */
-};
-
-#define BECORE_YUVP_GAMMA_LAST_KNOT	(EXYNOS_BECORE_GAMMA_POINTS - 1)
-
-static const struct becore_yuvp_gamma_range becore_yuvp_gamma_tables[] = {
-	{ BECORE_YUVP_GAMMA_R_FIRST, BECORE_YUVP_GAMMA_R_LAST, 0, 0, false },
-	{ BECORE_YUVP_GAMMA_R_DELTA_REG, BECORE_YUVP_GAMMA_R_DELTA_REG, 0,
-	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
-	{ BECORE_YUVP_GAMMA_G_LOW_FIRST, BECORE_YUVP_GAMMA_G_LOW_LAST, 1, 0,
-	  false },
-	{ BECORE_YUVP_GAMMA_G_HIGH_FIRST, BECORE_YUVP_GAMMA_G_HIGH_LAST, 1,
-	  BECORE_YUVP_GAMMA_G_SPLIT_KNOT, false },
-	{ BECORE_YUVP_GAMMA_G_DELTA_REG, BECORE_YUVP_GAMMA_G_DELTA_REG, 1,
-	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
-	{ BECORE_YUVP_GAMMA_B_FIRST, BECORE_YUVP_GAMMA_B_LAST, 2, 0, false },
-	{ BECORE_YUVP_GAMMA_B_DELTA_REG, BECORE_YUVP_GAMMA_B_DELTA_REG, 2,
-	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
-};
-
-/*
  * One register of one channel's tone curve, packed from the samples userspace
  * sent, or -ENOENT if this register is not part of a table.
  *
@@ -5396,41 +5459,28 @@ static const struct becore_yuvp_gamma_range becore_yuvp_gamma_tables[] = {
 static int becore_yuvp_gamma_curve_value(const struct becore_params_state *params,
 					 u32 reg, u32 *value)
 {
-	size_t i;
+	const struct becore_yuvp_gamma_range *range;
+	const u16 *curve;
+	u32 knot;
 
-	if (reg & 3)
+	range = becore_yuvp_gamma_lookup(reg, &knot);
+	if (!range)
 		return -ENOENT;
-
-	for (i = 0; i < ARRAY_SIZE(becore_yuvp_gamma_tables); i++) {
-		const struct becore_yuvp_gamma_range *range =
-			&becore_yuvp_gamma_tables[i];
-		const u16 *curve;
-		u32 knot;
-
-		if (reg < range->first || reg > range->last)
-			continue;
-		curve = params->gamma[range->channel];
-		if (range->delta) {
-			/*
-			 * A magnitude, as the driver's other two delta
-			 * encoders take one: the curve was checked
-			 * non-decreasing, so this is the difference, and
-			 * taking it this way means a curve that somehow fell
-			 * would encode a small number rather than wrap.
-			 */
-			knot = range->knot;
-			*value = curve[knot] > curve[knot - 1] ?
-				 curve[knot] - curve[knot - 1] :
-				 curve[knot - 1] - curve[knot];
-			return 0;
-		}
-		knot = range->knot + (reg - range->first) / 4 *
-		       BECORE_GAMMA_KNOTS_PER_REG;
+	curve = params->gamma[range->channel];
+	/*
+	 * A magnitude, as the driver's other two delta encoders take one: the
+	 * curve was checked non-decreasing, so this is the difference, and
+	 * taking it this way means a curve that somehow fell would encode a
+	 * small number rather than wrap.
+	 */
+	if (range->delta)
+		*value = curve[knot] > curve[knot - 1] ?
+			 curve[knot] - curve[knot - 1] :
+			 curve[knot - 1] - curve[knot];
+	else
 		*value = curve[knot] | ((u32)curve[knot + 1] << 16);
-		return 0;
-	}
 
-	return -ENOENT;
+	return 0;
 }
 
 /*

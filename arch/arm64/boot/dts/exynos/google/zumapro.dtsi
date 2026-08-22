@@ -4181,6 +4181,22 @@
 			iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>,
 				 <&sysmmu_rgbp_s1>, <&sysmmu_gdc>, <&sysmmu_mcsc>;
 			samsung,iommu-group = <&iommu_group_isp>;
+			/*
+			 * A VOTF producer signals its consumer by writing to a
+			 * register inside the consumer's own C2SERV window, at an
+			 * address the hardware forms from the consumer's IP ID --
+			 * the top three pages of the window, which hold the packet
+			 * inbox at +0xffe0 and the wrapper at +0xd304.  That write
+			 * is ordinary DMA out of the producer, so those pages have
+			 * to be reachable one-to-one from this node's domain.
+			 *
+			 * Both ends of the link this node makes are its own blocks,
+			 * so both windows are listed: YUVP as the producer and MCSC
+			 * as the consumer, because the fabric signals in both
+			 * directions.
+			 */
+			samsung,iommu-identity-map = <0x1c86d000 0x3000>,
+						     <0x1d05d000 0x3000>;
 			status = "disabled";
 		};
 

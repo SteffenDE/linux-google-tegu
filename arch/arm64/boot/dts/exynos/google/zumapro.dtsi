@@ -4190,13 +4190,15 @@
 			 * is ordinary DMA out of the producer, so those pages have
 			 * to be reachable one-to-one from this node's domain.
 			 *
-			 * Both ends of the link this node makes are its own blocks,
-			 * so both windows are listed: YUVP as the producer and MCSC
-			 * as the consumer, because the fabric signals in both
-			 * directions.
+			 * Downstream lists every window except the node's own, and
+			 * relies on the other members of the shared IOMMU group to
+			 * supply those.  This group has only this node and the
+			 * front end, and the front end lists nothing, so both ends
+			 * of the link have to be named here -- the fabric signals
+			 * in both directions and nothing else would map YUVP's.
 			 */
-			samsung,iommu-identity-map = <0x1c86d000 0x3000>,
-						     <0x1d05d000 0x3000>;
+			samsung,iommu-identity-map = <0x0 0x1c86d000 0x3000>,
+						     <0x0 0x1d05d000 0x3000>;
 			status = "disabled";
 		};
 

@@ -532,6 +532,19 @@ static_assert((BECORE_YUVP_INVCCM33_LAST - BECORE_YUVP_INVCCM33_FIRST) / 4 +
 	      1 == BECORE_INVCCM33_COEFFICIENTS);
 
 /*
+ * DIABLO_CCM's gate and the three offsets after its matrix.  The nine
+ * coefficients between them are the live AWB matrix -- one payload per frame,
+ * and per-frame in the invariance census -- so they stay in the recipe.  These
+ * four do not move: ApplyDefaults clears the config's bit 0 and nothing sets
+ * it, and the offsets are nominally live (AwbFrameData floats 9..11) but zero
+ * in every captured program.
+ */
+#define BECORE_YUVP_CCM_BASE		(BECORE_YUVP_PHYS_BASE + 0x7a00)
+#define BECORE_YUVP_CCM_CONFIG_REG	(BECORE_YUVP_CCM_BASE + 0x000)
+#define BECORE_YUVP_CCM_OFFSET_FIRST	(BECORE_YUVP_CCM_BASE + 0x028)
+#define BECORE_YUVP_CCM_OFFSET_LAST	(BECORE_YUVP_CCM_BASE + 0x030)
+
+/*
  * The colour LUT above 0x7b00, which Lyric's descriptors call
  * yuv_diablo_clut_*. Its input stage is three 1D LUTs, one per YUV channel,
  * each 22 registers at 0x7b50, 0x7ba8 and 0x7c00.
@@ -889,6 +902,7 @@ enum becore_generated_kind {
 	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
 	BECORE_GEN_CLUT,	/* the colour LUT's gate and its YUV-to-RGB matrix */
 	BECORE_GEN_INVCCM33,	/* the inverse colour matrix, an exact identity */
+	BECORE_GEN_CCM,		/* the colour matrix's gate and its zero offsets */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -908,7 +922,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	387
+#define BECORE_YUVP_GENERATED_WORDS	391
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1028,6 +1042,10 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_INVCCM33_FIRST, BECORE_YUVP_INVCCM33_LAST,
 	  BECORE_GEN_INVCCM33 },
+	{ BECORE_YUVP_CCM_CONFIG_REG, BECORE_YUVP_CCM_CONFIG_REG,
+	  BECORE_GEN_CCM },
+	{ BECORE_YUVP_CCM_OFFSET_FIRST, BECORE_YUVP_CCM_OFFSET_LAST,
+	  BECORE_GEN_CCM },
 	{ BECORE_YUVP_CLUT_BYPASS_REG, BECORE_YUVP_CLUT_EN_CONFIG_REG,
 	  BECORE_GEN_CLUT },
 	{ BECORE_YUVP_CLUT_MATRIX_FIRST, BECORE_YUVP_CLUT_MATRIX_LAST,
@@ -2628,6 +2646,24 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/*
+ * DIABLO_CCM's gate and its three offsets, by offset from the block's base.
+ *
+ * All four are zero, but say which four: a mis-stated range in the table above
+ * would otherwise be answered rather than refused, and the generator that has
+ * to agree with this refuses it.
+ */
+static int becore_yuvp_ccm_value(u32 offset, u32 *value)
+{
+	if (offset != 0x000 && (offset < 0x028 || offset > 0x030 ||
+				offset & 3))
+		return -EINVAL;
+
+	*value = 0;
+
+	return 0;
+}
+
 /* One coefficient of the inverse colour matrix, by offset from the first. */
 static int becore_yuvp_invccm33_value(u32 offset, u32 *value)
 {
@@ -3904,6 +3940,11 @@ static int becore_generated_value(const struct becore_device *becore,
 			if (becore_yuvp_invccm33_value(reg -
 						BECORE_YUVP_INVCCM33_FIRST,
 						&result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_CCM:
+			if (becore_yuvp_ccm_value(reg - BECORE_YUVP_CCM_BASE,
+						  &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_CLUT:

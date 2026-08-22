@@ -565,7 +565,7 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
  * YUV_YUVTORGB at +0x3900 and its _ZUMA twin at +0x6a00 are the BT.601 inverse
  * at Q12 in 14-bit signed fields. Their nine coefficients are in the same
  * order as the forward block's -- input slow, output fast, so the vendor's
- * coeff_<in>_<out> names run 0_0, 0_1, 0_2, 1_0 where the forward block's run
+ * coeff_<in>_<out> names run 0_0, 0_1, 0_2, 1_0 and the forward block's run
  * r1, r2, r3, g1 -- and the subscripts still swap below, because the driver's
  * two matrix tables are stored in opposite conventions and not because the two
  * register blocks disagree. Two things after them are not coefficients:
@@ -589,6 +589,58 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_YUVP_YUV2RGB_FIELD_MASK	GENMASK(13, 0)
 #define BECORE_YUVP_YUV2RGB_OFFSET_MASK	GENMASK(12, 0)
 #define BECORE_YUVP_YUV2RGB_LSHIFT	1
+/*
+ * RGB_RGBTOYUV420 at +0x7400 is the forward matrix again, but this is the copy
+ * at the end of the chain that produces the frame, so it runs wider than the
+ * 4:4:4 one and it subsamples: Q14 coefficients in 16-bit fields, 14-bit
+ * clipping limits, and a chroma decimation the other copy has no registers
+ * for.
+ *
+ * Its first register reads 0x100 and that bit is what blocked the block. The
+ * vendor's own register descriptor calls the whole word `bypass`, and that is
+ * a partial name rather than a wrong value: bit 0 is the bypass and bit 8 is
+ * the output bit depth. Lyric's TranslateCsc for this output writes bit 8 as
+ * "output bit depth == 10", and it is set because YUVP hands MCSC a P010
+ * surface. The same function decides the dither below from the same pair of
+ * depths -- the matrix accumulates at 14 bits and the frame leaves at 10 --
+ * which is why the two blocks are stated together and why the dither is not
+ * simply "a block that runs".
+ *
+ * Only this copy of the converter has that second field. The translators for
+ * the other three -- YUVP's +0x3a00 and both inverse blocks, and RGBP's
+ * +0x3b00 -- read-modify-write bit 0 and touch nothing else, so calling their
+ * word a bypass is as much as the evidence supports and no more.
+ *
+ * Three of the twenty-three are GetDefaultCsc literals whose *value* is read
+ * straight out of the vendor's defaults and whose *meaning* no field table
+ * gives: LS = 1, UV_COEFF = 0x02010201 and VER_SAMPLING_POSITION = 8. One
+ * statement of GetDefaultCsc writes the first two together. LS being 1 here
+ * and 0 in the Q13 copy, whose coefficients sit one binary point lower, makes
+ * a post-matrix shift the obvious reading -- but the Q12 inverse block's own
+ * shift is also 1, so the correlation is not a rule and the driver does not
+ * claim one.
+ */
+#define BECORE_YUVP_CSC420_BASE		(BECORE_YUVP_PHYS_BASE + 0x7400)
+#define BECORE_YUVP_CSC420_FIRST	(BECORE_YUVP_CSC420_BASE + 0x00)
+#define BECORE_YUVP_CSC420_LAST		(BECORE_YUVP_CSC420_BASE + 0x54)
+#define BECORE_YUVP_CSC420_VER_SAMPLING_REG (BECORE_YUVP_CSC420_BASE + 0xa0)
+#define BECORE_YUVP_CSC420_Q		14
+#define BECORE_YUVP_CSC420_FIELD_MASK	GENMASK(15, 0)
+#define BECORE_YUVP_CSC420_LIMIT_MASK	GENMASK(14, 0)
+#define BECORE_YUVP_CSC420_MAX		0x3fff	/* full range at this width */
+#define BECORE_YUVP_CSC420_LS		1
+#define BECORE_YUVP_CSC420_CTRL_BYPASS	BIT(0)
+#define BECORE_YUVP_CSC420_CTRL_OUT10	BIT(8)
+/*
+ * GetDefaultCsc's two remaining literals, which no field table explains: four
+ * bytes of chroma decimation weight, and where the chroma sample sits between
+ * the two luma rows it comes from.
+ */
+#define BECORE_YUVP_CSC420_UV_COEFF	0x02010201
+#define BECORE_YUVP_CSC420_VER_SAMPLING	8
+#define BECORE_YUVP_DITHER420_BASE	(BECORE_YUVP_PHYS_BASE + 0x3c00)
+#define BECORE_YUVP_DITHER420_FIRST	(BECORE_YUVP_DITHER420_BASE + 0x00)
+#define BECORE_YUVP_DITHER420_LAST	(BECORE_YUVP_DITHER420_BASE + 0x04)
 #define BECORE_RGBP_CHROMA_LPF_BASE	(BECORE_RGBP_PHYS_BASE + 0x3c00)
 #define BECORE_RGBP_CHROMA_LPF_CTRL_REG	(BECORE_RGBP_CHROMA_LPF_BASE + 0x00)
 #define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
@@ -1174,6 +1226,8 @@ enum becore_generated_kind {
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
 	BECORE_GEN_CSC,		/* RGB to YUV: BT.601, full range, Q13 */
 	BECORE_GEN_YUV2RGB,	/* YUV to RGB: the BT.601 inverse at Q12 */
+	BECORE_GEN_CSC420,	/* RGB to YUV 4:2:0: BT.601 at Q14, 10-bit out */
+	BECORE_GEN_DITHER420,	/* the dither a 10-bit output needs */
 	BECORE_GEN_CHROMA_LPF,	/* 4:4:4 to 4:2:2, a fixed binomial filter */
 	BECORE_GEN_DJAG,	/* MCSC DJAG at Samsung's neutral profile */
 	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
@@ -1210,7 +1264,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	419
+#define BECORE_YUVP_GENERATED_WORDS	444
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1307,10 +1361,16 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	{ BECORE_YUVP_YUV2RGB_FIRST, BECORE_YUVP_YUV2RGB_LAST,
 	  BECORE_GEN_YUV2RGB },
 	{ BECORE_YUVP_CSC_FIRST, BECORE_YUVP_CSC_LAST, BECORE_GEN_CSC },
+	{ BECORE_YUVP_DITHER420_FIRST, BECORE_YUVP_DITHER420_LAST,
+	  BECORE_GEN_DITHER420 },
 	{ BECORE_YUVP_YUV2RGB_ZUMA_BYPASS_REG,
 	  BECORE_YUVP_YUV2RGB_ZUMA_BYPASS_REG, BECORE_GEN_YUV2RGB },
 	{ BECORE_YUVP_YUV2RGB_ZUMA_FIRST, BECORE_YUVP_YUV2RGB_ZUMA_LAST,
 	  BECORE_GEN_YUV2RGB },
+	{ BECORE_YUVP_CSC420_FIRST, BECORE_YUVP_CSC420_LAST,
+	  BECORE_GEN_CSC420 },
+	{ BECORE_YUVP_CSC420_VER_SAMPLING_REG,
+	  BECORE_YUVP_CSC420_VER_SAMPLING_REG, BECORE_GEN_CSC420 },
 	{ BECORE_YUVP_NR_SLOPE_Y_REG,
 	  BECORE_YUVP_NR_SLOPE_Y_REG + BECORE_NOISE_TABLE_LAST,
 	  BECORE_GEN_NOISE_SLOPE },
@@ -3818,17 +3878,24 @@ static int becore_scaler_phase_value(u32 reg, u32 *value)
 }
 
 /*
- * BT.601 as exact rationals, column-major by input channel. Kr is 299/1000 and
- * Kb 114/1000; the chroma rows are those over 2 * (1 - Kb) and 2 * (1 - Kr),
- * whose denominators are 1772 and 1402.
+ * BT.601 as rationals, column-major by input channel: (Y, U, V) of R, then of
+ * G, then of B. The luma row is Kr, Kg, Kb exactly. The two chroma rows are
+ * the four-decimal values the vendor's own defaults carry rather than
+ * Kr / (2 * (1 - Kb)) and its relatives in full, and that is not cosmetic: at
+ * Q13 the two forms agree in all nine coefficients, so the block this table
+ * was written for cannot tell them apart, but the Q14 copy in YUVP can, and
+ * the exact form misses two of its nine. The constants are Lyric's own, from
+ * SetDefaultTuning(RgbYuvConversionTuning *) in liblyric_iq.so, whose float
+ * array reads 0.299, 0.587, 0.114, -0.1687, -0.3313, 0.5, 0.5, -0.4187,
+ * -0.0813.
  */
 static const struct becore_csc_coefficient {
 	s32 numerator;
 	s32 denominator;
 } becore_csc_matrix[3][3] = {
-	{ { 299, 1000 }, { -299, 1772 }, { 1, 2 } },
-	{ { 587, 1000 }, { -587, 1772 }, { -587, 1402 } },
-	{ { 114, 1000 }, { 1, 2 }, { -114, 1402 } },
+	{ { 299, 1000 }, { -1687, 10000 }, { 1, 2 } },
+	{ { 587, 1000 }, { -3313, 10000 }, { -4187, 10000 } },
+	{ { 114, 1000 }, { 1, 2 }, { -813, 10000 } },
 };
 
 /*
@@ -3951,6 +4018,81 @@ static int becore_yuvp_yuv2rgb_value(u32 offset, u32 *value)
 		*value = becore_csc_coefficient(&minus_half,
 						BECORE_YUVP_YUV2RGB_Q,
 						BECORE_YUVP_YUV2RGB_OFFSET_MASK);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/* The 4:2:0 converter, by offset from BECORE_YUVP_CSC420_BASE. */
+static int becore_yuvp_csc420_value(u32 offset, u32 *value)
+{
+	static const struct becore_csc_coefficient half = { 1, 2 };
+	u32 index;
+
+	if (offset & 3)
+		return -EINVAL;
+	if (offset >= 0x04 && offset < 0x28) {
+		index = (offset - 0x04) / 4;
+		*value = becore_csc_coefficient(&becore_csc_matrix[index / 3]
+								  [index % 3],
+						BECORE_YUVP_CSC420_Q,
+						BECORE_YUVP_CSC420_FIELD_MASK);
+		return 0;
+	}
+
+	switch (offset) {
+	case 0x00:		/* CTRL: not bypassed, and the output is 10-bit */
+		*value = BECORE_YUVP_CSC420_CTRL_OUT10;
+		return 0;
+	case 0x28:		/* YMIN */
+	case 0x30:		/* UMIN */
+	case 0x38:		/* VMIN */
+	case 0x44:		/* YOS: full range puts luma's offset at zero */
+		*value = 0;
+		return 0;
+	case 0x2c:		/* YMAX */
+	case 0x34:		/* UMAX */
+	case 0x3c:		/* VMAX */
+		*value = BECORE_YUVP_CSC420_MAX;
+		return 0;
+	case 0x40:		/* LS */
+		*value = BECORE_YUVP_CSC420_LS;
+		return 0;
+	case 0x48:		/* UOS */
+	case 0x4c:		/* VOS: half scale at this block's own Q */
+		*value = becore_csc_coefficient(&half,
+						BECORE_YUVP_CSC420_Q,
+						BECORE_YUVP_CSC420_LIMIT_MASK);
+		return 0;
+	case 0x50:		/* UV_COEFF */
+		*value = BECORE_YUVP_CSC420_UV_COEFF;
+		return 0;
+	case 0x54:		/* UV_ORDER: U first */
+		*value = 0;
+		return 0;
+	case 0xa0:		/* VER_SAMPLING_POSITION */
+		*value = BECORE_YUVP_CSC420_VER_SAMPLING;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/*
+ * The dither the 10-bit output needs, and the only thing that turns it on.
+ * Both words come out of the 4:2:0 converter's own translator, which enables
+ * the dither exactly when the output is narrower than the input -- here a
+ * 14-bit accumulate feeding a 10-bit frame.
+ */
+static int becore_yuvp_dither420_value(u32 offset, u32 *value)
+{
+	switch (offset) {
+	case 0x00:		/* BYPASS: the block runs */
+		*value = 0;
+		return 0;
+	case 0x04:		/* CONTROL */
+		*value = 1;
 		return 0;
 	}
 
@@ -4637,6 +4779,17 @@ static int becore_generated_value(const struct becore_device *becore,
 					   BECORE_YUVP_YUV2RGB_ZUMA_BASE :
 					   BECORE_YUVP_YUV2RGB_BASE),
 				    &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_CSC420:
+			if (becore_yuvp_csc420_value(reg -
+						     BECORE_YUVP_CSC420_BASE,
+						     &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_DITHER420:
+			if (becore_yuvp_dither420_value(
+				    reg - BECORE_YUVP_DITHER420_BASE, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_SCALER_PHASE:

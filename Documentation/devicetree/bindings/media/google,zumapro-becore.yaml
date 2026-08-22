@@ -137,6 +137,20 @@ properties:
     description:
       Shared IOMMU group object used by the Samsung System MMU v9 driver.
 
+  samsung,iommu-identity-map:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 8
+    items:
+      minItems: 2
+      maxItems: 2
+    description:
+      Address/size pairs that have to be mapped one-to-one in this device's
+      IOMMU domain.  A VOTF producer signals its consumer by writing to a
+      register inside the consumer's C2SERV window, at an address the hardware
+      derives from the consumer's IP ID rather than one anybody allocated, and
+      that write reaches the System MMU as ordinary DMA.
+
 required:
   - compatible
   - reg
@@ -208,5 +222,6 @@ examples:
         iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>,
                  <&sysmmu_gdc>, <&sysmmu_mcsc>;
         samsung,iommu-group = <&iommu_group_isp>;
+        samsung,iommu-identity-map = <0x1c86d000 0x3000>, <0x1d05d000 0x3000>;
     };
 ...

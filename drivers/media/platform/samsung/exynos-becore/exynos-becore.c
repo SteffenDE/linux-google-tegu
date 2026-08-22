@@ -167,6 +167,34 @@ static const u32 becore_c2serv_trs_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
 };
 
 /*
+ * A debug override, or the captured value when none is set.  The link this
+ * driver invents has no encoded program to check it against, so its geometry
+ * has to be swept against what the fabric reports -- and a sweep that needs a
+ * rebuild for every point is a sweep nobody finishes.
+ */
+static u32 becore_c2serv_override(u32 requested, u32 captured)
+{
+	return requested ? requested : captured;
+}
+
+/*
+ * Plane 1 keeps the captured link's ratio to plane 0 rather than being set on
+ * its own: 12 and 4 on the producer, 64 and 32 on the consumer.  The two
+ * ratios differ because TNR's entry in the vendor's parameter table carries
+ * sixteen extra lines on the luma plane and none on the chroma one.
+ */
+static u32 becore_c2serv_token(u32 requested, const u32 *captured,
+			       unsigned int plane)
+{
+	if (!requested)
+		return captured[plane];
+	if (!plane)
+		return requested;
+
+	return max(1u, requested * captured[plane] / captured[0]);
+}
+
+/*
  * How far the producer may run ahead, in tokens.  The vendor writes 1 on
  * every endpoint of every captured link; Samsung's own driver writes 0xff and
  * leans on a token of 1 instead.  Either way the ring is tens of lines.
@@ -1532,6 +1560,17 @@ static const struct becore_mcsc_dma_profile becore_mcsc_input = {
 	.enable = 1,
 };
 
+#define BECORE_MCSC_INPUT_VOTF_STALL_LINES	GENMASK_U32(29, 16)
+
+static u32 becore_mcsc_votf_enable(u32 requested_token)
+{
+	u32 token = becore_c2serv_token(requested_token,
+					becore_c2serv_trs_lines_in_token, 0);
+
+	return FIELD_PREP(BECORE_MCSC_INPUT_VOTF_STALL_LINES, token) | 1;
+}
+
+
 static const struct becore_mcsc_dma_profile becore_mcsc_output = {
 	.width = 4000,
 	.height = 3000,
@@ -1856,6 +1895,18 @@ struct becore_c2serv_state {
 	u32 ring_enable;
 	u32 local_ip;
 	u32 reset_enables;
+};
+
+/*
+ * The link's own registers, kept apart from the window state on purpose: a
+ * one-shot suspends as soon as it finishes, and tearing the windows down
+ * would otherwise erase the sample taken from a run that had just failed --
+ * which is the only thing that says why.  Nothing clears this but the next
+ * sample.
+ */
+struct becore_c2serv_link_state {
+	bool sampled;
+	bool after_run;
 	struct becore_c2serv_tws_state tws[BECORE_C2SERV_LINK_PLANES];
 	struct becore_c2serv_trs_state trs[BECORE_C2SERV_LINK_PLANES];
 };
@@ -1872,6 +1923,7 @@ struct becore_device {
 	void __iomem *sysreg_mcsc;
 	void __iomem *c2serv[BECORE_NUM_C2SERV];
 	struct becore_c2serv_state c2serv_state[BECORE_NUM_C2SERV];
+	struct becore_c2serv_link_state c2serv_link;
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
 	struct media_device mdev;
@@ -1949,6 +2001,14 @@ struct becore_device {
 	u32 active_input_profile;
 	u32 output_profile;
 	u32 active_output_profile;
+	/* Debug switch: carry YUVP into MCSC over the fabric, not through DRAM. */
+	u32 votf;
+	/* Debug geometry: zero means the captured value.  Plane 0; see below. */
+	u32 votf_tws_limit;
+	u32 votf_trs_limit;
+	u32 votf_tws_token;
+	u32 votf_trs_token;
+	bool active_votf;
 	u32 mcsc_completed_generation;
 	u32 mcsc_completed_output_size;
 	enum becore_mcsc_input_transport mcsc_encoded_transport;
@@ -2831,7 +2891,8 @@ static int becore_mcsc_djag_origin(u32 *x, u32 *y)
 
 static int
 becore_mcsc_dma_value(u32 index, u32 reg,
-		      enum becore_mcsc_input_transport transport, u32 *value)
+		      enum becore_mcsc_input_transport transport,
+		      u32 requested_token, u32 *value)
 {
 	if (index >= BECORE_MCSC_DMA_WORD_COUNT ||
 	    reg != becore_mcsc_dma_regs[index])
@@ -2841,8 +2902,17 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 
 	switch (index) {
 	case BECORE_MCSC_INPUT_VOTF:
+		/*
+		 * Bit 0 enables the transport and bits 29:16 say how many
+		 * lines the RDMA will stall for, which has to be the same
+		 * number as its C2SERV endpoint's token or the block and the
+		 * fabric are waiting for different things.  The captured word
+		 * is 0x00400001 and the captured consumer token is 64, which
+		 * is what says the two are the same field; generating it keeps
+		 * them that way when the token is swept.
+		 */
 		*value = transport == BECORE_MCSC_INPUT_MEMORY ? 0 :
-			 becore_mcsc_input.votf_enable;
+			 becore_mcsc_votf_enable(requested_token);
 		break;
 	case BECORE_MCSC_INPUT_FORMAT:
 		*value = becore_mcsc_input.data_format;
@@ -5548,7 +5618,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 				reg = shape->pair_registers[word / 2];
 				if (becore_mcsc_dma_value(typed_count, reg,
 							  BECORE_MCSC_INPUT_CAPTURED_VOTF,
-							  NULL))
+							  0, NULL))
 					return -EINVAL;
 				typed_count++;
 			}
@@ -5630,6 +5700,7 @@ becore_encode_mcsc(struct becore_device *becore,
 			if (shape->typed_mask & BIT(word)) {
 				reg = shape->pair_registers[word / 2];
 				if (becore_mcsc_dma_value(typed_count, reg, transport,
+							  becore->votf_trs_token,
 							  &value))
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
@@ -6035,6 +6106,121 @@ static void becore_c2serv_read_trs(struct becore_device *becore,
  * resume happens before any run has chosen a profile.  Per frame is also
  * where the vendor programs a link.
  */
+/*
+ * Light the link up, and put it out again.  Order matters at the moment it
+ * goes live: geometry first, then the four endpoints, then the ring, and the
+ * consumer's ring before the producer's so the receiver is listening before
+ * anything can be sent.  The vendor never has to choose, because its ring is
+ * up from stream setup and only the enables move per frame; this driver
+ * cannot do that, because a live ring with YUVP's WDMA asking for VOTF and
+ * nothing to answer it faults the frame.
+ *
+ * Stopping is the mirror, and it happens after every run whether the run
+ * worked or not.  The vendor leaves a link standing between frames and only
+ * clears the latched lost-connection bit; this takes it down each time, so
+ * that the fabric is quiet whenever a run is not in progress and a failure
+ * cannot leak into the next frame or into a run that is not using it.  That
+ * is worth the dozen writes until the link is trusted.
+ */
+static void becore_c2serv_link_start(struct becore_device *becore)
+{
+	void __iomem *tws_base = becore->c2serv[BECORE_C2SERV_YUVP];
+	void __iomem *trs_base = becore->c2serv[BECORE_C2SERV_MCSC];
+	unsigned int n;
+
+	/* The latched status is per connection, so clear it per run. */
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++)
+		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
+				  BECORE_C2SERV_TRS_LOST_CONNECTION);
+
+	/*
+	 * Ring first, endpoints second, consumer before producer.  This is the
+	 * vendor's steady state -- its ring is up from stream setup and only
+	 * the enables move per frame -- and the order is load-bearing: an
+	 * endpoint enabled onto a stopped ring never exchanges the credit that
+	 * lets the producer emit its first token, and both sides then wait for
+	 * ever.  Enabling onto a running ring is safe here because no endpoint
+	 * carries a destination until the link above programmed one, and
+	 * because the blocks have not been started yet.
+	 */
+	writel_relaxed(1, trs_base + BECORE_C2SERV_RING_CLK_EN);
+	writel_relaxed(1, trs_base + BECORE_C2SERV_RING_ENABLE);
+	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_CLK_EN);
+	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_ENABLE);
+
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
+				  BECORE_C2SERV_TRS_ENABLE);
+		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
+				  BECORE_C2SERV_TWS_ENABLE);
+	}
+}
+
+static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
+{
+	void __iomem *tws_base = becore->c2serv[BECORE_C2SERV_YUVP];
+	void __iomem *trs_base = becore->c2serv[BECORE_C2SERV_MCSC];
+	unsigned int n;
+
+	/*
+	 * Flush before anything else, which is the vendor's order and matters
+	 * for a stalled link: a flush is what abandons the tokens in flight,
+	 * and taking the ring away first leaves both blocks waiting on a
+	 * fabric that has stopped answering -- after which neither they nor
+	 * their C2SERV windows will reset, and the device is out of use until
+	 * the next boot.
+	 */
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
+				  BECORE_C2SERV_TWS_FLUSH);
+		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
+				  BECORE_C2SERV_TRS_FLUSH);
+	}
+
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		writel_relaxed(0, tws_base + BECORE_C2SERV_TWS(n) +
+				  BECORE_C2SERV_TWS_ENABLE);
+		writel_relaxed(0, trs_base + BECORE_C2SERV_TRS(n) +
+				  BECORE_C2SERV_TRS_ENABLE);
+	}
+
+	writel_relaxed(0, tws_base + BECORE_C2SERV_RING_CLK_EN);
+	writel_relaxed(0, tws_base + BECORE_C2SERV_RING_ENABLE);
+	writel_relaxed(0, trs_base + BECORE_C2SERV_RING_CLK_EN);
+	writel_relaxed(0, trs_base + BECORE_C2SERV_RING_ENABLE);
+
+	/*
+	 * A run that failed may have left an endpoint mid-token, and a flush
+	 * is only documented to empty the DMA.  Reset both windows so that
+	 * whatever went wrong cannot be inherited by the next frame -- there
+	 * is no resume between the frames of a stream to do it for us.  The
+	 * blocks themselves are reset by the failure path that follows.
+	 */
+	if (failed) {
+		becore_c2serv_reset(becore, BECORE_C2SERV_YUVP);
+		becore_c2serv_reset(becore, BECORE_C2SERV_MCSC);
+		becore_c2serv_disable_endpoints(becore, BECORE_C2SERV_YUVP);
+		becore_c2serv_disable_endpoints(becore, BECORE_C2SERV_MCSC);
+	}
+}
+
+/* What the fabric had to say, sampled while the link is still standing. */
+static void becore_c2serv_link_sample(struct becore_device *becore,
+				      bool after_run)
+{
+	struct becore_c2serv_link_state *link = &becore->c2serv_link;
+	unsigned int n;
+
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		becore_c2serv_read_tws(becore, BECORE_C2SERV_YUVP, n,
+				       &link->tws[n]);
+		becore_c2serv_read_trs(becore, BECORE_C2SERV_MCSC, n,
+				       &link->trs[n]);
+	}
+	link->sampled = true;
+	link->after_run = after_run;
+}
+
 static void becore_c2serv_program_link(struct becore_device *becore)
 {
 	const struct becore_yuvp_output_profile *profile =
@@ -6046,6 +6232,10 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 	void __iomem *tws_base = becore->c2serv[BECORE_C2SERV_YUVP];
 	void __iomem *trs_base = becore->c2serv[BECORE_C2SERV_MCSC];
 	u16 consumer_ip = becore_c2serv[BECORE_C2SERV_MCSC].local_ip;
+	u32 tws_limit = becore_c2serv_override(becore->votf_tws_limit,
+					       BECORE_C2SERV_LIMIT);
+	u32 trs_limit = becore_c2serv_override(becore->votf_trs_limit,
+					       BECORE_C2SERV_LIMIT);
 	unsigned int n;
 
 	if (!producer->ready || !consumer->ready)
@@ -6057,26 +6247,26 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 		u32 lines = n ? DIV_ROUND_UP(profile->height, 2) :
 				profile->height;
 
-		writel_relaxed(BECORE_C2SERV_LIMIT,
-			       tws + BECORE_C2SERV_TWS_LIMIT);
+		u32 tws_token = becore_c2serv_token(becore->votf_tws_token,
+					becore_c2serv_tws_lines_in_token, n);
+		u32 trs_token = becore_c2serv_token(becore->votf_trs_token,
+					becore_c2serv_trs_lines_in_token, n);
+
+		writel_relaxed(tws_limit, tws + BECORE_C2SERV_TWS_LIMIT);
 		writel_relaxed(BECORE_C2SERV_DEST(consumer_ip, n),
 			       tws + BECORE_C2SERV_TWS_DEST);
-		writel_relaxed(becore_c2serv_tws_lines_in_token[n],
+		writel_relaxed(tws_token,
 			       tws + BECORE_C2SERV_TWS_LINES_IN_TOKEN);
 
-		writel_relaxed(BECORE_C2SERV_LIMIT,
-			       trs + BECORE_C2SERV_TRS_LIMIT);
-		writel_relaxed(becore_c2serv_trs_lines_in_token[n],
+		writel_relaxed(trs_limit, trs + BECORE_C2SERV_TRS_LIMIT);
+		writel_relaxed(trs_token,
 			       trs + BECORE_C2SERV_TRS_LINES_IN_FIRST_TOKEN);
-		writel_relaxed(becore_c2serv_trs_lines_in_token[n],
+		writel_relaxed(trs_token,
 			       trs + BECORE_C2SERV_TRS_LINES_IN_TOKEN);
 		writel_relaxed(lines, trs + BECORE_C2SERV_TRS_LINES_COUNT);
-
-		becore_c2serv_read_tws(becore, BECORE_C2SERV_YUVP, n,
-				       &producer->tws[n]);
-		becore_c2serv_read_trs(becore, BECORE_C2SERV_MCSC, n,
-				       &consumer->trs[n]);
 	}
+
+	becore_c2serv_link_sample(becore, false);
 }
 
 /*
@@ -7587,6 +7777,8 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 			    struct vb2_buffer *capture, bool packed_output,
 			    bool run_mcsc)
 {
+	bool use_votf;
+
 	unsigned long flags;
 	bool diagnostic_output = !capture;
 	bool input_claimed = false;
@@ -7706,6 +7898,24 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	becore_c2serv_program_link(becore);
 
 	/*
+	 * The fabric needs all three blocks in one stage, both endpoints
+	 * transported over it, and both windows ready.  A consumer that ran
+	 * after the producer finished could not drain a ring the producer is
+	 * filling, so with a limit of one token the producer would stall at
+	 * the first one -- which is why this is a single switch and not three.
+	 *
+	 * It is resolved here rather than with the rest of the run's shape
+	 * because readiness is a property of the resume just above: a one-shot
+	 * arrives with its windows torn down, and only becomes able to use the
+	 * fabric once it has powered the block back up.
+	 */
+	use_votf = run_mcsc && READ_ONCE(becore->votf) &&
+		   output_profile == BECORE_YUVP_OUTPUT_SBWCL &&
+		   becore->c2serv_state[BECORE_C2SERV_YUVP].ready &&
+		   becore->c2serv_state[BECORE_C2SERV_MCSC].ready;
+	becore->active_votf = use_votf;
+
+	/*
 	 * Take this frame's parameters immediately before it is encoded: past
 	 * every refusal above, so a buffer is never spent on a frame that does
 	 * not happen, and before the encoder reads them, so a buffer queued for
@@ -7720,11 +7930,15 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	if (ret)
 		goto put_power;
 	if (run_mcsc) {
-		ret = becore_encode_mcsc(becore, BECORE_MCSC_INPUT_MEMORY);
+		enum becore_mcsc_input_transport transport = use_votf ?
+			BECORE_MCSC_INPUT_CAPTURED_VOTF :
+			BECORE_MCSC_INPUT_MEMORY;
+
+		ret = becore_encode_mcsc(becore, transport);
 		if (ret)
 			goto put_power;
 		becore->mcsc_encoded_generation = becore->mcsc_recipe_generation;
-		becore->mcsc_encoded_transport = BECORE_MCSC_INPUT_MEMORY;
+		becore->mcsc_encoded_transport = transport;
 	}
 	mark = becore_timing_mark(phase_ns, BECORE_TIMING_ENCODE, mark);
 
@@ -7772,11 +7986,27 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		becore->run_input->cpu_dirty = false;
 	}
 	mark = becore_timing_mark(phase_ns, BECORE_TIMING_ARM, mark);
-	ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS);
-	mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
-	if (!ret && run_mcsc) {
-		ret = becore_run_stage(becore, BIT(BECORE_MCSC));
-		mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE2, mark);
+	if (use_votf) {
+		/*
+		 * One stage, because the two halves of a VOTF link have to be
+		 * running at the same time.  becore_run_stage() already starts
+		 * every block in the mask together and waits for all their
+		 * frame-ends, so the whole of what this needs already exists.
+		 */
+		becore_c2serv_link_start(becore);
+		ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS |
+					       BIT(BECORE_MCSC));
+		becore_c2serv_link_sample(becore, true);
+		becore_c2serv_link_stop(becore, ret);
+		mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
+	} else {
+		ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS);
+		mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
+		if (!ret && run_mcsc) {
+			ret = becore_run_stage(becore, BIT(BECORE_MCSC));
+			mark = becore_timing_mark(phase_ns,
+						  BECORE_TIMING_STAGE2, mark);
+		}
 	}
 
 	/* A failed run's CRCs say how far the stream got, so read them too. */
@@ -8561,7 +8791,11 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   READ_ONCE(becore->output_profile),
 		   becore->active_output_profile);
 	seq_printf(s, "active_path      %s\n",
-		   becore->active_mcsc ? "YUVP-memory-to-MCSC" : "YUVP");
+		   !becore->active_mcsc ? "YUVP" :
+		   becore->active_votf ? "YUVP-votf-to-MCSC" :
+					 "YUVP-memory-to-MCSC");
+	seq_printf(s, "votf             %u requested, %u active\n",
+		   READ_ONCE(becore->votf), becore->active_votf);
 	becore_status_program(s, "rgbp_cmdq", &becore->program[BECORE_RGBP]);
 	becore_status_program(s, "yuvp_cmdq", &becore->program[BECORE_YUVP]);
 	seq_printf(s, "gtnr_output      %zu bytes, iova %pad\n",
@@ -8574,7 +8808,6 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	for (i = 0; i < BECORE_NUM_C2SERV; i++) {
 		const struct becore_c2serv_state *c2serv =
 			&becore->c2serv_state[i];
-		u32 n;
 
 		seq_printf(s,
 			   "votf_%-11s %s, ring_clk %#x, ring %#x, local_ip %#010x, named %#06x, reset_enables %#010x\n",
@@ -8584,28 +8817,27 @@ static int becore_status_show(struct seq_file *s, void *unused)
 			   c2serv->local_ip, becore_c2serv[i].local_ip,
 			   c2serv->reset_enables);
 
-		if (i == BECORE_C2SERV_YUVP)
-			for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++)
-				seq_printf(s,
-					   "  tws%u            enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
-					   n, c2serv->tws[n].enable,
-					   c2serv->tws[n].limit,
-					   c2serv->tws[n].dest,
-					   c2serv->tws[n].lines_in_token,
-					   c2serv->tws[n].busy,
-					   c2serv->tws[n].fullness);
+	}
 
-		if (i == BECORE_C2SERV_MCSC)
-			for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++)
-				seq_printf(s,
-					   "  trs%u            enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
-					   n, c2serv->trs[n].enable,
-					   c2serv->trs[n].limit,
-					   c2serv->trs[n].lines_in_first_token,
-					   c2serv->trs[n].lines_in_token,
-					   c2serv->trs[n].lines_count,
-					   c2serv->trs[n].busy,
-					   c2serv->trs[n].lost_connection);
+	if (becore->c2serv_link.sampled) {
+		const struct becore_c2serv_link_state *link = &becore->c2serv_link;
+
+		seq_printf(s, "votf_link        sampled %s a run\n",
+			   link->after_run ? "after" : "before");
+		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
+			seq_printf(s,
+				   "  tws%u            enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
+				   i, link->tws[i].enable, link->tws[i].limit,
+				   link->tws[i].dest, link->tws[i].lines_in_token,
+				   link->tws[i].busy, link->tws[i].fullness);
+		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
+			seq_printf(s,
+				   "  trs%u            enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
+				   i, link->trs[i].enable, link->trs[i].limit,
+				   link->trs[i].lines_in_first_token,
+				   link->trs[i].lines_in_token,
+				   link->trs[i].lines_count,
+				   link->trs[i].busy, link->trs[i].lost_connection);
 	}
 	seq_printf(s, "intcam           %lu Hz (saved %lu, raised %u)\n",
 		   clk_get_rate(becore->intcam_clk),
@@ -9575,6 +9807,15 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_override_fops);
 	debugfs_create_u32("input_profile", 0644, dir,
 			   &becore->input_profile);
+	debugfs_create_u32("votf", 0644, dir, &becore->votf);
+	debugfs_create_u32("votf_tws_limit", 0644, dir,
+			   &becore->votf_tws_limit);
+	debugfs_create_u32("votf_trs_limit", 0644, dir,
+			   &becore->votf_trs_limit);
+	debugfs_create_u32("votf_tws_token", 0644, dir,
+			   &becore->votf_tws_token);
+	debugfs_create_u32("votf_trs_token", 0644, dir,
+			   &becore->votf_trs_token);
 	debugfs_create_u32("output_profile", 0644, dir,
 			   &becore->output_profile);
 	debugfs_create_file("output", 0400, dir, becore, &becore_output_fops);

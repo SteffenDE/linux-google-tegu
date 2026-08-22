@@ -4110,6 +4110,16 @@
 		 * domains and GDC's System MMU are dependencies even though the first
 		 * offline path only submits RGBP and YUVP programs.  Keep the complete
 		 * complex passive until the board opts into the lifecycle driver.
+		 *
+		 * The last three windows are the C2SERV instances of the VOTF fabric,
+		 * which carries a frame between two blocks in line-sized tokens
+		 * instead of through a full-frame buffer in DRAM.  Each processor
+		 * owning a VOTF endpoint has its own 64 KB C2SERV window inside its
+		 * own power domain; seven exist across the camera complex, and these
+		 * are the three belonging to blocks this node already owns.  A window
+		 * identifies itself by writing its local IP ID -- the top 16 bits of
+		 * its own base address -- to C2COM_LOCAL_IP, which is how a producer
+		 * names its consumer.
 		 */
 		becore: camera@1c440000 {
 			compatible = "google,zumapro-becore";
@@ -4132,14 +4142,18 @@
 			      <0x1d144000 0xe00>,
 			      <0x1d154000 0xe00>,
 			      <0x1d164000 0xe00>,
-			      <0x1d020400 0x4>;
+			      <0x1d020400 0x4>,
+			      <0x1c460000 0x10000>,
+			      <0x1c860000 0x10000>,
+			      <0x1d050000 0x10000>;
 			reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp",
 				    "ssmt-yuvp", "sysreg-rgbp", "ssmt-mcfp0",
 				    "ssmt-mcfp1", "ssmt-mcfp2", "ssmt-mcfp3",
 				    "ssmt-mcfp4", "mcsc", "ssmt-mcsc0",
 				    "ssmt-mcsc1", "ssmt-mcsc2", "ssmt-mcsc3",
 				    "ssmt-mcsc4", "ssmt-mcsc5", "ssmt-mcsc6",
-				    "sysreg-mcsc";
+				    "sysreg-mcsc", "rgbp-c2serv", "yuvp-c2serv",
+				    "mcsc-c2serv";
 			interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,

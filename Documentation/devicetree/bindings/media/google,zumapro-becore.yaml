@@ -17,6 +17,11 @@ description:
   power domain, which is consequently a dependency even when GDC receives no
   per-frame program.
 
+  Each processor that owns an endpoint of the VOTF fabric -- which carries a
+  frame between two blocks in line-sized tokens rather than through a full-frame
+  buffer in DRAM -- also owns a C2SERV register window, located in that
+  processor's own power domain.
+
 properties:
   compatible:
     const: google,zumapro-becore
@@ -43,6 +48,9 @@ properties:
       - description: MCSC system memory stream-attribute mapper D5
       - description: MCSC system memory stream-attribute mapper D6
       - description: MCSC system register controlling internal routing
+      - description: RGBP VOTF C2SERV instance
+      - description: YUVP VOTF C2SERV instance
+      - description: MCSC VOTF C2SERV instance
 
   reg-names:
     items:
@@ -66,6 +74,9 @@ properties:
       - const: ssmt-mcsc5
       - const: ssmt-mcsc6
       - const: sysreg-mcsc
+      - const: rgbp-c2serv
+      - const: yuvp-c2serv
+      - const: mcsc-c2serv
 
   interrupts:
     items:
@@ -167,13 +178,17 @@ examples:
               <0x1d144000 0xe00>,
               <0x1d154000 0xe00>,
               <0x1d164000 0xe00>,
-              <0x1d020400 0x4>;
+              <0x1d020400 0x4>,
+              <0x1c460000 0x10000>,
+              <0x1c860000 0x10000>,
+              <0x1d050000 0x10000>;
         reg-names = "rgbp", "mcfp", "yuvp", "ssmt-rgbp", "ssmt-yuvp",
                     "sysreg-rgbp", "ssmt-mcfp0", "ssmt-mcfp1",
                     "ssmt-mcfp2", "ssmt-mcfp3", "ssmt-mcfp4", "mcsc",
                     "ssmt-mcsc0", "ssmt-mcsc1", "ssmt-mcsc2",
                     "ssmt-mcsc3", "ssmt-mcsc4", "ssmt-mcsc5",
-                    "ssmt-mcsc6", "sysreg-mcsc";
+                    "ssmt-mcsc6", "sysreg-mcsc", "rgbp-c2serv",
+                    "yuvp-c2serv", "mcsc-c2serv";
         interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,

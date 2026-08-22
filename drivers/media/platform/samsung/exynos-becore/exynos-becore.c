@@ -143,20 +143,6 @@
 #define BECORE_C2SERV_WRAPPER		0xd304
 #define BECORE_C2SERV_WRAPPER_CONNECT	0x8
 
-/*
- * Candidates for the connection that only ever half forms, each switchable on
- * its own so a boot can bisect them.  All off by default.
- *
- * WRAPPER_LIVE re-issues the wrapper write once the ring is running.  This
- * driver programs a link with the ring stopped and starts it afterwards,
- * where the vendor's ring has been up since stream setup, so every wrapper
- * write it makes lands on a live ring and ours never do.
- *
- * TRS_RECOVER sets the consumer's connection-lost recovery bit, which Pablo
- * sets on every link and neither the vendor's stream nor this driver does.
- */
-#define BECORE_VOTF_FIX_WRAPPER_LIVE	BIT(0)
-#define BECORE_VOTF_FIX_TRS_RECOVER	BIT(1)
 
 /*
  * A window will say what state one endpoint's connection is in: select the
@@ -2060,15 +2046,18 @@ struct becore_device {
 	u32 active_input_profile;
 	u32 output_profile;
 	u32 active_output_profile;
-	/* Debug switch: carry YUVP into MCSC over the fabric, not through DRAM. */
+	/*
+	 * Carry YUVP into MCSC over the fabric rather than through DRAM.  On
+	 * by default; clearing it puts the frame back through memory, which
+	 * is a slower path that is otherwise identical and is worth keeping
+	 * as the thing to compare a result against.
+	 */
 	u32 votf;
 	/* Debug geometry: zero means the captured value, per plane. */
 	u32 votf_tws_limit;
 	u32 votf_trs_limit;
 	u32 votf_tws_token[BECORE_C2SERV_LINK_PLANES];
 	u32 votf_trs_token[BECORE_C2SERV_LINK_PLANES];
-	/* Bisectable candidates for the connection that only half forms. */
-	u32 votf_fixes;
 	bool active_votf;
 	u32 mcsc_completed_generation;
 	u32 mcsc_completed_output_size;
@@ -6222,20 +6211,6 @@ static void becore_c2serv_link_start(struct becore_device *becore)
 	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_CLK_EN);
 	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_ENABLE);
 
-	/*
-	 * The vendor's wrapper writes always land on a ring that has been up
-	 * since stream setup; ours are made with it stopped, because the ring
-	 * cannot be started before the link exists.  Offering them again here
-	 * costs two writes and is the cheapest way to find out whether that
-	 * difference matters.
-	 */
-	if (becore->votf_fixes & BECORE_VOTF_FIX_WRAPPER_LIVE) {
-		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
-			       trs_base + BECORE_C2SERV_WRAPPER);
-		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
-			       tws_base + BECORE_C2SERV_WRAPPER);
-	}
-
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
 		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
 				  BECORE_C2SERV_TRS_ENABLE);
@@ -6379,8 +6354,6 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 		writel_relaxed(1, trs + BECORE_C2SERV_TRS_LOST_CONNECTION);
 		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
 			       trs_base + BECORE_C2SERV_WRAPPER);
-		if (becore->votf_fixes & BECORE_VOTF_FIX_TRS_RECOVER)
-			writel_relaxed(1, trs + BECORE_C2SERV_TRS_RECOVER);
 		writel_relaxed(trs_limit, trs + BECORE_C2SERV_TRS_LIMIT);
 		writel_relaxed(trs_token,
 			       trs + BECORE_C2SERV_TRS_LINES_IN_FIRST_TOKEN);
@@ -9973,7 +9946,6 @@ static int becore_debugfs_init(struct becore_device *becore)
 			   &becore->votf_trs_token[0]);
 	debugfs_create_u32("votf_trs_token_uv", 0644, dir,
 			   &becore->votf_trs_token[1]);
-	debugfs_create_u32("votf_fixes", 0644, dir, &becore->votf_fixes);
 	debugfs_create_u32("output_profile", 0644, dir,
 			   &becore->output_profile);
 	debugfs_create_file("output", 0400, dir, becore, &becore_output_fops);
@@ -10030,6 +10002,7 @@ static int becore_probe(struct platform_device *pdev)
 	becore->mcsc_output_first_changed = U32_MAX;
 	becore->active_input_profile = BECORE_RGBP_INPUT_SBWC;
 	becore->active_output_profile = BECORE_YUVP_OUTPUT_SBWCL;
+	becore->votf = 1;
 	becore->active_output_size = becore_active_output_size(becore);
 	becore->active_capture_size = becore_mcsc_output_active_size();
 	becore->blocks[BECORE_RGBP] = (struct becore_block) {

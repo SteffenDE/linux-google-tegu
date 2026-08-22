@@ -18,17 +18,20 @@
  *	:c:type:`exynos_becore_params_ccm`
  * @EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE: The local tone mapper's guide curve,
  *	:c:type:`exynos_becore_params_ltm_curve`
+ * @EXYNOS_BECORE_PARAM_BLOCK_CLUT: The colour LUT's chroma lattice,
+ *	:c:type:`exynos_becore_params_clut`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
- * Both of these are per-frame results of an algorithm rather than a per-module
- * calibration: the matrix comes from white balance and the curve from the
- * exposure estimate, and both change frame to frame in a moving scene. What
- * they do *not* carry is a register address or a program: userspace supplies
- * values in the units the block is specified in, and the driver encodes them.
+ * None of these is anything the kernel could know: the matrix is white
+ * balance's own output, the curve is the exposure estimate's, and the lattice
+ * comes from a tuning tree indexed by the illuminant estimate. What none of
+ * them carries is a register address or a program: userspace supplies values
+ * in the units the block is specified in, and the driver encodes them.
  */
 enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_CCM = 0,
 	EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE,
+	EXYNOS_BECORE_PARAM_BLOCK_CLUT,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -90,6 +93,50 @@ struct exynos_becore_params_ltm_curve {
 	__u16 curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
 } __attribute__((aligned(8)));
 
+/* 17 nodes per axis, indexed by RGB, each holding one (U, V) chroma pair. */
+#define EXYNOS_BECORE_CLUT_AXIS_NODES		17
+#define EXYNOS_BECORE_CLUT_NODES \
+	(EXYNOS_BECORE_CLUT_AXIS_NODES * EXYNOS_BECORE_CLUT_AXIS_NODES * \
+	 EXYNOS_BECORE_CLUT_AXIS_NODES)
+
+/*
+ * A sample is clamp(round(f * 1024) + 512) of a signed chroma float, so 512 is
+ * no chroma at all, and the hardware field is ten bits wide.
+ */
+#define EXYNOS_BECORE_CLUT_NEUTRAL		512
+#define EXYNOS_BECORE_CLUT_MAX			1023
+
+/**
+ * struct exynos_becore_params_clut - The colour LUT's chroma lattice
+ *
+ * @header: The parameters block header
+ * @lut_u: One blue-difference sample per node
+ * @lut_v: One red-difference sample per node
+ *
+ * The block converts YUV to RGB, indexes a 17 x 17 x 17 lattice with that RGB
+ * and takes a (U, V) pair out of it; luma is not an output. Nodes walk red
+ * slowest and blue fastest, so node (r, g, b) is at index
+ * ``(r * 17 + g) * 17 + b``.
+ *
+ * A sample is the chroma the block outputs rather than an offset to the chroma
+ * arriving, which is why there is no identity lattice: an all-neutral one
+ * outputs grey rather than leaving the picture alone. Sending no block, or
+ * sending this one with %V4L2_ISP_PARAMS_FL_BLOCK_DISABLE, bypasses the stage
+ * instead -- which is the driver's default, and is what passes the upstream
+ * chroma through untouched.
+ *
+ * No sample may exceed %EXYNOS_BECORE_CLUT_MAX, and both ends of the grey
+ * axis -- node (0, 0, 0) and node (16, 16, 16) -- must be
+ * %EXYNOS_BECORE_CLUT_NEUTRAL in both arrays. Black and white have no hue,
+ * every lattice the vendor ships is neutral at both, and a lattice that is not
+ * is what a stream written one sample out of step looks like.
+ */
+struct exynos_becore_params_clut {
+	struct v4l2_isp_params_block_header header;
+	__u16 lut_u[EXYNOS_BECORE_CLUT_NODES];
+	__u16 lut_v[EXYNOS_BECORE_CLUT_NODES];
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_BECORE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -98,6 +145,7 @@ struct exynos_becore_params_ltm_curve {
  */
 #define EXYNOS_BECORE_PARAMS_MAX_SIZE \
 	(sizeof(struct exynos_becore_params_ccm) + \
-	 sizeof(struct exynos_becore_params_ltm_curve))
+	 sizeof(struct exynos_becore_params_ltm_curve) + \
+	 sizeof(struct exynos_becore_params_clut))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

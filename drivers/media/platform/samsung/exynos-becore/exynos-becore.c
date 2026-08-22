@@ -824,6 +824,32 @@ static_assert((BECORE_YUVP_CCM_OFFSET_LAST - BECORE_YUVP_CCM_OFFSET_FIRST) / 4 +
 	      1 == EXYNOS_BECORE_CCM_OFFSETS);
 
 /*
+ * YUVP's forward GAMMARGB: the creative tone curve, and the grid it is
+ * sampled on.
+ *
+ * It is the same hardware primitive as RGBP's forward gamma one IP upstream
+ * -- 65 knots, two per register with the lower-numbered one low, and a last
+ * knot stored as its distance from the previous one because it would need
+ * 1 << Q exactly -- and it does a completely different job.  RGBP's is a
+ * fixed square-root encode that moves linear light into a gamma domain;
+ * DEGAMMARGB undoes it; this one is where the picture is actually graded, so
+ * its three per-channel tables are policy and belong to userspace.
+ *
+ * The grid does not: it is at Q14 what RGBP's is at Q12, and it says where a
+ * curve is measured rather than what the curve does.  Both it and the green
+ * table have a genuine four-register reserved hole in them, which is why the
+ * ranges below are named rather than strided.
+ */
+#define BECORE_YUVP_GAMMA_BASE		(BECORE_YUVP_PHYS_BASE + 0x4200)
+#define BECORE_YUVP_GAMMA_GATE_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x000)
+#define BECORE_YUVP_GAMMA_GATE_LAST	(BECORE_YUVP_GAMMA_BASE + 0x004)
+#define BECORE_YUVP_GAMMA_X_LOW_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x1c0)
+#define BECORE_YUVP_GAMMA_X_LOW_LAST	(BECORE_YUVP_GAMMA_BASE + 0x1ec)
+#define BECORE_YUVP_GAMMA_X_HIGH_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x200)
+#define BECORE_YUVP_GAMMA_X_HIGH_LAST	(BECORE_YUVP_GAMMA_BASE + 0x250)
+#define BECORE_YUVP_GAMMA_Q		14
+
+/*
  * The tone mapper's guide curve: 128 Q15 samples, two to a register with the
  * lower-numbered one in the low half.  It is the per-frame output of the
  * vendor's tone-mapping node rather than a tuning table -- driven by the
@@ -1233,6 +1259,7 @@ enum becore_generated_kind {
 	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
+	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
 	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
@@ -1264,7 +1291,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	444
+#define BECORE_YUVP_GENERATED_WORDS	479
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1396,6 +1423,12 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_GAMMA_GATE_FIRST, BECORE_YUVP_GAMMA_GATE_LAST,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_X_LOW_FIRST, BECORE_YUVP_GAMMA_X_LOW_LAST,
+	  BECORE_GEN_YUVP_GAMMA },
+	{ BECORE_YUVP_GAMMA_X_HIGH_FIRST, BECORE_YUVP_GAMMA_X_HIGH_LAST,
+	  BECORE_GEN_YUVP_GAMMA },
 	{ BECORE_YUVP_INVCCM33_FIRST, BECORE_YUVP_INVCCM33_LAST,
 	  BECORE_GEN_INVCCM33 },
 	{ BECORE_YUVP_CCM_CONFIG_REG, BECORE_YUVP_CCM_CONFIG_REG,
@@ -4357,6 +4390,91 @@ static int becore_rgbp_gamma_value(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/*
+ * YUVP's tone-curve grid: RGBP's own x grid, four times finer because this
+ * block's values are Q14 where RGBP's are Q12.  One grid serves all three
+ * channels, and the driver states it whether or not a curve has arrived.
+ */
+static int becore_yuvp_gamma_x(u32 index, u32 *x)
+{
+	int ret = becore_rgbp_gamma_knot(index, x);
+
+	if (ret)
+		return ret;
+	*x <<= BECORE_YUVP_GAMMA_Q - BECORE_RGBP_GAMMA_Q;
+
+	return 0;
+}
+
+/* Two points per register, the lower-numbered one in the low half. */
+static int becore_yuvp_gamma_x_pair(u32 index, u32 *value)
+{
+	u32 low;
+	u32 high;
+	int ret;
+
+	ret = becore_yuvp_gamma_x(index, &low);
+	if (ret)
+		return ret;
+	ret = becore_yuvp_gamma_x(index + 1, &high);
+	if (ret)
+		return ret;
+	*value = (high << 16) | low;
+
+	return 0;
+}
+
+/* The 65th point as its distance from the 64th, as a magnitude. */
+static int becore_yuvp_gamma_x_delta(u32 *value)
+{
+	u32 last;
+	u32 prev;
+	int ret;
+
+	ret = becore_yuvp_gamma_x(BECORE_RGBP_GAMMA_KNOTS - 1, &last);
+	if (ret)
+		return ret;
+	ret = becore_yuvp_gamma_x(BECORE_RGBP_GAMMA_KNOTS - 2, &prev);
+	if (ret)
+		return ret;
+	*value = last > prev ? last - prev : prev - last;
+
+	return 0;
+}
+
+/*
+ * The two gates and the grid.  The three per-channel tables between them are
+ * the tone curve itself and are not answered here: they stay whatever the
+ * recipe carries until a parameters block replaces them.
+ */
+static int becore_yuvp_gamma_value(u32 offset, u32 *value)
+{
+	if (offset & 3)
+		return -EINVAL;
+
+	switch (offset) {
+	case 0x000:		/* BYPASS: the block runs */
+	case 0x004:		/* PEDESTAL_EN */
+		*value = 0;
+		return 0;
+	case 0x250:		/* X_PNTS_TBL last-knot delta */
+		return becore_yuvp_gamma_x_delta(value);
+	}
+
+	if (offset >= 0x1c0 && offset <= 0x1ec)
+		return becore_yuvp_gamma_x_pair((offset - 0x1c0) / 4 * 2,
+						value);
+	/*
+	 * The four-register hole between points 23 and 24 is 0x1f0..0x1fc; no
+	 * range covers it, so it is never asked for.
+	 */
+	if (offset >= 0x200 && offset < 0x250)
+		return becore_yuvp_gamma_x_pair((offset - 0x200) / 4 * 2 + 24,
+						value);
+
+	return -EINVAL;
+}
+
 /* The identity itself: out[i] == in[i] << 5 at every knot. */
 static int becore_rgbp_gtm_value(u32 offset, u32 *value)
 {
@@ -4825,6 +4943,12 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_GAMMA:
 			if (becore_rgbp_gamma_value(reg -
 						    BECORE_RGBP_GAMMA_BASE,
+						    &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_YUVP_GAMMA:
+			if (becore_yuvp_gamma_value(reg -
+						    BECORE_YUVP_GAMMA_BASE,
 						    &result))
 				return -EINVAL;
 			break;

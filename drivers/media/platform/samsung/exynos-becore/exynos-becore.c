@@ -2936,13 +2936,16 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 	switch (index) {
 	case BECORE_MCSC_INPUT_VOTF:
 		/*
-		 * Bit 0 enables the transport and bits 29:16 say how many
-		 * lines the RDMA will stall for, which has to be the same
-		 * number as its C2SERV endpoint's token or the block and the
-		 * fabric are waiting for different things.  The captured word
-		 * is 0x00400001 and the captured consumer token is 64, which
-		 * is what says the two are the same field; generating it keeps
-		 * them that way when the token is swept.
+		 * Lyric builds this word two ways, and which one depends on
+		 * the direction rather than on the block: a consumer gets its
+		 * stall-line count in bits 29:16 with the enable in bit 0, and
+		 * a producer gets a constant 2 with the enable in bit 0 -- the
+		 * captured 0x00400001 here and 3 on YUVP's side.  The stall
+		 * count has to be the same number as this endpoint's C2SERV
+		 * token or the block and the fabric wait for different things,
+		 * so generating it keeps them together when the token is
+		 * swept.  There is one such register per DMA engine and none
+		 * per plane.
 		 */
 		*value = transport == BECORE_MCSC_INPUT_MEMORY ? 0 :
 			 becore_mcsc_votf_enable(requested_token);
@@ -6040,7 +6043,7 @@ static int becore_c2serv_reset(struct becore_device *becore,
  *
  * The YUVP program this driver runs is the vendor's, and the vendor captured
  * it while YUVP was a VOTF producer, so its combined WDMA still carries
- * VOTF_EN = 3 for both planes.  Writing the frame to memory works only
+ * VOTF_EN = 3.  Writing the frame to memory works only
  * because the fabric underneath is dead.  Start the ring with that bit still
  * set and no producer destination programmed, and the first frame faults:
  * a SysMMU write page fault on the YUVP domain at a stale address, a YUVP

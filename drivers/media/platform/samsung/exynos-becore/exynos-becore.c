@@ -18,6 +18,7 @@
 #include <linux/iopoll.h>
 #include <linux/io.h>
 #include <linux/log2.h>
+#include <linux/media/samsung/exynos-becore-config.h>
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -42,6 +43,7 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
+#include <media/v4l2-isp.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
@@ -549,8 +551,30 @@ static_assert((BECORE_YUVP_INVCCM33_LAST - BECORE_YUVP_INVCCM33_FIRST) / 4 +
  */
 #define BECORE_YUVP_CCM_BASE		(BECORE_YUVP_PHYS_BASE + 0x7a00)
 #define BECORE_YUVP_CCM_CONFIG_REG	(BECORE_YUVP_CCM_BASE + 0x000)
+#define BECORE_YUVP_CCM_MATRIX_FIRST	(BECORE_YUVP_CCM_BASE + 0x004)
+#define BECORE_YUVP_CCM_MATRIX_LAST	(BECORE_YUVP_CCM_BASE + 0x024)
 #define BECORE_YUVP_CCM_OFFSET_FIRST	(BECORE_YUVP_CCM_BASE + 0x028)
 #define BECORE_YUVP_CCM_OFFSET_LAST	(BECORE_YUVP_CCM_BASE + 0x030)
+#define BECORE_CCM_FIELD_MASK		GENMASK_U32(12, 0)
+
+static_assert((BECORE_YUVP_CCM_MATRIX_LAST - BECORE_YUVP_CCM_MATRIX_FIRST) / 4 +
+	      1 == EXYNOS_BECORE_CCM_COEFFICIENTS);
+static_assert((BECORE_YUVP_CCM_OFFSET_LAST - BECORE_YUVP_CCM_OFFSET_FIRST) / 4 +
+	      1 == EXYNOS_BECORE_CCM_OFFSETS);
+
+/*
+ * The tone mapper's guide curve: 128 Q15 samples, two to a register with the
+ * lower-numbered one in the low half.  It is the per-frame output of the
+ * vendor's tone-mapping node rather than a tuning table -- driven by the
+ * exposure estimate and the front end's bilateral-grid statistics -- which is
+ * why it is a parameters block and not something the driver can state.
+ */
+#define BECORE_YUVP_LTM_GMAP_FIRST	(BECORE_YUVP_PHYS_BASE + 0x6020)
+#define BECORE_YUVP_LTM_GMAP_LAST	(BECORE_YUVP_PHYS_BASE + 0x611c)
+#define BECORE_LTM_CURVE_PER_REG	2
+
+static_assert((BECORE_YUVP_LTM_GMAP_LAST - BECORE_YUVP_LTM_GMAP_FIRST) / 4 +
+	      1 == EXYNOS_BECORE_LTM_CURVE_POINTS / BECORE_LTM_CURVE_PER_REG);
 
 /*
  * The colour LUT above 0x7b00, which Lyric's descriptors call
@@ -1527,6 +1551,36 @@ struct becore_video_buffer {
 	struct list_head list;
 };
 
+/*
+ * What userspace has most recently asked for, in the units the blocks are
+ * specified in rather than as register words.  A frame carries only what
+ * changed, so a value persists until a later buffer replaces it, and a value
+ * that was never sent leaves the driver's own default in place.
+ */
+struct becore_params_state {
+	s16 ccm[EXYNOS_BECORE_CCM_COEFFICIENTS];
+	s16 ccm_offsets[EXYNOS_BECORE_CCM_OFFSETS];
+	u16 ltm_curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
+	bool ccm_valid;
+	bool ltm_curve_valid;
+};
+
+struct becore_params_buffer {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+	/*
+	 * A kernel copy taken at buf_prepare: validation is worthless against
+	 * memory userspace can still write to after it has been checked.
+	 */
+	struct v4l2_isp_params_buffer *config;
+};
+
+static inline struct becore_params_buffer *
+to_becore_params_buffer(struct vb2_v4l2_buffer *vb)
+{
+	return container_of(vb, struct becore_params_buffer, vb);
+}
+
 static inline struct becore_video_buffer *
 to_becore_video_buffer(struct vb2_v4l2_buffer *vb)
 {
@@ -1550,9 +1604,16 @@ struct becore_device {
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct vb2_queue queue;
+	struct video_device params_vdev;
+	struct media_pad params_pad;
+	struct vb2_queue params_queue;
+	/* Serializes V4L2 ioctls and vb2 queue setup on the parameters node. */
+	struct mutex params_lock;
+	struct list_head queued_params;
+	struct becore_params_state params;
 	/* Serializes V4L2 ioctls and vb2 queue setup/teardown. */
 	struct mutex video_lock;
-	/* Protects the pending processed-output buffer list. */
+	/* Protects the pending processed-output and parameters buffer lists. */
 	spinlock_t queue_lock;
 	struct list_head queued_outputs;
 	struct work_struct video_work;
@@ -1588,6 +1649,7 @@ struct becore_device {
 	u32 run_generation;
 	u32 completed_generation;
 	u32 video_sequence;
+	u32 params_sequence;
 	u32 cmdq_hold_mask;
 	u32 frame_done_mask;
 	u32 expected_mask;
@@ -1642,6 +1704,7 @@ struct exynos_becore_input {
 static void becore_video_return_all(struct becore_device *becore,
 				    enum vb2_buffer_state state);
 static void becore_video_controls_ungrab(struct becore_device *becore);
+static void becore_params_consume(struct becore_device *becore);
 
 static const char * const becore_pm_domain_names[] = {
 	"yuvp",
@@ -4416,10 +4479,53 @@ static int becore_override_check(u32 reg)
 }
 
 /*
+ * One register of a parameters block, or -ENOENT if none of them reaches it.
+ *
+ * The blocks name values, not registers, so this is where the two meet: a
+ * matrix coefficient is a 13-bit signed field of its own word, and the tone
+ * curve packs two samples per word with the lower-numbered one low.  Anything
+ * userspace never sent keeps whatever the recipe or the driver already put
+ * there, which is what makes a parameters buffer additive rather than a
+ * wholesale replacement of the program.
+ */
+static int becore_params_value(const struct becore_params_state *params,
+			       u32 reg, u32 *value)
+{
+	u32 index;
+
+	if (params->ccm_valid &&
+	    reg >= BECORE_YUVP_CCM_MATRIX_FIRST &&
+	    reg <= BECORE_YUVP_CCM_MATRIX_LAST) {
+		index = (reg - BECORE_YUVP_CCM_MATRIX_FIRST) / 4;
+		*value = (u32)params->ccm[index] & BECORE_CCM_FIELD_MASK;
+		return 0;
+	}
+	if (params->ccm_valid &&
+	    reg >= BECORE_YUVP_CCM_OFFSET_FIRST &&
+	    reg <= BECORE_YUVP_CCM_OFFSET_LAST) {
+		index = (reg - BECORE_YUVP_CCM_OFFSET_FIRST) / 4;
+		*value = (u32)params->ccm_offsets[index] &
+			 BECORE_CCM_FIELD_MASK;
+		return 0;
+	}
+	if (params->ltm_curve_valid &&
+	    reg >= BECORE_YUVP_LTM_GMAP_FIRST &&
+	    reg <= BECORE_YUVP_LTM_GMAP_LAST) {
+		index = (reg - BECORE_YUVP_LTM_GMAP_FIRST) / 4 *
+			BECORE_LTM_CURVE_PER_REG;
+		*value = params->ltm_curve[index] |
+			 ((u32)params->ltm_curve[index + 1] << 16);
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+/*
  * Substitute after the record's fixed words have been copied and the typed,
- * generated and address words written, so that an override wins over every
- * source -- and skip the two kinds becore_override_check() already refuses,
- * rather than relying on that refusal alone.
+ * generated and address words written, so that parameters and then an override
+ * win over every source -- and skip the two kinds becore_override_check()
+ * already refuses, rather than relying on that refusal alone.
  */
 static void becore_override_apply(const struct becore_device *becore,
 				  const struct becore_cmdq_shape *shape,
@@ -4444,6 +4550,32 @@ static void becore_override_apply(const struct becore_device *becore,
 			if (becore->overrides[i].reg == reg)
 				put_unaligned_le32(becore->overrides[i].value,
 						   payload + word * 4);
+	}
+}
+
+/* The same substitution, from the parameters buffer rather than debugfs. */
+static void becore_params_apply(const struct becore_device *becore,
+				const struct becore_cmdq_shape *shape,
+				u8 *payload)
+{
+	const struct becore_params_state *params = &becore->params;
+	u32 word;
+
+	if (!params->ccm_valid && !params->ltm_curve_valid)
+		return;
+
+	for (word = 0; word < shape->valid_words; word++) {
+		u32 value;
+		u32 reg;
+
+		if (shape->mode == 0x00090000 && !(word & 1))
+			continue;
+		if ((shape->address_mask | shape->typed_mask) & BIT(word))
+			continue;
+		if (becore_shape_register(shape, word, &reg) ||
+		    becore_params_value(params, reg, &value))
+			continue;
+		put_unaligned_le32(value, payload + word * 4);
 	}
 }
 
@@ -4515,6 +4647,7 @@ static int becore_encode_block(struct becore_device *becore,
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
+		becore_params_apply(becore, &shape[i], payload);
 		becore_override_apply(becore, &shape[i], payload);
 	}
 	if (typed_count != becore_typed_word_count(id) ||
@@ -5002,6 +5135,7 @@ becore_encode_mcsc(struct becore_device *becore,
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
+		becore_params_apply(becore, shape, payload);
 		becore_override_apply(becore, shape, payload);
 	}
 
@@ -6573,6 +6707,17 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		goto record_error;
 	}
 
+	/*
+	 * Take this frame's parameters immediately before it is encoded: past
+	 * every refusal above, so a buffer is never spent on a frame that does
+	 * not happen, and before the encoder reads them, so a buffer queued for
+	 * this frame reaches this frame rather than the next one.  The offline
+	 * path takes them too, which is what makes a parameters block auditable
+	 * -- stage a frame, queue a block, run, and read the encoded program
+	 * back out.
+	 */
+	becore_params_consume(becore);
+
 	ret = becore_encode_programs(becore);
 	if (ret)
 		goto put_power;
@@ -7034,6 +7179,12 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 
 	becore->video_sequence = 0;
+	/*
+	 * A capture starts from the driver's own defaults for the same reason
+	 * the parameters queue resets on its own STREAMON: a frame should be a
+	 * function of the buffers this session was given.
+	 */
+	memset(&becore->params, 0, sizeof(becore->params));
 	/* The shared driver-owned output now becomes the video bounce buffer. */
 	becore->completed_generation = 0;
 	becore->completed_output_size = 0;
@@ -7295,6 +7446,8 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "capture_size     %zu bytes\n",
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
+	seq_printf(s, "params           ccm %u, ltm curve %u\n",
+		   becore->params.ccm_valid, becore->params.ltm_curve_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -7543,10 +7696,434 @@ static int becore_stream_crc_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(becore_stream_crc);
 
+/* ---------------------------------------------------------------------------
+ * The parameters node
+ *
+ * Under ADR 0009 the kernel owns the hardware description and the register
+ * encoding; the per-frame image-quality *values* come from userspace through a
+ * V4L2_BUF_TYPE_META_OUTPUT node, one typed block per hardware block.  Two of
+ * them exist so far, and both are chosen because they are demonstrably live
+ * policy rather than calibration: the colour matrix is the white balance's own
+ * output and the tone curve is the exposure estimate's, and both move frame to
+ * frame in a moving scene.
+ *
+ * A buffer never carries a register, an address or a command -- only values,
+ * in the units the block is specified in.
+ */
+
+static const struct v4l2_isp_params_block_type_info
+becore_params_block_info[] = {
+	[EXYNOS_BECORE_PARAM_BLOCK_CCM] = {
+		.size = sizeof(struct exynos_becore_params_ccm),
+	},
+	[EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE] = {
+		.size = sizeof(struct exynos_becore_params_ltm_curve),
+	},
+};
+
+static_assert(ARRAY_SIZE(becore_params_block_info) ==
+	      EXYNOS_BECORE_PARAM_BLOCK_SENTINEL);
+
+#define BECORE_PARAMS_BUFFER_SIZE \
+	v4l2_isp_params_buffer_size(EXYNOS_BECORE_PARAMS_MAX_SIZE)
+
+/*
+ * Each row of the matrix has to sum to unity, which is what makes it preserve
+ * neutrals; the vendor's own encoder guarantees it by renormalising the third
+ * coefficient of each row.  A matrix that tints grey is far more likely to be
+ * an arithmetic mistake upstream than an intention, so refuse it rather than
+ * program it -- and refusing at buf_prepare tells userspace which buffer was
+ * wrong, where a silently accepted one shows up as a colour cast three
+ * abstraction layers away.
+ */
+static int becore_params_check_ccm(struct device *dev,
+				   const struct exynos_becore_params_ccm *ccm)
+{
+	unsigned int i;
+	unsigned int row;
+
+	for (i = 0; i < EXYNOS_BECORE_CCM_COEFFICIENTS; i++) {
+		if (ccm->matrix[i] < EXYNOS_BECORE_CCM_MIN ||
+		    ccm->matrix[i] > EXYNOS_BECORE_CCM_MAX) {
+			dev_dbg(dev, "CCM coefficient %u is out of range\n", i);
+			return -EINVAL;
+		}
+	}
+	for (i = 0; i < EXYNOS_BECORE_CCM_OFFSETS; i++) {
+		if (ccm->offsets[i] < EXYNOS_BECORE_CCM_MIN ||
+		    ccm->offsets[i] > EXYNOS_BECORE_CCM_MAX) {
+			dev_dbg(dev, "CCM offset %u is out of range\n", i);
+			return -EINVAL;
+		}
+	}
+	for (row = 0; row < EXYNOS_BECORE_CCM_COEFFICIENTS / 3; row++) {
+		s32 sum = ccm->matrix[row * 3] + ccm->matrix[row * 3 + 1] +
+			  ccm->matrix[row * 3 + 2];
+
+		if (sum != EXYNOS_BECORE_CCM_ONE) {
+			dev_dbg(dev, "CCM row %u sums to %d, not %d\n", row,
+				sum, EXYNOS_BECORE_CCM_ONE);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * A tone curve that goes backwards inverts contrast over that interval, which
+ * no tone mapper wants and which is what a sign or ordering error looks like.
+ */
+static int
+becore_params_check_ltm_curve(struct device *dev,
+			      const struct exynos_becore_params_ltm_curve *ltm)
+{
+	unsigned int i;
+
+	for (i = 0; i < EXYNOS_BECORE_LTM_CURVE_POINTS; i++) {
+		if (ltm->curve[i] > EXYNOS_BECORE_LTM_CURVE_ONE) {
+			dev_dbg(dev, "tone curve point %u exceeds unity\n", i);
+			return -EINVAL;
+		}
+		if (i && ltm->curve[i] < ltm->curve[i - 1]) {
+			dev_dbg(dev, "tone curve decreases at point %u\n", i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Walk the blocks once.  `apply` distinguishes the buf_prepare pass, which
+ * only says whether the buffer is acceptable, from the per-frame pass, which
+ * installs it -- so that the two cannot drift apart into a buffer that
+ * validates and then programs something else.
+ */
+static int becore_params_walk(struct becore_device *becore,
+			      const struct v4l2_isp_params_buffer *config,
+			      bool apply)
+{
+	size_t offset = 0;
+
+	while (offset < config->data_size) {
+		const struct v4l2_isp_params_block_header *header =
+			(const void *)(config->data + offset);
+		bool disable = header->flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
+		int ret;
+
+		offset += header->size;
+		switch (header->type) {
+		case EXYNOS_BECORE_PARAM_BLOCK_CCM: {
+			const struct exynos_becore_params_ccm *ccm =
+				(const void *)header;
+
+			if (disable) {
+				if (apply)
+					becore->params.ccm_valid = false;
+				break;
+			}
+			ret = becore_params_check_ccm(becore->dev, ccm);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			memcpy(becore->params.ccm, ccm->matrix,
+			       sizeof(becore->params.ccm));
+			memcpy(becore->params.ccm_offsets, ccm->offsets,
+			       sizeof(becore->params.ccm_offsets));
+			becore->params.ccm_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE: {
+			const struct exynos_becore_params_ltm_curve *ltm =
+				(const void *)header;
+
+			if (disable) {
+				if (apply)
+					becore->params.ltm_curve_valid = false;
+				break;
+			}
+			ret = becore_params_check_ltm_curve(becore->dev, ltm);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			memcpy(becore->params.ltm_curve, ltm->curve,
+			       sizeof(becore->params.ltm_curve));
+			becore->params.ltm_curve_valid = true;
+			break;
+		}
+		default:
+			/* v4l2_isp_params_validate_buffer() rejects these. */
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Take the oldest queued buffer, if there is one, and make it the current
+ * configuration.  A frame with nothing queued keeps the configuration it
+ * already had, which is what lets userspace send only what changed.
+ */
+static void becore_params_consume(struct becore_device *becore)
+{
+	struct becore_params_buffer *buf;
+
+	spin_lock_irq(&becore->queue_lock);
+	buf = list_first_entry_or_null(&becore->queued_params,
+				       struct becore_params_buffer, list);
+	if (buf)
+		list_del(&buf->list);
+	spin_unlock_irq(&becore->queue_lock);
+
+	if (!buf)
+		return;
+
+	/*
+	 * The blocks were checked at buf_prepare against this same walk, over
+	 * this same kernel copy, so this cannot fail -- and if it somehow did,
+	 * the frame would run on the configuration it already had.
+	 */
+	if (becore_params_walk(becore, buf->config, true))
+		dev_warn_once(becore->dev, "a validated params buffer did not apply\n");
+
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	buf->vb.sequence = becore->params_sequence++;
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
+static void becore_params_return_all(struct becore_device *becore,
+				     enum vb2_buffer_state state)
+{
+	struct becore_params_buffer *buf;
+	struct becore_params_buffer *tmp;
+
+	spin_lock_irq(&becore->queue_lock);
+	list_for_each_entry_safe(buf, tmp, &becore->queued_params, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+	spin_unlock_irq(&becore->queue_lock);
+}
+
+static int becore_params_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
+				     unsigned int *nplanes, unsigned int sizes[],
+				     struct device *alloc_devs[])
+{
+	if (*nplanes) {
+		if (*nplanes != 1 || sizes[0] < BECORE_PARAMS_BUFFER_SIZE)
+			return -EINVAL;
+		return 0;
+	}
+	*nplanes = 1;
+	sizes[0] = BECORE_PARAMS_BUFFER_SIZE;
+
+	return 0;
+}
+
+static int becore_params_buf_init(struct vb2_buffer *vb)
+{
+	struct becore_params_buffer *buf =
+		to_becore_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	buf->config = kvzalloc(BECORE_PARAMS_BUFFER_SIZE, GFP_KERNEL);
+
+	return buf->config ? 0 : -ENOMEM;
+}
+
+static void becore_params_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct becore_params_buffer *buf =
+		to_becore_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	kvfree(buf->config);
+	buf->config = NULL;
+}
+
+static int becore_params_buf_prepare(struct vb2_buffer *vb)
+{
+	struct becore_device *becore = vb2_get_drv_priv(vb->vb2_queue);
+	struct becore_params_buffer *buf =
+		to_becore_params_buffer(to_vb2_v4l2_buffer(vb));
+	const struct v4l2_isp_params_buffer *user = vb2_plane_vaddr(vb, 0);
+	int ret;
+
+	ret = v4l2_isp_params_validate_buffer_size(becore->dev, vb,
+						   BECORE_PARAMS_BUFFER_SIZE);
+	if (ret)
+		return ret;
+
+	/* Validate what will be programmed, not what may change underneath. */
+	memcpy(buf->config, user, BECORE_PARAMS_BUFFER_SIZE);
+
+	ret = v4l2_isp_params_validate_buffer(becore->dev, vb, buf->config,
+					      becore_params_block_info,
+					      ARRAY_SIZE(becore_params_block_info));
+	if (ret)
+		return ret;
+
+	return becore_params_walk(becore, buf->config, false);
+}
+
+static void becore_params_buf_queue(struct vb2_buffer *vb)
+{
+	struct becore_device *becore = vb2_get_drv_priv(vb->vb2_queue);
+	struct becore_params_buffer *buf =
+		to_becore_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	spin_lock_irq(&becore->queue_lock);
+	list_add_tail(&buf->list, &becore->queued_params);
+	spin_unlock_irq(&becore->queue_lock);
+}
+
+static int becore_params_start_streaming(struct vb2_queue *q,
+					 unsigned int count)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+
+	/*
+	 * A session starts from the driver's own defaults rather than from
+	 * whatever the last one left behind, so that a capture is a function
+	 * of the buffers it was given.
+	 */
+	mutex_lock(&becore->lock);
+	memset(&becore->params, 0, sizeof(becore->params));
+	becore->params_sequence = 0;
+	mutex_unlock(&becore->lock);
+
+	return 0;
+}
+
+static void becore_params_stop_streaming(struct vb2_queue *q)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+
+	becore_params_return_all(becore, VB2_BUF_STATE_ERROR);
+	mutex_lock(&becore->lock);
+	memset(&becore->params, 0, sizeof(becore->params));
+	mutex_unlock(&becore->lock);
+}
+
+static const struct vb2_ops becore_params_vb2_ops = {
+	.queue_setup = becore_params_queue_setup,
+	.buf_init = becore_params_buf_init,
+	.buf_cleanup = becore_params_buf_cleanup,
+	.buf_prepare = becore_params_buf_prepare,
+	.buf_queue = becore_params_buf_queue,
+	.start_streaming = becore_params_start_streaming,
+	.stop_streaming = becore_params_stop_streaming,
+};
+
+static int becore_params_querycap(struct file *file, void *priv,
+				  struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, "exynos-becore", sizeof(cap->driver));
+	strscpy(cap->card, "zumapro BE-core parameters", sizeof(cap->card));
+
+	return 0;
+}
+
+static void becore_params_fill_fmt(struct v4l2_meta_format *meta)
+{
+	memset(meta, 0, sizeof(*meta));
+	meta->dataformat = V4L2_META_FMT_BECORE_PARAMS;
+	meta->buffersize = BECORE_PARAMS_BUFFER_SIZE;
+}
+
+static int becore_params_g_fmt(struct file *file, void *priv,
+			       struct v4l2_format *f)
+{
+	becore_params_fill_fmt(&f->fmt.meta);
+
+	return 0;
+}
+
+static int becore_params_enum_fmt(struct file *file, void *priv,
+				  struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_META_FMT_BECORE_PARAMS;
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops becore_params_ioctl_ops = {
+	.vidioc_querycap = becore_params_querycap,
+	.vidioc_enum_fmt_meta_out = becore_params_enum_fmt,
+	.vidioc_g_fmt_meta_out = becore_params_g_fmt,
+	.vidioc_s_fmt_meta_out = becore_params_g_fmt,
+	.vidioc_try_fmt_meta_out = becore_params_g_fmt,
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+};
+
+static const struct video_device becore_params_template = {
+	.name = "exynos-becore parameters",
+	.fops = &becore_fops,
+	.ioctl_ops = &becore_params_ioctl_ops,
+	.release = video_device_release_empty,
+	.device_caps = V4L2_CAP_META_OUTPUT | V4L2_CAP_STREAMING,
+	.vfl_dir = VFL_DIR_TX,
+};
+
+static int becore_params_register(struct becore_device *becore)
+{
+	struct vb2_queue *q = &becore->params_queue;
+	int ret;
+
+	q->type = V4L2_BUF_TYPE_META_OUTPUT;
+	q->io_modes = VB2_MMAP;
+	q->dev = becore->dev;
+	q->drv_priv = becore;
+	q->ops = &becore_params_vb2_ops;
+	q->mem_ops = &vb2_vmalloc_memops;
+	q->buf_struct_size = sizeof(struct becore_params_buffer);
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->lock = &becore->params_lock;
+	ret = vb2_queue_init(q);
+	if (ret)
+		return ret;
+
+	becore->params_vdev = becore_params_template;
+	becore->params_vdev.v4l2_dev = &becore->v4l2_dev;
+	becore->params_vdev.queue = q;
+	becore->params_vdev.lock = &becore->params_lock;
+	becore->params_vdev.entity.function = MEDIA_ENT_F_IO_V4L;
+	video_set_drvdata(&becore->params_vdev, becore);
+
+	becore->params_pad.flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&becore->params_vdev.entity, 1,
+				     &becore->params_pad);
+	if (ret)
+		return ret;
+
+	ret = video_register_device(&becore->params_vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		media_entity_cleanup(&becore->params_vdev.entity);
+
+	return ret;
+}
+
 static void becore_video_unregister(void *data)
 {
 	struct becore_device *becore = data;
 
+	vb2_video_unregister_device(&becore->params_vdev);
+	media_entity_cleanup(&becore->params_vdev.entity);
 	vb2_video_unregister_device(&becore->vdev);
 	media_device_unregister(&becore->mdev);
 	media_entity_cleanup(&becore->vdev.entity);
@@ -7621,13 +8198,20 @@ static int becore_video_register(struct becore_device *becore)
 	if (ret)
 		goto err_entity;
 
-	ret = media_device_register(&becore->mdev);
+	ret = becore_params_register(becore);
 	if (ret)
 		goto err_vdev;
+
+	ret = media_device_register(&becore->mdev);
+	if (ret)
+		goto err_params;
 
 	return devm_add_action_or_reset(becore->dev,
 					becore_video_unregister, becore);
 
+err_params:
+	video_unregister_device(&becore->params_vdev);
+	media_entity_cleanup(&becore->params_vdev.entity);
 err_vdev:
 	video_unregister_device(&becore->vdev);
 err_entity:
@@ -7715,10 +8299,12 @@ static int becore_probe(struct platform_device *pdev)
 	becore->dev = dev;
 	mutex_init(&becore->lock);
 	mutex_init(&becore->video_lock);
+	mutex_init(&becore->params_lock);
 	spin_lock_init(&becore->run_lock);
 	spin_lock_init(&becore->queue_lock);
 	init_completion(&becore->run_completion);
 	INIT_LIST_HEAD(&becore->queued_outputs);
+	INIT_LIST_HEAD(&becore->queued_params);
 	INIT_WORK(&becore->video_work, becore_video_work);
 	becore->output_first_changed = U32_MAX;
 	becore->mcsc_output_first_changed = U32_MAX;

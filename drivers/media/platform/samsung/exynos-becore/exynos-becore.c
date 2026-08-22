@@ -82,6 +82,65 @@
 #define BECORE_STAT_RDMACL_EN		0x1600
 #define BECORE_RGBP_C_LOADER_ENABLE	0x4000
 
+/*
+ * The VOTF fabric.  Each processor that owns a fabric endpoint has its own
+ * C2SERV window, and a window is one node on a token ring: it names itself by
+ * writing its local IP ID to LOCAL_IP, and a producer names its consumer by
+ * that ID shifted up four bits with the consumer's DMA number in the low
+ * nibble.  Producer endpoints (TWS) and consumer endpoints (TRS) live in
+ * separate register regions.
+ *
+ * A region packs as many endpoint blocks into each 256-byte page as fit whole
+ * -- nine producers of 0x1c bytes, five consumers of 0x2c -- and starts a new
+ * page rather than letting one straddle, so the offset of endpoint n is not
+ * linear in n.  The two formulas below reproduce all thirty-two flush offsets
+ * the vendor writes, wraps included.
+ */
+#define BECORE_C2SERV_RING_CLK_EN	0x000c
+#define BECORE_C2SERV_RING_ENABLE	0x0010
+#define BECORE_C2SERV_LOCAL_IP		0x0014
+#define BECORE_C2SERV_SW_RESET		0x0018
+#define BECORE_C2SERV_SEL_REGISTER	0x0024
+#define BECORE_C2SERV_SEL_REGISTER_MODE	0x0028
+
+#define BECORE_C2SERV_TWS_PER_PAGE	9
+#define BECORE_C2SERV_TWS(n)		(0x0100 + \
+					 ((n) / BECORE_C2SERV_TWS_PER_PAGE) * 0x100 + \
+					 ((n) % BECORE_C2SERV_TWS_PER_PAGE) * 0x1c)
+#define BECORE_C2SERV_TWS_ENABLE	0x00
+#define BECORE_C2SERV_TWS_LIMIT		0x04
+#define BECORE_C2SERV_TWS_DEST		0x08
+#define BECORE_C2SERV_TWS_LINES_IN_TOKEN	0x0c
+#define BECORE_C2SERV_TWS_FLUSH		0x10
+#define BECORE_C2SERV_TWS_BUSY		0x14
+#define BECORE_C2SERV_TWS_FULLNESS	0x18
+
+#define BECORE_C2SERV_TRS_PER_PAGE	5
+#define BECORE_C2SERV_TRS(n)		(0x0300 + \
+					 ((n) / BECORE_C2SERV_TRS_PER_PAGE) * 0x100 + \
+					 ((n) % BECORE_C2SERV_TRS_PER_PAGE) * 0x2c)
+#define BECORE_C2SERV_TRS_ENABLE	0x00
+#define BECORE_C2SERV_TRS_RECOVER	0x04
+#define BECORE_C2SERV_TRS_LIMIT		0x08
+#define BECORE_C2SERV_TRS_CROP_START	0x0c
+#define BECORE_C2SERV_TRS_CROP_ENABLE	0x10
+#define BECORE_C2SERV_TRS_LINES_IN_FIRST_TOKEN	0x14
+#define BECORE_C2SERV_TRS_LINES_IN_TOKEN	0x18
+#define BECORE_C2SERV_TRS_LINES_COUNT	0x1c
+#define BECORE_C2SERV_TRS_FLUSH		0x20
+#define BECORE_C2SERV_TRS_BUSY		0x24
+#define BECORE_C2SERV_TRS_LOST_CONNECTION	0x28
+
+/* Both regions are sixteen deep on every instance the vendor flushes. */
+#define BECORE_C2SERV_ENDPOINTS		16
+
+/*
+ * A producer names its destination as the consumer's local IP ID followed by
+ * the consumer DMA number, which is how 0x1cc5 and DMA 1 becomes 0x1cc51.
+ */
+#define BECORE_C2SERV_DEST(ip, dma)	(((ip) << 4) | (dma))
+
+
 #define BECORE_RESET_TIMEOUT_US		1000
 /* The longer of the two per-stage CRC lists; checked against both at probe. */
 #define BECORE_STREAM_CRC_MAX		26
@@ -850,6 +909,13 @@ enum becore_block_id {
 	BECORE_YUVP,
 	BECORE_MCSC,
 	BECORE_NUM_BLOCKS,
+};
+
+enum becore_c2serv_id {
+	BECORE_C2SERV_RGBP,
+	BECORE_C2SERV_YUVP,
+	BECORE_C2SERV_MCSC,
+	BECORE_NUM_C2SERV,
 };
 
 struct becore_regval {
@@ -1707,6 +1773,21 @@ static ktime_t becore_timing_mark(u64 *phase_ns, enum becore_timing_phase phase,
 	return now;
 }
 
+/*
+ * What a window said after being made ready.  Only `ready` is a verdict: it
+ * comes from the software reset clearing itself, which is the one C2SERV read
+ * the vendor's own stream makes.  The rest are read because they are cheap
+ * and say something, not because anything is known about how they read back
+ * -- and the two ring bits should read zero, because this driver does not
+ * start the ring.
+ */
+struct becore_c2serv_state {
+	bool ready;
+	u32 ring_clk_en;
+	u32 ring_enable;
+	u32 local_ip;
+};
+
 struct becore_device {
 	struct device *dev;
 	struct clk *intcam_clk;
@@ -1717,6 +1798,8 @@ struct becore_device {
 	void __iomem *ssmt[14];
 	void __iomem *sysreg_rgbp;
 	void __iomem *sysreg_mcsc;
+	void __iomem *c2serv[BECORE_NUM_C2SERV];
+	struct becore_c2serv_state c2serv_state[BECORE_NUM_C2SERV];
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
 	struct media_device mdev;
@@ -1872,6 +1955,27 @@ static const char * const becore_ssmt_names[] = {
 	"ssmt-mcsc4",
 	"ssmt-mcsc5",
 	"ssmt-mcsc6",
+};
+
+/*
+ * The three VOTF C2SERV windows this node owns, out of the seven the camera
+ * complex has.  A window's local IP ID is the top sixteen bits of its own
+ * base address, and the endpoint counts are the vendor's own hardware
+ * parameters: RGBP has one producer, YUVP two, MCSC four consumers.  None of
+ * the three has endpoints in both directions, which is why a producer here
+ * can only ever reach a consumer somewhere else.
+ */
+struct becore_c2serv_desc {
+	const char *name;
+	u16 local_ip;
+	u8 producers;
+	u8 consumers;
+};
+
+static const struct becore_c2serv_desc becore_c2serv[BECORE_NUM_C2SERV] = {
+	[BECORE_C2SERV_RGBP] = { "rgbp-c2serv", 0x1c46, 1, 0 },
+	[BECORE_C2SERV_YUVP] = { "yuvp-c2serv", 0x1c86, 2, 0 },
+	[BECORE_C2SERV_MCSC] = { "mcsc-c2serv", 0x1d05, 0, 4 },
 };
 
 static const struct becore_regval becore_rgbp_init[] = {
@@ -5663,6 +5767,124 @@ static void becore_stream_power_put(struct becore_device *becore)
 	}
 }
 
+/*
+ * Both directions start by flushing every endpoint, consumers first, which is
+ * what the vendor does on every instance regardless of how many endpoints it
+ * actually has -- so all thirty-two of these writes are attested on this
+ * hardware.  Flushing only the ones an instance has would be tidier and would
+ * rest on the software reset clearing the rest, which Samsung's own register
+ * notes attach to SW_CORE_RESET at +0x1c rather than to the SW_RESET at +0x18
+ * that both this driver and the vendor write.  An unverifiable assumption is
+ * not worth twenty-odd writes once per stream.
+ */
+static void becore_c2serv_flush(struct becore_device *becore,
+				enum becore_c2serv_id id)
+{
+	void __iomem *base = becore->c2serv[id];
+	unsigned int i;
+
+	for (i = 0; i < BECORE_C2SERV_ENDPOINTS; i++)
+		writel_relaxed(1, base + BECORE_C2SERV_TRS(i) +
+				  BECORE_C2SERV_TRS_FLUSH);
+	for (i = 0; i < BECORE_C2SERV_ENDPOINTS; i++)
+		writel_relaxed(1, base + BECORE_C2SERV_TWS(i) +
+				  BECORE_C2SERV_TWS_FLUSH);
+}
+
+static int becore_c2serv_reset(struct becore_device *becore,
+			       enum becore_c2serv_id id)
+{
+	void __iomem *base = becore->c2serv[id];
+	u32 value;
+	int ret;
+
+	writel_relaxed(1, base + BECORE_C2SERV_SW_RESET);
+	ret = readl_poll_timeout(base + BECORE_C2SERV_SW_RESET, value, !value,
+				 1, BECORE_RESET_TIMEOUT_US);
+	if (ret)
+		dev_err(becore->dev, "%s reset timed out (%#010x)\n",
+			becore_c2serv[id].name, value);
+
+	return ret;
+}
+
+/*
+ * Make one C2SERV window ready: flush every endpoint, software-reset the
+ * window, select the register bank and let the window name itself.  The ring
+ * is deliberately left stopped, and that is a hardware requirement rather
+ * than caution.
+ *
+ * The YUVP program this driver runs is the vendor's, and the vendor captured
+ * it while YUVP was a VOTF producer, so its combined WDMA still carries
+ * VOTF_EN = 3 for both planes.  Writing the frame to memory works only
+ * because the fabric underneath is dead.  Start the ring with that bit still
+ * set and no producer destination programmed, and the first frame faults:
+ * a SysMMU write page fault on the YUVP domain at a stale address, a YUVP
+ * that then will not reset, and a camera down until reboot [HW 2026-08-22].
+ *
+ * So RING_CLK_EN and RING_ENABLE belong with the link, alongside the
+ * transport each endpoint's DMA is told to use, and not here.  The vendor
+ * starts them right after SEL_REGISTER and stops them in the mirror order --
+ * ring clock first, then the ring, then reset -- which is where they go when
+ * there is something on the ring to carry.
+ *
+ * SEL_REGISTER selects the immediate bank over the shadowed one and
+ * SEL_REGISTER_MODE makes a write take effect at once rather than at the next
+ * shadow trigger.  Every endpoint register therefore has a shadow alias this
+ * driver never uses, and a link is programmed by writing the plain offsets --
+ * which is what both the vendor's stream and Samsung's own driver do.
+ *
+ * Whether the window answered is decided by the software reset clearing
+ * itself, and by nothing else.  That is the only read of a C2SERV window the
+ * vendor's stream makes, so it is the only one whose read-back behaviour is
+ * known; the three registers sampled afterwards are recorded for debugfs and
+ * deliberately do not gate anything, because a register that turns out to be
+ * write-only would otherwise condemn hardware that is working.
+ */
+static void becore_c2serv_prepare(struct becore_device *becore,
+				  enum becore_c2serv_id id)
+{
+	const struct becore_c2serv_desc *desc = &becore_c2serv[id];
+	struct becore_c2serv_state *state = &becore->c2serv_state[id];
+	void __iomem *base = becore->c2serv[id];
+
+	becore_c2serv_flush(becore, id);
+
+	if (becore_c2serv_reset(becore, id)) {
+		memset(state, 0, sizeof(*state));
+		return;
+	}
+
+	writel_relaxed(1, base + BECORE_C2SERV_SEL_REGISTER_MODE);
+	writel_relaxed(1, base + BECORE_C2SERV_SEL_REGISTER);
+	writel_relaxed(desc->local_ip, base + BECORE_C2SERV_LOCAL_IP);
+
+	state->ring_clk_en = readl(base + BECORE_C2SERV_RING_CLK_EN);
+	state->ring_enable = readl(base + BECORE_C2SERV_RING_ENABLE);
+	state->local_ip = readl(base + BECORE_C2SERV_LOCAL_IP);
+	state->ready = true;
+}
+
+/*
+ * And put it back: flush, then reset.  Only a window that came up is touched,
+ * so a resume that gave up before reaching the fabric is not followed by
+ * writes to blocks that just failed to answer a reset.
+ */
+static void becore_c2serv_unprepare(struct becore_device *becore)
+{
+	unsigned int i;
+
+	for (i = 0; i < BECORE_NUM_C2SERV; i++) {
+		if (!becore->c2serv_state[i].ready)
+			continue;
+
+		becore_c2serv_flush(becore, i);
+		becore_c2serv_reset(becore, i);
+		memset(&becore->c2serv_state[i], 0,
+		       sizeof(becore->c2serv_state[i]));
+	}
+}
+
 static int becore_runtime_resume(struct device *dev)
 {
 	struct becore_device *becore = dev_get_drvdata(dev);
@@ -5686,6 +5908,9 @@ static int becore_runtime_resume(struct device *dev)
 	becore_write_table(&becore->blocks[BECORE_MCSC], becore_mcsc_init,
 			   ARRAY_SIZE(becore_mcsc_init));
 
+	for (i = 0; i < BECORE_NUM_C2SERV; i++)
+		becore_c2serv_prepare(becore, i);
+
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
 		becore_prepare_irqs(&becore->blocks[i]);
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
@@ -5708,6 +5933,8 @@ static int becore_runtime_suspend(struct device *dev)
 		becore_quiesce_irqs(&becore->blocks[i]);
 	for (i = 0; i < BECORE_NUM_BLOCKS; i++)
 		writel_relaxed(0, becore->blocks[i].base + BECORE_INT0_ENABLE);
+
+	becore_c2serv_unprepare(becore);
 
 	/* A failed reset must veto the following genpd power-down. */
 	ret = becore_reset_all(becore);
@@ -5842,6 +6069,37 @@ static int becore_map_resources(struct platform_device *pdev,
 	if (IS_ERR(becore->sysreg_mcsc))
 		return dev_err_probe(dev, PTR_ERR(becore->sysreg_mcsc),
 				     "cannot map sysreg-mcsc\n");
+
+	/*
+	 * A C2SERV window's local IP ID is the top sixteen bits of its own
+	 * base address, so the ID the vendor's hardware-parameter table gives
+	 * and the address the device tree gives have to agree.  Checking that
+	 * here is what proves the window is the one it is believed to be --
+	 * writing the ID and reading it back cannot, because the ID is a
+	 * constant this driver already holds.
+	 */
+	for (i = 0; i < BECORE_NUM_C2SERV; i++) {
+		const struct becore_c2serv_desc *desc = &becore_c2serv[i];
+		struct resource *res;
+
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						   desc->name);
+		if (!res)
+			return dev_err_probe(dev, -ENODEV, "no %s\n",
+					     desc->name);
+
+		if (res->start >> 16 != desc->local_ip)
+			return dev_err_probe(dev, -EINVAL,
+					     "%s is at %pa, which is IP %#06llx and not %#06x\n",
+					     desc->name, &res->start,
+					     (u64)res->start >> 16,
+					     desc->local_ip);
+
+		becore->c2serv[i] = devm_ioremap_resource(dev, res);
+		if (IS_ERR(becore->c2serv[i]))
+			return dev_err_probe(dev, PTR_ERR(becore->c2serv[i]),
+					     "cannot map %s\n", desc->name);
+	}
 
 	return 0;
 }
@@ -8098,6 +8356,17 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->mcsc_completed_output_size, becore->mcsc_output.size,
 		   &becore->mcsc_output.dma);
 	becore_status_program(s, "mcsc_cmdq", &becore->mcsc_program);
+	for (i = 0; i < BECORE_NUM_C2SERV; i++) {
+		const struct becore_c2serv_state *c2serv =
+			&becore->c2serv_state[i];
+
+		seq_printf(s,
+			   "votf_%-11s %s, ring_clk %#x, ring %#x, local_ip %#010x, named %#06x\n",
+			   becore_c2serv[i].name,
+			   c2serv->ready ? "ready" : "down",
+			   c2serv->ring_clk_en, c2serv->ring_enable,
+			   c2serv->local_ip, becore_c2serv[i].local_ip);
+	}
 	seq_printf(s, "intcam           %lu Hz (saved %lu, raised %u)\n",
 		   clk_get_rate(becore->intcam_clk),
 		   becore->saved_intcam_rate, becore->intcam_rate_active);

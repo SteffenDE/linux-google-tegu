@@ -19,7 +19,10 @@
 #define BECORE_RECIPE_HEADER_BYTES 32
 #define BECORE_RECIPE_RECORD_BYTES 76
 #define BECORE_RGBP_HEADER_COUNT 43
-#define BECORE_YUVP_HEADER_COUNT 353
+#define BECORE_YUVP_HEADER_COUNT 147
+/* Where DIABLO_CLUT's lattice burst was, and how long it is. */
+#define BECORE_YUVP_CLUT_HEADER 9
+#define BECORE_YUVP_CLUT_WORDS 3276
 #define BECORE_RECIPE_BYTES \
 	(BECORE_RECIPE_HEADER_BYTES + BECORE_RECIPE_RECORD_BYTES * \
 	 (BECORE_RGBP_HEADER_COUNT + BECORE_YUVP_HEADER_COUNT))
@@ -1034,3730 +1037,22 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 	{ /* h009 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
-		.type_map = 0x00000005,
-		.valid_words = 2,
+		.type_map = 0x05555555,
+		.valid_words = 14,
 		.address_mask = 0x0000,
-		.fixed_mask = 0x0002,
+		.fixed_mask = 0x2aaa,
 		.pair_registers = {
-			0x1c847b10, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
+			0x1c847400, 0x1c847404, 0x1c847408, 0x1c84740c,
+			0x1c847410, 0x1c847414, 0x1c847418, 0x00000000,
 		},
 		.fixed_values = {
-			0x00000000, 0x01000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
+			0x00000000, 0x00000100, 0x00000000, 0x00001323,
+			0x00000000, 0x0000f534, 0x00000000, 0x00002000,
+			0x00000000, 0x00002591, 0x00000000, 0x0000eacc,
+			0x00000000, 0x0000e534, 0x00000000, 0x00000000,
 		},
 	},
 	{ /* h010 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x21d80200, 0x1f6901fb, 0x2807c660, 0x1e7a81ec,
-			0x2df78abf, 0x1d9bfdde, 0x33f7571f, 0x1ccd79d0,
-			0x39e7237e, 0x1bfef5c3, 0x3fd6ebdd, 0x1e77b5b5,
-			0x22a7820a, 0x1d5929d9, 0x28b7426b, 0x1c6aadcb,
-		},
-	},
-	{ /* h011 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2eb706cb, 0x1b7c2dbc, 0x34c6cb2c, 0x1aadb5ae,
-			0x3ae6978d, 0x19bf39a0, 0x1d665bee, 0x1c57d1ca,
-			0x23370213, 0x1b294db7, 0x2946ba73, 0x1a4ad1a9,
-			0x2f567ed5, 0x195c559a, 0x35664735, 0x187dd98c,
-		},
-	},
-	{ /* h012 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x3b660b96, 0x178f5d7d, 0x1e06c1c0, 0x1a67f5ab,
-			0x23d6861c, 0x19097196, 0x29c62e7c, 0x181af186,
-			0x2fd5f2dd, 0x173c7977, 0x35f5bf3f, 0x165dfd6a,
-			0x3bf5839f, 0x1956ad5b, 0x1e8641cb, 0x1868198b,
-		},
-	},
-	{ /* h013 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x24660626, 0x16e99575, 0x2a45a284, 0x15eb1563,
-			0x305566e5, 0x150c9954, 0x36752f47, 0x142e1d46,
-			0x1964fba8, 0x1756d97a, 0x1ef5c1d3, 0x16683d6b,
-			0x2505862f, 0x14c9b953, 0x2ac5128c, 0x13ab313f,
-		},
-	},
-	{ /* h014 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x30e4d6ed, 0x12ccb931, 0x36f4a34e, 0x11fe4123,
-			0x1a158181, 0x1556fd5a, 0x1f8545db, 0x1478614c,
-			0x25950a37, 0x12a9e131, 0x2b448a95, 0x117b551b,
-			0x31644af5, 0x109cd90d, 0x37741357, 0x1455b100,
-		},
-	},
-	{ /* h015 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1ac4fd8c, 0x13671d3a, 0x2014c5e3, 0x1278852c,
-			0x26348a41, 0x108a0510, 0x2bd4029f, 0x0f3b74f8,
-			0x31e3befd, 0x0e6cf8ea, 0x1573875f, 0x1245dd2a,
-			0x1b347d98, 0x11673d1b, 0x20a449ea, 0x1078a90c,
-		},
-	},
-	{ /* h016 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x26c40e4a, 0x0e6a28ee, 0x2c537aa7, 0x0d0b94d6,
-			0x32632f05, 0x0c2d18c7, 0x16343d42, 0x10460d0a,
-			0x1bb3fda0, 0x0f7758fb, 0x2133c9f3, 0x0e88cced,
-			0x27538e53, 0x0c3a48cc, 0x2cf2eeb0, 0x0adbb8b4,
-		},
-	},
-	{ /* h017 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x32e2a30d, 0x0f44b8a3, 0x16e3bd4e, 0x0e4630e9,
-			0x1c2381a7, 0x0d7774dc, 0x21b349fc, 0x0c88eccd,
-			0x27d30e5b, 0x09fa68a8, 0x2d8266b9, 0x08cbdc92,
-			0x11821716, 0x0d44e4d9, 0x17833959, 0x0c564cc9,
-		},
-	},
-	{ /* h018 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1c8305ae, 0x0b878cbc, 0x2222ce03, 0x0a9904ae,
-			0x28529261, 0x07ea9084, 0x2e21e2c3, 0x06ac0471,
-			0x1242fd03, 0x0b4510b9, 0x17f2b965, 0x0a6668aa,
-			0x1ce285b4, 0x0997a89d, 0x22825209, 0x08a91c8f,
-		},
-	},
-	{ /* h019 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x28f21266, 0x05dab863, 0x2eb15acd, 0x0a43b84f,
-			0x1302790f, 0x09354099, 0x18623d6c, 0x0866848b,
-			0x1d5209bb, 0x0797d07e, 0x2321d213, 0x06a9446f,
-			0x29819670, 0x03bae043, 0x0da0d6d6, 0x0833e889,
-		},
-	},
-	{ /* h020 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x13b1f91b, 0x07456479, 0x18d1c173, 0x0676a06b,
-			0x1de18dc2, 0x0597f45e, 0x23b1521c, 0x04a9684f,
-			0x2a111679, 0x01ab0423, 0x0e51b8c4, 0x06341469,
-			0x14517926, 0x05457c59, 0x1941417a, 0x0486bc4c,
-		},
-	},
-	{ /* h021 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e610dc9, 0x0398183e, 0x2440d225, 0x02a98c2f,
-			0x2ab09683, 0x0532bc04, 0x0f0138cf, 0x04344449,
-			0x14c0f932, 0x03559839, 0x19b0c581, 0x0286d82c,
-			0x1ef091d0, 0x01a83c1f, 0x24d0562e, 0x00a9b410,
-		},
-	},
-	{ /* h022 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1f50168c, 0x21984e20, 0x25585a35, 0x20c9d611,
-			0x2b481e95, 0x1ffb5203, 0x3137eef4, 0x1f3ccdf7,
-			0x3727bf52, 0x1e7e49eb, 0x3d178bb1, 0x1d8fc5dd,
-			0x20080de3, 0x1fa88a00, 0x26d7d646, 0x1e8a51ee,
-		},
-	},
-	{ /* h023 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2db78eb8, 0x1d8bfdde, 0x34574f22, 0x1c8d9dcd,
-			0x3a771387, 0x1bbf21c1, 0x3dd6dbe8, 0x1e8731b9,
-			0x20a78de9, 0x1d68b9de, 0x27c73e54, 0x1c3a81c8,
-			0x2e86f6c4, 0x1b3c31b8, 0x3516b72e, 0x1a5dcda8,
-		},
-	},
-	{ /* h024 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x3b668795, 0x197f5d9c, 0x1b666bcd, 0x1c6749ce,
-			0x214705f3, 0x1b08edbb, 0x2856a260, 0x19daa9a2,
-			0x2f3662ce, 0x18fc5993, 0x35b62b39, 0x181df185,
-			0x3bf5f79e, 0x17ded978, 0x1b96cda1, 0x1a0771a6,
-		},
-	},
-	{ /* h025 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x21f66dfc, 0x18891996, 0x28e60a69, 0x177ac97c,
-			0x2fb5cad7, 0x169c7d6e, 0x36459b41, 0x15ee1562,
-			0x39f567a7, 0x1996315f, 0x1c46199f, 0x17b7957f,
-			0x22a5da07, 0x16394171, 0x29757673, 0x151aed56,
-		},
-	},
-	{ /* h026 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x302532df, 0x144c9548, 0x36a50348, 0x139e353d,
-			0x17650787, 0x1686217f, 0x1ce585ac, 0x1587b95c,
-			0x23454e11, 0x13e9694e, 0x29f4de7d, 0x12bb0d30,
-			0x30949ee6, 0x11fcad23, 0x37046f4e, 0x122db917,
-		},
-	},
-	{ /* h027 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x17059561, 0x1446514b, 0x1d74f9b6, 0x1357e13a,
-			0x23d4c21a, 0x1189912b, 0x2a844686, 0x106b290b,
-			0x30f40aed, 0x0facc4fe, 0x3563db54, 0x14a53103,
-			0x17c4b958, 0x11f68126, 0x1e046dc0, 0x11280916,
-		},
-	},
-	{ /* h028 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x24643624, 0x0f29b908, 0x2b03b28f, 0x0e2b44e6,
-			0x315376f4, 0x0d4cdcd9, 0x1373933d, 0x1115012f,
-			0x18842163, 0x0fc6a501, 0x1e93e1c9, 0x0ee82cf3,
-			0x24f3aa2d, 0x0cc9d8e5, 0x2b931a97, 0x0beb68c3,
-		},
-	},
-	{ /* h029 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x31b2e2fa, 0x0c5c94b3, 0x12944d22, 0x0eb52cf6,
-			0x19239171, 0x0da6c8df, 0x1f1359d1, 0x0cd84cd1,
-			0x25532234, 0x0a69f8c4, 0x2c2292a0, 0x09ab88a0,
-			0x30c25301, 0x0f9434a6, 0x13436912, 0x0c8568cf,
-		},
-	},
-	{ /* h030 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x19b3097d, 0x0b96e8be, 0x1f92d5d8, 0x0ac868b0,
-			0x25b29e3b, 0x085a20a3, 0x2ca206aa, 0x076ba87c,
-			0x0f722af6, 0x0be3f0de, 0x1442d11f, 0x0a65a0ad,
-			0x1a528986, 0x09970c9e, 0x203255e2, 0x08b89090,
-		},
-	},
-	{ /* h031 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x26621e45, 0x063a4882, 0x2d217ab3, 0x06fb8458,
-			0x0e730ce2, 0x098424a3, 0x1532492e, 0x0865c88b,
-			0x1ae20990, 0x0797307e, 0x20d1d5ec, 0x06b8b870,
-			0x27019e4f, 0x040a6c62, 0x2cc0eebb, 0x0a833455,
-		},
-	},
-	{ /* h032 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0f421cd2, 0x0774607d, 0x15d1c13d, 0x0665e86b,
-			0x1b618998, 0x0597505e, 0x216155f4, 0x04b8dc50,
-			0x27911e58, 0x01ea9042, 0x0b80eab7, 0x06c2f48d,
-			0x102188de, 0x05549c5b, 0x16513d48, 0x04660c4b,
-		},
-	},
-	{ /* h033 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1bd109a0, 0x0397703d, 0x21e0d1fd, 0x02b8fc30,
-			0x28109a60, 0x022a8422, 0x0c41cca3, 0x0693946e,
-			0x12618d05, 0x0595145e, 0x1781555f, 0x04c64850,
-			0x1c6121ac, 0x03f78c44, 0x2230ea03, 0x03090835,
-		},
-	},
-	{ /* h034 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2820aa62, 0x2407a825, 0x22a8ee0a, 0x23092a36,
-			0x28a8ae6a, 0x222aaa26, 0x2e987aca, 0x216c261a,
-			0x34884b28, 0x20bd9e0f, 0x3a682387, 0x200f1a04,
-			0x1d57efe6, 0x2217d625, 0x23a87216, 0x21398217,
-		},
-	},
-	{ /* h035 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2ab83687, 0x204b3a08, 0x3157faf2, 0x1f1ce1f8,
-			0x37a7b35a, 0x1e6e69e9, 0x3db783bb, 0x1ddf49db,
-			0x1df819c1, 0x20080205, 0x24d7ea24, 0x1ec9d9f4,
-			0x2cf796a1, 0x1d8be5de, 0x3457531f, 0x1c8da5ce,
-		},
-	},
-	{ /* h036 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x3ab7138a, 0x1bbf2dc0, 0x3bd6f3c7, 0x1ea6b5be,
-			0x1e87a1c7, 0x1dc831e2, 0x25b74a33, 0x1c0a19c9,
-			0x2df6eab5, 0x1b0c1db4, 0x3516af2e, 0x1a1dd1a5,
-			0x3b867796, 0x19ced598, 0x19767fad, 0x1c96b9d0,
-		},
-	},
-	{ /* h037 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1f16f5cb, 0x1b285db7, 0x26a6a240, 0x197a5d9f,
-			0x2eb646c2, 0x187c4d8c, 0x35a60b37, 0x17adf17e,
-			0x39d5db9e, 0x181e557d, 0x1946d582, 0x1996b9a9,
-			0x1fb645d6, 0x18a8898d, 0x2795f24e, 0x16da8974,
-		},
-	},
-	{ /* h038 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2f25a2ca, 0x15ec6163, 0x36056f3c, 0x154e1157,
-			0x37e57b85, 0x19b5b564, 0x19262d7c, 0x16e6ed77,
-			0x2075a9e1, 0x1618b565, 0x2835465a, 0x145aa94b,
-			0x2f84fed2, 0x137c753b, 0x3654d341, 0x13dda531,
-		},
-	},
-	{ /* h039 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x15751766, 0x16f59581, 0x19f55577, 0x1477194c,
-			0x21150dea, 0x1398e13e, 0x28c4a665, 0x11cac923,
-			0x2fd462d8, 0x111c8914, 0x34d43b46, 0x126d351b,
-			0x14c59942, 0x13457553, 0x1ac4ad85, 0x12274125,
-		},
-	},
-	{ /* h040 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x21d479f5, 0x11491119, 0x2944066f, 0x0f6ae8fa,
-			0x3033cadf, 0x0ecca0ef, 0x3343e730, 0x14c4b506,
-			0x1464dd34, 0x10d5b515, 0x1b741994, 0x0ff76903,
-			0x2263edff, 0x0f1930f6, 0x29d36277, 0x0d1b08d4,
-		},
-	},
-	{ /* h041 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x30a336e5, 0x0d8c50ca, 0x11839f1b, 0x11d47131,
-			0x1563d92f, 0x0e75f8ee, 0x1c338da1, 0x0db790df,
-			0x22e35e09, 0x0cd948d2, 0x2a62ce80, 0x0acb28b0,
-			0x2f82a2ed, 0x0c8c0cb7, 0x10645d02, 0x0d946501,
-		},
-	},
-	{ /* h042 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x16734540, 0x0c562cca, 0x1ce305ad, 0x0b97c4bd,
-			0x2382d215, 0x0ab96cb0, 0x2ae23e8a, 0x088b488b,
-			0x2eb266e0, 0x0fd3b4aa, 0x102394f0, 0x0b54a0bc,
-			0x1732b94f, 0x0a4658a8, 0x1d9281b7, 0x0977f09c,
-		},
-	},
-	{ /* h043 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x24324a20, 0x0899988e, 0x2b71ae93, 0x07bb2067,
-			0x0d823ed6, 0x0c836ce2, 0x111280eb, 0x0914dc99,
-			0x17f22d5d, 0x08368087, 0x1e31fdc1, 0x0768187b,
-			0x24c1c629, 0x0689b86c, 0x2b111e9c, 0x075b045d,
-		},
-	},
-	{ /* h044 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0c631cc3, 0x084354ac, 0x1211f0fb, 0x06e51c75,
-			0x1891a968, 0x0626a866, 0x1ed179cb, 0x05583c59,
-			0x25414232, 0x0479dc4b, 0x2ac0fe99, 0x0ad2b45b,
-			0x0d2240b0, 0x07e3cc88, 0x13d1dd18, 0x06c57071,
-		},
-	},
-	{ /* h045 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x19619d79, 0x05e6cc63, 0x1f1169d0, 0x05184c55,
-			0x25513234, 0x0439d847, 0x09810697, 0x08e2e094,
-			0x0fa224d9, 0x07e46884, 0x1581e53b, 0x0705c474,
-			0x1a31b18a, 0x0646f068, 0x1f717dd7, 0x05585c5a,
-		},
-	},
-	{ /* h046 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x25814238, 0x0459e04a, 0x1ff981e0, 0x2568825b,
-			0x26094240, 0x246a024b, 0x2bf906a0, 0x238b7e3c,
-			0x31e8d2ff, 0x22ccfa30, 0x37d8a75d, 0x221e7225,
-			0x3dc877bc, 0x24572a19, 0x20b911e9, 0x2398b63e,
-		},
-	},
-	{ /* h047 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x27a8da53, 0x22ba7a31, 0x2e589ac2, 0x21bc2620,
-			0x34e8532c, 0x20cdba0f, 0x3ae8278e, 0x1fef3e04,
-			0x1b37ffc6, 0x22674e28, 0x218889f5, 0x2199021e,
-			0x29385269, 0x207b020e, 0x30f806e9, 0x1f8cd9fd,
-		},
-	},
-	{ /* h048 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x37b7cb5a, 0x1e8e71ed, 0x3ba78fbd, 0x1e1ec9e0,
-			0x1be829a2, 0x20577e09, 0x22480200, 0x1f2949fa,
-			0x2a87ae7c, 0x1dbb55e4, 0x32f75703, 0x1c7d69ce,
-			0x3a270f7f, 0x1c0ea5c0, 0x39d707a6, 0x1ed639c1,
-		},
-	},
-	{ /* h049 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1c27ada4, 0x1e17a1e7, 0x23776e0c, 0x1c7985ce,
-			0x2b96f68d, 0x1aeb9db5, 0x3416a314, 0x19fd9da3,
-			0x39566f8c, 0x1a1e519d, 0x17868f8c, 0x1cb629d2,
-			0x1c870da4, 0x1b17c1ba, 0x2456ae1a, 0x1999c1a2,
-		},
-	},
-	{ /* h050 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2ca6429c, 0x183be188, 0x34c5fb26, 0x176dc57a,
-			0x37b5eb7a, 0x185dd182, 0x1726dd63, 0x1a0619ac,
-			0x1d1641a6, 0x1827ed86, 0x2535fe26, 0x16d9f973,
-			0x2d7592ac, 0x159c115e, 0x3525572c, 0x158d7d51,
-		},
-	},
-	{ /* h051 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x35d58b63, 0x19d53968, 0x16a63d5a, 0x1666157f,
-			0x1dd56db1, 0x15582158, 0x25f54e32, 0x13ea3545,
-			0x2e24eab7, 0x131c2934, 0x33f4b731, 0x140d1934,
-			0x13952745, 0x17250982, 0x16957550, 0x13865543,
-		},
-	},
-	{ /* h052 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e94cdc0, 0x12d84d30, 0x26b4aa3b, 0x114a5915,
-			0x2ea446c1, 0x10ac450d, 0x32a44720, 0x129cb11f,
-			0x12a5a123, 0x13d4e556, 0x17b4894f, 0x11269918,
-			0x1f5439ce, 0x1068710b, 0x27540a42, 0x0eba80ed,
-		},
-	},
-	{ /* h053 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2f13aac9, 0x0eec08e7, 0x3133f70d, 0x14d4390a,
-			0x1214f113, 0x1054d91d, 0x18a3e95f, 0x0ef6c8f3,
-			0x1ff3add8, 0x0e3898e7, 0x27f37a4c, 0x0c6aa4c6,
-			0x2e4312d1, 0x0dcbc4cd, 0x0f93aefa, 0x1223ed33,
-		},
-	},
-	{ /* h054 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x11d3fd0b, 0x0db518e7, 0x19734d71, 0x0cb6f4cf,
-			0x20a321e2, 0x0bf8c0c3, 0x2892ea57, 0x0a1ac8a2,
-			0x2d72b2c8, 0x0ccb84bc, 0x0e6464e3, 0x0e33d106,
-			0x12f32107, 0x0b6560be, 0x1a32c97f, 0x0ab720ae,
-		},
-	},
-	{ /* h055 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x21429ded, 0x09d8eca2, 0x29326662, 0x08bab47e,
-			0x2cc27abf, 0x0fe338b1, 0x0de3a8d0, 0x0a93c8c6,
-			0x14128519, 0x09459c99, 0x1ae2458b, 0x08a7448d,
-			0x21e219f7, 0x07c91481, 0x2911de6c, 0x07fa9c6a,
-		},
-	},
-	{ /* h056 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0b925ab7, 0x0cf2e8e3, 0x0ec2a8c7, 0x09a444a1,
-			0x15c24937, 0x0885f48c, 0x1bf2119e, 0x07c78080,
-			0x2261de03, 0x06e92473, 0x28f1a66c, 0x07ca8c61,
-			0x0a5324a4, 0x0ad318b3, 0x109290e8, 0x0934b89a,
-		},
-	},
-	{ /* h057 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x17023153, 0x08363488, 0x1c71fdaa, 0x0767987b,
-			0x2291ca08, 0x0689286d, 0x28e1926b, 0x0b023862,
-			0x0cd2b8ad, 0x0a53b8a9, 0x12f2790e, 0x09354099,
-			0x18523d6b, 0x0876788b, 0x1d120db8, 0x0797c07e,
-		},
-	},
-	{ /* h058 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2301d210, 0x06a93c6f, 0x1d51966f, 0x27b7d680,
-			0x2359da14, 0x26b95670, 0x29599a75, 0x25cad661,
-			0x2f495ad5, 0x24ec5252, 0x35392b34, 0x242dce46,
-			0x3b28ff92, 0x236f4a3b, 0x1dd995c0, 0x2637fe69,
-		},
-	},
-	{ /* h059 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x24697a22, 0x2559b658, 0x2b693e91, 0x242b6647,
-			0x31f8f6fd, 0x231d0a37, 0x3828b762, 0x224e8e29,
-			0x3bc87fc4, 0x2496a61d, 0x1e892dc6, 0x24483248,
-			0x25a8fe32, 0x234a123b, 0x2d98c2b0, 0x225c022a,
-		},
-	},
-	{ /* h060 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x34b87b27, 0x213db618, 0x3b083b8e, 0x204eba09,
-			0x19280fa6, 0x22b6ba2b, 0x1f489dd2, 0x21e86224,
-			0x26e87245, 0x20ea6a15, 0x2f381ec6, 0x1f9c8202,
-			0x36f7c74c, 0x1ebe49ee, 0x3997a39b, 0x1e4e49e6,
-		},
-	},
-	{ /* h061 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x19a83583, 0x2096ee0d, 0x1ff815de, 0x1fa88e03,
-			0x2837ca53, 0x1e3ab9ea, 0x2ff76ed7, 0x1cdcadd4,
-			0x37e72358, 0x1c4e1dc3, 0x37c71386, 0x1ef5b9c5,
-			0x19d7b980, 0x1e46f9ea, 0x20c775e4, 0x1ce8e1db,
-		},
-	},
-	{ /* h062 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x29270e67, 0x1b5aedbb, 0x30f6bae4, 0x1a1cf1a7,
-			0x37167f66, 0x1a4dc9a1, 0x15969f6b, 0x1ce5a1d4,
-			0x19d71d7d, 0x1b8719c0, 0x21b6b9f0, 0x19c929a8,
-			0x29d65674, 0x188b1d90, 0x31f602f3, 0x17bd2d79,
-		},
-	},
-	{ /* h063 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x35a5fb57, 0x189d4d85, 0x1516e544, 0x1a5581af,
-			0x1a36597a, 0x1827458c, 0x2285f1fb, 0x16c95977,
-			0x2a95ae7f, 0x15cb5565, 0x32b55701, 0x15bce955,
-			0x33c59740, 0x19e4bd6c, 0x14664939, 0x17157184,
-		},
-	},
-	{ /* h064 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1ae5817f, 0x15076d54, 0x23253607, 0x1409854a,
-			0x2b74fe8b, 0x130b9138, 0x31a4c709, 0x143c8d37,
-			0x11a53323, 0x17548184, 0x14158d2f, 0x1395854f,
-			0x1bc4b58d, 0x1277a129, 0x23c49613, 0x1159b123,
-		},
-	},
-	{ /* h065 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2c644698, 0x10dba10c, 0x306452fb, 0x12dc2d21,
-			0x1095a505, 0x14345d5b, 0x1464c528, 0x10b5cd18,
-			0x1cb415a1, 0x1007d102, 0x2473fa1e, 0x0e89e0fc,
-			0x2c838ea5, 0x0f2b70ea, 0x2f23feea, 0x14f3bd0e,
-		},
-	},
-	{ /* h066 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x100500f2, 0x11443d24, 0x1583d92c, 0x0e3614eb,
-			0x1d8381af, 0x0db804de, 0x25035e29, 0x0bba10d4,
-			0x2bf31aa8, 0x0deb38d0, 0x0da3bed9, 0x12437136,
-			0x0f941ce9, 0x0d644cf2, 0x16c32d3f, 0x0c0654c3,
-		},
-	},
-	{ /* h067 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e62f1be, 0x0b5834b9, 0x25a2c634, 0x0a2a20ad,
-			0x2b62bea3, 0x0d2b0cc0, 0x0c6468c5, 0x0eb34d08,
-			0x10933ce4, 0x0bf4c0c9, 0x17e2dd59, 0x0b0688b3,
-			0x1ea2b1c6, 0x0a4848a9, 0x26027e39, 0x08ea1c9a,
-		},
-	},
-	{ /* h068 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2ae28a9e, 0x0ff2c0b8, 0x0bc3b4b1, 0x0c7378ce,
-			0x1292f903, 0x0af53cb7, 0x1932a972, 0x0a26d0a6,
-			0x1f7279d4, 0x0958689a, 0x2612423e, 0x083a188b,
-			0x09a27a99, 0x0d126ce5, 0x0dc340bb, 0x0bf3f4ca,
-		},
-	},
-	{ /* h069 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1442d11f, 0x0a759cad, 0x1a328d85, 0x09a7049e,
-			0x201255e0, 0x08c88891, 0x26422243, 0x083a1083,
-			0x0a432c85, 0x0c8308ca, 0x103314e2, 0x0b948cc0,
-			0x1652d144, 0x0aa5fcae, 0x1b329999, 0x09d734a2,
-		},
-	},
-	{ /* h070 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x209265ea, 0x08f8a094, 0x26622a47, 0x2a072c85,
-			0x209a6dea, 0x2908a696, 0x26aa2e4a, 0x281a2a86,
-			0x2ca9f2aa, 0x271baa76, 0x32a9b30a, 0x264d2668,
-			0x38898369, 0x258ea25c, 0x1b5953c8, 0x28f74286,
-		},
-	},
-	{ /* h071 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x217a25f3, 0x27e8ee83, 0x2849e660, 0x26daa673,
-			0x2f0996cd, 0x259c4e5f, 0x35694f36, 0x24adde4e,
-			0x3b891797, 0x23aeca3f, 0x1b99a99f, 0x26f76e71,
-			0x2249a9ff, 0x26092e66, 0x2a097275, 0x252b2658,
-		},
-	},
-	{ /* h072 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x318932f0, 0x23dcf644, 0x3818e35f, 0x22ce8e32,
-			0x39c893a2, 0x24c62221, 0x1c5941a1, 0x2497a24c,
-			0x23591e0c, 0x23d98244, 0x2b68de8a, 0x22ab8a31,
-			0x33a88f0e, 0x218d7a1d, 0x38d85382, 0x209e360e,
-		},
-	},
-	{ /* h073 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x17081b87, 0x22e6222f, 0x1d38adae, 0x2297ca26,
-			0x24787617, 0x2179d61d, 0x2c883e9f, 0x1ffbc607,
-			0x3477eb1c, 0x1eedb9f5, 0x37a7b778, 0x1e8dcde9,
-			0x17684163, 0x20e65e10, 0x1da82dbb, 0x20080206,
-		},
-	},
-	{ /* h074 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2507ee21, 0x1eaa11f3, 0x2d778eae, 0x1d4c09dc,
-			0x35973b2b, 0x1c8d95c7, 0x35d72366, 0x1f253dcb,
-			0x1777c55f, 0x1eb665ee, 0x1e178dbe, 0x1db831d9,
-			0x26874236, 0x1bba45c3, 0x2e66d6bb, 0x1a7c41ae,
-		},
-	},
-	{ /* h075 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x34e68f3f, 0x1a8d45a5, 0x13a6b74b, 0x1d151dd7,
-			0x17473157, 0x1be665c3, 0x1f06d1c4, 0x1aa86dad,
-			0x27566e4a, 0x18fa7995, 0x2f3622c9, 0x17ec9580,
-			0x33860b34, 0x18fcd189, 0x12f6f125, 0x1a94edb3,
-		},
-	},
-	{ /* h076 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x17567153, 0x18c68d95, 0x1fc605d0, 0x1758a57a,
-			0x2815ae58, 0x163aad69, 0x303572d5, 0x15ec5159,
-			0x31d5a31d, 0x1a044172, 0x12465117, 0x1784dd89,
-			0x1805ad56, 0x1556c160, 0x20853ddc, 0x1478d14b,
-		},
-	},
-	{ /* h077 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x28d4f663, 0x137add3c, 0x2f44d2e1, 0x145c013a,
-			0x0fb54b04, 0x1793fd85, 0x11e5a10d, 0x1484e559,
-			0x18d4d95e, 0x1256f12a, 0x215489e8, 0x11d8fd1f,
-			0x2984426f, 0x111b0110, 0x2e345ed4, 0x133bad23,
-		},
-	},
-	{ /* h078 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0e85ace6, 0x1493d95f, 0x11e4e905, 0x10d4f925,
-			0x19b4056c, 0x0f9724fa, 0x2203ddf5, 0x0f4924f6,
-			0x29f39e78, 0x0f5ad8eb, 0x2d240ac7, 0x15234114,
-			0x0df508d2, 0x1193b92b, 0x12c40904, 0x0eb560f7,
-		},
-	},
-	{ /* h079 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1ae38d85, 0x0de758e1, 0x22836dff, 0x0d4940d7,
-			0x29a31a7d, 0x0e3ab4d4, 0x0bb3d6ba, 0x1262f536,
-			0x0d8434c8, 0x0f23ecf8, 0x1473a520, 0x0d55c8dd,
-			0x1ba34996, 0x0cb778ce, 0x22d31a06, 0x0bd950c1,
-		},
-	},
-	{ /* h080 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2952ce7e, 0x0dba94c4, 0x0a746ca6, 0x0f02c90b,
-			0x0f63acd3, 0x0db464e4, 0x16734d40, 0x0c8628cc,
-			0x1cc311ab, 0x0bc7bcc0, 0x2362de12, 0x0ae964b3,
-			0x29029a7d, 0x101244c0, 0x0b13bc91, 0x0ec344ee,
-		},
-	},
-	{ /* h081 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x112394f1, 0x0cf4d4da, 0x17c3215a, 0x0be670c2,
-			0x1da2e5bb, 0x0b07e8b5, 0x23b2b21b, 0x0a3970a7,
-			0x07b29a7b, 0x0e6268e7, 0x0d7390b9, 0x0e03dce4,
-			0x13836918, 0x0cf564d4, 0x19332578, 0x0c16b4c5,
-		},
-	},
-	{ /* h082 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e22f5c7, 0x0b3804b8, 0x23f2ba20, 0x0a4978a9,
-			0x1dfb01c0, 0x2b67fabb, 0x23eac61e, 0x2a697eab,
-			0x29fa867f, 0x296afe9b, 0x2ffa46df, 0x287c7e8c,
-			0x35fa0b3f, 0x279dfe7d, 0x3be9d79e, 0x2a66ae72,
-		},
-	},
-	{ /* h083 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e6ac9c3, 0x2a882aad, 0x254a8a2f, 0x2979e29d,
-			0x2c0a4a9c, 0x283b928a, 0x32a9f307, 0x270d2a75,
-			0x38c9ab6b, 0x260eb665, 0x195963a8, 0x2946b28b,
-			0x1f2a61ce, 0x28e86293, 0x266a223e, 0x280a4682,
-		},
-	},
-	{ /* h084 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2e19e6ba, 0x26ac2672, 0x35198f2e, 0x255dd25c,
-			0x39793b96, 0x23ee4a45, 0x1969b97e, 0x2746de75,
-			0x1ff9c9db, 0x26b89a6e, 0x27b99a50, 0x25aa9a60,
-			0x2fd946d2, 0x247ca24d, 0x3729074e, 0x231e023c,
-		},
-	},
-	{ /* h085 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x37d8a781, 0x25059a24, 0x1a094d7d, 0x24c71651,
-			0x20d935e6, 0x2468de4a, 0x29190e66, 0x231ae639,
-			0x30c8aae2, 0x21ecde23, 0x36a8635d, 0x20cdb613,
-			0x14f82368, 0x23359632, 0x1ae8bd87, 0x2297422b,
-		},
-	},
-	{ /* h086 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2158b1f0, 0x21c9121b, 0x29f85e76, 0x208b2210,
-			0x31d802f4, 0x1f1d2dfa, 0x35a7c756, 0x1edd4ded,
-			0x15484d44, 0x2125c614, 0x1b883d95, 0x2077560b,
-			0x22180200, 0x1f4919fb, 0x2b37ae81, 0x1dcb65e2,
-		},
-	},
-	{ /* h087 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x32c75300, 0x1ced05ce, 0x33f73744, 0x1f44c1d0,
-			0x1507cd3d, 0x1ee5c9f2, 0x1ba7ad95, 0x1da789e1,
-			0x22f76e0c, 0x1c5999d5, 0x2bc6e695, 0x1adb95b5,
-			0x32a6a712, 0x1aecb5ab, 0x11b6cb2c, 0x1d4495d9,
-		},
-	},
-	{ /* h088 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x14e74133, 0x1c45c9c7, 0x1c76f199, 0x1b17c5b8,
-			0x2486da17, 0x1929e59d, 0x2c863a9f, 0x184bd587,
-			0x3156230f, 0x195c558f, 0x10d6f906, 0x1ae469b5,
-			0x15067d2d, 0x1955d59b, 0x1d1639a4, 0x17b7f582,
-		},
-	},
-	{ /* h089 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x25a5de29, 0x168a0968, 0x2d458ea9, 0x163bb95f,
-			0x2fd5b6f9, 0x1a23c577, 0x103660f6, 0x17f44d8c,
-			0x1535d530, 0x1626096b, 0x1dd55db2, 0x1498254f,
-			0x26351235, 0x13da2d3c, 0x2cd4eeb4, 0x14cb753f,
-		},
-	},
-	{ /* h090 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0dc562e4, 0x17d37d88, 0x0fa5b0ec, 0x15045160,
-			0x15f4f931, 0x12a63537, 0x1e7495bc, 0x12085122,
-			0x26c4763f, 0x115a4d14, 0x2c146ead, 0x138b2d2a,
-			0x0c95b8c6, 0x14e35560, 0x0f9500e3, 0x1264792d,
-		},
-	},
-	{ /* h091 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x17246145, 0x10567d0b, 0x1f140dc8, 0x0fe87501,
-			0x2723f247, 0x0fba40ef, 0x2b242aa6, 0x1532c519,
-			0x0be510b3, 0x12033530, 0x112468f0, 0x1074dd14,
-			0x18b3f160, 0x0f26c4f5, 0x1fc3bdd6, 0x0e788ceb,
-		},
-	},
-	{ /* h092 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x27438a49, 0x0eba34da, 0x09c3f69d, 0x12927537,
-			0x0c9448a7, 0x1093ad0e, 0x1304090c, 0x0f1558f9,
-			0x1a03a97e, 0x0e3708e7, 0x208381e4, 0x0d68b4db,
-			0x27434651, 0x0e3a20cb, 0x08747487, 0x10c29d0d,
-		},
-	},
-	{ /* h093 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0e6428c7, 0x10041906, 0x14c3d929, 0x0e55c8ec,
-			0x1b138193, 0x0d7740db, 0x21134df0, 0x0c98c8ce,
-			0x27331653, 0x1031c8c9, 0x0af40491, 0x0ff33900,
-			0x10c3fcec, 0x0f44b4fa, 0x16e3bd4e, 0x0e4630e9,
-		},
-	},
-	{ /* h094 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1c0381a6, 0x0d876cdc, 0x21834df9, 0x0c98dcce,
-			0x1b630e57, 0x2db752e0, 0x213b59f3, 0x2cb8ced1,
-			0x274b1a54, 0x2bba52c1, 0x2d4adab4, 0x2acbd2b1,
-			0x334a9f14, 0x29cd56a1, 0x394a5b75, 0x28fed293,
-		},
-	},
-	{ /* h095 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1b7b19a0, 0x2d2766d6, 0x221b31fc, 0x2c191ec7,
-			0x28faee6c, 0x2aeaceb6, 0x2faa9ad8, 0x299c769f,
-			0x360a4b3e, 0x286e068b, 0x39ea03a2, 0x2ab62a76,
-			0x1bfadda0, 0x2bb796c1, 0x233ada0c, 0x2ab966b0,
-		},
-	},
-	{ /* h096 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2aba9a82, 0x299b4ea0, 0x320a46fa, 0x280d0e89,
-			0x3899e367, 0x265e3271, 0x17497388, 0x29962e8f,
-			0x1cda75a8, 0x2987ca9b, 0x240a4e19, 0x2889ae8f,
-			0x2c1a1296, 0x277bb27c, 0x33d9c717, 0x264d8a6a,
-		},
-	},
-	{ /* h097 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x37695773, 0x242dce4a, 0x1739c55c, 0x27a64678,
-			0x1da9d1b6, 0x2727fe73, 0x2559be29, 0x265a066c,
-			0x2d396ea9, 0x24cbf655, 0x34d91727, 0x237d7641,
-			0x35e8b761, 0x25351627, 0x17795d5a, 0x25068257,
-		},
-	},
-	{ /* h098 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1e4935c4, 0x2478324e, 0x26791235, 0x23ba4e45,
-			0x2e48caba, 0x223c362a, 0x34887339, 0x210d3a18,
-			0x12d83748, 0x23850a35, 0x1878d95d, 0x22b6be2e,
-			0x1ef8adce, 0x21b8562f, 0x2738663c, 0x210a9217,
-		},
-	},
-	{ /* h099 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2f3822ca, 0x1f9c7a00, 0x3377df32, 0x1f3ccdf2,
-			0x13385925, 0x21752217, 0x19384d6f, 0x20c6d210,
-			0x20081dd3, 0x1fa88601, 0x2827d641, 0x1e3ac5eb,
-			0x2fe76ed7, 0x1d5c65d6, 0x31f74f20, 0x1f6445d5,
-		},
-	},
-	{ /* h100 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x12b7d91c, 0x1f1531f6, 0x1947b96e, 0x1e26edea,
-			0x20c761e1, 0x1d98addd, 0x29371667, 0x1b5aedba,
-			0x3026bee2, 0x1b3c29b1, 0x0fc6df0b, 0x1d6411db,
-			0x12875111, 0x1c8535cb, 0x19a71971, 0x1b470dbd,
-		},
-	},
-	{ /* h101 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2186b1f2, 0x19c925b2, 0x29d65276, 0x18ab1190,
-			0x2f263ae6, 0x19abd594, 0x0ed700e7, 0x1b13e5b8,
-			0x12969d0b, 0x19f53da0, 0x1a365577, 0x1827458c,
-			0x2295e9fd, 0x16a96176, 0x2a65ae7f, 0x16ab1566,
-		},
-	},
-	{ /* h102 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2dd5cad5, 0x1a53497c, 0x0e2670d5, 0x1853c191,
-			0x12c5ed0a, 0x16b54d72, 0x1b058981, 0x15076d56,
-			0x23453207, 0x14198147, 0x2a650688, 0x151ae547,
-			0x0bd576c4, 0x17f2fd8b, 0x0d95c0cb, 0x1573bd66,
-		},
-	},
-	{ /* h103 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x13954514, 0x13858149, 0x1bb4b58e, 0x12879d29,
-			0x23b49a12, 0x11999d24, 0x29d49687, 0x13eab131,
-			0x0a95bca8, 0x1522d162, 0x0e551cc2, 0x13b41d41,
-			0x1504cd2a, 0x11a5ed24, 0x1cd455a6, 0x10f7cd12,
-		},
-	},
-	{ /* h104 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x23f42e1a, 0x1049ad08, 0x29544684, 0x15324d21,
-			0x09d51c93, 0x1312fd34, 0x1014b0e0, 0x12148d26,
-			0x16f46949, 0x10c65512, 0x1d8421b7, 0x1017f505,
-			0x2483f222, 0x0f29acf7, 0x07e41e80, 0x12b1f539,
-		},
-	},
-	{ /* h105 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0bd4a49d, 0x12437127, 0x11d480fc, 0x1135051d,
-			0x18942564, 0x0fe6a102, 0x1e53e9c7, 0x0f181cf5,
-			0x24b3b229, 0x0ec9ace7, 0x08747c68, 0x11c2991d,
-			0x0e346cc4, 0x1184091a, 0x14245122, 0x10a58d0f,
-		},
-	},
-	{ /* h106 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x19f41183, 0x0fb6e500, 0x1f03ddd4, 0x0ed840f2,
-			0x2503a230, 0x3006ace3, 0x1e8bedca, 0x2f181ef6,
-			0x249bae28, 0x2e19aae6, 0x2a9b6e8a, 0x2d1b26d6,
-			0x309b32e9, 0x2c1ca6c7, 0x36aaf34a, 0x2b1e2ab6,
-		},
-	},
-	{ /* h107 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x195ab7aa, 0x2f86aae6, 0x1f0bd5cd, 0x2ea852ef,
-			0x260b923a, 0x2d8a12de, 0x2cbb4aa7, 0x2c3bbaca,
-			0x332af710, 0x2afd4eb6, 0x396aa375, 0x293e52a1,
-			0x194b2d80, 0x2e96cada, 0x1feb8dd8, 0x2d6896dc,
-		},
-	},
-	{ /* h108 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x275b464d, 0x2c6a76cc, 0x2ebafec4, 0x2afc4ab8,
-			0x359a9f35, 0x293df69d, 0x37ea1b80, 0x2b05aa7a,
-			0x19aaf17e, 0x2c56fec5, 0x20bb01e5, 0x2b68cebc,
-			0x285ac65b, 0x2a6ac2ab, 0x306a82db, 0x292cb69a,
-		},
-	},
-	{ /* h109 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x366a2f52, 0x26bdaa78, 0x15297f69, 0x29c59e92,
-			0x1a7a8984, 0x29b73a9e, 0x218a61f1, 0x29390e95,
-			0x299a3a70, 0x27fb0e84, 0x3179daed, 0x269cf26c,
-			0x35696f4f, 0x245d524f, 0x14f9d13b, 0x27e5aa7b,
-		},
-	},
-	{ /* h110 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1b69e592, 0x27076675, 0x2299c5ff, 0x26d95a6f,
-			0x2ac99e82, 0x253b525d, 0x327932fd, 0x23dcea46,
-			0x33e8cb41, 0x25648e2b, 0x15096937, 0x2565e25a,
-			0x1c49459f, 0x24f7924d, 0x22f9020b, 0x2439923c,
-		},
-	},
-	{ /* h111 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2bc8fa97, 0x22ab8e32, 0x32388f0c, 0x214cae1e,
-			0x10c84b28, 0x23b47a39, 0x15e8e935, 0x22f61e35,
-			0x1cd8b1ae, 0x2307be2b, 0x23586e15, 0x2179d217,
-			0x2c8842a2, 0x201bbe07, 0x3137fb0a, 0x1f7c4df8,
-		},
-	},
-	{ /* h112 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x11186506, 0x21a48e1a, 0x16b85948, 0x21164a13,
-			0x1d4831b4, 0x20080207, 0x2487ea21, 0x1ec9fdf4,
-			0x2d078eab, 0x1dabc9dc, 0x2ff766fc, 0x1fa3c9d9,
-			0x1087dcfb, 0x1f3495f8, 0x16e7cd4a, 0x1ea655f1,
-		},
-	},
-	{ /* h113 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1dd785b7, 0x1d7839d3, 0x26474e32, 0x1bda3dc6,
-			0x2d96deb5, 0x1b9b99b7, 0x0dd6f2eb, 0x1d8391de,
-			0x104758ef, 0x1ce499d0, 0x1707314b, 0x1bb661c4,
-			0x1f06c5c1, 0x1ab86dac, 0x27267e48, 0x193a6197,
-		},
-	},
-	{ /* h114 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2cc652bc, 0x19fb5599, 0x0cc70cc8, 0x1b6361bb,
-			0x1046b8e8, 0x1a14a5a7, 0x17767d4f, 0x18c69195,
-			0x1fb609d1, 0x1768a17b, 0x27a5ba55, 0x171a756f,
-			0x2bc5e2b0, 0x1a82cd81, 0x0c167cb6, 0x18e33d96,
-		},
-	},
-	{ /* h115 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x10b600e4, 0x1764c57b, 0x17e5a955, 0x1536b55f,
-			0x207545db, 0x14d8c54e, 0x27f5225c, 0x157a554f,
-			0x09e58ea4, 0x1822818d, 0x0b75d4aa, 0x1673696e,
-			0x11f584fc, 0x1505095a, 0x1975196b, 0x1387053c,
-		},
-	},
-	{ /* h116 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2104d5e8, 0x1308dd33, 0x27b4b661, 0x144a3138,
-			0x0895c489, 0x15624d66, 0x0d654cb4, 0x14a3dd4f,
-			0x13d51918, 0x13b58942, 0x1ad4c988, 0x12973d2c,
-			0x218495f2, 0x11c8f920, 0x27846662, 0x1561d12a,
-		},
-	},
-	{ /* h117 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x09352473, 0x1452cd47, 0x0f2508d3, 0x13d44d3f,
-			0x1594e935, 0x1275f130, 0x1bf4859f, 0x1197791d,
-			0x221451ff, 0x10b91110, 0x05f44263, 0x1391f93a,
-			0x0bb4e09c, 0x13636537, 0x1184ccf9, 0x12f4dd31,
-		},
-	},
-	{ /* h118 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1784a957, 0x11f66124, 0x1cd46db3, 0x1127a116,
-			0x22943608, 0x10292907, 0x1bfc7da1, 0x3167771b,
-			0x21cc45fc, 0x3068f70c, 0x27fc065e, 0x2f6a7efc,
-			0x2dfbc6bf, 0x2e6bfaec, 0x33fb871f, 0x2d6d7edc,
-		},
-	},
-	{ /* h119 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x39fb477f, 0x30662acd, 0x1c0c6d9e, 0x31379318,
-			0x22dc3607, 0x30194f07, 0x29dbee79, 0x2eeafef6,
-			0x304b9ae2, 0x2dac9ae0, 0x368b4f47, 0x2c5e2acc,
-			0x175acb8a, 0x2fd622eb, 0x1cbc35a6, 0x3007c307,
-		},
-	},
-	{ /* h120 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x23ebea16, 0x2ef99af5, 0x2b6baa8e, 0x2deb76e5,
-			0x327b5b03, 0x2c5d2ece, 0x374aef6f, 0x297dd2a8,
-			0x172b4160, 0x2eb63adf, 0x1d7bb9b2, 0x2e57f6e9,
-			0x24cb7e24, 0x2d39d6d9, 0x2cbb369f, 0x2c3bdaca,
-		},
-	},
-	{ /* h121 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x343aeb1d, 0x29dd62b2, 0x35fa2f5f, 0x2b35267d,
-			0x176b055c, 0x2c9666c9, 0x1e6b05c1, 0x2bc832bf,
-			0x25bae233, 0x2aea22b3, 0x2ddaa6b3, 0x297c1ea1,
-			0x342a472c, 0x270d2a7f, 0x13198f49, 0x29f51295,
-		},
-	},
-	{ /* h122 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x182a955e, 0x29c6a2a4, 0x1f1a5dcd, 0x29586696,
-			0x271a4e44, 0x288a7290, 0x2ed9f6c5, 0x270c5a76,
-			0x33598b2c, 0x24acd253, 0x12c9dd19, 0x28150e7e,
-			0x1919fd69, 0x2736da77, 0x1ff9c9d9, 0x26e8a270,
-		},
-	},
-	{ /* h123 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2869ae53, 0x25dab66b, 0x2fc952d4, 0x244c564c,
-			0x31e8df1e, 0x25940630, 0x12897515, 0x25c5425c,
-			0x1a095579, 0x24e70e51, 0x209949e3, 0x2358aa3a,
-			0x29590e65, 0x231ae63b, 0x2fb8a6df, 0x21ac1e24,
-		},
-	},
-	{ /* h124 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0eb85b09, 0x23e3ea3c, 0x1348f50e, 0x23557e3b,
-			0x1ad8c58a, 0x22c7362d, 0x2158bdef, 0x2198ee1b,
-			0x29d85a72, 0x206b0e0f, 0x2ef80ae3, 0x1fbbd1fe,
-			0x0f0870e6, 0x21d3fe1c, 0x1478691f, 0x2165b218,
-		},
-	},
-	{ /* h125 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1b484592, 0x20774e0c, 0x22280200, 0x1f5929fb,
-			0x2a57b27d, 0x1deb21e4, 0x2df77ad7, 0x1fd34dde,
-			0x0e57e0db, 0x1f83f9fa, 0x1487dd26, 0x1f35c1f5,
-			0x1b87a593, 0x1d5779df, 0x2347620e, 0x1c7985d4,
-		},
-	},
-	{ /* h126 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2af6fe8a, 0x1bfb05bc, 0x0be706cb, 0x1da311e0,
-			0x0e0768ce, 0x1d2405d6, 0x14c73d25, 0x1c55c9cc,
-			0x1c46f199, 0x1ab7c1b4, 0x2456a61c, 0x19c9b5a1,
-			0x2a766a92, 0x1a4ad19e, 0x0ad714a9, 0x1ba2ddbe,
-		},
-	},
-	{ /* h127 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0e06d4c7, 0x1a7411ac, 0x15068129, 0x1935d19b,
-			0x1d0635a4, 0x17e7e983, 0x2505f625, 0x1799d176,
-			0x29c5fa8c, 0x1aa25186, 0x0a068897, 0x1962b99a,
-			0x0f2638d1, 0x18145587, 0x15f5e938, 0x16b62174,
-		},
-	},
-	{ /* h128 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1dd581b4, 0x15b8155d, 0x2565622d, 0x15f9c556,
-			0x07f5a284, 0x1862018f, 0x0aa5e889, 0x17233176,
-			0x10e5b8ed, 0x1674c96a, 0x17b58d56, 0x1526895b,
-			0x1e9535c6, 0x14583d4a, 0x25850634, 0x14c9b940,
-		},
-	},
-	{ /* h129 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0695d06a, 0x16622569, 0x0c958ca9, 0x15d3a160,
-			0x12b56d09, 0x15453959, 0x19453171, 0x1406d946,
-			0x1f64f1d6, 0x13386538, 0x2594ba3c, 0x15815531,
-			0x09355874, 0x1532c554, 0x0ef548d0, 0x14d4394f,
-		},
-	},
-	{ /* h130 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x14c52d2d, 0x1445b14a, 0x1ac4fd8d, 0x13671d3a,
-			0x2004c5e2, 0x1278812c, 0x19648a41, 0x33b6d33f,
-			0x1f0cd9d2, 0x32c83f31, 0x252c9e31, 0x31c9cf21,
-			0x2b4c5a94, 0x30cb5311, 0x314c1af4, 0x2fccd301,
-		},
-	},
-	{ /* h131 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x374bdb54, 0x2ede52f1, 0x193c9980, 0x33a6d33c,
-			0x1facd1d7, 0x32987b2f, 0x26ac8e44, 0x317a431d,
-			0x2d5c46b3, 0x304bdf09, 0x33bbfb19, 0x2f0d72f7,
-			0x37fba77e, 0x30b5aad2, 0x197c7d7c, 0x32b6f730,
-		},
-	},
-	{ /* h132 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x208c95e3, 0x3198c31e, 0x280c5258, 0x309a9f0e,
-			0x2f5c0ece, 0x2f5c66fc, 0x360bb33d, 0x2ccda2e2,
-			0x155adf69, 0x30159af0, 0x1a3c3980, 0x31072b16,
-			0x218c29f1, 0x2ff8ff05, 0x290bea67, 0x2efaeaf4,
-		},
-	},
-	{ /* h133 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x30ebaee5, 0x2d9cd2e2, 0x352b134a, 0x29cd52af,
-			0x150b553f, 0x2ed5a6e4, 0x1b3bc58b, 0x2e8762eb,
-			0x225b91fe, 0x2db936df, 0x2a2b5a77, 0x2cbb36d0,
-			0x31cb0af6, 0x2a6cd2b9, 0x33fa4b3e, 0x2b649e82,
-		},
-	},
-	{ /* h134 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x153b1138, 0x2cc5d6cc, 0x1c1b199b, 0x2be796c1,
-			0x234af20b, 0x2b697ab9, 0x2b6ac68b, 0x2a1b76a6,
-			0x31ea6705, 0x275ca688, 0x10f9a32a, 0x2a248298,
-			0x15da9d38, 0x2a0616a9, 0x1cda71a9, 0x2997c697,
-		},
-	},
-	{ /* h135 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x247a661a, 0x2949ce95, 0x2c4a229d, 0x275bae7f,
-			0x3129a706, 0x24ec5258, 0x1099e8f7, 0x28347681,
-			0x16da1542, 0x2776527d, 0x1d89c9b8, 0x2717fe74,
-			0x2539be28, 0x268a126c, 0x2d096ea9, 0x24abb250,
-		},
-	},
-	{ /* h136 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2ff8f2fb, 0x25c38234, 0x102984f1, 0x26149e5f,
-			0x17c96d54, 0x25168e56, 0x1e5939c4, 0x24182e4e,
-			0x2638f22f, 0x239a3e42, 0x2d38c2b4, 0x21fb8a2a,
-			0x0c986ae9, 0x24235a3f, 0x10a904e7, 0x23c4e241,
-		},
-	},
-	{ /* h137 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x18c8dd62, 0x22e6ba31, 0x1f28a9cf, 0x21b85628,
-			0x26f86a3e, 0x20da5e16, 0x2ca81aba, 0x1ffb5203,
-			0x0cf87cc7, 0x21f3721f, 0x12187cf6, 0x21a51a1d,
-			0x19285d6f, 0x20c6ca11, 0x200819d5, 0x1fb88a01,
-		},
-	},
-	{ /* h138 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2777d24f, 0x1e6a6dec, 0x2bf78eb3, 0x1ff2d1e2,
-			0x0c47ecba, 0x1fd365fe, 0x1247e8ff, 0x1f4525f9,
-			0x1957c16f, 0x1e16edea, 0x20c761e1, 0x1d28d5db,
-			0x2817265d, 0x1c4a71c3, 0x09f71aab, 0x1dd291e2,
-		},
-	},
-	{ /* h139 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0bf778ad, 0x1d6371dc, 0x12874902, 0x1c8531cd,
-			0x19a71572, 0x1b771dbe, 0x21a6c1f0, 0x1a6905ae,
-			0x28168e67, 0x1a9a51a4, 0x08d7208a, 0x1be259c1,
-			0x0c86f0a5, 0x1b03a9b6, 0x12d6a90c, 0x19e559a2,
-		},
-	},
-	{ /* h140 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1a86657e, 0x18974992, 0x223619fa, 0x18092d85,
-			0x27c61666, 0x1ac1d58b, 0x07f69477, 0x19b2819e,
-			0x0e365cc2, 0x18e41192, 0x14b63128, 0x1835bd88,
-			0x1bd5e995, 0x16e78172, 0x22b5aa05, 0x16793566,
-		},
-	},
-	{ /* h141 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0605b665, 0x18918191, 0x0a061880, 0x17f2fd82,
-			0x1005f0df, 0x1774857a, 0x1665d144, 0x16a62970,
-			0x1ce591ad, 0x15c7b560, 0x23255e0f, 0x15394152,
-			0x06a5d84b, 0x17122573, 0x0c75bca8, 0x16b3996d,
-		},
-	},
-	{ /* h142 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1245a105, 0x16650967, 0x18159161, 0x15a6895f,
-			0x1db555bf, 0x14c7e151, 0x23851e18, 0x35f63141,
-			0x1c8d6da9, 0x35179b56, 0x225d3204, 0x34191b47,
-			0x288cf267, 0x331aa736, 0x2e9cb2c9, 0x321c2726,
-		},
-	},
-	{ /* h143 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x349c7329, 0x311da717, 0x175c3789, 0x35e62347,
-			0x1ccd6da9, 0x3507bb56, 0x236d2e11, 0x33f97345,
-			0x2a6ce682, 0x32eb2733, 0x30dc9eeb, 0x31bcbf21,
-			0x371c5350, 0x2f2dd30e, 0x171cad60, 0x35262741,
-		},
-	},
-	{ /* h144 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1d5d41ae, 0x3447ef4a, 0x24acfa22, 0x3339cb39,
-			0x2c1cba9a, 0x322b9f29, 0x32fc6f0c, 0x309d4b13,
-			0x35fbc35c, 0x31052ad7, 0x173c915b, 0x33d65730,
-			0x1e3cddbc, 0x32b82f31, 0x259c9a32, 0x31ba0720,
-		},
-	},
-	{ /* h145 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2d5c5aab, 0x309bfb11, 0x33cbff25, 0x2d3d1aeb,
-			0x134af349, 0x306512f5, 0x17dc415d, 0x31769717,
-			0x1f0c49ca, 0x30885f0e, 0x267c0e3f, 0x2f7a46fd,
-			0x2e6bcabb, 0x2e1c32ed, 0x331b3326, 0x2a1cd2b6,
-		},
-	},
-	{ /* h146 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x12db5d1d, 0x2f051ee8, 0x18dbcd67, 0x2ea6d2f1,
-			0x1ffba1d8, 0x2e189ae5, 0x278b764d, 0x2d1a96d7,
-			0x2f5b2ecd, 0x2aec42c2, 0x31fa671d, 0x2b941687,
-			0x12eb1914, 0x2d0546cd, 0x19cb2977, 0x2c3702c4,
-		},
-	},
-	{ /* h147 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x20ab01e4, 0x2ba8d2bd, 0x28cade60, 0x2aaad2b2,
-			0x2f8a82db, 0x27bc1a90, 0x0ed9b30a, 0x2a53f29b,
-			0x136aa513, 0x2a5586ac, 0x1a9a7587, 0x29c72e9c,
-			0x219a65f1, 0x29491a96, 0x29aa4672, 0x27bb0285,
-		},
-	},
-	{ /* h148 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2ee9c2dd, 0x252bd25e, 0x0e59f4d5, 0x2853e284,
-			0x147a251a, 0x27b5be83, 0x1b69dd95, 0x27376675,
-			0x2289b9ff, 0x26994a6b, 0x2a499280, 0x250b1259,
-			0x2df906d6, 0x2602fa38, 0x0dd990cc, 0x2663fe63,
-		},
-	},
-	{ /* h149 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1569852d, 0x2565f259, 0x1c4949a1, 0x24979a4e,
-			0x23190e0b, 0x24098a3f, 0x2aa8da89, 0x224afa2e,
-			0x0a787aca, 0x2452ca43, 0x0e1914c2, 0x24243e47,
-			0x1628ed3a, 0x23162637, 0x1d08b5ae, 0x2257d229,
-		},
-	},
-	{ /* h150 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x24387215, 0x2149aa1d, 0x2a68368d, 0x203ad207,
-			0x0ae888a8, 0x2232ea21, 0x0f9890d0, 0x21e48622,
-			0x16c86946, 0x21164e16, 0x1d782db7, 0x20080206,
-			0x24e7ee21, 0x1ec9c5f3, 0x2a07a68f, 0x202251e7,
-		},
-	},
-	{ /* h151 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0a37fc9a, 0x2022de02, 0x1007f4d9, 0x1f64a1fa,
-			0x16f7cd4b, 0x1eb659ef, 0x1e378dbd, 0x1dd82ddc,
-			0x25774634, 0x1c99ddcb, 0x08072e8b, 0x1e0211e5,
-			0x09d7888c, 0x1dc301e2, 0x10675ce2, 0x1cd4a1d2,
-		},
-	},
-	{ /* h152 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1787254f, 0x1c167dc4, 0x1f06e9c9, 0x1b0861b3,
-			0x25c6ae3e, 0x1ae9cdab, 0x06e7286b, 0x1c21d9c5,
-			0x0b86fc96, 0x1b7365bb, 0x11e6ccfa, 0x1ad505b1,
-			0x1896a165, 0x19b6bda2, 0x1fb651d6, 0x18e88591,
-		},
-	},
-	{ /* h153 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x25c63643, 0x1af15990, 0x0776a457, 0x1a225da5,
-			0x0d567cb6, 0x1993dd9c, 0x13a65918, 0x18f57193,
-			0x1a26357f, 0x18371589, 0x2065fde5, 0x1768a17b,
-			0x0405d646, 0x19118194, 0x09e6387f, 0x18b2f58c,
-		},
-	},
-	{ /* h154 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0fb61cdc, 0x18346984, 0x15860939, 0x17e5d980,
-			0x1b65e996, 0x17074d75, 0x20f5adef, 0x1618bd66,
-			0x19fdfd81, 0x3766f77b, 0x1f9dc5db, 0x3678676c,
-			0x25bd8a3a, 0x3579f35c, 0x2bed469d, 0x347b7b4c,
-		},
-	},
-	{ /* h155 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x31ed06fe, 0x337cfb3c, 0x37ecc75e, 0x3675ab2c,
-			0x19ee017d, 0x3777077c, 0x205dc5e3, 0x3668a76c,
-			0x274d824e, 0x355a675b, 0x2dfd3ebc, 0x343c074a,
-			0x344cfb22, 0x332d9738, 0x155c4b69, 0x36259b4b,
-		},
-	},
-	{ /* h156 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1a2dd17e, 0x36d72373, 0x214d9dee, 0x35c8ef61,
-			0x28bd5e63, 0x34cacb51, 0x2fed1ad8, 0x338c8740,
-			0x34fcc344, 0x2f7d5315, 0x150cc13f, 0x3535a345,
-			0x1b0d8d8a, 0x35675b5d, 0x223d41fc, 0x34592f4a,
-		},
-	},
-	{ /* h157 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x29dcfe74, 0x335b1b3a, 0x316cbeef, 0x312cbb26,
-			0x33fbe33a, 0x3144a6dc, 0x152ca13a, 0x33f5c733,
-			0x1bdd0997, 0x33878f3d, 0x231cce0a, 0x3269672c,
-			0x2abc8280, 0x313b5719, 0x318c22fd, 0x2dac96f3,
-		},
-	},
-	{ /* h158 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x112b0729, 0x30b48ef8, 0x15ac4d3c, 0x31c5fb1b,
-			0x1cac61a5, 0x30e7c313, 0x23fc2617, 0x2fd9a303,
-			0x2bcbe291, 0x2eab92f2, 0x310b5302, 0x2a7c52bd,
-			0x10bb64fb, 0x2f3496ea, 0x167be143, 0x2f1636f4,
-		},
-	},
-	{ /* h159 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1d8bb9b2, 0x2e57f6ea, 0x24eb8625, 0x2d79e2dc,
-			0x2cab46a3, 0x2b6baac9, 0x2ffa7ef9, 0x2bb38e8c,
-			0x10ab20f2, 0x2d44a6cf, 0x177b3552, 0x2c666ac9,
-			0x1e5b11bf, 0x2bd832c1, 0x25dae633, 0x2aea26b4,
-		},
-	},
-	{ /* h160 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2cfa9eb0, 0x282b8a96, 0x0cb9c6ea, 0x2a736a9d,
-			0x10dab0ef, 0x2ac4e6af, 0x185a9161, 0x29d6a29e,
-			0x1f1a6dcb, 0x29586698, 0x270a4e43, 0x283a528e,
-			0x2ca9deb5, 0x256b5663, 0x0c29fcb4, 0x28935687,
-		},
-	},
-	{ /* h161 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x120a2cf2, 0x28251e8a, 0x1929e96d, 0x2766d678,
-			0x1ff9c9d9, 0x26a89e6d, 0x2799a251, 0x255a6e5f,
-			0x2bf916b2, 0x2632763c, 0x0ba99ca8, 0x26835a68,
-			0x12d9a908, 0x25955260, 0x19f95579, 0x24e70e52,
-		},
-	},
-	{ /* h162 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x20c935e6, 0x2438ce47, 0x27f8ee5c, 0x22aa6a32,
-			0x08688aaa, 0x24823e46, 0x0ba928a0, 0x24a39e49,
-			0x13890510, 0x2355823a, 0x1ac8bd88, 0x22973e2d,
-			0x215891f4, 0x21b90a1b, 0x28284a65, 0x207a560d,
-		},
-	},
-	{ /* h163 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x08e89489, 0x22826624, 0x0d18a0ae, 0x2213ea27,
-			0x14786d23, 0x2145b218, 0x1b784193, 0x2067660b,
-			0x22280200, 0x1f4929fa, 0x2807be69, 0x2061d5ec,
-			0x08280c7a, 0x20725206, 0x0db808b8, 0x1f93fdfd,
-		},
-	},
-	{ /* h164 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x14d7d524, 0x1ee5cdf2, 0x1bf7ad9a, 0x1e0799e5,
-			0x2317760b, 0x1d0945d4, 0x0617426b, 0x1e4195e8,
-			0x08d7946c, 0x1df2b9e2, 0x0f0770cf, 0x1d6455d8,
-			0x15c74939, 0x1c85fdcd, 0x1cb711a5, 0x1b87c5bd,
-		},
-	},
-	{ /* h165 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2386d617, 0x1b294db3, 0x04e7344c, 0x1c51b9c8,
-			0x0ad7048d, 0x1bc331bf, 0x10f6e4ed, 0x1b44c1b7,
-			0x1756bd53, 0x1ab65dae, 0x1dc6a1ba, 0x19f7f1a2,
-			0x23d66a1e, 0x1b20d996, 0x0756bc56, 0x1aa251ac,
-		},
-	},
-	{ /* h166 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0d26a0b3, 0x1a23c5a5, 0x12f68110, 0x19c5399e,
-			0x18c6696d, 0x1956ad99, 0x1e8641cb, 0x1868198b,
-			0x17860626, 0x39b6579f, 0x1d1e59b3, 0x38c7bf91,
-			0x22ee1e0d, 0x37c94382, 0x292dde71, 0x36cacf71,
-		},
-	},
-	{ /* h167 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2f3d9ed3, 0x35cc4f61, 0x353d5f33, 0x34cdcf51,
-			0x172e2160, 0x39d653a1, 0x1d8e5db6, 0x38d7eb92,
-			0x241e1e1d, 0x37c99b82, 0x2afdda8a, 0x36bb4770,
-			0x316d9af4, 0x35bce360, 0x35ed5b59, 0x36c52f32,
-		},
-	},
-	{ /* h168 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x173e115c, 0x39465f96, 0x1e1e3dbc, 0x38381b89,
-			0x255dfa2d, 0x3739f378, 0x2cadb6a4, 0x362bbf68,
-			0x337d7714, 0x339d0f56, 0x135c5f49, 0x36651751,
-			0x17fdd95c, 0x38269389, 0x1eededc9, 0x36e85374,
-		},
-	},
-	{ /* h169 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x265da23c, 0x35da3f63, 0x2e0d62b7, 0x34dc2353,
-			0x32dce320, 0x2fccd31c, 0x12fcd51f, 0x35651b49,
-			0x18ad9d65, 0x35c6c363, 0x1fcd55d6, 0x34988f4f,
-			0x274d0e4b, 0x339a733e, 0x2eeccec5, 0x318c2b2e,
-		},
-	},
-	{ /* h170 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x31fbfb19, 0x319426e1, 0x130cb119, 0x34353736,
-			0x196d0172, 0x3376f73d, 0x20bcc1e4, 0x3248cf2a,
-			0x282c7e5a, 0x315aaf1a, 0x2f4c3ed4, 0x2e1c12fa,
-			0x0f1b1f09, 0x30d406fb, 0x136c5d1a, 0x31b56b20,
-		},
-	},
-	{ /* h171 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1a3c617e, 0x31172b17, 0x219c2df1, 0x30090305,
-			0x290bea67, 0x2efaeaf4, 0x2edb72dc, 0x2acbd2c2,
-			0x0e8b74d9, 0x2f5402ec, 0x144bf11e, 0x2f359ef8,
-			0x1b1bc58b, 0x2ec75ef1, 0x225b99fd, 0x2da936e0,
-		},
-	},
-	{ /* h172 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x29fb5275, 0x2bcb06cd, 0x2dfa9ad5, 0x2bf30691,
-			0x0e7b2cd0, 0x2d640ad2, 0x152b4d2a, 0x2cc5d6cf,
-			0x1c0b2999, 0x2c0796c5, 0x233aee0b, 0x2b096eb5,
-			0x2a7aaa84, 0x288af69d, 0x0aa9daca, 0x2aa2dea1,
-		},
-	},
-	{ /* h173 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0e6ac0cd, 0x2af43ab1, 0x15eab136, 0x2a3612a8,
-			0x1cda79a8, 0x2967ca99, 0x240a4619, 0x2879aa8c,
-			0x2a59f28c, 0x25cad66a, 0x09fa0c92, 0x28e2ce89,
-			0x0f2a30ca, 0x28846a8a, 0x16ba0d42, 0x27964a7e,
-		},
-	},
-	{ /* h174 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1db9d5b5, 0x26b7fe6f, 0x24d99e25, 0x2589c662,
-			0x2a09328e, 0x2661ee41, 0x0999a885, 0x26b2be6e,
-			0x0fe9a0d6, 0x26049e64, 0x17996d52, 0x25267a56,
-			0x1e7935c4, 0x24483249, 0x25790233, 0x22f9da38,
-		},
-	},
-	{ /* h175 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x06489a8a, 0x24b1b249, 0x09493c7e, 0x2492ee4d,
-			0x10a918e2, 0x23c4d640, 0x1858d95f, 0x22c6b231,
-			0x1f48a1d1, 0x21d85e23, 0x25d8623e, 0x20c9d612,
-			0x06e8a069, 0x22c1de28, 0x0ae8b08b, 0x22434a28,
-		},
-	},
-	{ /* h176 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x11f880f8, 0x2185221c, 0x19484d6e, 0x20b6e60f,
-			0x200819db, 0x1fa88e00, 0x2607d643, 0x209159f1,
-			0x06281c5a, 0x20720e0a, 0x0c580ca4, 0x1fc39e00,
-			0x1307e50c, 0x1f2551f6, 0x19e7b979, 0x1e6709ea,
-		},
-	},
-	{ /* h177 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x20b785e8, 0x1d88b1dc, 0x0417564a, 0x1e8115eb,
-			0x08479065, 0x1df28de1, 0x0e4770c2, 0x1d7415d9,
-			0x14975527, 0x1cf5add2, 0x1af7358d, 0x1c6749ca,
-			0x214705f3, 0x1b78cdbd, 0x04c7402c, 0x1c91adcc,
-		},
-	},
-	{ /* h178 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0a971c8a, 0x1c2321c5, 0x1066fce7, 0x1bb495be,
-			0x1636e544, 0x1b5609b7, 0x1c06cda1, 0x1ab781b0,
-			0x21d699fd, 0x3bf5b9a1, 0x1a9ee98c, 0x3b171fb5,
-			0x202eb1e5, 0x3a288fa7, 0x265e7244, 0x391a1f97,
-		},
-	},
-	{ /* h179 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2c9e32a8, 0x381ba787, 0x329df309, 0x371d2377,
-			0x157db368, 0x3c25a3a9, 0x1abef98a, 0x3b3737b8,
-			0x211eb9ef, 0x3a38d7a8, 0x27de7659, 0x391a8b97,
-			0x2e7e32c5, 0x381c2786, 0x34ddf32b, 0x351d4f78,
-		},
-	},
-	{ /* h180 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x151e3541, 0x3b85a3a6, 0x1b0ed98b, 0x3ab753b0,
-			0x21ee95f9, 0x39a91ba0, 0x295e566e, 0x38aaf78f,
-			0x306e12e1, 0x378cab7f, 0x33ed6f37, 0x3724af37,
-			0x151e213b, 0x3965cf98, 0x1bce5197, 0x3887878e,
-		},
-	},
-	{ /* h181 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x22de0a06, 0x3779537d, 0x2a4dca7c, 0x367b276c,
-			0x313d86ee, 0x33ec875c, 0x115c7329, 0x36b49356,
-			0x15cde13a, 0x3745fb76, 0x1c8dc9a2, 0x3657bb6c,
-			0x23bd7e14, 0x35498f5a, 0x2b1d3a8a, 0x344b5f49,
-		},
-	},
-	{ /* h182 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x30dcf6fd, 0x301c5321, 0x10ececff, 0x3594934e,
-			0x168d5946, 0x35362753, 0x1d5d45ae, 0x3447ef4a,
-			0x24acfa23, 0x3339cb38, 0x2c1cb69a, 0x320b9f28,
-			0x2fec12f8, 0x31d3a2e6, 0x10ecc0f7, 0x3364c33a,
-		},
-	},
-	{ /* h183 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x173ccd52, 0x33365f32, 0x1e3cb5bd, 0x32082727,
-			0x258c6a30, 0x30fa0715, 0x2cfc2aa8, 0x2e6b8703,
-			0x0d0b32e9, 0x30f37aff, 0x11ac68f6, 0x3134f317,
-			0x181c455e, 0x30d69f10, 0x1f0c19cb, 0x2f985aff,
-		},
-	},
-	{ /* h184 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x265bce3d, 0x2e8a36ee, 0x2c9b8ab3, 0x2b1b52ca,
-			0x0c6b80b8, 0x2f8376ee, 0x125bd500, 0x2f1526f2,
-			0x18fbbd6b, 0x2e56ceea, 0x1feb7dd8, 0x2d2892d8,
-			0x272b364b, 0x2c2a66c7, 0x2bfab2b0, 0x2c228296,
-		},
-	},
-	{ /* h185 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0c4b34ad, 0x2d239ad6, 0x130b3d0a, 0x2ce55ace,
-			0x19cb2178, 0x2bd702c2, 0x20cadde6, 0x2ac8c6b1,
-			0x27ea9a57, 0x28ea62a1, 0x0889f2aa, 0x2ac256a3,
-			0x0ccad4ab, 0x2ab3beaf, 0x139aa913, 0x2a5582a9,
-		},
-	},
-	{ /* h186 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1aaa7d86, 0x29473e99, 0x217a3df3, 0x2848f28a,
-			0x2819fa63, 0x261a5670, 0x07ca1870, 0x29424a8c,
-			0x0d4a34b3, 0x2863de88, 0x144a111c, 0x27c5b280,
-			0x1b79dd94, 0x26d76e70, 0x2249a1ff, 0x25d92663,
-		},
-	},
-	{ /* h187 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x28094a6a, 0x26916a46, 0x0779b863, 0x26e26274,
-			0x0dc9a0ba, 0x2603fe63, 0x15297128, 0x2555ea59,
-			0x1c693da0, 0x24779e4a, 0x23090a0b, 0x2349463d,
-			0x0458ae6a, 0x24f12a4c, 0x07e9505c, 0x24a2824f,
-		},
-	},
-	{ /* h188 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0e6918c2, 0x23d43a42, 0x15f8e537, 0x22f62235,
-			0x1d38a9ae, 0x2237d227, 0x23887617, 0x21195616,
-			0x04e8ac4a, 0x23115a2c, 0x0998b078, 0x2252ea28,
-			0x101884dc, 0x21a49e1d, 0x1728594c, 0x20e66212,
-		},
-	},
-	{ /* h189 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1de829bc, 0x20080205, 0x2407ea21, 0x20d0d9f6,
-			0x05a82c3a, 0x2021ea07, 0x0b880099, 0x1fa369fd,
-			0x11e7dcfc, 0x1f44fdf6, 0x1837c561, 0x1ec695ee,
-			0x1e97a1c7, 0x1de829e3, 0x0227662a, 0x1ea109ee,
-		},
-	},
-	{ /* h190 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x08079861, 0x1e227de4, 0x0dd77cbe, 0x1db3f1dd,
-			0x13a7651b, 0x1d4565d7, 0x19774978, 0x1cd6d9d0,
-			0x1f4729d6, 0x1c084dc5, 0x180f7962, 0x3d667bda,
-			0x1daf45bc, 0x3c77e3cc, 0x238f0a17, 0x3b796bbd,
-		},
-	},
-	{ /* h191 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x29ceca7b, 0x3a7afbac, 0x2fee86de, 0x397c7b9c,
-			0x35ee4b3e, 0x3c852f8c, 0x17ff8d5e, 0x3d9687de,
-			0x1e4f51c2, 0x3c9817ce, 0x24df0e28, 0x3b89c7be,
-			0x2b9eca95, 0x3a7b73ad, 0x31fe8afe, 0x397d039d,
-		},
-	},
-	{ /* h192 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x135dcb48, 0x3c751fad, 0x188f0567, 0x3b86abbd,
-			0x1efec9cd, 0x3a8847ad, 0x25ae8a35, 0x3969fb9c,
-			0x2c6e46a2, 0x386ba38b, 0x32be0709, 0x357ccf7b,
-			0x130e4520, 0x3a4547aa, 0x192e7571, 0x3976d39c,
-		},
-	},
-	{ /* h193 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1fae45d7, 0x38687b8c, 0x267e0242, 0x375a2f7b,
-			0x2d2dbeb0, 0x365bcf6a, 0x31ed7f15, 0x37642b3c,
-			0x13ae351a, 0x38156b87, 0x19edfd7c, 0x3767037c,
-			0x205dc5e3, 0x3668ab6c, 0x274d824f, 0x354a6b5a,
-		},
-	},
-	{ /* h194 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x2dfd3ebd, 0x343c0749, 0x0f5c8709, 0x36f40f5b,
-			0x144dad24, 0x36259b65, 0x1a9d7d88, 0x3567335b,
-			0x211d45ee, 0x3458df4b, 0x283cfe5d, 0x333a9f39,
-			0x2eccbaca, 0x306bd327, 0x0eccfcde, 0x34e43b52,
-		},
-	},
-	{ /* h195 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x150d252e, 0x3425cb45, 0x1b4ced92, 0x33375f39,
-			0x21ecb9f9, 0x32291328, 0x28fc726a, 0x311acf16,
-			0x2dfc26d4, 0x32031aeb, 0x0f7cc8d4, 0x32d46331,
-			0x15cca13a, 0x31d5f725, 0x1c0c619e, 0x31078f16,
-		},
-	},
-	{ /* h196 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x22cc2e06, 0x2ff94705, 0x29abe677, 0x2ecaf2f3,
-			0x0aeb46c9, 0x3112ef02, 0x100c3cde, 0x30c4970e,
-			0x167c2146, 0x2f962300, 0x1cdbd5ab, 0x2ec7c2f1,
-			0x239b9a14, 0x2db97ae1, 0x2a4b5681, 0x2b6ad2cf,
-		},
-	},
-	{ /* h197 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0a3b9096, 0x2ee316f0, 0x10bbb0e7, 0x2e94c2eb,
-			0x172b8d52, 0x2d6656db, 0x1dab45b8, 0x2c87f6cd,
-			0x245b0a21, 0x2b79a6bd, 0x29fac68c, 0x2c51fa9b,
-			0x0acb408b, 0x2ca33acd, 0x116b24f2, 0x2c34eac7,
-		},
-	},
-	{ /* h198 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x180af95d, 0x2b368ab8, 0x1e7ab9c4, 0x2a482aaa,
-			0x252a7e2e, 0x2939d699, 0x066a068a, 0x2af1caa7,
-			0x0b5ab093, 0x2a7362a9, 0x120a98fc, 0x29d512a2,
-			0x18ca6569, 0x2906ba95, 0x1f3a31cf, 0x28185a87,
-		},
-	},
-	{ /* h199 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x25d9ee3a, 0x2669d675, 0x05aa284f, 0x28c1ee90,
-			0x0bea209c, 0x28438a86, 0x12ca0507, 0x2795467c,
-			0x1989d575, 0x26e6ea72, 0x1ff9a1dc, 0x25c88a62,
-			0x26095e45, 0x26d0e64b, 0x0629c441, 0x26920e6d,
-		},
-	},
-	{ /* h200 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0c8998a6, 0x2603ba64, 0x13997114, 0x25557659,
-			0x1a394980, 0x24971e4f, 0x20b911e9, 0x2388b23e,
-			0x0268c24a, 0x2530ae50, 0x06a93c49, 0x2482364a,
-			0x0d5914af, 0x23e3ea41, 0x1448ed20, 0x23259e37,
-		},
-	},
-	{ /* h201 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1af8b98b, 0x22674e2b, 0x216885f5, 0x2168d61c,
-			0x02e8bc2b, 0x22b13a2f, 0x08d89c6e, 0x2222b225,
-			0x0f187ccf, 0x21a44e1c, 0x15786135, 0x2105e614,
-			0x1be8359b, 0x20577e09, 0x21d80200, 0x21005dfb,
-		},
-	},
-	{ /* h202 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x05683036, 0x2041d608, 0x0b480495, 0x1fc34dff,
-			0x1117e8f2, 0x1f44c1f7, 0x16f7c94f, 0x1ec639ef,
-			0x1cc7a9ad, 0x1e77b5e8, 0x1567820a, 0x3fb5cffc,
-			0x1b0fd992, 0x3ec73bf1, 0x20bf9ded, 0x3dd8b3e2,
-		},
-	},
-	{ /* h203 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x26ff5e4e, 0x3cca43d2, 0x2d3f1eb2, 0x3bcbcfc2,
-			0x333edf13, 0x3acd4fb2, 0x160f993f, 0x3db5fbdf,
-			0x1bbf599c, 0x3cc767d1, 0x217f1df7, 0x3bd8e3c2,
-			0x27bede59, 0x3aca73b2, 0x2dde9ebd, 0x39cbf7a2,
-		},
-	},
-	{ /* h204 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x33de5f1d, 0x3cc4ab92, 0x16af194a, 0x3bb623c0,
-			0x1c5ed9a7, 0x3ac793b1, 0x222e9e02, 0x39c913a2,
-			0x286e5e65, 0x38ca9f92, 0x2e8e1ec8, 0x37cc2382,
-			0x115ddf28, 0x3ac4d7b1, 0x177e9954, 0x39b657a0,
-		},
-	},
-	{ /* h205 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1d0e59b2, 0x38c7bb91, 0x22ee1e0d, 0x37c93f82,
-			0x292dde70, 0x36cacf71, 0x2f3d9ed3, 0x35cc4f61,
-			0x11fe58ff, 0x38c4ff91, 0x183e2160, 0x37a6837f,
-			0x1dbdd9be, 0x36c7e771, 0x239d9e18, 0x35c96f62,
-		},
-	},
-	{ /* h206 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x29dd5e7c, 0x34cafb51, 0x2fed1ede, 0x37b3ab41,
-			0x12add90a, 0x36d52f71, 0x18cda56c, 0x35b6ab60,
-			0x1e5d59c8, 0x34c80f51, 0x246d1e24, 0x33c9a341,
-			0x2aacda8a, 0x32cb2b31, 0x0d5c9ae9, 0x35b3d760,
-		},
-	},
-	{ /* h207 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x136d5915, 0x34d55b52, 0x196d1d75, 0x33b6d33f,
-			0x1f0cd9d2, 0x32c83f31, 0x253c9a31, 0x31b9d721,
-			0x2b5c5a96, 0x30bb5311, 0x0dfd08bd, 0x33c4033f,
-			0x141cdd20, 0x32b58332, 0x1a2c997f, 0x31b7031f,
-		},
-	},
-	{ /* h208 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x1fbc59dd, 0x30c86f11, 0x25fc1a3d, 0x2fba0301,
-			0x2bfbda9f, 0x324296f1, 0x0e9c84c7, 0x31b42b1e,
-			0x14ac592b, 0x30a5a710, 0x1aec1d8b, 0x2fb72eff,
-			0x206bd9e9, 0x2ec89ef1, 0x26ab9a49, 0x2dba2ae1,
-		},
-	},
-	{ /* h209 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x08db5aa9, 0x3022bf05, 0x0f2bfcd0, 0x2f9452fc,
-			0x153bd134, 0x2eb5d6ee, 0x1b7ba196, 0x2db756e0,
-			0x212b59f3, 0x2cb8ced1, 0x274b1a54, 0x2bba52c1,
-			0x096b9c75, 0x2e12e2e4, 0x0fbb74da, 0x2d6472da,
-		},
-	},
-	{ /* h210 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x15fb493d, 0x2cc602cf, 0x1c1b1da0, 0x2bb77ec0,
-			0x21ead9fd, 0x2ab8fab1, 0x27fa9a5f, 0x2c9176a1,
-			0x0a0b147e, 0x2bf306c2, 0x105af0e3, 0x2b449ab8,
-			0x16aac948, 0x2ab62eb0, 0x1cba99ab, 0x29b7aaa0,
-		},
-	},
-	{ /* h211 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x229a5a09, 0x28b92a90, 0x045a1a6a, 0x2a719aaa,
-			0x0a9a8c88, 0x29d32aa0, 0x10ea68ed, 0x2944c297,
-			0x174a4953, 0x28b6568f, 0x1d5a19b5, 0x27b7d680,
-			0x2359da14, 0x26b95670, 0x04fa382e, 0x2851c289,
-		},
-	},
-	{ /* h212 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x0b2a0491, 0x27c3567e, 0x1199e8f7, 0x2744ee77,
-			0x17e9c55d, 0x26a67e6e, 0x1e0995c0, 0x25b7fe60,
-			0x24095a20, 0x27106250, 0x0599b438, 0x2651ea69,
-			0x0be9849b, 0x25c3825f, 0x12396502, 0x25351656,
-		},
-	},
-	{ /* h213 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xffff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x18894166, 0x2496a64d, 0x1ea915ca, 0x23b82a40,
-			0x0078da2a, 0x24f09a53, 0x06492c44, 0x24421648,
-			0x0c9908a7, 0x23c3ae3f, 0x12e8e50c, 0x23253e36,
-			0x1928bd71, 0x2286ce2c, 0x1f5895d5, 0x21984e20,
-		},
-	},
-	{ /* h214 */
-		.mode = 0x000b0000,
-		.target = 0x1c847b14,
-		.type_map = 0x00555555,
-		.valid_words = 12,
-		.address_mask = 0x0000,
-		.fixed_mask = 0x0fff,
-		.pair_registers = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-		.fixed_values = {
-			0x02b8c80c, 0x22a12a2e, 0x08989c6a, 0x2212a223,
-			0x0e687cc7, 0x21a41a1c, 0x14485925, 0x21058e13,
-			0x1a283183, 0x20670609, 0x20080de3, 0x20080200,
-			0x00000000, 0x00000000, 0x00000000, 0x00000000,
-		},
-	},
-	{ /* h215 */
-		.mode = 0x00090000,
-		.target = 0x00000000,
-		.type_map = 0x55555555,
-		.valid_words = 16,
-		.address_mask = 0x0000,
-		.fixed_mask = 0xaaaa,
-		.pair_registers = {
-			0x1c847b10, 0x1c847400, 0x1c847404, 0x1c847408,
-			0x1c84740c, 0x1c847410, 0x1c847414, 0x1c847418,
-		},
-		.fixed_values = {
-			0x00000000, 0x00000000, 0x00000000, 0x00000100,
-			0x00000000, 0x00001323, 0x00000000, 0x0000f534,
-			0x00000000, 0x00002000, 0x00000000, 0x00002591,
-			0x00000000, 0x0000eacc, 0x00000000, 0x0000e534,
-		},
-	},
-	{ /* h216 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4775,7 +1070,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h217 */
+	{ /* h011 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4793,7 +1088,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00003fff, 0x00000000, 0x00000001,
 		},
 	},
-	{ /* h218 */
+	{ /* h012 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4811,7 +1106,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00003a7e,
 		},
 	},
-	{ /* h219 */
+	{ /* h013 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4829,7 +1124,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00001800, 0x00000000, 0x00001800,
 		},
 	},
-	{ /* h220 */
+	{ /* h014 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4847,7 +1142,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000003,
 		},
 	},
-	{ /* h221 */
+	{ /* h015 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4865,7 +1160,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h222 */
+	{ /* h016 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4883,7 +1178,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x02000200, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h223 */
+	{ /* h017 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4901,7 +1196,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x003ab7fe, 0x00000000, 0x04000400,
 		},
 	},
-	{ /* h224 */
+	{ /* h018 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4919,7 +1214,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x000006fc,
 		},
 	},
-	{ /* h225 */
+	{ /* h019 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4937,7 +1232,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h226 */
+	{ /* h020 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4955,7 +1250,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h227 */
+	{ /* h021 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4973,7 +1268,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x000a0003, 0x00000000, 0x000a000e,
 		},
 	},
-	{ /* h228 */
+	{ /* h022 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -4991,7 +1286,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00220012, 0x00000000, 0x00370031,
 		},
 	},
-	{ /* h229 */
+	{ /* h023 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5009,7 +1304,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00970068, 0x00000000, 0x000000a8,
 		},
 	},
-	{ /* h230 */
+	{ /* h024 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5028,7 +1323,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00004020, 0x00000000, 0x00008060,
 		},
 	},
-	{ /* h231 */
+	{ /* h025 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5046,7 +1341,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00400020, 0x00000000, 0x00800060,
 		},
 	},
-	{ /* h232 */
+	{ /* h026 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5064,7 +1359,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h233 */
+	{ /* h027 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x00000005,
@@ -5082,7 +1377,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h234 */
+	{ /* h028 */
 		.mode = 0x00080000,
 		.target = 0x1c845338,
 		.type_map = 0x55555555,
@@ -5100,7 +1395,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h235 */
+	{ /* h029 */
 		.mode = 0x00080000,
 		.target = 0x1c845378,
 		.type_map = 0x55555555,
@@ -5118,7 +1413,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h236 */
+	{ /* h030 */
 		.mode = 0x00080000,
 		.target = 0x1c8453b8,
 		.type_map = 0x55555555,
@@ -5136,7 +1431,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h237 */
+	{ /* h031 */
 		.mode = 0x00080000,
 		.target = 0x1c8453f8,
 		.type_map = 0x55555555,
@@ -5154,7 +1449,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h238 */
+	{ /* h032 */
 		.mode = 0x00080000,
 		.target = 0x1c845438,
 		.type_map = 0x55555555,
@@ -5172,7 +1467,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h239 */
+	{ /* h033 */
 		.mode = 0x00080000,
 		.target = 0x1c845478,
 		.type_map = 0x55555555,
@@ -5190,7 +1485,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h240 */
+	{ /* h034 */
 		.mode = 0x00080000,
 		.target = 0x1c8454b8,
 		.type_map = 0x00000005,
@@ -5208,7 +1503,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h241 */
+	{ /* h035 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5226,7 +1521,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x000d000d, 0x00000000, 0x002c002c,
 		},
 	},
-	{ /* h242 */
+	{ /* h036 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5244,7 +1539,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0d0f1f1f, 0x00000000, 0x1a1a4040,
 		},
 	},
-	{ /* h243 */
+	{ /* h037 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5262,7 +1557,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00170017, 0x00000000, 0x0f1a1f1f,
 		},
 	},
-	{ /* h244 */
+	{ /* h038 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5280,7 +1575,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x070c3232, 0x00000000, 0x07203232,
 		},
 	},
-	{ /* h245 */
+	{ /* h039 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5298,7 +1593,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000608, 0x00000000, 0x05100506,
 		},
 	},
-	{ /* h246 */
+	{ /* h040 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5316,7 +1611,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x03840009, 0x00000000, 0x00000003,
 		},
 	},
-	{ /* h247 */
+	{ /* h041 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5334,7 +1629,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0033003a, 0x00000000, 0x0026002d,
 		},
 	},
-	{ /* h248 */
+	{ /* h042 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5352,7 +1647,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x002d0036, 0x00000000, 0x00200026,
 		},
 	},
-	{ /* h249 */
+	{ /* h043 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5370,7 +1665,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0081009b, 0x00000000, 0x00300060,
 		},
 	},
-	{ /* h250 */
+	{ /* h044 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5388,7 +1683,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h251 */
+	{ /* h045 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5406,7 +1701,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h252 */
+	{ /* h046 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5424,7 +1719,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h253 */
+	{ /* h047 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5442,7 +1737,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h254 */
+	{ /* h048 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5460,7 +1755,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h255 */
+	{ /* h049 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5478,7 +1773,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h256 */
+	{ /* h050 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5496,7 +1791,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h257 */
+	{ /* h051 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5514,7 +1809,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h258 */
+	{ /* h052 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5532,7 +1827,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x03000100, 0x00000000, 0x06b800d1,
 		},
 	},
-	{ /* h259 */
+	{ /* h053 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5550,7 +1845,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x01180072, 0x00000000, 0x03e80166,
 		},
 	},
-	{ /* h260 */
+	{ /* h054 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5568,7 +1863,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000001, 0x00000000, 0x00000001,
 		},
 	},
-	{ /* h261 */
+	{ /* h055 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5586,7 +1881,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000001, 0x00000000, 0x00000007,
 		},
 	},
-	{ /* h262 */
+	{ /* h056 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5604,7 +1899,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h263 */
+	{ /* h057 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5622,7 +1917,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h264 */
+	{ /* h058 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5640,7 +1935,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h265 */
+	{ /* h059 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5658,7 +1953,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x486a4869, 0x00000000, 0x0000486b,
 		},
 	},
-	{ /* h266 */
+	{ /* h060 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5677,7 +1972,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h267 */
+	{ /* h061 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5696,7 +1991,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h268 */
+	{ /* h062 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x00555555,
@@ -5715,7 +2010,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h269 */
+	{ /* h063 */
 		.mode = 0x00080000,
 		.target = 0x1c8443c0,
 		.type_map = 0x00555555,
@@ -5733,7 +2028,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h270 */
+	{ /* h064 */
 		.mode = 0x00080000,
 		.target = 0x1c844400,
 		.type_map = 0x55555555,
@@ -5751,7 +2046,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x22002000, 0x26002400, 0x2a002800, 0x2e002c00,
 		},
 	},
-	{ /* h271 */
+	{ /* h065 */
 		.mode = 0x00080000,
 		.target = 0x1c844440,
 		.type_map = 0x00000155,
@@ -5769,7 +2064,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h272 */
+	{ /* h066 */
 		.mode = 0x00080000,
 		.target = 0x1c84420c,
 		.type_map = 0x55555555,
@@ -5787,7 +2082,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x16a115d2, 0x18271768, 0x1a3d18df, 0x1cbf1b87,
 		},
 	},
-	{ /* h273 */
+	{ /* h067 */
 		.mode = 0x00080000,
 		.target = 0x1c84424c,
 		.type_map = 0x55555555,
@@ -5805,7 +2100,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x39353828, 0x3b3e3a3c, 0x3d333c3b, 0x3f153e26,
 		},
 	},
-	{ /* h274 */
+	{ /* h068 */
 		.mode = 0x00080000,
 		.target = 0x1c84428c,
 		.type_map = 0x00000001,
@@ -5823,7 +2118,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h275 */
+	{ /* h069 */
 		.mode = 0x00080000,
 		.target = 0x1c8442a0,
 		.type_map = 0x55555555,
@@ -5841,7 +2136,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x16a115d2, 0x18271768, 0x1a3d18df, 0x1cbf1b87,
 		},
 	},
-	{ /* h276 */
+	{ /* h070 */
 		.mode = 0x00080000,
 		.target = 0x1c8442e0,
 		.type_map = 0x00000055,
@@ -5859,7 +2154,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h277 */
+	{ /* h071 */
 		.mode = 0x00080000,
 		.target = 0x1c844300,
 		.type_map = 0x01555555,
@@ -5877,7 +2172,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x000000eb, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h278 */
+	{ /* h072 */
 		.mode = 0x00080000,
 		.target = 0x1c844338,
 		.type_map = 0x55555555,
@@ -5895,7 +2190,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x16a115d2, 0x18271768, 0x1a3d18df, 0x1cbf1b87,
 		},
 	},
-	{ /* h279 */
+	{ /* h073 */
 		.mode = 0x00080000,
 		.target = 0x1c844378,
 		.type_map = 0x55555555,
@@ -5913,7 +2208,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x39353828, 0x3b3e3a3c, 0x3d333c3b, 0x3f153e26,
 		},
 	},
-	{ /* h280 */
+	{ /* h074 */
 		.mode = 0x00080000,
 		.target = 0x1c8443b8,
 		.type_map = 0x00000001,
@@ -5931,7 +2226,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h281 */
+	{ /* h075 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5950,7 +2245,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x3a8c3831, 0x00000000, 0x3eca3cbd,
 		},
 	},
-	{ /* h282 */
+	{ /* h076 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5968,7 +2263,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x52845175, 0x00000000, 0x5488538a,
 		},
 	},
-	{ /* h283 */
+	{ /* h077 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -5986,7 +2281,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x5fce5f1f, 0x00000000, 0x61206078,
 		},
 	},
-	{ /* h284 */
+	{ /* h078 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6004,7 +2299,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x690c688a, 0x00000000, 0x6a076989,
 		},
 	},
-	{ /* h285 */
+	{ /* h079 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6022,7 +2317,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x70226fbc, 0x00000000, 0x70eb7088,
 		},
 	},
-	{ /* h286 */
+	{ /* h080 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6040,7 +2335,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x75e47590, 0x00000000, 0x76897637,
 		},
 	},
-	{ /* h287 */
+	{ /* h081 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6058,7 +2353,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x7abc7a73, 0x00000000, 0x7b497b04,
 		},
 	},
-	{ /* h288 */
+	{ /* h082 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6076,7 +2371,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x7eeb7eac, 0x00000000, 0x7f667f28,
 		},
 	},
-	{ /* h289 */
+	{ /* h083 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6094,7 +2389,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x04a6041c, 0x00000000, 0x05bf0532,
 		},
 	},
-	{ /* h290 */
+	{ /* h084 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6112,7 +2407,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0dbd0d2a, 0x00000000, 0x0ee20e50,
 		},
 	},
-	{ /* h291 */
+	{ /* h085 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6130,7 +2425,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x16b7162b, 0x00000000, 0x17cf1743,
 		},
 	},
-	{ /* h292 */
+	{ /* h086 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6148,7 +2443,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x1f4a1ec4, 0x00000000, 0x20561fd0,
 		},
 	},
-	{ /* h293 */
+	{ /* h087 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6166,7 +2461,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x277a26fa, 0x00000000, 0x287927fa,
 		},
 	},
-	{ /* h294 */
+	{ /* h088 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6184,7 +2479,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x2f4a2ed0, 0x00000000, 0x303e2fc4,
 		},
 	},
-	{ /* h295 */
+	{ /* h089 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6202,7 +2497,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x36be364a, 0x00000000, 0x37a63733,
 		},
 	},
-	{ /* h296 */
+	{ /* h090 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6220,7 +2515,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x3dd93d6a, 0x00000000, 0x3eb73e48,
 		},
 	},
-	{ /* h297 */
+	{ /* h091 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6238,7 +2533,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h298 */
+	{ /* h092 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6257,7 +2552,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h299 */
+	{ /* h093 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6276,7 +2571,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000001, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h300 */
+	{ /* h094 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x05555555,
@@ -6295,7 +2590,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h301 */
+	{ /* h095 */
 		.mode = 0x00080000,
 		.target = 0x1c8462dc,
 		.type_map = 0x55555555,
@@ -6314,7 +2609,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h302 */
+	{ /* h096 */
 		.mode = 0x00080000,
 		.target = 0x1c84631c,
 		.type_map = 0x55555555,
@@ -6333,7 +2628,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h303 */
+	{ /* h097 */
 		.mode = 0x00080000,
 		.target = 0x1c84635c,
 		.type_map = 0x55555555,
@@ -6352,7 +2647,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h304 */
+	{ /* h098 */
 		.mode = 0x00080000,
 		.target = 0x1c84639c,
 		.type_map = 0x55555555,
@@ -6371,7 +2666,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h305 */
+	{ /* h099 */
 		.mode = 0x00080000,
 		.target = 0x1c8463dc,
 		.type_map = 0x55555555,
@@ -6390,7 +2685,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h306 */
+	{ /* h100 */
 		.mode = 0x00080000,
 		.target = 0x1c84641c,
 		.type_map = 0x55555555,
@@ -6409,7 +2704,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h307 */
+	{ /* h101 */
 		.mode = 0x00080000,
 		.target = 0x1c84645c,
 		.type_map = 0x55555555,
@@ -6428,7 +2723,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h308 */
+	{ /* h102 */
 		.mode = 0x00080000,
 		.target = 0x1c84649c,
 		.type_map = 0x55555555,
@@ -6447,7 +2742,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h309 */
+	{ /* h103 */
 		.mode = 0x00080000,
 		.target = 0x1c8464dc,
 		.type_map = 0x00000001,
@@ -6466,7 +2761,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h310 */
+	{ /* h104 */
 		.mode = 0x00080000,
 		.target = 0x1c8464e0,
 		.type_map = 0x55555555,
@@ -6485,7 +2780,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h311 */
+	{ /* h105 */
 		.mode = 0x00080000,
 		.target = 0x1c846520,
 		.type_map = 0x55555555,
@@ -6504,7 +2799,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h312 */
+	{ /* h106 */
 		.mode = 0x00080000,
 		.target = 0x1c846560,
 		.type_map = 0x55555555,
@@ -6523,7 +2818,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h313 */
+	{ /* h107 */
 		.mode = 0x00080000,
 		.target = 0x1c8465a0,
 		.type_map = 0x55555555,
@@ -6542,7 +2837,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h314 */
+	{ /* h108 */
 		.mode = 0x00080000,
 		.target = 0x1c8465e0,
 		.type_map = 0x00000001,
@@ -6561,7 +2856,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h315 */
+	{ /* h109 */
 		.mode = 0x00080000,
 		.target = 0x1c8465e4,
 		.type_map = 0x55555555,
@@ -6580,7 +2875,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h316 */
+	{ /* h110 */
 		.mode = 0x00080000,
 		.target = 0x1c846624,
 		.type_map = 0x55555555,
@@ -6599,7 +2894,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h317 */
+	{ /* h111 */
 		.mode = 0x00080000,
 		.target = 0x1c846664,
 		.type_map = 0x55555555,
@@ -6618,7 +2913,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h318 */
+	{ /* h112 */
 		.mode = 0x00080000,
 		.target = 0x1c8466a4,
 		.type_map = 0x01555555,
@@ -6637,7 +2932,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h319 */
+	{ /* h113 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6656,7 +2951,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000001, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h320 */
+	{ /* h114 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6674,7 +2969,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0000ffd7, 0x00000000, 0x0000f96d,
 		},
 	},
-	{ /* h321 */
+	{ /* h115 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6693,7 +2988,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h322 */
+	{ /* h116 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6712,7 +3007,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h323 */
+	{ /* h117 */
 		.mode = 0x00080000,
 		.target = 0x1c8440c0,
 		.type_map = 0x00555555,
@@ -6730,7 +3025,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h324 */
+	{ /* h118 */
 		.mode = 0x00080000,
 		.target = 0x1c844100,
 		.type_map = 0x55555555,
@@ -6748,7 +3043,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x22002000, 0x26002400, 0x2a002800, 0x2e002c00,
 		},
 	},
-	{ /* h325 */
+	{ /* h119 */
 		.mode = 0x00080000,
 		.target = 0x1c844140,
 		.type_map = 0x00000155,
@@ -6766,7 +3061,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h326 */
+	{ /* h120 */
 		.mode = 0x00080000,
 		.target = 0x1c843f0c,
 		.type_map = 0x55555555,
@@ -6784,7 +3079,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00a90090, 0x00e100c4, 0x01440100, 0x01e40190,
 		},
 	},
-	{ /* h327 */
+	{ /* h121 */
 		.mode = 0x00080000,
 		.target = 0x1c843f4c,
 		.type_map = 0x55555555,
@@ -6802,7 +3097,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x27102400, 0x2d902a40, 0x34903100, 0x3c103840,
 		},
 	},
-	{ /* h328 */
+	{ /* h122 */
 		.mode = 0x00080000,
 		.target = 0x1c843f8c,
 		.type_map = 0x00000001,
@@ -6820,7 +3115,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h329 */
+	{ /* h123 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6838,7 +3133,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00001c5a, 0x00000000, 0x0000166f,
 		},
 	},
-	{ /* h330 */
+	{ /* h124 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6856,7 +3151,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h331 */
+	{ /* h125 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6874,7 +3169,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h332 */
+	{ /* h126 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6892,7 +3187,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000007, 0x00000000, 0x00000007,
 		},
 	},
-	{ /* h333 */
+	{ /* h127 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6910,7 +3205,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000003, 0x00000000, 0x00000218,
 		},
 	},
-	{ /* h334 */
+	{ /* h128 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6929,7 +3224,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0fff0af0, 0x00000000, 0x003d003d,
 		},
 	},
-	{ /* h335 */
+	{ /* h129 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6948,7 +3243,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h336 */
+	{ /* h130 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6967,7 +3262,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00250025, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h337 */
+	{ /* h131 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -6986,7 +3281,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00100101, 0x00000000, 0x00100808,
 		},
 	},
-	{ /* h338 */
+	{ /* h132 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7004,7 +3299,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00a63333, 0x00000000, 0x01400404,
 		},
 	},
-	{ /* h339 */
+	{ /* h133 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7022,7 +3317,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00003ff2, 0x00000000, 0x00003ff4,
 		},
 	},
-	{ /* h340 */
+	{ /* h134 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7040,7 +3335,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000e98, 0x00000000, 0x00000d7d,
 		},
 	},
-	{ /* h341 */
+	{ /* h135 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7058,7 +3353,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000066, 0x00000000, 0x01120014,
 		},
 	},
-	{ /* h342 */
+	{ /* h136 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7076,7 +3371,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x02ad0029, 0x00000000, 0x006e0004,
 		},
 	},
-	{ /* h343 */
+	{ /* h137 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7094,7 +3389,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000003, 0x00000000, 0x00000001,
 		},
 	},
-	{ /* h344 */
+	{ /* h138 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7112,7 +3407,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x02020c01, 0x00000000, 0x00000004,
 		},
 	},
-	{ /* h345 */
+	{ /* h139 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7130,7 +3425,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x0020000a, 0x00000000, 0x00000100,
 		},
 	},
-	{ /* h346 */
+	{ /* h140 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7148,7 +3443,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x04000000, 0x00000000, 0x04000400,
 		},
 	},
-	{ /* h347 */
+	{ /* h141 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x00000555,
@@ -7166,7 +3461,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h348 */
+	{ /* h142 */
 		.mode = 0x00080000,
 		.target = 0x1c843524,
 		.type_map = 0x55555555,
@@ -7184,7 +3479,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x0c800c00, 0x0d800d00, 0x0e800e00, 0x01000f00,
 		},
 	},
-	{ /* h349 */
+	{ /* h143 */
 		.mode = 0x00080000,
 		.target = 0x1c843574,
 		.type_map = 0x55555555,
@@ -7202,7 +3497,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00800080, 0x00800080, 0x00600060, 0x00000060,
 		},
 	},
-	{ /* h350 */
+	{ /* h144 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7220,7 +3515,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h351 */
+	{ /* h145 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x55555555,
@@ -7239,7 +3534,7 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 		},
 	},
-	{ /* h352 */
+	{ /* h146 */
 		.mode = 0x00090000,
 		.target = 0x00000000,
 		.type_map = 0x00000555,

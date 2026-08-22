@@ -142,11 +142,12 @@ properties:
     minItems: 1
     maxItems: 8
     items:
-      minItems: 2
-      maxItems: 2
+      minItems: 3
+      maxItems: 3
     description:
-      Address/size pairs that have to be mapped one-to-one in this device's
-      IOMMU domain.  A VOTF producer signals its consumer by writing to a
+      Regions that have to be mapped one-to-one in this device's IOMMU domain,
+      each a 64-bit address followed by a 32-bit size.  Both must be a whole
+      number of pages.  A VOTF producer signals its consumer by writing to a
       register inside the consumer's C2SERV window, at an address the hardware
       derives from the consumer's IP ID rather than one anybody allocated, and
       that write reaches the System MMU as ordinary DMA.
@@ -222,6 +223,7 @@ examples:
         iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>,
                  <&sysmmu_gdc>, <&sysmmu_mcsc>;
         samsung,iommu-group = <&iommu_group_isp>;
-        samsung,iommu-identity-map = <0x1c86d000 0x3000>, <0x1d05d000 0x3000>;
+        samsung,iommu-identity-map = <0x0 0x1c86d000 0x3000>,
+                                     <0x0 0x1d05d000 0x3000>;
     };
 ...

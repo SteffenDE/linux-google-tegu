@@ -181,8 +181,10 @@ struct exynos_becore_params_clut {
  * its rise in its final segment.
  *
  * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the curve to
- * whatever the driver's own default is rather than switching the stage off:
- * the block has no bypass this driver ever asserts.
+ * the driver's own default rather than switching the stage off: the block has
+ * no bypass this driver ever asserts, and the default is the identity, so the
+ * stage keeps running and passes its input through. That is a picture in
+ * very nearly linear light, not a pleasing one.
  */
 struct exynos_becore_params_gamma {
 	struct v4l2_isp_params_block_header header;

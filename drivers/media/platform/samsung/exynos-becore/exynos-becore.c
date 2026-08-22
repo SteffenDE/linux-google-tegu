@@ -79,6 +79,8 @@
 #define BECORE_RGBP_C_LOADER_ENABLE	0x4000
 
 #define BECORE_RESET_TIMEOUT_US		1000
+/* The longer of the two per-stage CRC lists; checked against both at probe. */
+#define BECORE_STREAM_CRC_MAX		26
 
 #define BECORE_INT_FRAME_END		BIT(1)
 #define BECORE_INT_CMDQ_HOLD		BIT(2)
@@ -99,6 +101,9 @@
 #define BECORE_GRID_SIZE			(BECORE_LTM_GRID_ROW_BYTES * \
 					 BECORE_LTM_GRID_ROWS)
 #define BECORE_RUN_TIMEOUT_MS		1000
+
+/* Each block's device-tree reg window; a debug read has to stay inside it. */
+#define BECORE_BLOCK_WINDOW		0x10000
 
 #define BECORE_RGBP_PHYS_BASE		0x1c440000
 #define BECORE_YUVP_PHYS_BASE		0x1c840000
@@ -1499,6 +1504,8 @@ struct becore_block {
 	u32 last_cmdq_int;
 	atomic64_t int0_count;
 	atomic64_t int1_count;
+	u32 stream_crc_armed[BECORE_STREAM_CRC_MAX];
+	u32 stream_crc_result[BECORE_STREAM_CRC_MAX];
 };
 
 struct becore_irq {
@@ -1580,6 +1587,9 @@ struct becore_device {
 	u32 output_first_changed;
 	u32 mcsc_output_changed_bytes;
 	u32 mcsc_output_first_changed;
+	u32 stream_crc_seed;
+	u32 stream_crc_armed_seed;
+	u32 stream_crc_generation;
 	u32 input_profile;
 	u32 active_input_profile;
 	u32 output_profile;
@@ -1700,6 +1710,105 @@ static const struct becore_regval becore_mcsc_init[] = {
 	{ BECORE_GLOBAL_ENABLE, 0x1 },
 };
 
+/*
+ * Every stage of RGBP and YUVP ends its register page with a stream CRC:
+ * CRC_SEED in bits 7:0, writable, and CRC_RESULT in bits 15:8, read-only.
+ * Samsung's own tables for this IP family carry both fields at these widths,
+ * and Lyric's Zuma descriptors name the registers -- but nothing has ever
+ * exercised them, on this SoC or here, so whether the result register behaves
+ * as the table says is unverified.  Reading the whole word rather than the
+ * result field is what answers that: the seed has to read back where the
+ * table puts it.
+ *
+ * With a deterministic input this is a per-stage signature of the stream
+ * leaving each block, for one MMIO write and one read -- no WDMA, no output
+ * buffer, no image decode -- so a discrepancy localises to the first stage
+ * whose CRC moved.
+ *
+ * A zero seed produces a zero result on every stage, including ones that are
+ * plainly running [HW 2026-08-22], so the feature is inert until a seed is
+ * written and the driver skips it entirely rather than spending 117 MMIO
+ * accesses per frame on a diagnostic nobody asked for.  Eleven of these
+ * offsets are in register pages no recipe touches, so leaving them alone by
+ * default also keeps that first contact inside the harness.
+ *
+ * The offsets come from Lyric's own descriptors rather than a sibling SFR
+ * header: where the two disagree the target's map wins, and they do disagree,
+ * over where local tone mapping ends.
+ */
+struct becore_stream_crc {
+	u32 offset;
+	const char *name;
+};
+
+static const struct becore_stream_crc becore_rgbp_stream_crc[] = {
+	{ 0x30fc, "byr_dtp" },
+	{ 0x31fc, "byr_dns" },
+	{ 0x32fc, "byr_dmsc" },
+	{ 0x38fc, "rgb_gamma_rgb" },
+	{ 0x3afc, "rgb_gtm" },
+	{ 0x3bfc, "rgb_rgb_to_yuv" },
+	{ 0x3cfc, "yuv_yuv444_to422" },
+	{ 0x3efc, "y_decomp" },
+	{ 0x40fc, "rgb_ccm33" },
+	{ 0x45fc, "yuv_sc" },
+	{ 0x47fc, "y_gamma_lr" },
+	{ 0x49fc, "y_upsc" },
+	{ 0x4bfc, "y_gamma_hr" },
+};
+
+static const struct becore_stream_crc becore_yuvp_stream_crc[] = {
+	{ 0x10fc, "yuv_cinfifo0" },
+	{ 0x30fc, "yuv_dtp" },
+	{ 0x37fc, "yuv_yuv_nr" },
+	{ 0x38fc, "yuv_yuv422_to444" },
+	{ 0x39fc, "yuv_yuv_to_rgb" },
+	{ 0x3afc, "rgb_rgb_to_yuv" },
+	{ 0x3cfc, "yuv_dither420" },
+	{ 0x3efc, "rgb_invccm33" },
+	{ 0x41fc, "rgb_degamma_rgb" },
+	{ 0x44fc, "rgb_gamma_rgb" },
+	{ 0x46fc, "yuv_gamma_oetf" },
+	{ 0x4dfc, "rgb_prc" },
+	{ 0x51fc, "yuv_sharp_enhancer_sharpen" },
+	{ 0x54fc, "yuv_sharp_enhancer_hfmixer" },
+	{ 0x56fc, "yuv_sharp_enhancer_noise_gen" },
+	{ 0x57fc, "yuv_sharp_enhancer_noise_mixer" },
+	{ 0x58fc, "yuv_sharp_enhancer_cont_det" },
+	{ 0x5afc, "yuv_sharp_enhancer" },
+	{ 0x66fc, "rgb_diablo_ltm" },
+	{ 0x6afc, "yuv_yuv_to_rgb_zuma" },
+	{ 0x6dfc, "rgb_degamma_rgb_main" },
+	{ 0x72fc, "rgb_degamma_rgb_linear" },
+	{ 0x74fc, "rgb_rgb_to_yuv420" },
+	{ 0x75fc, "rgb_rgb_to_yuv422" },
+	{ 0x76fc, "yuv_yuv420_to422" },
+	{ 0x7afc, "rgb_diablo_ccm" },
+};
+
+static_assert(ARRAY_SIZE(becore_rgbp_stream_crc) <= BECORE_STREAM_CRC_MAX);
+static_assert(ARRAY_SIZE(becore_yuvp_stream_crc) <= BECORE_STREAM_CRC_MAX);
+
+#define BECORE_STREAM_CRC_SEED_MASK	GENMASK_U32(7, 0)
+#define BECORE_STREAM_CRC_RESULT_MASK	GENMASK_U32(15, 8)
+#define BECORE_STREAM_CRC_RESULT_SHIFT	8
+
+static const struct becore_stream_crc *
+becore_stream_crc_table(enum becore_block_id id, size_t *count)
+{
+	if (id == BECORE_RGBP) {
+		*count = ARRAY_SIZE(becore_rgbp_stream_crc);
+		return becore_rgbp_stream_crc;
+	}
+	if (id == BECORE_YUVP) {
+		*count = ARRAY_SIZE(becore_yuvp_stream_crc);
+		return becore_yuvp_stream_crc;
+	}
+	*count = 0;
+
+	return NULL;
+}
+
 static void becore_write_table(struct becore_block *block,
 			       const struct becore_regval *table,
 			       size_t count)
@@ -1810,6 +1919,36 @@ becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile)
 static size_t becore_input_allocation_size(void)
 {
 	return becore_rgbp_input_size(&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC]);
+}
+
+static int becore_stream_crc_validate(struct device *dev)
+{
+	unsigned int id;
+
+	for (id = 0; id < BECORE_NUM_BLOCKS; id++) {
+		const struct becore_stream_crc *table;
+		size_t count;
+		size_t i;
+
+		table = becore_stream_crc_table(id, &count);
+		if (count > BECORE_STREAM_CRC_MAX)
+			return dev_err_probe(dev, -EINVAL,
+					     "block %u has %zu stream CRCs\n",
+					     id, count);
+		for (i = 0; i < count; i++) {
+			if (table[i].offset & 3 ||
+			    table[i].offset >= BECORE_BLOCK_WINDOW)
+				return dev_err_probe(dev, -EINVAL,
+						     "stream CRC %u:%zu is outside the block\n",
+						     id, i);
+			if (i && table[i].offset <= table[i - 1].offset)
+				return dev_err_probe(dev, -EINVAL,
+						     "stream CRC %u:%zu is out of order\n",
+						     id, i);
+		}
+	}
+
+	return 0;
 }
 
 static int becore_input_profiles_validate(struct device *dev)
@@ -5179,6 +5318,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	ret = becore_input_profiles_validate(becore->dev);
 	if (ret)
 		return ret;
+	ret = becore_stream_crc_validate(becore->dev);
+	if (ret)
+		return ret;
 	ret = becore_noise_knots_resolve(becore->dev);
 	if (ret)
 		return ret;
@@ -6084,6 +6226,58 @@ static void becore_publish_program(struct becore_device *becore,
 	writel_relaxed(1, block->base + BECORE_CMDQ_QUE_CMD_START);
 }
 
+/*
+ * The seed is written after the processors have been reset and the programs
+ * encoded, and the result read before the run's pm_runtime_put_sync() resets
+ * them again -- there is no other window in which both are meaningful.
+ */
+static void becore_stream_crc_arm(struct becore_device *becore)
+{
+	u32 seed = READ_ONCE(becore->stream_crc_seed) &
+		   BECORE_STREAM_CRC_SEED_MASK;
+	unsigned int id;
+
+	becore->stream_crc_armed_seed = seed;
+	for (id = 0; id < BECORE_NUM_BLOCKS; id++) {
+		struct becore_block *block = &becore->blocks[id];
+		const struct becore_stream_crc *table;
+		size_t count;
+		size_t i;
+
+		table = becore_stream_crc_table(id, &count);
+		for (i = 0; i < count; i++) {
+			block->stream_crc_armed[i] = 0;
+			block->stream_crc_result[i] = 0;
+			if (!seed)
+				continue;
+			writel_relaxed(seed, block->base + table[i].offset);
+			block->stream_crc_armed[i] =
+				readl_relaxed(block->base + table[i].offset);
+		}
+	}
+}
+
+static void becore_stream_crc_capture(struct becore_device *becore)
+{
+	unsigned int id;
+
+	becore->stream_crc_generation = becore->run_generation;
+	if (!becore->stream_crc_armed_seed)
+		return;
+
+	for (id = 0; id < BECORE_NUM_BLOCKS; id++) {
+		struct becore_block *block = &becore->blocks[id];
+		const struct becore_stream_crc *table;
+		size_t count;
+		size_t i;
+
+		table = becore_stream_crc_table(id, &count);
+		for (i = 0; i < count; i++)
+			block->stream_crc_result[i] =
+				readl_relaxed(block->base + table[i].offset);
+	}
+}
+
 static void becore_measure_buffer(const struct becore_dma_buffer *buffer,
 				  u32 *changed_bytes, u32 *first_changed)
 {
@@ -6314,12 +6508,17 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	spin_unlock_irqrestore(&becore->run_lock, flags);
 	becore->active_mcsc = run_mcsc;
 
+	becore_stream_crc_arm(becore);
+
 	/* Move staged or producer-written Bayer pages into RGBP's DMA domain. */
 	dma_sync_sgtable_for_device(becore->dev, becore->run_input->buffer.sgt,
 				    DMA_TO_DEVICE);
 	ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS);
 	if (!ret && run_mcsc)
 		ret = becore_run_stage(becore, BIT(BECORE_MCSC));
+
+	/* A failed run's CRCs say how far the stream got, so read them too. */
+	becore_stream_crc_capture(becore);
 
 	spin_lock_irqsave(&becore->run_lock, flags);
 	becore->running = false;
@@ -7043,6 +7242,41 @@ static int becore_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(becore_status);
 
+static int becore_stream_crc_show(struct seq_file *s, void *unused)
+{
+	struct becore_device *becore = s->private;
+	unsigned int id;
+
+	mutex_lock(&becore->lock);
+	seq_printf(s, "seed             0x%02x requested, 0x%02x armed\n",
+		   READ_ONCE(becore->stream_crc_seed) &
+		   BECORE_STREAM_CRC_SEED_MASK,
+		   becore->stream_crc_armed_seed);
+	seq_printf(s, "generation       %u of %u\n",
+		   becore->stream_crc_generation, becore->run_generation);
+	for (id = 0; id < BECORE_NUM_BLOCKS; id++) {
+		struct becore_block *block = &becore->blocks[id];
+		const struct becore_stream_crc *table;
+		size_t count;
+		size_t i;
+
+		table = becore_stream_crc_table(id, &count);
+		for (i = 0; i < count; i++)
+			seq_printf(s,
+				   "%-4s %-30s +%#06x armed %#010x result %#010x crc 0x%02x\n",
+				   block->name, table[i].name, table[i].offset,
+				   block->stream_crc_armed[i],
+				   block->stream_crc_result[i],
+				   (block->stream_crc_result[i] &
+				    BECORE_STREAM_CRC_RESULT_MASK) >>
+				   BECORE_STREAM_CRC_RESULT_SHIFT);
+	}
+	mutex_unlock(&becore->lock);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(becore_stream_crc);
+
 static void becore_video_unregister(void *data)
 {
 	struct becore_device *becore = data;
@@ -7163,6 +7397,10 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_mcsc_recipe_fops);
 	debugfs_create_file("input", 0200, dir, becore, &becore_input_fops);
 	debugfs_create_file("grid", 0200, dir, becore, &becore_grid_fops);
+	debugfs_create_u32("stream_crc_seed", 0644, dir,
+			   &becore->stream_crc_seed);
+	debugfs_create_file("stream_crc", 0400, dir, becore,
+			    &becore_stream_crc_fops);
 	debugfs_create_u32("input_profile", 0644, dir,
 			   &becore->input_profile);
 	debugfs_create_u32("output_profile", 0644, dir,

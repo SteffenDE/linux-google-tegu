@@ -1046,14 +1046,89 @@ static bool samsung_sysmmu_v9_capable(struct device *dev, enum iommu_cap cap)
 	return cap == IOMMU_CAP_CACHE_COHERENCY;
 }
 
+/*
+ * Camera blocks on this SoC signal each other through the VOTF fabric, and a
+ * producer does that by writing to a register inside its consumer's own
+ * C2SERV window -- an address the hardware forms from the consumer's IP ID,
+ * not one anybody allocated.  That write leaves the producer as ordinary DMA
+ * and arrives at this System MMU, so the consumer's window has to be mapped
+ * one-to-one in the producer's domain or the first token faults.
+ *
+ * `samsung,iommu-identity-map` is how the device tree says which windows a
+ * master has to be able to reach that way.  Its cells are a 64-bit address
+ * and a 32-bit size, which is downstream's own encoding for this property --
+ * a two-cell form would parse a pasted downstream list without complaint and
+ * turn six windows into nine enormous regions starting at zero.  Reporting
+ * them as direct regions gets them both mapped into the group's domain and
+ * withheld from the DMA allocator, which is exactly what is wanted: nothing
+ * else may be handed those addresses.
+ */
+#define SAMSUNG_SYSMMU_IDENTITY_CELLS	3
+
+static void samsung_sysmmu_v9_get_resv_regions(struct device *dev,
+					       struct list_head *head)
+{
+	static const char *prop = "samsung,iommu-identity-map";
+	unsigned int prot = IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO;
+	unsigned int i;
+	int count;
+
+	count = of_property_count_u32_elems(dev->of_node, prop);
+	if (count < 0)
+		count = 0;
+	if (count % SAMSUNG_SYSMMU_IDENTITY_CELLS) {
+		dev_err(dev, "%s is not <address-hi address-lo size> triples\n",
+			prop);
+		count = 0;
+	}
+
+	for (i = 0; i < count; i += SAMSUNG_SYSMMU_IDENTITY_CELLS) {
+		struct iommu_resv_region *region;
+		u32 hi, lo, size;
+		u64 base;
+
+		if (of_property_read_u32_index(dev->of_node, prop, i, &hi) ||
+		    of_property_read_u32_index(dev->of_node, prop, i + 1, &lo) ||
+		    of_property_read_u32_index(dev->of_node, prop, i + 2, &size))
+			break;
+
+		base = ((u64)hi << 32) | lo;
+
+		/*
+		 * The core maps a direct region by rounding its start up and
+		 * its end up, and reserves it by rounding the start down, so
+		 * anything but a whole number of pages reserves an address it
+		 * never maps -- which shows up much later as a fault on an
+		 * address the device tree appears to have asked for.
+		 */
+		if (!size || !PAGE_ALIGNED(base) || !PAGE_ALIGNED(size)) {
+			dev_err(dev, "%s entry %pa/%#x is not page-aligned\n",
+				prop, &base, size);
+			continue;
+		}
+
+		region = iommu_alloc_resv_region(base, size, prot,
+						 IOMMU_RESV_DIRECT, GFP_KERNEL);
+		if (!region) {
+			dev_err(dev, "cannot reserve %s entry %pa\n", prop,
+				&base);
+			break;
+		}
+
+		list_add_tail(&region->list, head);
+	}
+
+	of_iommu_get_resv_regions(dev, head);
+}
+
 static const struct iommu_ops samsung_sysmmu_v9_ops = {
 	.owner = THIS_MODULE,
 	.capable = samsung_sysmmu_v9_capable,
+	.get_resv_regions = samsung_sysmmu_v9_get_resv_regions,
 	.domain_alloc_paging = samsung_sysmmu_v9_domain_alloc_paging,
 	.probe_device = samsung_sysmmu_v9_probe_device,
 	.release_device = samsung_sysmmu_v9_release_device,
 	.device_group = samsung_sysmmu_v9_device_group,
-	.get_resv_regions = of_iommu_get_resv_regions,
 	.of_xlate = samsung_sysmmu_v9_of_xlate,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev = samsung_sysmmu_v9_attach_dev,

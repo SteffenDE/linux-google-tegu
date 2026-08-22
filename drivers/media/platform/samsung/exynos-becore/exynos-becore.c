@@ -11,6 +11,7 @@
  * a software reset.
  */
 
+#include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
@@ -111,6 +112,15 @@
 
 /* What a queued capture's address must be aligned to; see becore_buf_prepare. */
 #define BECORE_CAPTURE_ALIGN		32
+
+/*
+ * The INTCAM operating point the vendor holds while a 4000 x 3000 rear
+ * ultrawide stream runs [HW 2026-08-20].  It has to be an exact rung of the
+ * measured ladder -- 664000 533000 465000 310000 233000 111000 kHz -- because
+ * the ACPM clock passes the requested rate straight to firmware rather than
+ * rounding it up to a supported OPP the way downstream's PM QoS does.
+ */
+#define BECORE_INTCAM_ACTIVE_RATE	233000000UL
 
 /* Each block's device-tree reg window; a debug read has to stay inside it. */
 #define BECORE_BLOCK_WINDOW		0x10000
@@ -1690,6 +1700,9 @@ static ktime_t becore_timing_mark(u64 *phase_ns, enum becore_timing_phase phase,
 
 struct becore_device {
 	struct device *dev;
+	struct clk *intcam_clk;
+	unsigned long saved_intcam_rate;
+	bool intcam_rate_active;
 	struct becore_block blocks[BECORE_NUM_BLOCKS];
 	struct becore_irq irqs[BECORE_NUM_BLOCKS * 2];
 	void __iomem *ssmt[14];
@@ -5509,6 +5522,74 @@ static void becore_disable_linux_irqs(struct becore_device *becore)
 	becore->irqs_enabled = false;
 }
 
+/*
+ * Nothing in mainline asks INTCAM for anything, so RGBP, YUVP and MCSC run a
+ * 4000 x 3000 stream at the bottom rung of its ladder: 111 MHz, with clk_summary
+ * reporting the domain "deviceless" for the whole of a capture [HW 2026-08-22].
+ * The front end beside this one already votes for CAM and for memory bandwidth;
+ * this is the back end's half of the same contract.
+ *
+ * The rate is raised rather than set, so a larger vote from anything else --
+ * a future GDC, GSE or LME consumer, all of which share INTCAM -- survives,
+ * and
+ * the entry rate is restored rather than assumed, so a failed unwind cannot
+ * quietly become the next stream's idle baseline.
+ */
+static int becore_qos_disable(struct becore_device *becore)
+{
+	int ret = 0;
+
+	if (becore->intcam_rate_active) {
+		ret = clk_set_rate(becore->intcam_clk,
+				   becore->saved_intcam_rate);
+		if (ret)
+			return ret;
+		becore->intcam_rate_active = false;
+		becore->saved_intcam_rate = 0;
+	}
+
+	return 0;
+}
+
+static int becore_qos_enable(struct becore_device *becore)
+{
+	int cleanup_ret;
+	int ret;
+
+	/* Retry a restore the preceding stream left incomplete. */
+	ret = becore_qos_disable(becore);
+	if (ret)
+		return ret;
+
+	becore->saved_intcam_rate = clk_get_rate(becore->intcam_clk);
+	if (!becore->saved_intcam_rate)
+		return -EIO;
+
+	/* A transport error can arrive after firmware accepted the request. */
+	becore->intcam_rate_active = true;
+	ret = clk_set_rate(becore->intcam_clk,
+			   max(becore->saved_intcam_rate,
+			       BECORE_INTCAM_ACTIVE_RATE));
+	if (ret) {
+		cleanup_ret = becore_qos_disable(becore);
+		if (cleanup_ret)
+			dev_err(becore->dev,
+				"cannot restore INTCAM after error: %d\n",
+				cleanup_ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void becore_qos_restore(struct becore_device *becore)
+{
+	int ret = becore_qos_disable(becore);
+
+	if (ret)
+		dev_err(becore->dev, "cannot restore INTCAM: %d\n", ret);
+}
+
 static int becore_runtime_resume(struct device *dev)
 {
 	struct becore_device *becore = dev_get_drvdata(dev);
@@ -6102,6 +6183,7 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 	streaming = becore->video_streaming;
 	becore->video_streaming = false;
 	becore->producer_streaming = false;
+	becore_qos_restore(becore);
 	spin_lock_irqsave(&becore->run_lock, flags);
 	if (becore->running) {
 		becore->abort_run = true;
@@ -7394,6 +7476,7 @@ static void becore_video_fail(struct becore_device *becore,
 {
 	mutex_lock(&becore->lock);
 	becore->video_streaming = false;
+	becore_qos_restore(becore);
 	mutex_unlock(&becore->lock);
 
 	becore_video_stop_producer(becore);
@@ -7580,6 +7663,12 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto unlock;
 	}
 
+	ret = becore_qos_enable(becore);
+	if (ret) {
+		becore_input_callback_put(input);
+		goto unlock;
+	}
+
 	becore->video_sequence = 0;
 	/* The shared driver-owned output now becomes the video bounce buffer. */
 	becore->completed_generation = 0;
@@ -7593,6 +7682,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		becore_input_callback_put(input);
 		mutex_lock(&becore->lock);
 		becore->video_streaming = false;
+		becore_qos_restore(becore);
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
 		becore_video_controls_ungrab(becore);
@@ -7613,6 +7703,9 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		input->ops->stop_streaming(input->producer_data);
 	becore_input_callback_put(input);
 	if (ret) {
+		mutex_lock(&becore->lock);
+		becore_qos_restore(becore);
+		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
 		becore_video_controls_ungrab(becore);
 		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
@@ -7656,6 +7749,9 @@ static void becore_stop_streaming(struct vb2_queue *q)
 	becore_video_stop_producer(becore);
 	becore_video_controls_ungrab(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
+	mutex_lock(&becore->lock);
+	becore_qos_restore(becore);
+	mutex_unlock(&becore->lock);
 	/* Nothing is going to run a frame for a queued parameters buffer now. */
 	becore_params_drain_idle(becore);
 }
@@ -7881,6 +7977,9 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->mcsc_completed_output_size, becore->mcsc_output.size,
 		   &becore->mcsc_output.dma);
 	becore_status_program(s, "mcsc_cmdq", &becore->mcsc_program);
+	seq_printf(s, "intcam           %lu Hz (saved %lu, raised %u)\n",
+		   clk_get_rate(becore->intcam_clk),
+		   becore->saved_intcam_rate, becore->intcam_rate_active);
 	seq_printf(s, "timing_runs      %u\n", becore->timing_runs);
 	for (i = 0; i < BECORE_TIMING_PHASE_COUNT; i++)
 		seq_printf(s, "timing_%-9s %llu us last, %llu us total\n",
@@ -8940,6 +9039,11 @@ static int becore_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
+
+	becore->intcam_clk = devm_clk_get(dev, "intcam");
+	if (IS_ERR(becore->intcam_clk))
+		return dev_err_probe(dev, PTR_ERR(becore->intcam_clk),
+				     "cannot get INTCAM clock\n");
 
 	ret = becore_map_resources(pdev, becore);
 	if (ret)

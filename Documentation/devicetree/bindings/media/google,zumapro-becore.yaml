@@ -103,6 +103,16 @@ properties:
       - const: gdc
       - const: mcsc
 
+  clocks:
+    maxItems: 1
+    description:
+      INTCAM ACPM DVFS domain.  RGBP, MCFP, YUVP, GDC and MCSC all belong to
+      it, so one request covers the whole back end.
+
+  clock-names:
+    items:
+      - const: intcam
+
   iommus:
     items:
       - description: YUVP System MMU
@@ -124,6 +134,8 @@ required:
   - interrupt-names
   - power-domains
   - power-domain-names
+  - clocks
+  - clock-names
   - iommus
   - samsung,iommu-group
 
@@ -131,6 +143,7 @@ additionalProperties: false
 
 examples:
   - |
+    #include <dt-bindings/clock/google,zumapro-acpm.h>
     #include <dt-bindings/interrupt-controller/arm-gic.h>
 
     camera@1c440000 {
@@ -175,6 +188,8 @@ examples:
                           "mcsc-int0", "mcsc-int1";
         power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>, <&pd_mcsc>;
         power-domain-names = "yuvp", "rgbp", "gdc", "mcsc";
+        clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INTCAM>;
+        clock-names = "intcam";
         iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>, <&sysmmu_rgbp_s1>,
                  <&sysmmu_gdc>, <&sysmmu_mcsc>;
         samsung,iommu-group = <&iommu_group_isp>;

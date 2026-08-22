@@ -4155,6 +4155,15 @@
 			power-domains = <&pd_yuvp>, <&pd_rgbp>, <&pd_gdc>,
 					<&pd_mcsc>;
 			power-domain-names = "yuvp", "rgbp", "gdc", "mcsc";
+			/*
+			 * All four RGBP/MCFP/YUVP/GDC clocks the vendor's
+			 * lwis_be_core names, and MCSC's, are clock-family 1
+			 * -- INTCAM.  Nothing here models CMU_RGBP/YUVP/MCSC,
+			 * so the blocks keep the bootloader's mux and divider
+			 * settings and this is the one knob that moves them.
+			 */
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INTCAM>;
+			clock-names = "intcam";
 			iommus = <&sysmmu_yuvp>, <&sysmmu_rgbp_s0>,
 				 <&sysmmu_rgbp_s1>, <&sysmmu_gdc>, <&sysmmu_mcsc>;
 			samsung,iommu-group = <&iommu_group_isp>;

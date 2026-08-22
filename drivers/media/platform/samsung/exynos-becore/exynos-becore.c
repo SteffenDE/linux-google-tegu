@@ -1813,6 +1813,7 @@ struct becore_device {
 	bool output_quarantined;
 	bool video_streaming;
 	bool producer_streaming;
+	bool stream_powered;
 	/*
 	 * Where MCSC writes this run.  The driver-owned buffer except during a
 	 * capture, which redirects it at the queued vb2 buffer; every path that
@@ -5599,6 +5600,69 @@ static void becore_qos_restore(struct becore_device *becore)
 		dev_err(becore->dev, "cannot restore INTCAM: %d\n", ret);
 }
 
+/*
+ * A stream holds the block powered for its whole length rather than letting
+ * each frame power it up and down.  becore_run_frame()'s own get and put then
+ * only move the usage count, which never reaches zero, so no callback runs and
+ * the four processors are reset once per stream instead of once per frame --
+ * which is what Pablo does too, resetting in enable/disable rather than shot.
+ *
+ * Measured, the per-frame cycle was 1,228 us of resume and 93 us of suspend
+ * against a frame of 31.6 ms.  That was noise when the frame was 340 ms; it is
+ * 56% of the 2.3 ms that now separates the run from the sensor's period.
+ *
+ * The one-shot debugfs diagnostics keep powering up and down per run: they are
+ * not a stream and nothing holds this reference for them.
+ */
+static int becore_stream_power_get(struct becore_device *becore)
+{
+	int ret;
+
+	if (WARN_ON_ONCE(becore->stream_powered))
+		return -EBUSY;
+
+	ret = pm_runtime_resume_and_get(becore->dev);
+	if (ret)
+		return ret;
+	if (becore->reset_failed) {
+		/*
+		 * Drop the count without an idle notification, so the device
+		 * stays powered rather than attempting a suspend whose reset
+		 * has already failed.  reset_failed is sticky and refuses every
+		 * entry point from here, so nothing runs on it again.
+		 */
+		pm_runtime_put_noidle(becore->dev);
+		return -EIO;
+	}
+	becore->stream_powered = true;
+
+	ret = becore_qos_enable(becore);
+	if (ret) {
+		becore->stream_powered = false;
+		if (pm_runtime_put_sync(becore->dev) < 0)
+			pm_runtime_get_noresume(becore->dev);
+	}
+
+	return ret;
+}
+
+static void becore_stream_power_put(struct becore_device *becore)
+{
+	int ret;
+
+	becore_qos_restore(becore);
+	if (!becore->stream_powered)
+		return;
+	becore->stream_powered = false;
+
+	ret = pm_runtime_put_sync(becore->dev);
+	if (ret < 0) {
+		/* Match probe: never leave a failed-reset device at usage zero. */
+		pm_runtime_get_noresume(becore->dev);
+		dev_err(becore->dev, "cannot power down after stream: %d\n", ret);
+	}
+}
+
 static int becore_runtime_resume(struct device *dev)
 {
 	struct becore_device *becore = dev_get_drvdata(dev);
@@ -6192,7 +6256,7 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 	streaming = becore->video_streaming;
 	becore->video_streaming = false;
 	becore->producer_streaming = false;
-	becore_qos_restore(becore);
+	becore_stream_power_put(becore);
 	spin_lock_irqsave(&becore->run_lock, flags);
 	if (becore->running) {
 		becore->abort_run = true;
@@ -6903,9 +6967,10 @@ static void becore_publish_program(struct becore_device *becore,
 }
 
 /*
- * The seed is written after the processors have been reset and the programs
- * encoded, and the result read before the run's pm_runtime_put_sync() resets
- * them again -- there is no other window in which both are meaningful.
+ * The seed is written after the programs are encoded and the result read before
+ * the next frame overwrites it.  Under a stream the processors are no longer
+ * reset between frames, so what bounds the window is the run itself rather than
+ * a reset either side of it; the seed is rewritten every frame regardless.
  */
 static void becore_stream_crc_arm(struct becore_device *becore)
 {
@@ -7054,6 +7119,7 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	bool diagnostic_output = !capture;
 	bool input_claimed = false;
 	u64 phase_ns[BECORE_TIMING_PHASE_COUNT] = {};
+	bool quiesced;
 	ktime_t start;
 	ktime_t mark;
 	int pm_ret;
@@ -7248,11 +7314,38 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	spin_unlock_irqrestore(&becore->run_lock, flags);
 	mark = becore_timing_mark(phase_ns, BECORE_TIMING_CRC, mark);
 
-	/* runtime_suspend synchronizes IRQs and resets all four processors. */
+	/*
+	 * Without a stream this suspends: runtime_suspend synchronizes IRQs and
+	 * resets all four processors.  Under one it only drops the usage count,
+	 * because the stream holds its own reference.
+	 */
 	pm_ret = pm_runtime_put_sync(becore->dev);
 	if (pm_ret < 0) {
 		/* Match probe: never leave a failed-reset device at usage zero. */
 		pm_runtime_get_noresume(becore->dev);
+		quiesced = false;
+		if (!ret)
+			ret = pm_ret;
+	} else if (ret && becore->stream_powered) {
+		/*
+		 * The put above reset nothing, so a run that failed leaves the
+		 * processors unproven -- and on a timeout they are genuinely
+		 * still going.  The slot cannot go back to a producer that
+		 * would begin writing it, and producer_acquire() does not gate
+		 * on streaming, so prove quiescence here rather than waiting
+		 * for the teardown that follows.  Losing the init tables with
+		 * it costs nothing: every path that reaches this stops the
+		 * stream, and the next STREAMON resumes through them again.
+		 */
+		int reset_ret = becore_reset_all(becore);
+
+		becore->reset_failed = !!reset_ret;
+		quiesced = !reset_ret;
+	} else {
+		quiesced = true;
+	}
+
+	if (!quiesced) {
 		/*
 		 * The input mapping may not be returned after an unproven stop.
 		 * The capture is worse and is not resolved here: MCSC writes it
@@ -7273,15 +7366,13 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		becore->completed_output_size = 0;
 		becore->mcsc_completed_generation = 0;
 		becore->mcsc_completed_output_size = 0;
-		if (!ret)
-			ret = pm_ret;
 	} else {
 		becore->run_input->state = BECORE_INPUT_FREE;
 		becore->run_input->ready_sequence = 0;
 	}
 	becore->run_input = NULL;
 	input_claimed = false;
-	if (pm_ret >= 0)
+	if (quiesced)
 		dma_rmb();
 	becore_timing_mark(phase_ns, BECORE_TIMING_SUSPEND, mark);
 	phase_ns[BECORE_TIMING_FRAME] =
@@ -7506,7 +7597,7 @@ static void becore_video_fail(struct becore_device *becore,
 {
 	mutex_lock(&becore->lock);
 	becore->video_streaming = false;
-	becore_qos_restore(becore);
+	becore_stream_power_put(becore);
 	mutex_unlock(&becore->lock);
 
 	becore_video_stop_producer(becore);
@@ -7693,7 +7784,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto unlock;
 	}
 
-	ret = becore_qos_enable(becore);
+	ret = becore_stream_power_get(becore);
 	if (ret) {
 		becore_input_callback_put(input);
 		goto unlock;
@@ -7712,7 +7803,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		becore_input_callback_put(input);
 		mutex_lock(&becore->lock);
 		becore->video_streaming = false;
-		becore_qos_restore(becore);
+		becore_stream_power_put(becore);
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
 		becore_video_controls_ungrab(becore);
@@ -7734,7 +7825,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	becore_input_callback_put(input);
 	if (ret) {
 		mutex_lock(&becore->lock);
-		becore_qos_restore(becore);
+		becore_stream_power_put(becore);
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
 		becore_video_controls_ungrab(becore);
@@ -7780,7 +7871,7 @@ static void becore_stop_streaming(struct vb2_queue *q)
 	becore_video_controls_ungrab(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
 	mutex_lock(&becore->lock);
-	becore_qos_restore(becore);
+	becore_stream_power_put(becore);
 	mutex_unlock(&becore->lock);
 	/* Nothing is going to run a frame for a queued parameters buffer now. */
 	becore_params_drain_idle(becore);

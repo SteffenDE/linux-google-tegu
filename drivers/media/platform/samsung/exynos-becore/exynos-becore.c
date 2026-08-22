@@ -81,6 +81,9 @@
 #define BECORE_RESET_TIMEOUT_US		1000
 /* The longer of the two per-stage CRC lists; checked against both at probe. */
 #define BECORE_STREAM_CRC_MAX		26
+/* Debug register overrides: enough to sweep a small LUT, not a whole block. */
+#define BECORE_OVERRIDE_MAX		32
+#define BECORE_OVERRIDE_TEXT_MAX	1024
 
 #define BECORE_INT_FRAME_END		BIT(1)
 #define BECORE_INT_CMDQ_HOLD		BIT(2)
@@ -779,6 +782,11 @@ enum becore_block_id {
 
 struct becore_regval {
 	u32 offset;
+	u32 value;
+};
+
+struct becore_override {
+	u32 reg;
 	u32 value;
 };
 
@@ -1590,6 +1598,12 @@ struct becore_device {
 	u32 stream_crc_seed;
 	u32 stream_crc_armed_seed;
 	u32 stream_crc_generation;
+	struct becore_override overrides[BECORE_OVERRIDE_MAX];
+	u32 override_count;
+	char override_text[BECORE_OVERRIDE_TEXT_MAX];
+	size_t override_text_len;
+	/* Compared, never dereferenced: which descriptor owns the text. */
+	const struct file *override_writer;
 	u32 input_profile;
 	u32 active_input_profile;
 	u32 output_profile;
@@ -4343,6 +4357,106 @@ static int becore_recipe_validate(struct becore_device *becore)
 	return becore_recipe_records_validate(becore, true);
 }
 
+/*
+ * A debug override replaces the value of a word the program already writes.
+ *
+ * That restriction is the safety property, not a limitation to work around: an
+ * override can change what a register is set to but can never add a write to a
+ * register the encoder was not already going to touch, so no unmapped offset
+ * and no unrelated block can be reached through it.  On top of that it refuses
+ * every address and typed-DMA word outright, because those name driver-owned
+ * memory and a wrong one points the hardware at pages it does not own.
+ *
+ * Only the three blocks the offline loop measures are covered.  GTNR's startup
+ * program is not part of that chain and its registers are simply not found.
+ */
+static int becore_override_check(u32 reg)
+{
+	static const struct {
+		const struct becore_cmdq_shape *shape;
+		u32 count;
+	} programs[] = {
+		{ becore_rgbp_shape, BECORE_RGBP_HEADER_COUNT },
+		{ becore_yuvp_shape, BECORE_YUVP_HEADER_COUNT },
+		{ becore_mcsc_shape, BECORE_MCSC_HEADER_COUNT },
+	};
+	bool found = false;
+	size_t block;
+	u32 i;
+	u32 word;
+
+	for (block = 0; block < ARRAY_SIZE(programs); block++) {
+		for (i = 0; i < programs[block].count; i++) {
+			const struct becore_cmdq_shape *shape =
+				&programs[block].shape[i];
+
+			/*
+			 * Every word of a repeated-target header names the
+			 * same register -- it is a streamed LUT port -- so one
+			 * override would rewrite the whole payload rather than
+			 * one field.  Answer that before asking which word,
+			 * because becore_shape_register() cannot say.
+			 */
+			if (shape->mode == 0x000b0000) {
+				if (shape->target == reg)
+					return -EPERM;
+				continue;
+			}
+			for (word = 0; word < shape->valid_words; word++) {
+				u32 candidate;
+
+				if (shape->mode == 0x00090000 && !(word & 1))
+					continue;
+				if (becore_shape_register(shape, word,
+							  &candidate) ||
+				    candidate != reg)
+					continue;
+				if ((shape->address_mask | shape->typed_mask) &
+				    BIT(word))
+					return -EPERM;
+				found = true;
+			}
+		}
+	}
+
+	return found ? 0 : -ENOENT;
+}
+
+/*
+ * Substitute after the record's fixed words have been copied and the typed,
+ * generated and address words written, so that an override wins over every
+ * source -- and skip the two kinds becore_override_check() already refuses,
+ * rather than relying on that refusal alone.
+ */
+static void becore_override_apply(const struct becore_device *becore,
+				  const struct becore_cmdq_shape *shape,
+				  u8 *payload)
+{
+	u32 word;
+	u32 i;
+
+	if (!becore->override_count)
+		return;
+
+	for (word = 0; word < shape->valid_words; word++) {
+		u32 reg;
+
+		if (shape->mode == 0x00090000 && !(word & 1))
+			continue;
+		if ((shape->address_mask | shape->typed_mask) & BIT(word))
+			continue;
+		if (becore_shape_register(shape, word, &reg))
+			continue;
+		for (i = 0; i < becore->override_count; i++) {
+			if (becore->overrides[i].reg != reg)
+				continue;
+			put_unaligned_le32(becore->overrides[i].value,
+					   payload + word * 4);
+			break;
+		}
+	}
+}
+
 static int becore_encode_block(struct becore_device *becore,
 			       enum becore_block_id id,
 			       const struct becore_cmdq_shape *shape,
@@ -4411,6 +4525,7 @@ static int becore_encode_block(struct becore_device *becore,
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
+		becore_override_apply(becore, &shape[i], payload);
 	}
 	if (typed_count != becore_typed_word_count(id) ||
 	    generated_count != becore_generated_word_count(id))
@@ -4897,6 +5012,7 @@ becore_encode_mcsc(struct becore_device *becore,
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma), payload + word * 4);
 		}
+		becore_override_apply(becore, shape, payload);
 	}
 
 	if (typed_count != BECORE_MCSC_DMA_WORD_COUNT ||
@@ -6898,6 +7014,15 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EBUSY;
 		goto unlock;
 	}
+	/*
+	 * A debug override must not be able to leak into an ordinary capture,
+	 * and a forgotten one is easy to leave behind, so the ordinary path
+	 * refuses to start rather than quietly running a swept program.
+	 */
+	if (becore->override_count) {
+		ret = -EPERM;
+		goto unlock;
+	}
 	ret = becore_recipe_records_validate(becore, false);
 	if (ret)
 		goto unlock;
@@ -7179,6 +7304,7 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   &becore->output.dma);
 	seq_printf(s, "capture_size     %zu bytes\n",
 		   becore->active_capture_size);
+	seq_printf(s, "overrides        %u\n", becore->override_count);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -7241,6 +7367,189 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(becore_status);
+
+static int becore_override_show(struct seq_file *s, void *unused)
+{
+	struct becore_device *becore = s->private;
+	u32 i;
+
+	mutex_lock(&becore->lock);
+	seq_printf(s, "# %u of %u overrides\n", becore->override_count,
+		   BECORE_OVERRIDE_MAX);
+	for (i = 0; i < becore->override_count; i++)
+		seq_printf(s, "%#010x %#010x\n", becore->overrides[i].reg,
+			   becore->overrides[i].value);
+	mutex_unlock(&becore->lock);
+
+	return 0;
+}
+
+static int becore_override_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, becore_override_show, inode->i_private);
+}
+
+/*
+ * The list is whatever has been written to one descriptor so far, re-parsed in
+ * full every time and installed only if all of it is good.  A sweep therefore
+ * never runs against a partly applied set, and neither does a shell:
+ * `printf '%s\n' '...'` reaches this node as *two* writes on busybox, the line
+ * and then its newline, and treating the second as a fresh list would leave
+ * the first one installed under a syntax error or drop it entirely.
+ *
+ * "One descriptor" is enforced rather than assumed: the text belongs to
+ * whichever file wrote it at offset zero, and a second writer is refused until
+ * that one is done.  Two shells redirecting into this node at once would
+ * otherwise splice one list out of both halves, and it would parse.
+ *
+ * Each line is a register and the value to encode for it, both as ordinary
+ * numbers; a line that is blank or starts with '#' is skipped, so the read
+ * back can be piped straight back in.  Writing nothing but whitespace clears
+ * the list.
+ *
+ * A write that leaves the accumulated text unparseable installs nothing and
+ * does not advance the descriptor, so a writer that splits mid-token -- which
+ * no shell does, but `dd bs=8` would -- has to start again at offset zero.
+ */
+static int becore_override_parse(struct becore_device *becore)
+{
+	struct becore_override parsed[BECORE_OVERRIDE_MAX] = {};
+	u32 parsed_count = 0;
+	char *text;
+	char *cursor;
+	char *line;
+	int ret = 0;
+
+	text = kmemdup_nul(becore->override_text, becore->override_text_len,
+			   GFP_KERNEL);
+	if (!text)
+		return -ENOMEM;
+
+	cursor = text;
+	while ((line = strsep(&cursor, "\n"))) {
+		char *value_text;
+		u32 reg;
+		u32 value;
+		u32 i;
+
+		line = strim(line);
+		if (!*line || *line == '#')
+			continue;
+		value_text = line;
+		strsep(&value_text, " \t");
+		if (!value_text || kstrtou32(line, 0, &reg) ||
+		    kstrtou32(strim(value_text), 0, &value)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (parsed_count == BECORE_OVERRIDE_MAX) {
+			ret = -E2BIG;
+			goto out;
+		}
+		/* Two values for one register would make the list ordered. */
+		for (i = 0; i < parsed_count; i++) {
+			if (parsed[i].reg == reg) {
+				ret = -EEXIST;
+				goto out;
+			}
+		}
+		ret = becore_override_check(reg);
+		if (ret)
+			goto out;
+		parsed[parsed_count].reg = reg;
+		parsed[parsed_count].value = value;
+		parsed_count++;
+	}
+
+	memcpy(becore->overrides, parsed, sizeof(parsed));
+	becore->override_count = parsed_count;
+
+out:
+	kfree(text);
+	return ret;
+}
+
+static ssize_t becore_override_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct becore_device *becore =
+		((struct seq_file *)file->private_data)->private;
+	ssize_t ret;
+
+	size_t base;
+
+	if (*ppos < 0)
+		return -EINVAL;
+	if (!count)
+		return 0;
+
+	mutex_lock(&becore->lock);
+	if (becore->video_streaming || becore->running) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (*ppos == 0) {
+		base = 0;
+	} else if (*ppos != becore->override_text_len ||
+		   becore->override_writer != file) {
+		ret = -ESPIPE;
+		goto unlock;
+	} else {
+		base = becore->override_text_len;
+	}
+	/* Nothing is discarded until the write is known to fit. */
+	if (count > BECORE_OVERRIDE_TEXT_MAX - base) {
+		ret = -EFBIG;
+		goto unlock;
+	}
+	if (copy_from_user(becore->override_text + base, buf, count)) {
+		becore->override_text_len = base;
+		ret = -EFAULT;
+		goto reset;
+	}
+	becore->override_text_len = base + count;
+	becore->override_writer = file;
+	ret = becore_override_parse(becore);
+	if (ret)
+		goto reset;
+	*ppos += count;
+	ret = count;
+	goto unlock;
+
+reset:
+	/* A half-written list is not a list; leave nothing behind to inherit. */
+	becore->override_text_len = 0;
+	becore->override_writer = NULL;
+	becore->override_count = 0;
+unlock:
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
+static int becore_override_release(struct inode *inode, struct file *file)
+{
+	struct becore_device *becore =
+		((struct seq_file *)file->private_data)->private;
+
+	mutex_lock(&becore->lock);
+	if (becore->override_writer == file) {
+		becore->override_writer = NULL;
+		becore->override_text_len = 0;
+	}
+	mutex_unlock(&becore->lock);
+
+	return single_release(inode, file);
+}
+
+static const struct file_operations becore_override_fops = {
+	.owner = THIS_MODULE,
+	.open = becore_override_open,
+	.read = seq_read,
+	.write = becore_override_write,
+	.llseek = seq_lseek,
+	.release = becore_override_release,
+};
 
 static int becore_stream_crc_show(struct seq_file *s, void *unused)
 {
@@ -7401,6 +7710,8 @@ static int becore_debugfs_init(struct becore_device *becore)
 			   &becore->stream_crc_seed);
 	debugfs_create_file("stream_crc", 0400, dir, becore,
 			    &becore_stream_crc_fops);
+	debugfs_create_file("override", 0600, dir, becore,
+			    &becore_override_fops);
 	debugfs_create_u32("input_profile", 0644, dir,
 			   &becore->input_profile);
 	debugfs_create_u32("output_profile", 0644, dir,

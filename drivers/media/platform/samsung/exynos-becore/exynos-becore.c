@@ -843,11 +843,52 @@ static_assert((BECORE_YUVP_CCM_OFFSET_LAST - BECORE_YUVP_CCM_OFFSET_FIRST) / 4 +
 #define BECORE_YUVP_GAMMA_BASE		(BECORE_YUVP_PHYS_BASE + 0x4200)
 #define BECORE_YUVP_GAMMA_GATE_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x000)
 #define BECORE_YUVP_GAMMA_GATE_LAST	(BECORE_YUVP_GAMMA_BASE + 0x004)
+#define BECORE_YUVP_GAMMA_R_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x00c)
+#define BECORE_YUVP_GAMMA_R_LAST	(BECORE_YUVP_GAMMA_BASE + 0x088)
+#define BECORE_YUVP_GAMMA_R_DELTA_REG	(BECORE_YUVP_GAMMA_BASE + 0x08c)
+#define BECORE_YUVP_GAMMA_G_LOW_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x0a0)
+#define BECORE_YUVP_GAMMA_G_LOW_LAST	(BECORE_YUVP_GAMMA_BASE + 0x0ec)
+#define BECORE_YUVP_GAMMA_G_HIGH_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x100)
+#define BECORE_YUVP_GAMMA_G_HIGH_LAST	(BECORE_YUVP_GAMMA_BASE + 0x12c)
+#define BECORE_YUVP_GAMMA_G_DELTA_REG	(BECORE_YUVP_GAMMA_BASE + 0x130)
+#define BECORE_YUVP_GAMMA_B_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x138)
+#define BECORE_YUVP_GAMMA_B_LAST	(BECORE_YUVP_GAMMA_BASE + 0x1b4)
+#define BECORE_YUVP_GAMMA_B_DELTA_REG	(BECORE_YUVP_GAMMA_BASE + 0x1b8)
 #define BECORE_YUVP_GAMMA_X_LOW_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x1c0)
 #define BECORE_YUVP_GAMMA_X_LOW_LAST	(BECORE_YUVP_GAMMA_BASE + 0x1ec)
 #define BECORE_YUVP_GAMMA_X_HIGH_FIRST	(BECORE_YUVP_GAMMA_BASE + 0x200)
 #define BECORE_YUVP_GAMMA_X_HIGH_LAST	(BECORE_YUVP_GAMMA_BASE + 0x250)
 #define BECORE_YUVP_GAMMA_Q		14
+/* Two knots per register, and a last knot that has a register to itself. */
+#define BECORE_GAMMA_KNOTS_PER_REG	2
+#define BECORE_YUVP_GAMMA_G_SPLIT_KNOT	40
+
+static_assert(EXYNOS_BECORE_GAMMA_POINTS == BECORE_RGBP_GAMMA_KNOTS);
+/*
+ * Every knot but the last is half of a register.  An odd count would divide
+ * silently and drop one, because the packing counts registers rather than
+ * knots.
+ */
+static_assert((EXYNOS_BECORE_GAMMA_POINTS - 1) % BECORE_GAMMA_KNOTS_PER_REG ==
+	      0);
+static_assert(EXYNOS_BECORE_GAMMA_ONE == 1 << BECORE_YUVP_GAMMA_Q);
+/*
+ * Each range has to hold exactly the knots the table below says it starts at,
+ * or the packing would run off the end of a curve. The green table's hole is
+ * the reason this is worth asserting rather than reading: it splits at knot 40
+ * and nothing about the addresses says so.
+ */
+static_assert((BECORE_YUVP_GAMMA_R_LAST - BECORE_YUVP_GAMMA_R_FIRST) / 4 + 1 ==
+	      (EXYNOS_BECORE_GAMMA_POINTS - 1) / BECORE_GAMMA_KNOTS_PER_REG);
+static_assert((BECORE_YUVP_GAMMA_B_LAST - BECORE_YUVP_GAMMA_B_FIRST) / 4 + 1 ==
+	      (EXYNOS_BECORE_GAMMA_POINTS - 1) / BECORE_GAMMA_KNOTS_PER_REG);
+static_assert((BECORE_YUVP_GAMMA_G_LOW_LAST - BECORE_YUVP_GAMMA_G_LOW_FIRST) /
+	      4 + 1 == BECORE_YUVP_GAMMA_G_SPLIT_KNOT /
+	      BECORE_GAMMA_KNOTS_PER_REG);
+static_assert((BECORE_YUVP_GAMMA_G_HIGH_LAST -
+	       BECORE_YUVP_GAMMA_G_HIGH_FIRST) / 4 + 1 ==
+	      (EXYNOS_BECORE_GAMMA_POINTS - 1 -
+	       BECORE_YUVP_GAMMA_G_SPLIT_KNOT) / BECORE_GAMMA_KNOTS_PER_REG);
 
 /*
  * The tone mapper's guide curve: 128 Q15 samples, two to a register with the
@@ -1947,9 +1988,11 @@ struct becore_params_state {
 	u16 ltm_curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
 	u16 clut_u[EXYNOS_BECORE_CLUT_NODES];
 	u16 clut_v[EXYNOS_BECORE_CLUT_NODES];
+	u16 gamma[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
 	bool ccm_valid;
 	bool ltm_curve_valid;
 	bool clut_valid;
+	bool gamma_valid;
 };
 
 struct becore_params_buffer {
@@ -5307,6 +5350,90 @@ static int becore_override_check(u32 reg)
 }
 
 /*
+ * Where each channel's tone-curve table is, and which knot its first register
+ * carries.
+ *
+ * Three things make this a table rather than arithmetic. The green table has a
+ * four-register reserved hole in the middle of it, so it takes two entries and
+ * the second one starts at knot 40. The last knot of every table is stored in
+ * a register of its own, as its distance from the knot before it, because a
+ * value of 1 << Q does not fit the field. And the three tables are not evenly
+ * spaced, so nothing derives one from another.
+ */
+struct becore_yuvp_gamma_range {
+	u32 first;		/* physical register, inclusive */
+	u32 last;		/* inclusive; equal to first for one register */
+	u8 channel;
+	u8 knot;		/* the knot this range's first register holds */
+	bool delta;		/* the last knot, as a distance */
+};
+
+#define BECORE_YUVP_GAMMA_LAST_KNOT	(EXYNOS_BECORE_GAMMA_POINTS - 1)
+
+static const struct becore_yuvp_gamma_range becore_yuvp_gamma_tables[] = {
+	{ BECORE_YUVP_GAMMA_R_FIRST, BECORE_YUVP_GAMMA_R_LAST, 0, 0, false },
+	{ BECORE_YUVP_GAMMA_R_DELTA_REG, BECORE_YUVP_GAMMA_R_DELTA_REG, 0,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+	{ BECORE_YUVP_GAMMA_G_LOW_FIRST, BECORE_YUVP_GAMMA_G_LOW_LAST, 1, 0,
+	  false },
+	{ BECORE_YUVP_GAMMA_G_HIGH_FIRST, BECORE_YUVP_GAMMA_G_HIGH_LAST, 1,
+	  BECORE_YUVP_GAMMA_G_SPLIT_KNOT, false },
+	{ BECORE_YUVP_GAMMA_G_DELTA_REG, BECORE_YUVP_GAMMA_G_DELTA_REG, 1,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+	{ BECORE_YUVP_GAMMA_B_FIRST, BECORE_YUVP_GAMMA_B_LAST, 2, 0, false },
+	{ BECORE_YUVP_GAMMA_B_DELTA_REG, BECORE_YUVP_GAMMA_B_DELTA_REG, 2,
+	  BECORE_YUVP_GAMMA_LAST_KNOT, true },
+};
+
+/*
+ * One register of one channel's tone curve, packed from the samples userspace
+ * sent, or -ENOENT if this register is not part of a table.
+ *
+ * The curve was checked non-decreasing at buf_prepare, which is what makes the
+ * last knot's magnitude enough: the direction lives in a _DELTA_SIGN register
+ * that stays unwritten, so a falling curve would encode as a rising one.
+ */
+static int becore_yuvp_gamma_curve_value(const struct becore_params_state *params,
+					 u32 reg, u32 *value)
+{
+	size_t i;
+
+	if (reg & 3)
+		return -ENOENT;
+
+	for (i = 0; i < ARRAY_SIZE(becore_yuvp_gamma_tables); i++) {
+		const struct becore_yuvp_gamma_range *range =
+			&becore_yuvp_gamma_tables[i];
+		const u16 *curve;
+		u32 knot;
+
+		if (reg < range->first || reg > range->last)
+			continue;
+		curve = params->gamma[range->channel];
+		if (range->delta) {
+			/*
+			 * A magnitude, as the driver's other two delta
+			 * encoders take one: the curve was checked
+			 * non-decreasing, so this is the difference, and
+			 * taking it this way means a curve that somehow fell
+			 * would encode a small number rather than wrap.
+			 */
+			knot = range->knot;
+			*value = curve[knot] > curve[knot - 1] ?
+				 curve[knot] - curve[knot - 1] :
+				 curve[knot - 1] - curve[knot];
+			return 0;
+		}
+		knot = range->knot + (reg - range->first) / 4 *
+		       BECORE_GAMMA_KNOTS_PER_REG;
+		*value = curve[knot] | ((u32)curve[knot + 1] << 16);
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+/*
  * One register of a parameters block, or -ENOENT if none of them reaches it.
  *
  * The blocks name values, not registers, so this is where the two meet: a
@@ -5346,6 +5473,14 @@ static int becore_params_value(const struct becore_params_state *params,
 			 ((u32)params->ltm_curve[index + 1] << 16);
 		return 0;
 	}
+	/*
+	 * No range test in front of this one: the table it walks is the only
+	 * statement of where those registers are, and a second copy of their
+	 * extent here would be a copy to keep in step.
+	 */
+	if (params->gamma_valid &&
+	    !becore_yuvp_gamma_curve_value(params, reg, value))
+		return 0;
 	/*
 	 * The colour LUT's lattice is not a register and is emitted separately,
 	 * but the gate in front of it is one: the driver's own default asserts
@@ -9268,9 +9403,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "capture_size     %zu bytes\n",
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
-	seq_printf(s, "params           ccm %u, ltm curve %u, colour LUT %u\n",
+	seq_printf(s,
+		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u\n",
 		   becore->params.ccm_valid, becore->params.ltm_curve_valid,
-		   becore->params.clut_valid);
+		   becore->params.clut_valid, becore->params.gamma_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -9601,10 +9737,12 @@ DEFINE_SHOW_ATTRIBUTE(becore_stream_crc);
  * Under ADR 0009 the kernel owns the hardware description and the register
  * encoding; the per-frame image-quality *values* come from userspace through a
  * V4L2_BUF_TYPE_META_OUTPUT node, one typed block per hardware block.  Two of
- * them exist so far, and both are chosen because they are demonstrably live
- * policy rather than calibration: the colour matrix is the white balance's own
- * output and the tone curve is the exposure estimate's, and both move frame to
- * frame in a moving scene.
+ * them carry live policy -- the colour matrix is the white balance's own
+ * output, the guide curve is the exposure estimate's, and both move frame to
+ * frame in a moving scene -- and the fourth carries a calibration, which is a
+ * different argument for the same boundary: the tone curve does not move at
+ * all, and what makes it userspace's is that it is Google's image-quality work
+ * rather than a description of the hardware.
  *
  * A buffer never carries a register, an address or a command -- only values,
  * in the units the block is specified in.
@@ -9620,6 +9758,9 @@ becore_params_block_info[] = {
 	},
 	[EXYNOS_BECORE_PARAM_BLOCK_CLUT] = {
 		.size = sizeof(struct exynos_becore_params_clut),
+	},
+	[EXYNOS_BECORE_PARAM_BLOCK_GAMMA] = {
+		.size = sizeof(struct exynos_becore_params_gamma),
 	},
 };
 
@@ -9725,6 +9866,63 @@ static int becore_params_check_clut(struct device *dev,
 }
 
 /*
+ * A tone curve that goes backwards is not just a strange picture: the block
+ * stores its last knot as a distance from the one before it and puts the
+ * direction in a _DELTA_SIGN register that this driver never writes, so a
+ * falling curve would be encoded as a rising one.  The range is the other
+ * half of the same encoding -- the field is fourteen bits, which is exactly
+ * why the last knot is a distance -- so only that knot may reach unity.
+ */
+static int
+becore_params_check_gamma(struct device *dev,
+			  const struct exynos_becore_params_gamma *gamma)
+{
+	unsigned int channel;
+	unsigned int i;
+
+	for (channel = 0; channel < EXYNOS_BECORE_GAMMA_CHANNELS; channel++) {
+		const __u16 *curve = gamma->curve[channel];
+
+		u32 last = EXYNOS_BECORE_GAMMA_POINTS - 1;
+
+		for (i = 0; i < EXYNOS_BECORE_GAMMA_POINTS; i++) {
+			u32 limit = i == last ? EXYNOS_BECORE_GAMMA_ONE :
+				    EXYNOS_BECORE_GAMMA_MAX;
+
+			if (curve[i] > limit) {
+				dev_dbg(dev,
+					"gamma channel %u point %u exceeds %u\n",
+					channel, i, limit);
+				return -EINVAL;
+			}
+			if (i && curve[i] < curve[i - 1]) {
+				dev_dbg(dev,
+					"gamma channel %u decreases at point %u\n",
+					channel, i);
+				return -EINVAL;
+			}
+		}
+
+		/*
+		 * The last knot reaches the hardware as a distance rather than
+		 * as a value, so it is the distance that has to fit the field:
+		 * a curve sitting at zero and jumping to unity in its final
+		 * segment satisfies every check above and would encode one bit
+		 * past it.  The only curves this refuses are ones that do
+		 * almost all of their rise between the last two knots.
+		 */
+		if (curve[last] - curve[last - 1] > EXYNOS_BECORE_GAMMA_MAX) {
+			dev_dbg(dev,
+				"gamma channel %u rises by %u in its last segment\n",
+				channel, curve[last] - curve[last - 1]);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
  * Walk the blocks once.  `apply` distinguishes the buf_prepare pass, which
  * only says whether the buffer is acceptable, from the per-frame pass, which
  * installs it -- so that the two cannot drift apart into a buffer that
@@ -9808,6 +10006,25 @@ static int becore_params_walk(struct becore_device *becore,
 			memcpy(becore->params.clut_v, clut->lut_v,
 			       sizeof(becore->params.clut_v));
 			becore->params.clut_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_GAMMA: {
+			const struct exynos_becore_params_gamma *gamma =
+				(const void *)header;
+
+			if (disable) {
+				if (apply)
+					becore->params.gamma_valid = false;
+				break;
+			}
+			ret = becore_params_check_gamma(becore->dev, gamma);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			memcpy(becore->params.gamma, gamma->curve,
+			       sizeof(becore->params.gamma));
+			becore->params.gamma_valid = true;
 			break;
 		}
 		default:

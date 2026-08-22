@@ -182,27 +182,34 @@
 #define BECORE_C2SERV_LINK_PLANES	2
 
 /*
- * Token geometry, assembled from the two links the vendor did capture rather
- * than computed.  Lyric derives a token from a per-IP table -- extra lines
- * plus process lines, halved for the chroma plane, quartered for an SBWC
- * producer -- and for YUVP into MCSC every term is 1, because both blocks
- * declare one process line.  Paired with the limit of 1 the vendor uses
- * everywhere that is a one-line ring, which appears in none of the four links
- * anyone has measured and which MCSC's vertical downscale cannot filter from.
+ * Token geometry, taken whole from the one captured link that has the same
+ * shape as this one rather than assembled from two.  Lyric computes a token
+ * from a per-IP table -- extra lines plus process lines, halved for chroma,
+ * quartered for an SBWC producer -- and for YUVP into MCSC every term is 1,
+ * because both blocks declare one process line.  That gives a one-line ring,
+ * which is not a geometry any measured link uses.
  *
- * So each side keeps the token its own captured link gave it: YUVP's producer
- * side from YUVP into TNR, and MCSC's consumer side from GDC0 into MCSC.  The
- * consumer's token is the one that matters, because the ring is limit times
- * token lines deep; the producer's being finer only means it signals more
- * often than the consumer needs.  Both halves are what the hardware ran, and
- * both keep their block's captured DMA-side VOTF word unchanged.
+ * What works is `YUVP -> TNR`'s pair, 12 and 4 against 48 and 16.  It is the
+ * vendor's only captured link with a two-plane SBWC producer -- the shape
+ * this one has -- and the reason it works is arithmetic: 3120 lines in tokens
+ * of 12 is 260 tokens, and in tokens of 48 is 65, an exact factor of four, so
+ * both ends agree about how many tokens a frame is.  MCSC's own captured
+ * pairing, 64 and 32 against GDC0's producer, does not divide that way once
+ * YUVP is the producer: 260 producer tokens against 48.75 consumer ones.
+ *
+ * That mismatch is not a subtlety, it is the whole difference between working
+ * and not.  With 64/32 the link half-forms -- one plane connects and the
+ * other sits in WAIT_TOKEN_ACK -- and at a limit large enough to paper over
+ * it the consumer runs about a third ahead of the data and the picture goes
+ * to fill part way down.  With 48/16 the frame is byte-identical to the
+ * memory path at the vendor's own limit of 1.
  */
 static const u32 becore_c2serv_tws_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
 	12, 4,
 };
 
 static const u32 becore_c2serv_trs_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
-	64, 32,
+	48, 16,
 };
 
 /*

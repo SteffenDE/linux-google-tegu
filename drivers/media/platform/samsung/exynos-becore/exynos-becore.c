@@ -96,6 +96,8 @@
  * linear in n.  The two formulas below reproduce all thirty-two flush offsets
  * the vendor writes, wraps included.
  */
+#define BECORE_C2SERV_DEBUG		0x0000
+#define BECORE_C2SERV_DEBUG_DOUT	0x0004
 #define BECORE_C2SERV_RING_CLK_EN	0x000c
 #define BECORE_C2SERV_RING_ENABLE	0x0010
 #define BECORE_C2SERV_LOCAL_IP		0x0014
@@ -130,6 +132,27 @@
 #define BECORE_C2SERV_TRS_FLUSH		0x20
 #define BECORE_C2SERV_TRS_BUSY		0x24
 #define BECORE_C2SERV_TRS_LOST_CONNECTION	0x28
+
+/*
+ * The wrapper between the DMAs and the fabric.  Every captured endpoint setup
+ * writes 8 here, on the same window as the endpoint it is programming and in
+ * a fixed position in the sequence; Samsung's register table puts the
+ * wrapper's software reset next door at +0xd300.
+ */
+#define BECORE_C2SERV_WRAPPER		0xd304
+#define BECORE_C2SERV_WRAPPER_CONNECT	0x8
+
+/*
+ * A window will say what state one endpoint's connection is in: select the
+ * endpoint through DEBUG and read the answer out of DEBUG_DOUT.  This is the
+ * one measurement that separates "the handshake never completed" from
+ * "connected, and then starved" -- the difference between a link that is
+ * mis-programmed and one that is merely mis-tuned.
+ */
+#define BECORE_C2SERV_DEBUG_ENABLE	BIT(0)
+#define BECORE_C2SERV_DEBUG_ENDPOINT	GENMASK_U32(4, 1)
+#define BECORE_C2SERV_DEBUG_CONSUMER	BIT(5)
+#define BECORE_C2SERV_DEBUG_STATE	GENMASK_U32(3, 0)
 
 /* Both regions are sixteen deep on every instance the vendor flushes. */
 #define BECORE_C2SERV_ENDPOINTS		16
@@ -174,7 +197,13 @@ static const u32 becore_c2serv_trs_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
  */
 static u32 becore_c2serv_override(u32 requested, u32 captured)
 {
-	return requested ? requested : captured;
+	/*
+	 * Every field these feed is eight bits wide, and a value that wrapped
+	 * silently would be read back as something the sweep never asked for
+	 * -- a limit of 256 becoming 0 looks exactly like the deadlock the
+	 * sweep is trying to characterise.
+	 */
+	return min(requested ? requested : captured, 0xffu);
 }
 
 /*
@@ -186,6 +215,7 @@ static u32 becore_c2serv_override(u32 requested, u32 captured)
 static u32 becore_c2serv_token(u32 requested, const u32 *captured,
 			       unsigned int plane)
 {
+	requested = min(requested, 0xffu);
 	if (!requested)
 		return captured[plane];
 	if (!plane)
@@ -1853,6 +1883,7 @@ static ktime_t becore_timing_mark(u64 *phase_ns, enum becore_timing_phase phase,
 
 /* One producer endpoint, as the hardware reads it back. */
 struct becore_c2serv_tws_state {
+	u32 conn;
 	u32 enable;
 	u32 limit;
 	u32 dest;
@@ -1863,6 +1894,7 @@ struct becore_c2serv_tws_state {
 
 /* One consumer endpoint, as the hardware reads it back. */
 struct becore_c2serv_trs_state {
+	u32 conn;
 	u32 enable;
 	u32 limit;
 	u32 lines_in_first_token;
@@ -1906,7 +1938,6 @@ struct becore_c2serv_state {
  */
 struct becore_c2serv_link_state {
 	bool sampled;
-	bool after_run;
 	struct becore_c2serv_tws_state tws[BECORE_C2SERV_LINK_PLANES];
 	struct becore_c2serv_trs_state trs[BECORE_C2SERV_LINK_PLANES];
 };
@@ -1923,7 +1954,9 @@ struct becore_device {
 	void __iomem *sysreg_mcsc;
 	void __iomem *c2serv[BECORE_NUM_C2SERV];
 	struct becore_c2serv_state c2serv_state[BECORE_NUM_C2SERV];
-	struct becore_c2serv_link_state c2serv_link;
+	/* The link as armed, and as it stood when the run finished. */
+	struct becore_c2serv_link_state c2serv_armed;
+	struct becore_c2serv_link_state c2serv_done;
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
 	struct media_device mdev;
@@ -6059,12 +6092,36 @@ static void becore_c2serv_prepare(struct becore_device *becore,
 	state->ready = true;
 }
 
+/*
+ * What the fabric thinks of one endpoint's connection: 0 idle, 1 the consumer
+ * waiting, 2 the producer waiting, 3 connected.  Selecting an endpoint is a
+ * write, so this is not a passive read -- it is only done between runs and on
+ * a link that is standing still.
+ */
+static u32 becore_c2serv_conn(struct becore_device *becore,
+			      enum becore_c2serv_id id, unsigned int n,
+			      bool consumer)
+{
+	void __iomem *base = becore->c2serv[id];
+	u32 select = BECORE_C2SERV_DEBUG_ENABLE |
+		     FIELD_PREP(BECORE_C2SERV_DEBUG_ENDPOINT, n);
+
+	if (consumer)
+		select |= BECORE_C2SERV_DEBUG_CONSUMER;
+
+	writel(select, base + BECORE_C2SERV_DEBUG);
+
+	return FIELD_GET(BECORE_C2SERV_DEBUG_STATE,
+			 readl(base + BECORE_C2SERV_DEBUG_DOUT));
+}
+
 static void becore_c2serv_read_tws(struct becore_device *becore,
 				   enum becore_c2serv_id id, unsigned int n,
 				   struct becore_c2serv_tws_state *tws)
 {
 	void __iomem *ep = becore->c2serv[id] + BECORE_C2SERV_TWS(n);
 
+	tws->conn = becore_c2serv_conn(becore, id, n, false);
 	tws->enable = readl(ep + BECORE_C2SERV_TWS_ENABLE);
 	tws->limit = readl(ep + BECORE_C2SERV_TWS_LIMIT);
 	tws->dest = readl(ep + BECORE_C2SERV_TWS_DEST);
@@ -6079,6 +6136,7 @@ static void becore_c2serv_read_trs(struct becore_device *becore,
 {
 	void __iomem *ep = becore->c2serv[id] + BECORE_C2SERV_TRS(n);
 
+	trs->conn = becore_c2serv_conn(becore, id, n, true);
 	trs->enable = readl(ep + BECORE_C2SERV_TRS_ENABLE);
 	trs->limit = readl(ep + BECORE_C2SERV_TRS_LIMIT);
 	trs->lines_in_first_token =
@@ -6089,34 +6147,21 @@ static void becore_c2serv_read_trs(struct becore_device *becore,
 	trs->lost_connection = readl(ep + BECORE_C2SERV_TRS_LOST_CONNECTION);
 }
 
-/*
- * Describe the YUVP-to-MCSC link in the fabric, one endpoint pair per plane,
- * and read back what the hardware kept.  The endpoint enables and the ring
- * both stay off, so this configures a link that cannot carry anything: the
- * point is to find out whether the endpoint registers hold what is written
- * and what `busy`, `fullness` and `lost_connection` say, none of which the
- * vendor's stream ever reads and all four of which the eventual stall
- * diagnosis depends on.
- *
- * The line count is the plane's height, exactly as in both captured links,
- * and it is taken from the profile this run resolved rather than from a
- * constant, so the fabric and the block cannot disagree about the frame.
- * That is why this runs per frame from the run path and not once from the
- * resume: a stream holds one runtime-PM reference across all its frames, so a
- * resume happens before any run has chosen a profile.  Per frame is also
- * where the vendor programs a link.
- */
+static void becore_c2serv_link_sample(struct becore_device *becore,
+				      struct becore_c2serv_link_state *link);
+
 /*
  * Light the link up, and put it out again.  Order matters at the moment it
- * goes live: geometry first, then the four endpoints, then the ring, and the
+ * goes live: geometry first, then the ring, then the four endpoints, and the
  * consumer's ring before the producer's so the receiver is listening before
  * anything can be sent.  The vendor never has to choose, because its ring is
  * up from stream setup and only the enables move per frame; this driver
  * cannot do that, because a live ring with YUVP's WDMA asking for VOTF and
  * nothing to answer it faults the frame.
  *
- * Stopping is the mirror, and it happens after every run whether the run
- * worked or not.  The vendor leaves a link standing between frames and only
+ * Stopping happens after every run whether the run worked or not, and stops
+ * the ring in the same order it started it, clock before ring, which is what
+ * the vendor's teardown does.  The vendor leaves a link standing between frames and only
  * clears the latched lost-connection bit; this takes it down each time, so
  * that the fabric is quiet whenever a run is not in progress and a failure
  * cannot leak into the next frame or into a run that is not using it.  That
@@ -6127,11 +6172,6 @@ static void becore_c2serv_link_start(struct becore_device *becore)
 	void __iomem *tws_base = becore->c2serv[BECORE_C2SERV_YUVP];
 	void __iomem *trs_base = becore->c2serv[BECORE_C2SERV_MCSC];
 	unsigned int n;
-
-	/* The latched status is per connection, so clear it per run. */
-	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++)
-		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
-				  BECORE_C2SERV_TRS_LOST_CONNECTION);
 
 	/*
 	 * Ring first, endpoints second, consumer before producer.  This is the
@@ -6154,6 +6194,14 @@ static void becore_c2serv_link_start(struct becore_device *becore)
 		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
 				  BECORE_C2SERV_TWS_ENABLE);
 	}
+
+	/*
+	 * Sample the link as armed, before either block has been started.  A
+	 * connection that is already made here and one that is still waiting
+	 * are different problems, and after a run has timed out there is no
+	 * way left to tell them apart.
+	 */
+	becore_c2serv_link_sample(becore, &becore->c2serv_armed);
 }
 
 static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
@@ -6206,9 +6254,8 @@ static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
 
 /* What the fabric had to say, sampled while the link is still standing. */
 static void becore_c2serv_link_sample(struct becore_device *becore,
-				      bool after_run)
+				      struct becore_c2serv_link_state *link)
 {
-	struct becore_c2serv_link_state *link = &becore->c2serv_link;
 	unsigned int n;
 
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
@@ -6218,9 +6265,25 @@ static void becore_c2serv_link_sample(struct becore_device *becore,
 				       &link->trs[n]);
 	}
 	link->sampled = true;
-	link->after_run = after_run;
 }
 
+/*
+ * Describe the YUVP-to-MCSC link in the fabric, one endpoint pair per plane,
+ * in the order and with the interleaved wrapper write the vendor uses for
+ * every captured connection.  This programs the link but does not arm it --
+ * the endpoint enables and the ring are becore_c2serv_link_start()'s -- and
+ * it runs only for a frame that is going to use the fabric, so the memory
+ * path's register writes are exactly what they were before there was a
+ * fabric at all.
+ *
+ * The line count is the plane's height, as in every captured link, and it is
+ * taken from the profile this run resolved rather than from a constant, so
+ * the fabric and the block cannot disagree about the frame.  That is why this
+ * runs per frame from the run path and not once from the resume: a stream
+ * holds one runtime-PM reference across all its frames, so a resume happens
+ * before any run has chosen a profile.  Per frame is also where the vendor
+ * programs a link.
+ */
 static void becore_c2serv_program_link(struct becore_device *becore)
 {
 	const struct becore_yuvp_output_profile *profile =
@@ -6253,11 +6316,21 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 					becore_c2serv_trs_lines_in_token, n);
 
 		writel_relaxed(tws_limit, tws + BECORE_C2SERV_TWS_LIMIT);
+		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
+			       tws_base + BECORE_C2SERV_WRAPPER);
 		writel_relaxed(BECORE_C2SERV_DEST(consumer_ip, n),
 			       tws + BECORE_C2SERV_TWS_DEST);
 		writel_relaxed(tws_token,
 			       tws + BECORE_C2SERV_TWS_LINES_IN_TOKEN);
 
+		/*
+		 * The consumer half opens by clearing the latched
+		 * lost-connection bit and writing the wrapper, in that order,
+		 * which is where the vendor puts both.
+		 */
+		writel_relaxed(1, trs + BECORE_C2SERV_TRS_LOST_CONNECTION);
+		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
+			       trs_base + BECORE_C2SERV_WRAPPER);
 		writel_relaxed(trs_limit, trs + BECORE_C2SERV_TRS_LIMIT);
 		writel_relaxed(trs_token,
 			       trs + BECORE_C2SERV_TRS_LINES_IN_FIRST_TOKEN);
@@ -6266,7 +6339,6 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 		writel_relaxed(lines, trs + BECORE_C2SERV_TRS_LINES_COUNT);
 	}
 
-	becore_c2serv_link_sample(becore, false);
 }
 
 /*
@@ -7895,8 +7967,6 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		ret = -EIO;
 		goto record_error;
 	}
-	becore_c2serv_program_link(becore);
-
 	/*
 	 * The fabric needs all three blocks in one stage, both endpoints
 	 * transported over it, and both windows ready.  A consumer that ran
@@ -7914,6 +7984,8 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		   becore->c2serv_state[BECORE_C2SERV_YUVP].ready &&
 		   becore->c2serv_state[BECORE_C2SERV_MCSC].ready;
 	becore->active_votf = use_votf;
+	if (use_votf)
+		becore_c2serv_program_link(becore);
 
 	/*
 	 * Take this frame's parameters immediately before it is encoded: past
@@ -7996,7 +8068,7 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		becore_c2serv_link_start(becore);
 		ret = becore_run_stage(becore, BECORE_YUVP_STAGE_BLOCKS |
 					       BIT(BECORE_MCSC));
-		becore_c2serv_link_sample(becore, true);
+		becore_c2serv_link_sample(becore, &becore->c2serv_done);
 		becore_c2serv_link_stop(becore, ret);
 		mark = becore_timing_mark(phase_ns, BECORE_TIMING_STAGE1, mark);
 	} else {
@@ -8687,6 +8759,15 @@ static void becore_status_program(struct seq_file *s, const char *name,
 		   program->header_count, program->capacity, &program->dma);
 }
 
+static const char *becore_c2serv_conn_name(u32 state)
+{
+	static const char * const names[] = {
+		"idle", "consumer waiting", "producer waiting", "connected",
+	};
+
+	return state < ARRAY_SIZE(names) ? names[state] : "unknown";
+}
+
 static int becore_status_show(struct seq_file *s, void *unused)
 {
 	static const char * const input_state_names[] = {
@@ -8707,6 +8788,7 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	bool irq_error;
 	bool running;
 	bool video_streaming;
+	u32 which;
 	u32 i;
 
 	mutex_lock(&becore->lock);
@@ -8819,21 +8901,27 @@ static int becore_status_show(struct seq_file *s, void *unused)
 
 	}
 
-	if (becore->c2serv_link.sampled) {
-		const struct becore_c2serv_link_state *link = &becore->c2serv_link;
+	for (which = 0; which < 2; which++) {
+		const struct becore_c2serv_link_state *link = which ?
+			&becore->c2serv_done : &becore->c2serv_armed;
 
-		seq_printf(s, "votf_link        sampled %s a run\n",
-			   link->after_run ? "after" : "before");
+		if (!link->sampled)
+			continue;
+
+		seq_printf(s, "votf_link        %s\n",
+			   which ? "when the run finished" : "as armed");
 		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
 			seq_printf(s,
-				   "  tws%u            enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
-				   i, link->tws[i].enable, link->tws[i].limit,
+				   "  tws%u            %s(%u), enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
+				   i, becore_c2serv_conn_name(link->tws[i].conn),
+				   link->tws[i].conn, link->tws[i].enable, link->tws[i].limit,
 				   link->tws[i].dest, link->tws[i].lines_in_token,
 				   link->tws[i].busy, link->tws[i].fullness);
 		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
 			seq_printf(s,
-				   "  trs%u            enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
-				   i, link->trs[i].enable, link->trs[i].limit,
+				   "  trs%u            %s(%u), enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
+				   i, becore_c2serv_conn_name(link->trs[i].conn),
+				   link->trs[i].conn, link->trs[i].enable, link->trs[i].limit,
 				   link->trs[i].lines_in_first_token,
 				   link->trs[i].lines_in_token,
 				   link->trs[i].lines_count,

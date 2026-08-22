@@ -98,6 +98,7 @@
  */
 #define BECORE_C2SERV_DEBUG		0x0000
 #define BECORE_C2SERV_DEBUG_DOUT	0x0004
+#define BECORE_C2SERV_RCV_VALID		0x0008
 #define BECORE_C2SERV_RING_CLK_EN	0x000c
 #define BECORE_C2SERV_RING_ENABLE	0x0010
 #define BECORE_C2SERV_LOCAL_IP		0x0014
@@ -141,6 +142,21 @@
  */
 #define BECORE_C2SERV_WRAPPER		0xd304
 #define BECORE_C2SERV_WRAPPER_CONNECT	0x8
+
+/*
+ * Candidates for the connection that only ever half forms, each switchable on
+ * its own so a boot can bisect them.  All off by default.
+ *
+ * WRAPPER_LIVE re-issues the wrapper write once the ring is running.  This
+ * driver programs a link with the ring stopped and starts it afterwards,
+ * where the vendor's ring has been up since stream setup, so every wrapper
+ * write it makes lands on a live ring and ours never do.
+ *
+ * TRS_RECOVER sets the consumer's connection-lost recovery bit, which Pablo
+ * sets on every link and neither the vendor's stream nor this driver does.
+ */
+#define BECORE_VOTF_FIX_WRAPPER_LIVE	BIT(0)
+#define BECORE_VOTF_FIX_TRS_RECOVER	BIT(1)
 
 /*
  * A window will say what state one endpoint's connection is in: select the
@@ -207,21 +223,20 @@ static u32 becore_c2serv_override(u32 requested, u32 captured)
 }
 
 /*
- * Plane 1 keeps the captured link's ratio to plane 0 rather than being set on
- * its own: 12 and 4 on the producer, 64 and 32 on the consumer.  The two
- * ratios differ because TNR's entry in the vendor's parameter table carries
- * sixteen extra lines on the luma plane and none on the chroma one.
+ * Each plane's token is set on its own, because the two ratios that matter
+ * differ: the captured consumer pair is 64 and 32, and the vendor's only
+ * SBWC-producer link pairs 12 and 4 against 48 and 16 -- a third, not a half,
+ * because TNR's entry in the parameter table carries sixteen extra lines on
+ * the luma plane and none on the chroma one.  Deriving plane 1 from plane 0
+ * made that second shape inexpressible, which is exactly the shape worth
+ * trying.
  */
-static u32 becore_c2serv_token(u32 requested, const u32 *captured,
+static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 			       unsigned int plane)
 {
-	requested = min(requested, 0xffu);
-	if (!requested)
-		return captured[plane];
-	if (!plane)
-		return requested;
+	u32 value = min(requested[plane], 0xffu);
 
-	return max(1u, requested * captured[plane] / captured[0]);
+	return value ? value : captured[plane];
 }
 
 /*
@@ -1592,7 +1607,7 @@ static const struct becore_mcsc_dma_profile becore_mcsc_input = {
 
 #define BECORE_MCSC_INPUT_VOTF_STALL_LINES	GENMASK_U32(29, 16)
 
-static u32 becore_mcsc_votf_enable(u32 requested_token)
+static u32 becore_mcsc_votf_enable(const u32 *requested_token)
 {
 	u32 token = becore_c2serv_token(requested_token,
 					becore_c2serv_trs_lines_in_token, 0);
@@ -1884,6 +1899,8 @@ static ktime_t becore_timing_mark(u64 *phase_ns, enum becore_timing_phase phase,
 /* One producer endpoint, as the hardware reads it back. */
 struct becore_c2serv_tws_state {
 	u32 conn;
+	u32 conn_raw;
+	u32 rcv_valid;
 	u32 enable;
 	u32 limit;
 	u32 dest;
@@ -1895,6 +1912,8 @@ struct becore_c2serv_tws_state {
 /* One consumer endpoint, as the hardware reads it back. */
 struct becore_c2serv_trs_state {
 	u32 conn;
+	u32 conn_raw;
+	u32 rcv_valid;
 	u32 enable;
 	u32 limit;
 	u32 lines_in_first_token;
@@ -2036,11 +2055,13 @@ struct becore_device {
 	u32 active_output_profile;
 	/* Debug switch: carry YUVP into MCSC over the fabric, not through DRAM. */
 	u32 votf;
-	/* Debug geometry: zero means the captured value.  Plane 0; see below. */
+	/* Debug geometry: zero means the captured value, per plane. */
 	u32 votf_tws_limit;
 	u32 votf_trs_limit;
-	u32 votf_tws_token;
-	u32 votf_trs_token;
+	u32 votf_tws_token[BECORE_C2SERV_LINK_PLANES];
+	u32 votf_trs_token[BECORE_C2SERV_LINK_PLANES];
+	/* Bisectable candidates for the connection that only half forms. */
+	u32 votf_fixes;
 	bool active_votf;
 	u32 mcsc_completed_generation;
 	u32 mcsc_completed_output_size;
@@ -2925,7 +2946,7 @@ static int becore_mcsc_djag_origin(u32 *x, u32 *y)
 static int
 becore_mcsc_dma_value(u32 index, u32 reg,
 		      enum becore_mcsc_input_transport transport,
-		      u32 requested_token, u32 *value)
+		      const u32 *requested_token, u32 *value)
 {
 	if (index >= BECORE_MCSC_DMA_WORD_COUNT ||
 	    reg != becore_mcsc_dma_regs[index])
@@ -5654,7 +5675,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 				reg = shape->pair_registers[word / 2];
 				if (becore_mcsc_dma_value(typed_count, reg,
 							  BECORE_MCSC_INPUT_CAPTURED_VOTF,
-							  0, NULL))
+							  NULL, NULL))
 					return -EINVAL;
 				typed_count++;
 			}
@@ -6114,8 +6135,7 @@ static u32 becore_c2serv_conn(struct becore_device *becore,
 
 	writel(select, base + BECORE_C2SERV_DEBUG);
 
-	return FIELD_GET(BECORE_C2SERV_DEBUG_STATE,
-			 readl(base + BECORE_C2SERV_DEBUG_DOUT));
+	return readl(base + BECORE_C2SERV_DEBUG_DOUT);
 }
 
 static void becore_c2serv_read_tws(struct becore_device *becore,
@@ -6124,7 +6144,9 @@ static void becore_c2serv_read_tws(struct becore_device *becore,
 {
 	void __iomem *ep = becore->c2serv[id] + BECORE_C2SERV_TWS(n);
 
-	tws->conn = becore_c2serv_conn(becore, id, n, false);
+	tws->conn_raw = becore_c2serv_conn(becore, id, n, false);
+	tws->conn = FIELD_GET(BECORE_C2SERV_DEBUG_STATE, tws->conn_raw);
+	tws->rcv_valid = readl(becore->c2serv[id] + BECORE_C2SERV_RCV_VALID);
 	tws->enable = readl(ep + BECORE_C2SERV_TWS_ENABLE);
 	tws->limit = readl(ep + BECORE_C2SERV_TWS_LIMIT);
 	tws->dest = readl(ep + BECORE_C2SERV_TWS_DEST);
@@ -6139,7 +6161,9 @@ static void becore_c2serv_read_trs(struct becore_device *becore,
 {
 	void __iomem *ep = becore->c2serv[id] + BECORE_C2SERV_TRS(n);
 
-	trs->conn = becore_c2serv_conn(becore, id, n, true);
+	trs->conn_raw = becore_c2serv_conn(becore, id, n, true);
+	trs->conn = FIELD_GET(BECORE_C2SERV_DEBUG_STATE, trs->conn_raw);
+	trs->rcv_valid = readl(becore->c2serv[id] + BECORE_C2SERV_RCV_VALID);
 	trs->enable = readl(ep + BECORE_C2SERV_TRS_ENABLE);
 	trs->limit = readl(ep + BECORE_C2SERV_TRS_LIMIT);
 	trs->lines_in_first_token =
@@ -6191,6 +6215,20 @@ static void becore_c2serv_link_start(struct becore_device *becore)
 	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_CLK_EN);
 	writel_relaxed(1, tws_base + BECORE_C2SERV_RING_ENABLE);
 
+	/*
+	 * The vendor's wrapper writes always land on a ring that has been up
+	 * since stream setup; ours are made with it stopped, because the ring
+	 * cannot be started before the link exists.  Offering them again here
+	 * costs two writes and is the cheapest way to find out whether that
+	 * difference matters.
+	 */
+	if (becore->votf_fixes & BECORE_VOTF_FIX_WRAPPER_LIVE) {
+		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
+			       trs_base + BECORE_C2SERV_WRAPPER);
+		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
+			       tws_base + BECORE_C2SERV_WRAPPER);
+	}
+
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
 		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
 				  BECORE_C2SERV_TRS_ENABLE);
@@ -6222,10 +6260,10 @@ static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
 	 * the next boot.
 	 */
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
-		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
-				  BECORE_C2SERV_TWS_FLUSH);
 		writel_relaxed(1, trs_base + BECORE_C2SERV_TRS(n) +
 				  BECORE_C2SERV_TRS_FLUSH);
+		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
+				  BECORE_C2SERV_TWS_FLUSH);
 	}
 
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
@@ -6334,6 +6372,8 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 		writel_relaxed(1, trs + BECORE_C2SERV_TRS_LOST_CONNECTION);
 		writel_relaxed(BECORE_C2SERV_WRAPPER_CONNECT,
 			       trs_base + BECORE_C2SERV_WRAPPER);
+		if (becore->votf_fixes & BECORE_VOTF_FIX_TRS_RECOVER)
+			writel_relaxed(1, trs + BECORE_C2SERV_TRS_RECOVER);
 		writel_relaxed(trs_limit, trs + BECORE_C2SERV_TRS_LIMIT);
 		writel_relaxed(trs_token,
 			       trs + BECORE_C2SERV_TRS_LINES_IN_FIRST_TOKEN);
@@ -8762,13 +8802,26 @@ static void becore_status_program(struct seq_file *s, const char *name,
 		   program->header_count, program->capacity, &program->dma);
 }
 
+/*
+ * Samsung's `votf_debug_state` is a six-value space, not the four its comment
+ * lists: 5 and 7 are real and are the two that matter.  A producer sitting in
+ * 5 means its packet went out and was never acknowledged -- Pablo treats that
+ * as unrecoverable and forces a ramdump for it -- and 7 is the same thing for
+ * a reset.
+ */
 static const char *becore_c2serv_conn_name(u32 state)
 {
 	static const char * const names[] = {
-		"idle", "consumer waiting", "producer waiting", "connected",
+		[0] = "idle",
+		[1] = "consumer waiting",
+		[2] = "producer waiting",
+		[3] = "connected",
+		[5] = "waiting for token ack",
+		[7] = "waiting for reset ack",
 	};
 
-	return state < ARRAY_SIZE(names) ? names[state] : "unknown";
+	return state < ARRAY_SIZE(names) && names[state] ? names[state] :
+							   "undocumented";
 }
 
 static int becore_status_show(struct seq_file *s, void *unused)
@@ -8915,16 +8968,18 @@ static int becore_status_show(struct seq_file *s, void *unused)
 			   which ? "when the run finished" : "as armed");
 		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
 			seq_printf(s,
-				   "  tws%u            %s(%u), enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
+				   "  tws%u            %s, dout %#x, rcv %#x, enable %u, limit %u, dest %#07x, token %u, busy %u, fullness %u\n",
 				   i, becore_c2serv_conn_name(link->tws[i].conn),
-				   link->tws[i].conn, link->tws[i].enable, link->tws[i].limit,
+				   link->tws[i].conn_raw, link->tws[i].rcv_valid,
+				   link->tws[i].enable, link->tws[i].limit,
 				   link->tws[i].dest, link->tws[i].lines_in_token,
 				   link->tws[i].busy, link->tws[i].fullness);
 		for (i = 0; i < BECORE_C2SERV_LINK_PLANES; i++)
 			seq_printf(s,
-				   "  trs%u            %s(%u), enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
+				   "  trs%u            %s, dout %#x, rcv %#x, enable %u, limit %u, first %u, token %u, lines %u, busy %u, lost %u\n",
 				   i, becore_c2serv_conn_name(link->trs[i].conn),
-				   link->trs[i].conn, link->trs[i].enable, link->trs[i].limit,
+				   link->trs[i].conn_raw, link->trs[i].rcv_valid,
+				   link->trs[i].enable, link->trs[i].limit,
 				   link->trs[i].lines_in_first_token,
 				   link->trs[i].lines_in_token,
 				   link->trs[i].lines_count,
@@ -9904,9 +9959,14 @@ static int becore_debugfs_init(struct becore_device *becore)
 	debugfs_create_u32("votf_trs_limit", 0644, dir,
 			   &becore->votf_trs_limit);
 	debugfs_create_u32("votf_tws_token", 0644, dir,
-			   &becore->votf_tws_token);
+			   &becore->votf_tws_token[0]);
+	debugfs_create_u32("votf_tws_token_uv", 0644, dir,
+			   &becore->votf_tws_token[1]);
 	debugfs_create_u32("votf_trs_token", 0644, dir,
-			   &becore->votf_trs_token);
+			   &becore->votf_trs_token[0]);
+	debugfs_create_u32("votf_trs_token_uv", 0644, dir,
+			   &becore->votf_trs_token[1]);
+	debugfs_create_u32("votf_fixes", 0644, dir, &becore->votf_fixes);
 	debugfs_create_u32("output_profile", 0644, dir,
 			   &becore->output_profile);
 	debugfs_create_file("output", 0400, dir, becore, &becore_output_fops);

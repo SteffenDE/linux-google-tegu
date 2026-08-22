@@ -94,6 +94,7 @@
 
 #define BECORE_CMDQ_HEADER_BYTES		16
 #define BECORE_CMDQ_PAYLOAD_BYTES	64
+#define BECORE_CMDQ_PAYLOAD_WORDS	(BECORE_CMDQ_PAYLOAD_BYTES / 4)
 #define BECORE_CMDQ_MODE		0x9000
 
 /* Fixed neutral LTM policy for the proven 4000x3000 processing profile. */
@@ -637,6 +638,40 @@ static_assert(BECORE_CLUT_ONE - (BECORE_CLUT_1DLUT_ENTRIES - 1) *
 
 static_assert((BECORE_YUVP_CLUT_MATRIX_LAST - BECORE_YUVP_CLUT_MATRIX_FIRST) /
 	      4 + 1 == (BECORE_CLUT_MATRIX_COEFFICIENTS + 1) / 2);
+
+/*
+ * The 17^3 lattice, and the two registers it is streamed through: an index
+ * that arms the write port at entry zero and the port itself. There is no way
+ * to read a lattice back out, so the port is write-only in both senses.
+ *
+ * The stream is one (U, V) pair per node in node order, packed three 10-bit
+ * fields to a word with the low field first -- so a node's pair straddles word
+ * boundaries and the whole thing is a flat list of values rather than a table
+ * with a row length. 9,826 values do not divide by three, so the last word
+ * carries two spare fields, and the only sensible padding is the value that
+ * means no chroma.
+ */
+#define BECORE_YUVP_CLUT_INDEX_REG	(BECORE_YUVP_CLUT_BASE + 0x010)
+#define BECORE_YUVP_CLUT_FIFO_REG	(BECORE_YUVP_CLUT_BASE + 0x014)
+#define BECORE_CLUT_FIFO_OPEN		0x01000000
+#define BECORE_CLUT_FIELDS_PER_WORD	3
+#define BECORE_CLUT_LATTICE_VALUES	(EXYNOS_BECORE_CLUT_NODES * 2)
+#define BECORE_CLUT_LATTICE_WORDS \
+	DIV_ROUND_UP(BECORE_CLUT_LATTICE_VALUES, BECORE_CLUT_FIELDS_PER_WORD)
+/* The lattice, plus the pair that opens the port and the pair that closes it. */
+#define BECORE_YUVP_CLUT_BURST_HEADERS \
+	(DIV_ROUND_UP(BECORE_CLUT_LATTICE_WORDS, BECORE_CMDQ_PAYLOAD_WORDS) + 2)
+#define BECORE_YUVP_PROGRAM_HEADERS \
+	(BECORE_YUVP_HEADER_COUNT + BECORE_YUVP_CLUT_BURST_HEADERS)
+
+/*
+ * What the driver derives from 17 nodes an axis has to be the length the
+ * vendor's own burst was, which is what the generator recorded when it took
+ * that burst out of the recipe.
+ */
+static_assert(BECORE_CLUT_LATTICE_WORDS == BECORE_YUVP_CLUT_WORDS);
+static_assert(BECORE_YUVP_CLUT_HEADER < BECORE_YUVP_HEADER_COUNT);
+static_assert(EXYNOS_BECORE_CLUT_MAX == BECORE_CLUT_FIELD_MAX);
 
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
@@ -1572,8 +1607,11 @@ struct becore_params_state {
 	s16 ccm[EXYNOS_BECORE_CCM_COEFFICIENTS];
 	s16 ccm_offsets[EXYNOS_BECORE_CCM_OFFSETS];
 	u16 ltm_curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
+	u16 clut_u[EXYNOS_BECORE_CLUT_NODES];
+	u16 clut_v[EXYNOS_BECORE_CLUT_NODES];
 	bool ccm_valid;
 	bool ltm_curve_valid;
+	bool clut_valid;
 };
 
 struct becore_params_buffer {
@@ -3457,9 +3495,14 @@ static int becore_rgbp_csc_value(u32 offset, u32 *value)
  *
  * The lattice itself is not here and cannot be: 4,913 (R, G, B) nodes of a
  * (U, V) pair is per-camera tuning, and it belongs in a parameters buffer
- * rather than in this driver. What the block is *for* is stateable, and this
- * is it -- run, convert YUV to RGB with the ordinary BT.601 inverse, and take
- * the input curves as written.
+ * rather than in this driver. Which is also why the gate says *bypass*: the
+ * entries are the chroma the block outputs rather than an offset to it, so
+ * there is no neutral fill that leaves the picture alone, and the only
+ * identity this block has is not running. becore_params_value() clears the
+ * bypass when a lattice arrives.
+ *
+ * The rest of it is stateable and is what the block is for: convert YUV to RGB
+ * with the ordinary BT.601 inverse, and take the input curves as written.
  */
 static int becore_yuvp_clut_value(u32 offset, u32 *value)
 {
@@ -3469,8 +3512,8 @@ static int becore_yuvp_clut_value(u32 offset, u32 *value)
 		return -EINVAL;
 
 	switch (offset) {
-	case 0x000:		/* BYPASS: the block runs */
-		*value = 0;
+	case 0x000:		/* BYPASS: nothing until a lattice arrives */
+		*value = 1;
 		return 0;
 	case 0x004:		/* EN_CONFIG: the matrix, and no input curve */
 		*value = BECORE_CLUT_EN_MATRIX;
@@ -4478,6 +4521,12 @@ static int becore_override_check(u32 reg)
 			 * override would rewrite the whole payload rather than
 			 * one field.  Answer that before asking which word,
 			 * because becore_shape_register() cannot say.
+			 *
+			 * No shape carries such a header today: the colour
+			 * LUT's lattice was the only one, and the driver emits
+			 * that burst rather than replaying it, which puts it
+			 * out of an override's reach entirely.  This stands
+			 * for the next recipe that brings one back.
 			 */
 			if (shape->mode == 0x000b0000) {
 				if (shape->target == reg)
@@ -4544,6 +4593,16 @@ static int becore_params_value(const struct becore_params_state *params,
 			 ((u32)params->ltm_curve[index + 1] << 16);
 		return 0;
 	}
+	/*
+	 * The colour LUT's lattice is not a register and is emitted separately,
+	 * but the gate in front of it is one: the driver's own default asserts
+	 * BYPASS because there is no lattice, and a block that brings one
+	 * clears it.  The two cannot disagree -- the same flag decides both.
+	 */
+	if (params->clut_valid && reg == BECORE_YUVP_CLUT_BYPASS_REG) {
+		*value = 0;
+		return 0;
+	}
 
 	return -ENOENT;
 }
@@ -4583,16 +4642,24 @@ static void becore_override_apply(const struct becore_device *becore,
 	}
 }
 
-/* The same substitution, from the parameters buffer rather than debugfs. */
+/*
+ * The same substitution, from the parameters buffer rather than debugfs.
+ *
+ * There is deliberately no "is anything installed" shortcut in front of the
+ * loop.  One used to name each block's validity flag, and adding a block
+ * without adding it to that list made the new block reach the encoder and
+ * stop there: the colour LUT's burst was emitted, its bypass gate was not
+ * cleared, and the picture came out identical to a bypassed one with a
+ * complete lattice sitting in a stage that never ran.  becore_params_value()
+ * already answers -ENOENT for every register when nothing is installed, so
+ * the loop is its own shortcut and cannot fall out of step with the blocks.
+ */
 static void becore_params_apply(const struct becore_device *becore,
 				const struct becore_cmdq_shape *shape,
 				u8 *payload)
 {
 	const struct becore_params_state *params = &becore->params;
 	u32 word;
-
-	if (!params->ccm_valid && !params->ltm_curve_valid)
-		return;
 
 	for (word = 0; word < shape->valid_words; word++) {
 		u32 value;
@@ -4609,6 +4676,155 @@ static void becore_params_apply(const struct becore_device *becore,
 	}
 }
 
+/*
+ * Where the next header and its payload go.
+ *
+ * A program used to be exactly the recipe's headers in the recipe's order, and
+ * an index served for both. It is not any more -- the colour LUT's burst is
+ * emitted between two recipe headers and only when there is a lattice to send
+ * -- so the output position has to be counted rather than derived, and the
+ * payload area's start depends on how many headers the whole program will
+ * have.
+ */
+struct becore_cmdq_emitter {
+	struct becore_cmdq_program *program;
+	size_t payload_offset;
+	u32 count;
+	u32 total;
+};
+
+static void becore_cmdq_emitter_init(struct becore_cmdq_emitter *emitter,
+				     struct becore_cmdq_program *program,
+				     u32 total)
+{
+	emitter->program = program;
+	emitter->payload_offset = ALIGN((size_t)total *
+					BECORE_CMDQ_HEADER_BYTES,
+					BECORE_CMDQ_PAYLOAD_BYTES);
+	emitter->count = 0;
+	emitter->total = total;
+}
+
+/*
+ * A header's type map: two bits per value word, 01 each, and nothing above
+ * them.  Built by counting rather than by shifting a constant down, so that
+ * neither an empty header nor a full one is a shift the width of the type.
+ */
+static u32 becore_cmdq_type_map(u32 words)
+{
+	u32 type_map = 0;
+	u32 word;
+
+	for (word = 0; word < words && word < BECORE_CMDQ_PAYLOAD_WORDS; word++)
+		type_map |= 1u << (2 * word);
+
+	return type_map;
+}
+
+/* One header, and the payload it points at -- zeroed, and the caller's to fill. */
+static u8 *becore_cmdq_emit(struct becore_cmdq_emitter *emitter, u32 mode,
+			    u32 target, u32 type_map)
+{
+	size_t offset = emitter->payload_offset +
+			(size_t)emitter->count * BECORE_CMDQ_PAYLOAD_BYTES;
+	u8 *header;
+
+	if (emitter->count >= emitter->total)
+		return NULL;
+	header = (u8 *)emitter->program->cpu +
+		 (size_t)emitter->count * BECORE_CMDQ_HEADER_BYTES;
+	put_unaligned_le32(mode, header);
+	put_unaligned_le32(lower_32_bits(emitter->program->dma + offset),
+			   header + 4);
+	put_unaligned_le32(target, header + 8);
+	put_unaligned_le32(type_map, header + 12);
+	emitter->count++;
+
+	return (u8 *)emitter->program->cpu + offset;
+}
+
+/*
+ * One word of the colour LUT's lattice: three 10-bit fields, low field first,
+ * taken from a flat stream of one (U, V) pair per node.
+ *
+ * The samples are masked rather than trusted. buf_prepare refuses a lattice
+ * with a sample wider than the field, but the consequence of one getting
+ * through here would be corrupting a *neighbouring* node's chroma rather than
+ * its own, which is a far harder thing to see in a picture.
+ */
+static u32 becore_clut_word(const struct becore_params_state *params, u32 index)
+{
+	u32 packed = 0;
+	u32 field;
+
+	for (field = 0; field < BECORE_CLUT_FIELDS_PER_WORD; field++) {
+		u32 value = index * BECORE_CLUT_FIELDS_PER_WORD + field;
+		u32 sample = EXYNOS_BECORE_CLUT_NEUTRAL;
+
+		if (value < BECORE_CLUT_LATTICE_VALUES)
+			sample = value & 1 ? params->clut_v[value / 2] :
+					     params->clut_u[value / 2];
+		packed |= (sample & BECORE_CLUT_FIELD_MAX) <<
+			  (BECORE_CLUT_FIELD_BITS * field);
+	}
+
+	return packed;
+}
+
+/*
+ * DIABLO_CLUT's lattice, as a burst the driver emits rather than words the
+ * recipe carries.
+ *
+ * It cannot come from the recipe: every value in this driver is resolved by the
+ * register it programs, and 205 headers all name one FIFO port, so that one
+ * address would need 3,276 answers. The index register beside it is written
+ * twice with two different values, which has the same problem. Both retire
+ * together here.
+ *
+ * Where the burst goes matters and is not guessed: the vendor fills the lattice
+ * at this exact point in YUVP's program, and whether the order relative to the
+ * rest of the block matters is not something a register readback could show
+ * going wrong. So it is emitted in place rather than appended.
+ */
+static int becore_encode_clut(const struct becore_device *becore,
+			      struct becore_cmdq_emitter *emitter)
+{
+	const struct becore_params_state *params = &becore->params;
+	u32 written = 0;
+	u8 *payload;
+
+	payload = becore_cmdq_emit(emitter, 0x00090000, 0,
+				   becore_cmdq_type_map(2));
+	if (!payload)
+		return -EINVAL;
+	put_unaligned_le32(BECORE_YUVP_CLUT_INDEX_REG, payload);
+	put_unaligned_le32(BECORE_CLUT_FIFO_OPEN, payload + 4);
+
+	while (written < BECORE_CLUT_LATTICE_WORDS) {
+		u32 words = min(BECORE_CLUT_LATTICE_WORDS - written,
+				(u32)BECORE_CMDQ_PAYLOAD_WORDS);
+		u32 word;
+
+		payload = becore_cmdq_emit(emitter, 0x000b0000,
+					   BECORE_YUVP_CLUT_FIFO_REG,
+					   becore_cmdq_type_map(words));
+		if (!payload)
+			return -EINVAL;
+		for (word = 0; word < words; word++, written++)
+			put_unaligned_le32(becore_clut_word(params, written),
+					   payload + word * 4);
+	}
+
+	payload = becore_cmdq_emit(emitter, 0x00090000, 0,
+				   becore_cmdq_type_map(2));
+	if (!payload)
+		return -EINVAL;
+	put_unaligned_le32(BECORE_YUVP_CLUT_INDEX_REG, payload);
+	put_unaligned_le32(0, payload + 4);
+
+	return 0;
+}
+
 static int becore_encode_block(struct becore_device *becore,
 			       enum becore_block_id id,
 			       const struct becore_cmdq_shape *shape,
@@ -4616,35 +4832,40 @@ static int becore_encode_block(struct becore_device *becore,
 {
 	struct becore_cmdq_program *program = &becore->program[id];
 	const u8 *record = becore_recipe_records(becore, id);
-	size_t payload_offset = ALIGN((size_t)header_count *
-				      BECORE_CMDQ_HEADER_BYTES,
-				      BECORE_CMDQ_PAYLOAD_BYTES);
+	struct becore_cmdq_emitter emitter;
+	bool clut = id == BECORE_YUVP && becore->params.clut_valid;
+	u32 total = header_count +
+		    (clut ? BECORE_YUVP_CLUT_BURST_HEADERS : 0);
 	u32 i;
 	u32 typed_count = 0;
 	u32 generated_count = 0;
+	int ret;
 
 	/* An encode produces a whole program or none of one. */
 	program->header_count = 0;
-	if (!program->cpu || program->capacity != header_count ||
+	if (!program->cpu || total > program->capacity ||
 	    program->size != becore_cmdq_program_size(program->capacity) ||
 	    upper_32_bits(program->dma) ||
 	    upper_32_bits(program->dma + program->size - 1))
 		return -EINVAL;
 
 	memset(program->cpu, 0, program->size);
+	becore_cmdq_emitter_init(&emitter, program, total);
 	for (i = 0; i < header_count;
 	     i++, record += BECORE_RECIPE_RECORD_BYTES) {
-		u8 *header = (u8 *)program->cpu + i * BECORE_CMDQ_HEADER_BYTES;
-		u8 *payload = (u8 *)program->cpu + payload_offset +
-			      i * BECORE_CMDQ_PAYLOAD_BYTES;
-		dma_addr_t payload_dma = program->dma + payload_offset +
-					 i * BECORE_CMDQ_PAYLOAD_BYTES;
+		u8 *payload;
 		u32 word;
 
-		put_unaligned_le32(shape[i].mode, header);
-		put_unaligned_le32(lower_32_bits(payload_dma), header + 4);
-		put_unaligned_le32(shape[i].target, header + 8);
-		put_unaligned_le32(shape[i].type_map, header + 12);
+		if (clut && i == BECORE_YUVP_CLUT_HEADER) {
+			ret = becore_encode_clut(becore, &emitter);
+			if (ret)
+				return ret;
+		}
+
+		payload = becore_cmdq_emit(&emitter, shape[i].mode,
+					   shape[i].target, shape[i].type_map);
+		if (!payload)
+			return -EINVAL;
 		memcpy(payload, record + 12, BECORE_CMDQ_PAYLOAD_BYTES);
 
 		for (word = 0; word < shape[i].valid_words; word++) {
@@ -4682,10 +4903,11 @@ static int becore_encode_block(struct becore_device *becore,
 		becore_params_apply(becore, &shape[i], payload);
 		becore_override_apply(becore, &shape[i], payload);
 	}
-	if (typed_count != becore_typed_word_count(id) ||
+	if (emitter.count != total ||
+	    typed_count != becore_typed_word_count(id) ||
 	    generated_count != becore_generated_word_count(id))
 		return -EINVAL;
-	program->header_count = header_count;
+	program->header_count = total;
 
 	return 0;
 }
@@ -5652,8 +5874,13 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (ret)
 		return ret;
 
+	/*
+	 * Sized for the longest YUVP program, which is the recipe plus the
+	 * colour LUT's burst.  What is encoded is shorter whenever userspace
+	 * has sent no lattice, which is the ordinary case.
+	 */
 	ret = becore_alloc_cmdq_program(becore, BECORE_YUVP,
-					BECORE_YUVP_HEADER_COUNT);
+					BECORE_YUVP_PROGRAM_HEADERS);
 	if (ret)
 		return ret;
 	ret = becore_alloc_cmdq_buffer(becore, &becore->gtnr_program,
@@ -7506,8 +7733,9 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "capture_size     %zu bytes\n",
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
-	seq_printf(s, "params           ccm %u, ltm curve %u\n",
-		   becore->params.ccm_valid, becore->params.ltm_curve_valid);
+	seq_printf(s, "params           ccm %u, ltm curve %u, colour LUT %u\n",
+		   becore->params.ccm_valid, becore->params.ltm_curve_valid,
+		   becore->params.clut_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -7800,6 +8028,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_LTM_CURVE] = {
 		.size = sizeof(struct exynos_becore_params_ltm_curve),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_CLUT] = {
+		.size = sizeof(struct exynos_becore_params_clut),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -7853,6 +8084,49 @@ becore_params_check_ltm_curve(struct device *dev,
 		}
 		if (i && ltm->curve[i] < ltm->curve[i - 1]) {
 			dev_dbg(dev, "tone curve decreases at point %u\n", i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * The lattice entries are the chroma the block outputs rather than an offset
+ * to it, so there is no fill that leaves the picture alone and nothing here
+ * can check that a table is *sensible*.  Two things it can check:
+ *
+ * The range, because the hardware field is ten bits and three of them share a
+ * word -- a sample that did not fit would corrupt a neighbouring node rather
+ * than itself.
+ *
+ * And the two ends of the grey axis.  Black and white have no hue, every
+ * lattice the vendor ships is exactly neutral at both, and a lattice that is
+ * not is what a stream written one sample out of step looks like.  The
+ * interior of the diagonal is deliberately not checked: the vendor's own
+ * tables are a count or two off neutral in the mid-greys, which is a tuning
+ * choice rather than a mistake.
+ */
+static int becore_params_check_clut(struct device *dev,
+				    const struct exynos_becore_params_clut *clut)
+{
+	static const unsigned int grey[] = { 0, EXYNOS_BECORE_CLUT_NODES - 1 };
+	unsigned int i;
+
+	for (i = 0; i < EXYNOS_BECORE_CLUT_NODES; i++) {
+		if (clut->lut_u[i] > EXYNOS_BECORE_CLUT_MAX ||
+		    clut->lut_v[i] > EXYNOS_BECORE_CLUT_MAX) {
+			dev_dbg(dev, "colour LUT node %u exceeds %u\n", i,
+				EXYNOS_BECORE_CLUT_MAX);
+			return -EINVAL;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(grey); i++) {
+		if (clut->lut_u[grey[i]] != EXYNOS_BECORE_CLUT_NEUTRAL ||
+		    clut->lut_v[grey[i]] != EXYNOS_BECORE_CLUT_NEUTRAL) {
+			dev_dbg(dev, "colour LUT node %u is not neutral\n",
+				grey[i]);
 			return -EINVAL;
 		}
 	}
@@ -7918,6 +8192,32 @@ static int becore_params_walk(struct becore_device *becore,
 			memcpy(becore->params.ltm_curve, ltm->curve,
 			       sizeof(becore->params.ltm_curve));
 			becore->params.ltm_curve_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_CLUT: {
+			const struct exynos_becore_params_clut *clut =
+				(const void *)header;
+
+			/*
+			 * Disabling this one really does switch the stage off,
+			 * because bypass is what the driver has instead of a
+			 * default lattice.
+			 */
+			if (disable) {
+				if (apply)
+					becore->params.clut_valid = false;
+				break;
+			}
+			ret = becore_params_check_clut(becore->dev, clut);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			memcpy(becore->params.clut_u, clut->lut_u,
+			       sizeof(becore->params.clut_u));
+			memcpy(becore->params.clut_v, clut->lut_v,
+			       sizeof(becore->params.clut_v));
+			becore->params.clut_valid = true;
 			break;
 		}
 		default:

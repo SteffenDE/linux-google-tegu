@@ -44,6 +44,7 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-isp.h>
+#include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
@@ -107,6 +108,9 @@
 #define BECORE_GRID_SIZE			(BECORE_LTM_GRID_ROW_BYTES * \
 					 BECORE_LTM_GRID_ROWS)
 #define BECORE_RUN_TIMEOUT_MS		1000
+
+/* What a queued capture's address must be aligned to; see becore_buf_prepare. */
+#define BECORE_CAPTURE_ALIGN		32
 
 /* Each block's device-tree reg window; a debug read has to stay inside it. */
 #define BECORE_BLOCK_WINDOW		0x10000
@@ -1649,7 +1653,6 @@ enum becore_timing_phase {
 	BECORE_TIMING_STAGE2,
 	BECORE_TIMING_CRC,
 	BECORE_TIMING_SUSPEND,
-	BECORE_TIMING_COPY,
 	BECORE_TIMING_FRAME,
 	BECORE_TIMING_PHASE_COUNT,
 };
@@ -1662,7 +1665,6 @@ static const char * const becore_timing_names[BECORE_TIMING_PHASE_COUNT] = {
 	[BECORE_TIMING_STAGE2] = "stage2",
 	[BECORE_TIMING_CRC] = "crc",
 	[BECORE_TIMING_SUSPEND] = "suspend",
-	[BECORE_TIMING_COPY] = "copy",
 	[BECORE_TIMING_FRAME] = "frame",
 };
 
@@ -1789,6 +1791,12 @@ struct becore_device {
 	bool output_quarantined;
 	bool video_streaming;
 	bool producer_streaming;
+	/*
+	 * Where MCSC writes this run.  The driver-owned buffer except during a
+	 * capture, which redirects it at the queued vb2 buffer; every path that
+	 * encodes MCSC sets it first rather than inheriting the last run's.
+	 */
+	dma_addr_t mcsc_dest_dma;
 	/* Written only by a completed run, read under the same lock. */
 	struct becore_timing timing[BECORE_TIMING_PHASE_COUNT];
 	u32 timing_runs;
@@ -2773,9 +2781,9 @@ static dma_addr_t becore_mcsc_address_dma(struct becore_device *becore, u32 reg)
 	case BECORE_MCSC_INPUT_PLANE2_REG:
 		return becore->output.dma + becore_yuvp_output_plane2_offset(input);
 	case BECORE_MCSC_OUTPUT_PLANE1_REG:
-		return becore->mcsc_output.dma;
+		return becore->mcsc_dest_dma;
 	case BECORE_MCSC_OUTPUT_PLANE2_REG:
-		return becore->mcsc_output.dma +
+		return becore->mcsc_dest_dma +
 		       becore_mcsc_output_plane2_offset();
 	default:
 		return DMA_MAPPING_ERROR;
@@ -5922,6 +5930,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				      becore_mcsc_output_size(), "MCSC output");
 	if (ret)
 		return ret;
+	becore->mcsc_dest_dma = becore->mcsc_output.dma;
 	ret = becore_alloc_cmdq_program(becore, BECORE_RGBP,
 					BECORE_RGBP_HEADER_COUNT);
 	if (ret)
@@ -6745,6 +6754,7 @@ static int becore_mcsc_encode_set(void *data, u64 value)
 	} else if (becore->running || becore->video_streaming) {
 		ret = -EBUSY;
 	} else {
+		becore->mcsc_dest_dma = becore->mcsc_output.dma;
 		ret = becore_mcsc_recipe_validate(becore);
 		if (!ret)
 			ret = becore_encode_mcsc(becore,
@@ -6930,11 +6940,11 @@ becore_next_input(struct becore_device *becore, bool allow_staged)
 
 static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 			    u32 output_profile, bool ready_only,
-			    void *capture_output, bool packed_output,
+			    struct vb2_buffer *capture, bool packed_output,
 			    bool run_mcsc)
 {
 	unsigned long flags;
-	bool diagnostic_output = !capture_output;
+	bool diagnostic_output = !capture;
 	bool input_claimed = false;
 	u64 phase_ns[BECORE_TIMING_PHASE_COUNT] = {};
 	ktime_t start;
@@ -6993,6 +7003,24 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	    (!diagnostic_output || becore->run_input->ready_sequence)) {
 		ret = -EINVAL;
 		goto record_error;
+	}
+	if (capture) {
+		becore->mcsc_dest_dma =
+			vb2_dma_contig_plane_dma_addr(capture, 0);
+		/*
+		 * MCSC's address registers are 32 bits, and a capture is the
+		 * one destination the driver did not allocate, so it gets the
+		 * bounds check the driver's own buffers get at probe.
+		 */
+		if (!becore->mcsc_dest_dma ||
+		    upper_32_bits(becore->mcsc_dest_dma) ||
+		    upper_32_bits(becore->mcsc_dest_dma +
+				  becore_mcsc_output_active_size() - 1)) {
+			ret = -EINVAL;
+			goto record_error;
+		}
+	} else {
+		becore->mcsc_dest_dma = becore->mcsc_output.dma;
 	}
 	becore->active_input_profile = input_profile;
 	becore->active_output_profile = output_profile;
@@ -7111,9 +7139,18 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		/* Match probe: never leave a failed-reset device at usage zero. */
 		pm_runtime_get_noresume(becore->dev);
 		/*
-		 * Neither DMA mapping may be returned after an unproven stop.
-		 * The output is driver-owned, so userspace's vb2 buffer was never
-		 * exposed to the processors and remains safe to return with ERROR.
+		 * The input mapping may not be returned after an unproven stop.
+		 * The capture is worse and is not resolved here: MCSC writes it
+		 * directly, so unlike the driver-owned output it *was* a live
+		 * destination, and the caller returns it with ERROR.  Nothing
+		 * below holds its pages -- vb2_queue_error() pushes userspace
+		 * straight to REQBUFS(0), which frees them.  What bounds the
+		 * damage is the SysMMU: dma_free_attrs() unmaps the IOVA before
+		 * releasing the pages, so a write still in flight faults rather
+		 * than landing in recycled memory, until that IOVA is reused.
+		 * reset_failed is sticky and stops the device being used again,
+		 * but it cannot stop a transfer already started.  Proving
+		 * quiescence needs an idle-status read this driver does not do.
 		 */
 		becore->run_input->state = BECORE_INPUT_QUARANTINED;
 		becore->output_quarantined = true;
@@ -7134,12 +7171,7 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	input_claimed = false;
 	if (pm_ret >= 0)
 		dma_rmb();
-	mark = becore_timing_mark(phase_ns, BECORE_TIMING_SUSPEND, mark);
-	if (capture_output && !ret && pm_ret >= 0)
-		memcpy(capture_output,
-		       run_mcsc ? becore->mcsc_output.cpu : becore->output.cpu,
-		       becore->active_capture_size);
-	becore_timing_mark(phase_ns, BECORE_TIMING_COPY, mark);
+	becore_timing_mark(phase_ns, BECORE_TIMING_SUSPEND, mark);
 	phase_ns[BECORE_TIMING_FRAME] =
 		ktime_to_ns(ktime_sub(ktime_get(), start));
 	for (i = 0; i < BECORE_TIMING_PHASE_COUNT; i++) {
@@ -7378,7 +7410,6 @@ static void becore_video_work(struct work_struct *work)
 
 	for (;;) {
 		struct becore_video_buffer *buf;
-		void *vaddr;
 		int ret;
 
 		mutex_lock(&becore->lock);
@@ -7398,14 +7429,9 @@ static void becore_video_work(struct work_struct *work)
 		list_del(&buf->list);
 		spin_unlock_irq(&becore->queue_lock);
 
-		vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
-		if (WARN_ON_ONCE(!vaddr)) {
-			becore_video_fail(becore, buf);
-			return;
-		}
 		ret = becore_run_frame(becore, BECORE_RGBP_INPUT_SBWC,
 				       BECORE_YUVP_OUTPUT_SBWCL,
-				       true, vaddr, false, true);
+				       true, &buf->vb.vb2_buf, false, true);
 		if (ret == -ENODATA || ret == -EBUSY) {
 			spin_lock_irq(&becore->queue_lock);
 			list_add(&buf->list, &becore->queued_outputs);
@@ -7459,12 +7485,40 @@ static int becore_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
 
 static int becore_buf_prepare(struct vb2_buffer *vb)
 {
+	struct becore_device *becore = vb2_get_drv_priv(vb->vb2_queue);
 	struct v4l2_pix_format pix;
+	dma_addr_t dma;
 
 	becore_video_fill_pix(&pix);
-	if (vb2_plane_size(vb, 0) < pix.sizeimage ||
-	    !vb2_plane_vaddr(vb, 0))
+	if (vb2_plane_size(vb, 0) < pix.sizeimage)
 		return -EINVAL;
+
+	/*
+	 * An imported buffer's address is not the driver's to choose, so every
+	 * property MCSC needs of it is checked here rather than at the point of
+	 * use: a run that refuses a buffer takes the whole stream down with it,
+	 * where QBUF refusing one costs the caller only that buffer.
+	 */
+	dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+	if (!dma || upper_32_bits(dma) ||
+	    upper_32_bits(dma + becore_mcsc_output_active_size() - 1)) {
+		dev_err_ratelimited(becore->dev,
+				    "buffer at %pad is outside 32-bit DMA\n",
+				    &dma);
+		return -EINVAL;
+	}
+	/*
+	 * The raw node refuses a misaligned import because the front end drops
+	 * the low bits rather than faulting, and MCSC's own stride is a
+	 * multiple of this, so hold a capture to the same rule.  Every buffer
+	 * either node allocates is page-aligned and cannot reach this.
+	 */
+	if (!IS_ALIGNED(dma, BECORE_CAPTURE_ALIGN)) {
+		dev_err_ratelimited(becore->dev,
+				    "buffer at %pad is not %u-byte aligned\n",
+				    &dma, BECORE_CAPTURE_ALIGN);
+		return -EINVAL;
+	}
 
 	vb2_set_plane_payload(vb, 0, pix.sizeimage);
 
@@ -8704,11 +8758,11 @@ static int becore_video_register(struct becore_device *becore)
 	}
 
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	q->io_modes = VB2_MMAP;
+	q->io_modes = VB2_MMAP | VB2_DMABUF;
 	q->dev = becore->dev;
 	q->drv_priv = becore;
 	q->ops = &becore_vb2_ops;
-	q->mem_ops = &vb2_vmalloc_memops;
+	q->mem_ops = &vb2_dma_contig_memops;
 	q->buf_struct_size = sizeof(struct becore_video_buffer);
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->min_queued_buffers = 1;

@@ -558,6 +558,37 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_CSC_FIELD_MASK	GENMASK(13, 0)
 #define BECORE_RGBP_CSC_MAX		0xfff	/* full range, not studio */
 #define BECORE_RGBP_CSC_CHROMA_OFFSET	0x800
+/*
+ * YUVP carries the same colour-space converter three times over, and the two
+ * copies here are the ones the 12-bit Q13 block above does not cover.
+ *
+ * YUV_YUVTORGB at +0x3900 and its _ZUMA twin at +0x6a00 are the BT.601 inverse
+ * at Q12 in 14-bit signed fields. Their nine coefficients are in the same
+ * order as the forward block's -- input slow, output fast, so the vendor's
+ * coeff_<in>_<out> names run 0_0, 0_1, 0_2, 1_0 where the forward block's run
+ * r1, r2, r3, g1 -- and the subscripts still swap below, because the driver's
+ * two matrix tables are stored in opposite conventions and not because the two
+ * register blocks disagree. Two things after them are not coefficients:
+ * LSHIFT is the post-matrix shift, which
+ * Lyric's TranslateCsc writes as a bare 1 whatever the tuning says, and the
+ * three OFFSETs are the pedestal the block subtracts from its input -- zero
+ * for luma and minus a half for each chroma channel, in a 13-bit signed field.
+ * Half of the block's own Q rather than a literal 0x800, so the same rounding
+ * that produces the matrix produces the pedestal.
+ */
+#define BECORE_YUVP_YUV2RGB_BASE	(BECORE_YUVP_PHYS_BASE + 0x3900)
+#define BECORE_YUVP_YUV2RGB_BYPASS_REG	(BECORE_YUVP_YUV2RGB_BASE + 0x00)
+/* +0x04 is not a register: the vendor's table jumps bypass to coeff_0_0. */
+#define BECORE_YUVP_YUV2RGB_FIRST	(BECORE_YUVP_YUV2RGB_BASE + 0x08)
+#define BECORE_YUVP_YUV2RGB_LAST	(BECORE_YUVP_YUV2RGB_BASE + 0x38)
+#define BECORE_YUVP_YUV2RGB_ZUMA_BASE	(BECORE_YUVP_PHYS_BASE + 0x6a00)
+#define BECORE_YUVP_YUV2RGB_ZUMA_BYPASS_REG (BECORE_YUVP_YUV2RGB_ZUMA_BASE + 0x00)
+#define BECORE_YUVP_YUV2RGB_ZUMA_FIRST	(BECORE_YUVP_YUV2RGB_ZUMA_BASE + 0x08)
+#define BECORE_YUVP_YUV2RGB_ZUMA_LAST	(BECORE_YUVP_YUV2RGB_ZUMA_BASE + 0x38)
+#define BECORE_YUVP_YUV2RGB_Q		12
+#define BECORE_YUVP_YUV2RGB_FIELD_MASK	GENMASK(13, 0)
+#define BECORE_YUVP_YUV2RGB_OFFSET_MASK	GENMASK(12, 0)
+#define BECORE_YUVP_YUV2RGB_LSHIFT	1
 #define BECORE_RGBP_CHROMA_LPF_BASE	(BECORE_RGBP_PHYS_BASE + 0x3c00)
 #define BECORE_RGBP_CHROMA_LPF_CTRL_REG	(BECORE_RGBP_CHROMA_LPF_BASE + 0x00)
 #define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
@@ -1142,6 +1173,7 @@ enum becore_generated_kind {
 	BECORE_GEN_RUNNING,	/* a bypass the program clears: the block runs */
 	BECORE_GEN_DECOMP_SIZE,	/* a frame size, from the Bayer input */
 	BECORE_GEN_CSC,		/* RGB to YUV: BT.601, full range, Q13 */
+	BECORE_GEN_YUV2RGB,	/* YUV to RGB: the BT.601 inverse at Q12 */
 	BECORE_GEN_CHROMA_LPF,	/* 4:4:4 to 4:2:2, a fixed binomial filter */
 	BECORE_GEN_DJAG,	/* MCSC DJAG at Samsung's neutral profile */
 	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
@@ -1178,7 +1210,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	391
+#define BECORE_YUVP_GENERATED_WORDS	419
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1270,7 +1302,15 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },
+	{ BECORE_YUVP_YUV2RGB_BYPASS_REG, BECORE_YUVP_YUV2RGB_BYPASS_REG,
+	  BECORE_GEN_YUV2RGB },
+	{ BECORE_YUVP_YUV2RGB_FIRST, BECORE_YUVP_YUV2RGB_LAST,
+	  BECORE_GEN_YUV2RGB },
 	{ BECORE_YUVP_CSC_FIRST, BECORE_YUVP_CSC_LAST, BECORE_GEN_CSC },
+	{ BECORE_YUVP_YUV2RGB_ZUMA_BYPASS_REG,
+	  BECORE_YUVP_YUV2RGB_ZUMA_BYPASS_REG, BECORE_GEN_YUV2RGB },
+	{ BECORE_YUVP_YUV2RGB_ZUMA_FIRST, BECORE_YUVP_YUV2RGB_ZUMA_LAST,
+	  BECORE_GEN_YUV2RGB },
 	{ BECORE_YUVP_NR_SLOPE_Y_REG,
 	  BECORE_YUVP_NR_SLOPE_Y_REG + BECORE_NOISE_TABLE_LAST,
 	  BECORE_GEN_NOISE_SLOPE },
@@ -3873,6 +3913,51 @@ static int becore_rgbp_csc_value(u32 offset, u32 *value)
 }
 
 /*
+ * YUVP's two YUV-to-RGB matrices, by offset from either block's base. The
+ * two copies are bit-identical, so one intent serves both.
+ */
+static int becore_yuvp_yuv2rgb_value(u32 offset, u32 *value)
+{
+	static const struct becore_csc_coefficient minus_half = { -1, 2 };
+	u32 index;
+
+	if (offset & 3)
+		return -EINVAL;
+	if (offset >= 0x08 && offset < 0x2c) {
+		index = (offset - 0x08) / 4;
+		/*
+		 * The register order is input-slow and output-fast, as in the
+		 * forward block. becore_clut_yuv2rgb is stored the other way
+		 * from becore_csc_matrix -- [out][in] rather than [in][out] --
+		 * so the two subscripts swap here and not in the forward path.
+		 */
+		*value = becore_csc_coefficient(&becore_clut_yuv2rgb[index % 3]
+								    [index / 3],
+						BECORE_YUVP_YUV2RGB_Q,
+						BECORE_YUVP_YUV2RGB_FIELD_MASK);
+		return 0;
+	}
+
+	switch (offset) {
+	case 0x00:		/* BYPASS: the block runs */
+	case 0x30:		/* OFFSET_0_0: luma carries no pedestal */
+		*value = 0;
+		return 0;
+	case 0x2c:		/* LSHIFT */
+		*value = BECORE_YUVP_YUV2RGB_LSHIFT;
+		return 0;
+	case 0x34:		/* OFFSET_0_1 */
+	case 0x38:		/* OFFSET_0_2: half scale, subtracted */
+		*value = becore_csc_coefficient(&minus_half,
+						BECORE_YUVP_YUV2RGB_Q,
+						BECORE_YUVP_YUV2RGB_OFFSET_MASK);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/*
  * The colour LUT's gate and the matrix in front of its lattice, by offset from
  * BECORE_YUVP_CLUT_BASE.
  *
@@ -4544,6 +4629,14 @@ static int becore_generated_value(const struct becore_device *becore,
 							 BECORE_RGBP_CSC_BASE :
 							 BECORE_YUVP_CSC_BASE),
 						  &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_YUV2RGB:
+			if (becore_yuvp_yuv2rgb_value(
+				    reg - (reg >= BECORE_YUVP_YUV2RGB_ZUMA_BASE ?
+					   BECORE_YUVP_YUV2RGB_ZUMA_BASE :
+					   BECORE_YUVP_YUV2RGB_BASE),
+				    &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_SCALER_PHASE:

@@ -1624,7 +1624,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1345
+#define BECORE_YUVP_GENERATED_WORDS	1347
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {

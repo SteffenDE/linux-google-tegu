@@ -1519,6 +1519,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
+	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
 	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
@@ -1557,7 +1558,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1194
+#define BECORE_YUVP_GENERATED_WORDS	1217
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1677,6 +1678,44 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
 	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_YUVP_PHYS_BASE + 0x3208, BECORE_YUVP_PHYS_BASE + 0x3208,
+	  BECORE_GEN_NR_DEFAULT },	/* low_power_en */
+	{ BECORE_YUVP_PHYS_BASE + 0x32d0, BECORE_YUVP_PHYS_BASE + 0x32d0,
+	  BECORE_GEN_NR_DEFAULT },	/* radthrs_radial_config */
+	{ BECORE_YUVP_PHYS_BASE + 0x3314, BECORE_YUVP_PHYS_BASE + 0x3314,
+	  BECORE_GEN_NR_DEFAULT },	/* center_weight */
+	{ BECORE_YUVP_PHYS_BASE + 0x3320, BECORE_YUVP_PHYS_BASE + 0x3320,
+	  BECORE_GEN_NR_DEFAULT },	/* radial */
+	{ BECORE_YUVP_PHYS_BASE + 0x334c, BECORE_YUVP_PHYS_BASE + 0x334c,
+	  BECORE_GEN_NR_DEFAULT },	/* radial_thresh_limit */
+	{ BECORE_YUVP_PHYS_BASE + 0x3398, BECORE_YUVP_PHYS_BASE + 0x3398,
+	  BECORE_GEN_NR_DEFAULT },	/* contents_aware */
+	{ BECORE_YUVP_PHYS_BASE + 0x33a4, BECORE_YUVP_PHYS_BASE + 0x33a4,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_0 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33ac, BECORE_YUVP_PHYS_BASE + 0x33ac,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_1 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33b4, BECORE_YUVP_PHYS_BASE + 0x33b4,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_2 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33bc, BECORE_YUVP_PHYS_BASE + 0x33bc,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_3 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33c4, BECORE_YUVP_PHYS_BASE + 0x33c4,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_4 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33cc, BECORE_YUVP_PHYS_BASE + 0x33cc,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_5 */
+	{ BECORE_YUVP_PHYS_BASE + 0x33d4, BECORE_YUVP_PHYS_BASE + 0x33d4,
+	  BECORE_GEN_NR_DEFAULT },	/* confmap_seg_6 */
+	{ BECORE_YUVP_PHYS_BASE + 0x344c, BECORE_YUVP_PHYS_BASE + 0x3458,
+	  BECORE_GEN_NR_DEFAULT },	/* wavelet_edge_map..nlm_map_suppression_uv */
+	{ BECORE_YUVP_PHYS_BASE + 0x3500, BECORE_YUVP_PHYS_BASE + 0x3500,
+	  BECORE_GEN_NR_DEFAULT },	/* tuning_param1 */
+	{ BECORE_YUVP_PHYS_BASE + 0x3508, BECORE_YUVP_PHYS_BASE + 0x3508,
+	  BECORE_GEN_NR_DEFAULT },	/* tuning_param3 */
+	{ BECORE_YUVP_PHYS_BASE + 0x35dc, BECORE_YUVP_PHYS_BASE + 0x35dc,
+	  BECORE_GEN_NR_DEFAULT },	/* wide_edge */
+	{ BECORE_YUVP_PHYS_BASE + 0x3610, BECORE_YUVP_PHYS_BASE + 0x3610,
+	  BECORE_GEN_NR_DEFAULT },	/* h_nr_en */
+	{ BECORE_YUVP_PHYS_BASE + 0x3784, BECORE_YUVP_PHYS_BASE + 0x3788,
+	  BECORE_GEN_NR_DEFAULT },	/* filterweights_param3..filterweights_param4 */
 	{ BECORE_YUVP_SHARPEN_BYPASS_REG, BECORE_YUVP_SHARPEN_BYPASS_REG,
 	  BECORE_GEN_SHARPEN },
 	BECORE_SHARPEN_TUNING_RANGES
@@ -4477,6 +4516,79 @@ static const u8 becore_chroma_lpf_taps[] = { 0, 32, 64, 32, 0 };
  *    256: 0 | 16 << 8, 32 | 64 << 8, 96 | 128 << 8, 192 | 256 << 8. Both
  *    could be generated from the ramp; neither is today.
  */
+/*
+ * `YUVNR`'s fixed half: 23 words the block's tuning never reaches.
+ *
+ * The block has two output structures, and three things together say which
+ * words belong to which. `YuvpYuvNrBlock::InitContext` hands its virtual a
+ * second pointer at `&context + 0x278`. The map from context word to register
+ * that `ConfigureWith` carries climbs 0x3200..0x37d0 over the 117 words below
+ * that offset and then *starts over* at 0x3208 for 23 more -- two ascending
+ * runs is what two structures look like from the register side. And
+ * `YuvNrFixedOutput` is exactly 0x5c bytes, twenty-three u32, which is the
+ * size of the second run and not of the first.
+ *
+ * `GetDefaultYuvNr(YuvNrFixedOutput&, YuvNrOutput&)` fills the fixed one from
+ * compiled-in literals and the other by constructing a default
+ * `apcamera.YuvNrTuning` and running `TranslateYuvNrCommon` over it. So these
+ * 23 are the same kind of thing as the sharpener's 83 -- the block's own
+ * defaults, not one frame's tuning -- and they are the first of `YUVNR` the
+ * driver can state without reading the encode.
+ *
+ * Twelve of the literals are visible in the decompile and match the capture
+ * digit for digit: `radial` is `|= 0x10000000`, `radial_thresh_limit` is
+ * `& 0xe000e000 | 0x16661666`, a 128-bit store writes `wavelet_edge_map`,
+ * `wavelet_wide_filter` and both `nlm_map_suppression` words at once as
+ * 0x01140641, 0x28000080, 7 and 7, and a `dup` writes 0x321 into both
+ * `filterweights_param3` and `_param4`.
+ *
+ * The other eleven are *masked* rather than set, so their zero is the context
+ * arriving zeroed. All 426 captured programs agree, on three cameras and
+ * eighteen sessions, but the decompile alone does not prove it -- and it is
+ * where a non-zero incoming context would show up first, because
+ * `contents_aware`'s mask keeps bits 8..31 and the `confmap_seg_*` masks keep
+ * bits 6, 7, 22 and 23.
+ *
+ * Eight of them say the same thing the sharpener's confidence map said:
+ * `contents_aware` is clear and `confmap_seg_0..6` are zero, so content-aware
+ * segmentation is off. That is by construction here rather than by
+ * coincidence -- mainline has no segmentation producer to fill it.
+ */
+struct becore_yuvnr_default {
+	u32 offset;			/* from BECORE_YUVP_PHYS_BASE */
+	u32 value;
+};
+
+#define BECORE_YUVNR_DEFAULTS		23
+
+static const struct becore_yuvnr_default becore_yuvnr_defaults[] = {
+	{ 0x3208, 0x00000000 },	/* low_power_en */
+	{ 0x32d0, 0x00000001 },	/* radthrs_radial_config */
+	{ 0x3314, 0x00000707 },	/* center_weight */
+	{ 0x3320, 0x10000000 },	/* radial */
+	{ 0x334c, 0x16661666 },	/* radial_thresh_limit */
+	{ 0x3398, 0x00000000 },	/* contents_aware */
+	{ 0x33a4, 0x00000000 },	/* confmap_seg_0 */
+	{ 0x33ac, 0x00000000 },	/* confmap_seg_1 */
+	{ 0x33b4, 0x00000000 },	/* confmap_seg_2 */
+	{ 0x33bc, 0x00000000 },	/* confmap_seg_3 */
+	{ 0x33c4, 0x00000000 },	/* confmap_seg_4 */
+	{ 0x33cc, 0x00000000 },	/* confmap_seg_5 */
+	{ 0x33d4, 0x00000000 },	/* confmap_seg_6 */
+	{ 0x344c, 0x01140641 },	/* wavelet_edge_map */
+	{ 0x3450, 0x28000080 },	/* wavelet_wide_filter */
+	{ 0x3454, 0x00000007 },	/* nlm_map_suppression_y */
+	{ 0x3458, 0x00000007 },	/* nlm_map_suppression_uv */
+	{ 0x3500, 0x00000000 },	/* tuning_param1 */
+	{ 0x3508, 0x00000000 },	/* tuning_param3 */
+	{ 0x35dc, 0x00000001 },	/* wide_edge */
+	{ 0x3610, 0x0000001f },	/* h_nr_en */
+	{ 0x3784, 0x00000321 },	/* filterweights_param3 */
+	{ 0x3788, 0x00000321 },	/* filterweights_param4 */
+};
+
+static_assert(ARRAY_SIZE(becore_yuvnr_defaults) == BECORE_YUVNR_DEFAULTS);
+
 struct becore_sharpen_default {
 	u32 offset;			/* from BECORE_YUVP_PHYS_BASE */
 	u32 value;
@@ -4989,7 +5101,22 @@ static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
 	return total;
 }
 
-/* One of the block's compiled-in defaults, by offset from YUVP's base. */
+/* One of YUVNR's fixed-output words, by offset from YUVP's base. */
+static int becore_yuvp_nr_default(u32 offset, u32 *value)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_yuvnr_defaults); i++) {
+		if (becore_yuvnr_defaults[i].offset != offset)
+			continue;
+		*value = becore_yuvnr_defaults[i].value;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/* One of the sharpener's compiled-in defaults, by offset from YUVP's base. */
 static int becore_yuvp_sharpen_default(u32 offset, u32 *value)
 {
 	size_t i;
@@ -6117,6 +6244,11 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_SHARPEN_DEFAULT:
 			if (becore_yuvp_sharpen_default(
 				    reg - BECORE_YUVP_PHYS_BASE, &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_NR_DEFAULT:
+			if (becore_yuvp_nr_default(reg - BECORE_YUVP_PHYS_BASE,
+						   &result))
 				return -EINVAL;
 			break;
 		/*

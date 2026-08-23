@@ -665,7 +665,7 @@ struct exynos_becore_params_sharpen {
 } __attribute__((aligned(8)));
 
 /*
- * The noise reducer carries 19 enables and 169 tuning values, and every one of
+ * The noise reducer carries 19 enables and 174 tuning values, and every one of
  * them is a `float` in the vendor's own tuning proto reaching the hardware as
  * ``round(f * scale)`` at one of nine fixed points.  Userspace does that
  * multiplication and this block carries the result, exactly as the sharpener's
@@ -682,10 +682,12 @@ struct exynos_becore_params_sharpen {
  * **The block's slope tables are not here, because they are not tuning.**  The
  * hardware wants a slope and a shift per segment of each noise curve, and the
  * vendor computes both from the knots; the driver does the same arithmetic
- * from @std_lut_x and the range beside it, and from @mcfp_gain_lut_y for the
- * temporal curve.  Sending a slope would mean sending something that has to
- * agree with the knots beside it, and nothing would check that it did.  The
- * same goes for the luma curve's last interval -- see @luma_gain_y.
+ * from @std_lut_x and the range beside it, and from @mcfp_gain_lut_x and
+ * @mcfp_gain_lut_y for the temporal curve.  Sending a slope would mean sending
+ * something that has to agree with the knots beside it, and nothing would
+ * check that it did.  The same goes for the luma curve's last interval -- see
+ * @luma_gain_y -- and for the six register knots @mcfp_gain_lut_x's five
+ * become.
  *
  * The radial gain's *geometry* is absent for a different reason: it is the
  * frame's size rather than tuning, so no member here could carry it.  Those
@@ -720,6 +722,12 @@ struct exynos_becore_params_sharpen {
 
 /* The temporal filter's gain curve. */
 #define EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS	6
+
+/*
+ * Its domain is one knot shorter than its range: the hardware wants six knots
+ * and the first of them is a constant the block does not carry.
+ */
+#define EXYNOS_BECORE_YUVNR_MCFP_LUT_X_POINTS	5
 
 /* Nine directional gains, one per tap of the vertical or horizontal filter. */
 #define EXYNOS_BECORE_YUVNR_GAIN_POINTS		9
@@ -791,6 +799,15 @@ struct exynos_becore_params_sharpen {
  * @mcfp_center_weight: how much the centre tap counts
  * @mcfp_y_hfnr_min_ratio: the floor on luma high-frequency noise reduction
  * @mcfp_uv_hfnr_min_ratio: the floor on the chroma one
+ * @mcfp_gain_lut_x: where the temporal filter's gain curve is sampled, on the
+ *	block's own seven-bit scale, and **truncated rather than rounded** --
+ *	see the comment above the member. The hardware wants six knots and
+ *	these are the last five: the first is a constant the driver states.
+ *	Each is capped at **123 plus its own index**, except the last, which is
+ *	capped at 127 instead, and then raised to its predecessor plus one if it
+ *	does not exceed it -- which is what the vendor's own translator does, so
+ *	a curve sent flat or falling arrives rising by one count a knot rather
+ *	than being refused
  * @mcfp_gain_lut_y: the temporal filter's gain at each knot
  * @luma_gain_y: the noise gain against luma, on a 32-point grid. The hardware
  *	takes 31 of the 32 and then the **width of the last interval**, so the
@@ -842,6 +859,7 @@ struct exynos_becore_params_sharpen {
  * @return_noise_power_shifter_uv: the same for chroma
  * @return_noise_limit_y: the ceiling on returned luma noise
  * @return_noise_limit_uv: the ceiling on returned chroma noise
+ * @reserved: must be zero
  *
  * The values come from a tuning tree the vendor indexes by scaler ratio,
  * analog gain and exposure ratio, so this is a per-frame block rather than a
@@ -933,6 +951,16 @@ struct exynos_becore_params_yuvnr {
 	/* Floors on high-frequency noise reduction. round(f * 256). */
 	__s32 mcfp_y_hfnr_min_ratio;
 	__s32 mcfp_uv_hfnr_min_ratio;
+
+	/*
+	 * Where that curve's knots sit, on the block's own scale. round(f * 1).
+	 * The hardware *truncates* this one -- and @std_lut_x above -- rather
+	 * than rounding it, so a tuning value of 103.6 reaches the register as
+	 * 103. Both are integers in every shipped tuning, which is why the
+	 * distinction shows up nowhere until userspace sends a value that is
+	 * not.
+	 */
+	__s32 mcfp_gain_lut_x[EXYNOS_BECORE_YUVNR_MCFP_LUT_X_POINTS];
 
 	/* The temporal filter's gain curve. round(f * 4096). */
 	__s32 mcfp_gain_lut_y[EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS];
@@ -1048,6 +1076,15 @@ struct exynos_becore_params_yuvnr {
 	/* The ceiling on what it returns. round(f * 4096). */
 	__s32 return_noise_limit_y;
 	__s32 return_noise_limit_uv;
+
+	/*
+	 * Must be zero.  The block carries an odd number of values and every
+	 * block is eight-byte aligned, so one word of it is padding either
+	 * way -- naming it is what keeps the block a flat sequence userspace
+	 * can write without knowing what the compiler did, and what lets a
+	 * value take it later without changing the block's size.
+	 */
+	__s32 reserved;
 } __attribute__((aligned(8)));
 
 /**

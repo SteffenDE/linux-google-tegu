@@ -53,7 +53,7 @@ struct becore_yuvnr_reg {
 
 #define BECORE_YUVNR_REGS		110
 #define BECORE_YUVNR_FIELDS		215
-#define BECORE_YUVNR_VALUES		188
+#define BECORE_YUVNR_VALUES		194
 
 /*
  * The block is a flat sequence of __s32 behind its header, with no padding
@@ -857,11 +857,12 @@ static_assert(ARRAY_SIZE(becore_yuvnr_regs) == BECORE_YUVNR_REGS);
  * there is a default noise curve to state in their place, and the chroma
  * domain stays BECORE_GEN_NOISE_DOMAIN, which repeats the luma one.
  *
- * A range added here has to stay clear of *both* readers of the recipe by
- * register: becore_noise_knots_resolve(), which is why the twelve above are
- * held back, and becore_yuvnr_tnr_resolve(), which reads the temporal gain
- * curve's knots at +0x33f8..+0x3400.  Those three are not field deposits and
- * so were never in this list, but nothing else says they must not be.
+ * A range added here has to stay clear of the one reader of the recipe left,
+ * becore_noise_knots_resolve(), which is why the twelve above are held back.
+ * The temporal gain curve's knots at +0x33f8..+0x3400 were a second reader
+ * until the driver started deriving them from `mcfp_gain_lut_x`; they are not
+ * field deposits, so they are still not in this list, and the driver names
+ * their range beside the slopes it derives the same way.
  */
 #define BECORE_YUVNR_RANGE(first, last)	\
 	{ BECORE_YUVP_PHYS_BASE + (first),	\

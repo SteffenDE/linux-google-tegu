@@ -69,16 +69,34 @@ static_assert(sizeof(struct exynos_becore_params_yuvnr) ==
 	offsetof(struct exynos_becore_params_yuvnr, member)
 
 /*
- * Turning the low-frequency noise reducer off turns these off with it, which
- * is what the vendor's translators do rather than something chosen here.  The
- * list is measured -- the generator runs the translators again with
- * `lfnr_enable` clear and sees which fields stop being written -- so it cannot
- * drift from them.
+ * The two gates.  Turning a stage off turns these members off with it, which
+ * is what the vendor's translators do rather than something chosen here, and
+ * the lists are measured: the generator runs the translators again with the
+ * enable clear and sees which fields stop being written.
+ *
+ * There are two because `TranslateYuvNrCommon` clears **both** bits of
+ * `yuv_yuv_nr_top` whenever the block's own @enable is zero, before any of the
+ * seventeen helpers runs -- and every downstream gate reads that *register*
+ * bit rather than the tuning field.  So @enable gates the two enables in `top`
+ * directly, and everything else hangs off `top[1]`, which is
+ * `enable && lfnr_enable`.
+ *
+ * The two take different truth tests, and that is not a stylistic choice:
+ * @enable is deposited *inverted* and the inversion happens before the clamp,
+ * so any non-zero value runs the block, while @lfnr_enable is a plain field
+ * clamped to one bit and a negative value reads as off in the register.
  */
-#define BECORE_YUVNR_LFNR_GATED		\
+#define BECORE_YUVNR_ENABLE_GATED	\
+	{ BECORE_YUVNR_AT(hfnr_enable), \
+	  BECORE_YUVNR_AT(lfnr_enable) }
+
+#define BECORE_YUVNR_LFNR_GATED	\
 	{ BECORE_YUVNR_AT(luma_gain_enable), \
 	  BECORE_YUVNR_AT(add_hf_y_enable), \
-	  BECORE_YUVNR_AT(add_hf_uv_enable) }
+	  BECORE_YUVNR_AT(add_hf_uv_enable), \
+	  BECORE_YUVNR_AT(noise_addback_y_enable), \
+	  BECORE_YUVNR_AT(noise_addback_uv_enable) }
+
 
 /*
  * The bits the low-frequency stage's own branch deposits, which are not fields

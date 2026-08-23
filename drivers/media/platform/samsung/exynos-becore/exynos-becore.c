@@ -5214,9 +5214,19 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 		*value = (BECORE_RGBP_DNS_BINNING_UNITY << 16) |
 			 BECORE_RGBP_DNS_BINNING_UNITY;
 		return 0;
-	case 0x1c0:		/* RADIAL_CENTER: 15-bit signed, x low, y high */
-		x = -(s32)((profile->width >> 1) & ~1u);
-		y = -(s32)((profile->height >> 1) & ~1u);
+	/*
+	 * RADIAL_CENTER: 15-bit signed, x low, y high.  Plain `-(w / 2)`, and
+	 * the `& ~1` this used to carry was Samsung's rather than Lyric's:
+	 * `rgbp_hw_s_dns_size()` in the downstream driver masks the halved
+	 * width to an even number and `lyric::TranslateByrDns` does not
+	 * (`neg w8, w8, lsr #1` at `liblyric_iq.so` +0x14f73c, the same
+	 * instruction `SetRaidalConfig` uses for `YUVNR`'s copy).  Lyric is
+	 * what programs this hardware, and no captured array shows the
+	 * difference: every one of them halves to an even number already.
+	 */
+	case 0x1c0:
+		x = -(s32)(profile->width >> 1);
+		y = -(s32)(profile->height >> 1);
 		*value = ((y & BECORE_RGBP_DNS_CENTRE_MASK) << 16) |
 			 (x & BECORE_RGBP_DNS_CENTRE_MASK);
 		return 0;

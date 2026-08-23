@@ -494,6 +494,32 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_YUVP_NR_Y_UV_REG		(BECORE_YUVP_NR_BASE + 0x284)
 #define BECORE_YUVP_NR_SLOPE_UV_REG	(BECORE_YUVP_NR_BASE + 0x2a4)
 #define BECORE_YUVP_NR_SHIFT_UV_REG	(BECORE_YUVP_NR_BASE + 0x2b4)
+/*
+ * The luma-gain curve's x grid: 32 knots, 0, 128, 256 ... 3840, 4096.
+ *
+ * `luma_gain_x` is a tuning field like any other -- it lives in the shipped
+ * `YuvNrStaticParam` and is not interpolated -- so what makes it stateable is
+ * that it does not move, on three independent counts: it is bit-identical in
+ * all thirty shipped tuning files, bit-identical in all 426 captured programs
+ * on three cameras, and equal to the value `SetDefaultTuningCommon` compiles
+ * in.
+ *
+ * All three are needed. The compiled-in default alone proves nothing: the
+ * field beside it in the same message, `std_lut_x`, is filled by that same
+ * function and then overridden by most of the shipped tunings, which carry
+ * five different noise-curve axes between them.
+ */
+#define BECORE_YUVP_NR_LUMA_GRID_FIRST	(BECORE_YUVP_NR_BASE + 0x524)
+#define BECORE_YUVP_NR_LUMA_GRID_LAST	(BECORE_YUVP_NR_BASE + 0x560)
+#define BECORE_NR_LUMA_GRID_KNOTS	32
+#define BECORE_NR_LUMA_GRID_STEP	128
+#define BECORE_NR_LUMA_GRID_FULL_SCALE	4096
+#define BECORE_NR_LUMA_GRID_PER_REG	2
+
+static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
+	       BECORE_YUVP_NR_LUMA_GRID_FIRST) / 4 + 1 ==
+	      BECORE_NR_LUMA_GRID_KNOTS / BECORE_NR_LUMA_GRID_PER_REG);
+
 #define BECORE_NOISE_KNOTS		8
 #define BECORE_NOISE_TABLE_REGS		(BECORE_NOISE_KNOTS / 2)
 #define BECORE_NOISE_TABLE_LAST		((BECORE_NOISE_TABLE_REGS - 1) * 4)
@@ -1520,6 +1546,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
 	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
+	BECORE_GEN_NR_LUMA_GRID,	/* its luma-gain curve's knot grid */
 	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
@@ -1558,7 +1585,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1217
+#define BECORE_YUVP_GENERATED_WORDS	1233
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1678,6 +1705,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
 	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_YUVP_NR_LUMA_GRID_FIRST, BECORE_YUVP_NR_LUMA_GRID_LAST,
+	  BECORE_GEN_NR_LUMA_GRID },
 	{ BECORE_YUVP_PHYS_BASE + 0x3208, BECORE_YUVP_PHYS_BASE + 0x3208,
 	  BECORE_GEN_NR_DEFAULT },	/* low_power_en */
 	{ BECORE_YUVP_PHYS_BASE + 0x32d0, BECORE_YUVP_PHYS_BASE + 0x32d0,
@@ -5101,6 +5130,53 @@ static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
 	return total;
 }
 
+/*
+ * One knot of `YUVNR`'s luma-gain x grid, by index, called only with 0..31.
+ *
+ * The last one is not a knot but the *width of the last interval*, which is
+ * the same thing `GAMMARGB`'s `X_PNTS_TBL` does and for the same reason: the
+ * final knot is 4096 and the field is twelve bits, so what fits is
+ * 4096 - 3840 = 256. The layout differs -- `GAMMARGB` gives the width a
+ * register of its own where this packs it in the last pair's high half -- so
+ * it is the convention that carries over, not the arrangement.
+ */
+static u32 becore_nr_luma_grid_knot(u32 knot)
+{
+	if (knot < BECORE_NR_LUMA_GRID_KNOTS - 1)
+		return knot * BECORE_NR_LUMA_GRID_STEP;
+
+	return BECORE_NR_LUMA_GRID_FULL_SCALE -
+	       (BECORE_NR_LUMA_GRID_KNOTS - 2) * BECORE_NR_LUMA_GRID_STEP;
+}
+
+/*
+ * One register of that grid: two knots, the lower-numbered one in the low
+ * half.
+ *
+ * The curve sampled on the grid is a different thing and stays in the recipe:
+ * `luma_gain_y` is a repeated float in the block's *dynamic* parameters, and
+ * fifteen of its sixteen registers move frame to frame in the captures --
+ * the sixteenth holds the curve's first two entries, which happen never to.
+ */
+
+static int becore_yuvp_nr_luma_grid(u32 offset, u32 *value)
+{
+	u32 index;
+
+	if (offset & 3 ||
+	    offset < BECORE_YUVP_NR_LUMA_GRID_FIRST - BECORE_YUVP_PHYS_BASE ||
+	    offset > BECORE_YUVP_NR_LUMA_GRID_LAST - BECORE_YUVP_PHYS_BASE)
+		return -EINVAL;
+
+	index = (offset - (BECORE_YUVP_NR_LUMA_GRID_FIRST -
+			   BECORE_YUVP_PHYS_BASE)) / 4 *
+		BECORE_NR_LUMA_GRID_PER_REG;
+	*value = becore_nr_luma_grid_knot(index) |
+		 becore_nr_luma_grid_knot(index + 1) << 16;
+
+	return 0;
+}
+
 /* One of YUVNR's fixed-output words, by offset from YUVP's base. */
 static int becore_yuvp_nr_default(u32 offset, u32 *value)
 {
@@ -6249,6 +6325,12 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_NR_DEFAULT:
 			if (becore_yuvp_nr_default(reg - BECORE_YUVP_PHYS_BASE,
 						   &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_NR_LUMA_GRID:
+			if (becore_yuvp_nr_luma_grid(reg -
+						     BECORE_YUVP_PHYS_BASE,
+						     &result))
 				return -EINVAL;
 			break;
 		/*

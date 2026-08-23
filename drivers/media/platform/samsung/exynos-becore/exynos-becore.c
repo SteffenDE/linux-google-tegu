@@ -853,12 +853,22 @@ static_assert((BECORE_YUVP_INVCCM33_LAST - BECORE_YUVP_INVCCM33_FIRST) / 4 +
 	      1 == BECORE_INVCCM33_COEFFICIENTS);
 
 /*
- * DIABLO_CCM's gate and the three offsets after its matrix.  The nine
- * coefficients between them are the live AWB matrix -- one payload per frame,
- * and per-frame in the invariance census -- so they stay in the recipe.  These
- * four do not move: ApplyDefaults clears the config's bit 0 and nothing sets
- * it, and the offsets are nominally live (AwbFrameData floats 9..11) but zero
- * in every captured program.
+ * DIABLO_CCM: a gate, nine coefficients and three offsets.
+ *
+ * The nine are the live AWB matrix -- one payload per frame, and per-frame in
+ * the invariance census -- so under ADR 0009 the kernel writes an identity and
+ * a parameters block carries the real one.  Row-major, each row summing to
+ * %EXYNOS_BECORE_CCM_ONE, which the captured matrix does on all three rows.
+ *
+ * The identity is load-bearing rather than decorative, and that is measured
+ * rather than assumed: the config's bit 0 is clear in every captured program
+ * and ApplyDefaults never sets it, which reads like a disabled block -- but
+ * zeroing the nine coefficients through the debugfs override changes the
+ * picture, so the block runs whatever that bit means.  Writing nothing here
+ * would leave nine zeros in a live stage.
+ *
+ * The gate and the offsets do not move: the offsets are nominally live
+ * (AwbFrameData floats 9..11) but zero in every captured program.
  */
 #define BECORE_YUVP_CCM_BASE		(BECORE_YUVP_PHYS_BASE + 0x7a00)
 #define BECORE_YUVP_CCM_CONFIG_REG	(BECORE_YUVP_CCM_BASE + 0x000)
@@ -1401,7 +1411,7 @@ enum becore_generated_kind {
 	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
 	BECORE_GEN_CLUT,	/* the colour LUT's gate and its YUV-to-RGB matrix */
 	BECORE_GEN_INVCCM33,	/* the inverse colour matrix, an exact identity */
-	BECORE_GEN_CCM,		/* the colour matrix's gate and its zero offsets */
+	BECORE_GEN_CCM,		/* the colour matrix's gate, identity and offsets */
 	BECORE_GEN_CHAIN_SIZE,	/* a raster size, from the output profile */
 	BECORE_GEN_CHAIN_ORIGIN,	/* a chain stage that does not crop */
 	BECORE_GEN_CHAIN_RATIO,	/* a chain stage that does not scale */
@@ -1421,7 +1431,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	790
+#define BECORE_YUVP_GENERATED_WORDS	799
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1585,9 +1595,7 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_YUVP_GAMMA },
 	{ BECORE_YUVP_INVCCM33_FIRST, BECORE_YUVP_INVCCM33_LAST,
 	  BECORE_GEN_INVCCM33 },
-	{ BECORE_YUVP_CCM_CONFIG_REG, BECORE_YUVP_CCM_CONFIG_REG,
-	  BECORE_GEN_CCM },
-	{ BECORE_YUVP_CCM_OFFSET_FIRST, BECORE_YUVP_CCM_OFFSET_LAST,
+	{ BECORE_YUVP_CCM_CONFIG_REG, BECORE_YUVP_CCM_OFFSET_LAST,
 	  BECORE_GEN_CCM },
 	{ BECORE_YUVP_CLUT_BYPASS_REG, BECORE_YUVP_CLUT_EN_CONFIG_REG,
 	  BECORE_GEN_CLUT },
@@ -3592,16 +3600,30 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 }
 
 /*
- * DIABLO_CCM's gate and its three offsets, by offset from the block's base.
+ * DIABLO_CCM's gate, its nine coefficients and its three offsets, by offset
+ * from the block's base.
  *
- * All four are zero, but say which four: a mis-stated range in the table above
- * would otherwise be answered rather than refused, and the generator that has
- * to agree with this refuses it.
+ * Say which registers rather than answering for the whole block: a mis-stated
+ * range in the table above would otherwise be answered rather than refused,
+ * and the generator that has to agree with this refuses it.
  */
 static int becore_yuvp_ccm_value(u32 offset, u32 *value)
 {
-	if (offset != 0x000 && (offset < 0x028 || offset > 0x030 ||
-				offset & 3))
+	u32 index;
+
+	if (offset & 3)
+		return -EINVAL;
+
+	if (offset >= BECORE_YUVP_CCM_MATRIX_FIRST - BECORE_YUVP_CCM_BASE &&
+	    offset <= BECORE_YUVP_CCM_MATRIX_LAST - BECORE_YUVP_CCM_BASE) {
+		index = (offset - (BECORE_YUVP_CCM_MATRIX_FIRST -
+				   BECORE_YUVP_CCM_BASE)) / 4;
+		/* Row-major, so the diagonal is at 0, 4 and 8. */
+		*value = index % 4 ? 0 : EXYNOS_BECORE_CCM_ONE;
+		return 0;
+	}
+
+	if (offset != 0x000 && (offset < 0x028 || offset > 0x030))
 		return -EINVAL;
 
 	*value = 0;

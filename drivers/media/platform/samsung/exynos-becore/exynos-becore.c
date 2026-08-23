@@ -776,9 +776,17 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
  * 49152 shorts, exactly the 96 KiB LTM grid this driver already generates as
  * an identity.
  *
- * So the block runs. Its two curves and its CONFIG words are live per-frame
- * tuning and stay in the recipe; the gate, the luma weights, the grid geometry
- * and the vendor's own identity fills are stated below.
+ * So the block runs. Of its two curves, the guide curve is a parameters block
+ * with an identity ramp under it and the second one stays in the recipe with
+ * the CONFIG words; the gate, the luma weights, the grid geometry and the
+ * vendor's own identity fills are stated below.
+ *
+ * Say what those remaining 82 words are, because it is not what this comment
+ * used to claim: the invariance census over 426 programs and three cameras
+ * finds 65 registers in 0x6020..0x62d8 per-frame and 82 invariant, and 64 of
+ * the 65 are the guide curve. So what is left replayed is a *static profile*,
+ * not live per-frame tuning, and it should retire the way DJAG did rather
+ * than wait for an IPA.
  *
  * Lyric's embedded register descriptors name the whole range rgb_diablo_ltm_*,
  * and that is what fixes where each stated run ends: the gain LUT does not
@@ -992,6 +1000,18 @@ static_assert(BECORE_YUVP_DEGAMMA_TOE_KNOTS < EXYNOS_BECORE_GAMMA_POINTS);
  * vendor's tone-mapping node rather than a tuning table -- driven by the
  * exposure estimate and the front end's bilateral-grid statistics -- which is
  * why it is a parameters block and not something the driver can state.
+ *
+ * The driver's default under it is the identity ramp, and here that is not a
+ * judgement call: with the neutral grid this driver writes, the curve makes no
+ * difference to the picture at all.  Sending the ramp through the parameters
+ * node produces a frame byte-identical to the one the vendor's own captured
+ * curve produces, on the same staged input, and the captured curve is nowhere
+ * near a ramp -- it departs from one by 14162 of 32767 at its furthest.  So
+ * the ramp is measured to be a no-op today rather than argued to be harmless.
+ *
+ * It will stop being a no-op the moment something sends a real grid, which is
+ * the intended end state: an IPA owns both, and a ramp under a real grid is
+ * a curve that does nothing rather than a curve that does damage.
  */
 #define BECORE_YUVP_LTM_GMAP_FIRST	(BECORE_YUVP_PHYS_BASE + 0x6020)
 #define BECORE_YUVP_LTM_GMAP_LAST	(BECORE_YUVP_PHYS_BASE + 0x611c)
@@ -1431,7 +1451,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	799
+#define BECORE_YUVP_GENERATED_WORDS	863
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1564,6 +1584,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_LUMA_FIRST, BECORE_YUVP_LTM_LUMA_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_GMAP_FIRST, BECORE_YUVP_LTM_GMAP_LAST,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_GRID_FIRST, BECORE_YUVP_LTM_GRID_LAST,
 	  BECORE_GEN_LTM },
@@ -3499,10 +3521,11 @@ static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
 /*
  * YUVP local tone mapping, by offset from BECORE_YUVP_LTM_BASE. What the block
  * is for, rather than what one scene wanted from it: it forms a guide luma
- * from RGB, looks that up in a tone curve and applies a spatial gain grid. The
- * curve and the CONFIG words are the tuning and stay in the recipe; the gate,
- * the luma weights, the grid the frame is divided into and the vendor's own
- * unity fills are all stateable.
+ * from RGB, looks that up in a tone curve and applies a spatial gain grid.
+ * The guide curve comes from a parameters block with the ramp below under it;
+ * the second curve and the CONFIG words stay in the recipe; the gate, the luma
+ * weights, the grid the frame is divided into and the vendor's own unity fills
+ * are all stateable.
  */
 /*
  * How far the block steps through the grid per raster pixel, at Q16.
@@ -3526,6 +3549,13 @@ static int becore_ltm_grid_scale(u32 cells, u32 extent, u32 *scale)
 	*scale = step;
 
 	return 0;
+}
+
+/* Sample n of the guide curve's identity: round(n * ONE / (POINTS - 1)). */
+static u32 becore_ltm_curve_identity(u32 index)
+{
+	return DIV_ROUND_CLOSEST(index * EXYNOS_BECORE_LTM_CURVE_ONE,
+				 EXYNOS_BECORE_LTM_CURVE_POINTS - 1);
 }
 
 static int becore_yuvp_ltm_value(u32 offset, u32 *value)
@@ -3561,6 +3591,30 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 		return 0;
 	case 0x130:				/* SLCGRID_GRID_HEIGHT */
 		*value = BECORE_LTM_SLCGRID_ROWS;
+		return 0;
+	}
+
+	if (offset >= BECORE_YUVP_LTM_GMAP_FIRST - BECORE_YUVP_LTM_BASE &&
+	    offset <= BECORE_YUVP_LTM_GMAP_LAST - BECORE_YUVP_LTM_BASE) {
+		/*
+		 * The identity ramp, two samples to a register with the
+		 * lower-numbered one in the low half.
+		 *
+		 * Rounded to nearest rather than truncated, which is worth
+		 * saying because it is *not* about the endpoint: 127 * 32767
+		 * divides by 127 exactly, so truncation reaches unity too.
+		 * It is about the 63 samples from index 64 up, where the two
+		 * differ by one -- and the identity has to be bit-exact
+		 * against what the parameters path packs, or "send the ramp
+		 * and the frame does not move" stops being a check on this
+		 * default.
+		 */
+		u32 index = (offset - (BECORE_YUVP_LTM_GMAP_FIRST -
+				       BECORE_YUVP_LTM_BASE)) / 4 *
+			    BECORE_LTM_CURVE_PER_REG;
+
+		*value = becore_ltm_curve_identity(index) |
+			 becore_ltm_curve_identity(index + 1) << 16;
 		return 0;
 	}
 
@@ -7530,6 +7584,13 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 	return 0;
 }
 
+/*
+ * The neutral grid, and the reason the guide curve's identity ramp above is a
+ * measured no-op rather than a hopeful one: with every cell at unity gain and
+ * zero bias, the curve has nothing to modulate. The two are written by
+ * different code and coupled only by that fact, so anything that makes this
+ * grid non-neutral makes the ramp a live tone curve in the same breath.
+ */
 static int becore_ltm_grid_generate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *grid = &becore->grid;

@@ -1609,7 +1609,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1339
+#define BECORE_YUVP_GENERATED_WORDS	1342
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1781,12 +1781,16 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NR_DEFAULT },	/* filterweights_param3..filterweights_param4 */
 	BECORE_YUVNR_TUNING_RANGES
 	/*
-	 * The temporal gain curve's slopes, which the generated list above
-	 * cannot carry because they are not field deposits.  They describe
-	 * `mcfp_gain_lut_y`, and that *is* in the list -- so leaving these
-	 * replayed would leave five slopes describing the vendor's curve
-	 * over knots the driver now writes as zero.
+	 * The temporal gain curve, which the generated list above cannot carry
+	 * because neither its knots nor its slopes are field deposits.  The
+	 * knots are `SetTnrLut`'s six, built out of `mcfp_gain_lut_x`'s five
+	 * and a stated 64; the slopes describe `mcfp_gain_lut_y`, and that
+	 * *is* in the list -- so leaving either replayed would leave the
+	 * recipe describing a curve the driver no longer writes.
 	 */
+	{ BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_KNOT_FIRST,
+	  BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_KNOT_FIRST +
+	  (BECORE_YUVNR_TNR_KNOTS / 2 - 1) * 4, BECORE_GEN_YUVNR },
 	{ BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_SLOPE_FIRST,
 	  BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_SLOPE_FIRST +
 	  (BECORE_YUVNR_TNR_KNOTS - 2) * 4, BECORE_GEN_YUVNR },

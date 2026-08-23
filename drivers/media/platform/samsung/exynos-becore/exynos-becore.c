@@ -496,6 +496,19 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_YUVP_NR_SLOPE_UV_REG	(BECORE_YUVP_NR_BASE + 0x2a4)
 #define BECORE_YUVP_NR_SHIFT_UV_REG	(BECORE_YUVP_NR_BASE + 0x2b4)
 /*
+ * The temporal filter's gain curve: six knots two to a register, five slopes
+ * one per register.  Up here with the rest of the block's geography because
+ * the generated-range table names the slopes, and that table is built long
+ * before the arithmetic that reads them.
+ */
+#define BECORE_YUVNR_TNR_KNOTS		EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS
+#define BECORE_YUVNR_TNR_KNOT_FIRST	0x33f8
+#define BECORE_YUVNR_TNR_KNOT_MASK	GENMASK(6, 0)
+#define BECORE_YUVNR_TNR_SLOPE_FIRST	0x340c
+#define BECORE_YUVNR_TNR_SLOPE_MASK	GENMASK(13, 0)
+#define BECORE_YUVNR_TNR_GAIN_MAX	4096
+
+/*
  * The luma-gain curve's x grid: 32 knots, 0, 128, 256 ... 3840, 4096.
  *
  * `luma_gain_x` is a tuning field like any other -- it lives in the shipped
@@ -1555,6 +1568,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
 	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
+	BECORE_GEN_YUVNR,	/* the noise reducer bypassed, its tuning at zero */
 	BECORE_GEN_NR_LUMA_GRID,	/* its luma-gain curve's knot grid */
 	BECORE_GEN_GRID_DMA,	/* the LTM grid RDMA, from our own buffer */
 	BECORE_GEN_YUVP_CHAIN_SIZE,	/* the raster YUVP is handed */
@@ -1596,7 +1610,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1240
+#define BECORE_YUVP_GENERATED_WORDS	1339
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1766,6 +1780,17 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NR_DEFAULT },	/* h_nr_en */
 	{ BECORE_YUVP_PHYS_BASE + 0x3784, BECORE_YUVP_PHYS_BASE + 0x3788,
 	  BECORE_GEN_NR_DEFAULT },	/* filterweights_param3..filterweights_param4 */
+	BECORE_YUVNR_TUNING_RANGES
+	/*
+	 * The temporal gain curve's slopes, which the generated list above
+	 * cannot carry because they are not field deposits.  They describe
+	 * `mcfp_gain_lut_y`, and that *is* in the list -- so leaving these
+	 * replayed would leave five slopes describing the vendor's curve
+	 * over knots the driver now writes as zero.
+	 */
+	{ BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_SLOPE_FIRST,
+	  BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_TNR_SLOPE_FIRST +
+	  (BECORE_YUVNR_TNR_KNOTS - 2) * 4, BECORE_GEN_YUVNR },
 	{ BECORE_YUVP_SHARPEN_BYPASS_REG, BECORE_YUVP_SHARPEN_BYPASS_REG,
 	  BECORE_GEN_SHARPEN },
 	BECORE_SHARPEN_TUNING_RANGES
@@ -5576,13 +5601,6 @@ static void becore_yuvnr_last_interval(const struct exynos_becore_params_yuvnr *
  * fail per frame, and `SetTnrSlope`'s quotient truncates toward zero, which is
  * what C division does.
  */
-#define BECORE_YUVNR_TNR_KNOTS		EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS
-#define BECORE_YUVNR_TNR_KNOT_FIRST	0x33f8
-#define BECORE_YUVNR_TNR_KNOT_MASK	GENMASK(6, 0)
-#define BECORE_YUVNR_TNR_SLOPE_FIRST	0x340c
-#define BECORE_YUVNR_TNR_SLOPE_MASK	GENMASK(13, 0)
-#define BECORE_YUVNR_TNR_GAIN_MAX	4096
-
 static s32 becore_yuvnr_tnr_dx[BECORE_YUVNR_TNR_KNOTS - 1];
 static bool becore_yuvnr_tnr_ready;
 
@@ -5682,6 +5700,20 @@ static int becore_yuvnr_value(const struct exynos_becore_params_yuvnr *params,
 }
 
 /*
+ * The tuning a stream with no parameters buffer runs on: nothing.  Every field
+ * is zero, and the block's own inverted bypass turns that into the noise
+ * reducer switched off, which is what the sharpener's default does too.
+ *
+ * Running the encode over a zeroed block rather than taking each entry's
+ * constant -- which is how the sharpener produces its default -- is not a
+ * stylistic difference.  This block has a field whose zero is *not* the
+ * constant's: `enable` inverts, so the default has to go through the same
+ * arithmetic a buffer does, and a default that read the constants would leave
+ * the noise reducer running with no tuning at all.
+ */
+static const struct exynos_becore_params_yuvnr becore_yuvnr_off;
+
+/*
  * What this block writes from outside the generated field table: bits ORed
  * into a register the table also writes, and whole registers the table does
  * not write at all.  Naming them is what puts them under the overlap check
@@ -5725,8 +5757,14 @@ static int becore_yuvnr_table_validate(struct device *dev)
 				return dev_err_probe(dev, -EINVAL,
 						     "noise reducer +%#06x field %u does not fit\n",
 						     entry->offset, j);
-			if (field->max >= (s32)BIT(field->width) ||
-			    field->min < -(s32)BIT(field->width - 1))
+			/*
+			 * Widened, because `(s32)BIT(31)` is `INT_MIN` and
+			 * would make this test pass for anything.  A 31-bit
+			 * field is legal and the table has no reason never to
+			 * grow one.
+			 */
+			if (field->max >= (s64)BIT_ULL(field->width) ||
+			    field->min < -(s64)BIT_ULL(field->width - 1))
 				return dev_err_probe(dev, -EINVAL,
 						     "noise reducer +%#06x field %u has limits wider than itself\n",
 						     entry->offset, j);
@@ -5854,8 +5892,9 @@ static int becore_sharpen_table_validate(struct device *dev)
 				return dev_err_probe(dev, -EINVAL,
 						     "sharpener +%#06x field %u does not fit\n",
 						     entry->offset, j);
-			if (field->max >= (s32)BIT(field->width) ||
-			    field->min < -(s32)BIT(field->width - 1))
+			/* Widened for the same reason as the noise reducer's. */
+			if (field->max >= (s64)BIT_ULL(field->width) ||
+			    field->min < -(s64)BIT_ULL(field->width - 1))
 				return dev_err_probe(dev, -EINVAL,
 						     "sharpener +%#06x field %u has limits wider than itself\n",
 						     entry->offset, j);
@@ -6874,6 +6913,19 @@ static int becore_generated_value(const struct becore_device *becore,
 				break;
 			}
 			if (becore_sharpen_value(NULL, reg, &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_YUVNR:
+			/*
+			 * The same pair the per-frame path uses, so the
+			 * default and a buffer of zeros cannot diverge: the
+			 * field table first, then the one derivation whose
+			 * registers the table does not hold.
+			 */
+			if (becore_yuvnr_value(&becore_yuvnr_off, reg,
+					       &result) &&
+			    becore_yuvnr_tnr_slope(&becore_yuvnr_off, reg,
+						   &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_LPF:

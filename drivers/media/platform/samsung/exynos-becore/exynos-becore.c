@@ -359,7 +359,7 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
  * each because 18 bits do not fit beside anything.
  */
 /*
- * Three RGBP blocks and one YUVP register whose values are named constants
+ * Three RGBP blocks and seven YUVP registers whose values are named constants
  * rather than anyone's tuning.
  *
  * RGB_RGBTOYUV is BT.601 at Q13, full range rather than studio, and it is
@@ -388,6 +388,19 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
  * property of these three constants and not of the kernels. Deriving the sums
  * from the tap registers would make it a real check, and would want them out
  * of the recipe first.
+ *
+ * SHARPENHANCER's ten noise seeds are not tuning either, and they are the one
+ * thing in the block that a capture cannot be replayed for: the vendor redraws
+ * them every frame, so the recipe was carrying one frame's dice. They are the
+ * same kind of object as MCSC's DJAG LFSR seeds, which this driver already
+ * writes as constants.
+ *
+ * The value is the vendor's own. lyric::TranslateYuvSharpEnhancer writes these
+ * seeds as immediates -- 11111 times 1 to 5, with the second generator's five
+ * starting one step along -- and that is what reaches the hardware whenever
+ * nothing has redrawn them yet: five of the 426 captured programs carry
+ * exactly this tuple. So this is Lyric's compiled-in seed and not a constant
+ * of our choosing.
  */
 /*
  * Two blocks whose captured words are literal constants rather than a scene.
@@ -646,6 +659,15 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
 #define BECORE_RGBP_CHROMA_LPF_LAST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x0c)
 #define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
+/*
+ * Ten 16-bit seeds over six registers: SEED0_0..2 then SEED1_0..2, packed two
+ * to a register, so the third register of each group carries one seed and a
+ * reserved half.
+ */
+#define BECORE_YUVP_NOISE_SEED_FIRST	(BECORE_YUVP_PHYS_BASE + 0x5610)
+#define BECORE_YUVP_NOISE_SEED_LAST	(BECORE_YUVP_PHYS_BASE + 0x5624)
+#define BECORE_YUVP_NOISE_SEEDS		5
+#define BECORE_YUVP_NOISE_SEED_STEP	11111
 /*
  * RGBP's forward gamma is not a tuning curve: at all 65 of its knots the
  * captured output is round(sqrt(x) * 4096) on a 0..4096 input, an exact
@@ -1340,6 +1362,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
+	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
 	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
 	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
 	BECORE_GEN_NOISE_DOMAIN,	/* a chroma domain repeating the luma one */
@@ -1370,7 +1393,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	646
+#define BECORE_YUVP_GENERATED_WORDS	652
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1492,6 +1515,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SHIFT },
 	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
 	  BECORE_GEN_LPF_NORM },
+	{ BECORE_YUVP_NOISE_SEED_FIRST, BECORE_YUVP_NOISE_SEED_LAST,
+	  BECORE_GEN_NOISE_SEED },
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_LUMA_FIRST, BECORE_YUVP_LTM_LUMA_LAST,
@@ -4337,6 +4362,37 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 	return -EINVAL;
 }
 
+/*
+ * Seed n of generator g is 11111 * ((g + n) mod 5 + 1), truncated to 16 bits,
+ * and the pair sharing a register is (2w, 2w + 1) of that generator's five.
+ */
+static int becore_yuvp_noise_seed_value(u32 offset, u32 *value)
+{
+	u32 generator, word, half, packed = 0;
+
+	if (offset > BECORE_YUVP_NOISE_SEED_LAST - BECORE_YUVP_NOISE_SEED_FIRST ||
+	    offset % sizeof(u32))
+		return -EINVAL;
+
+	generator = offset / sizeof(u32) / 3;
+	word = offset / sizeof(u32) % 3;
+
+	for (half = 0; half < 2; half++) {
+		u32 index = word * 2 + half;
+		u32 step;
+
+		if (index >= BECORE_YUVP_NOISE_SEEDS)
+			break;	/* the third register's high half is reserved */
+
+		step = (generator + index) % BECORE_YUVP_NOISE_SEEDS + 1;
+		packed |= (BECORE_YUVP_NOISE_SEED_STEP * step & 0xffff) <<
+			  (16 * half);
+	}
+	*value = packed;
+
+	return 0;
+}
+
 /* log2 of each kernel's sum, packed at bits 0, 8 and 16. */
 static int becore_yuvp_lpf_norm_value(u32 *value)
 {
@@ -5262,6 +5318,11 @@ static int becore_generated_value(const struct becore_device *becore,
 		}
 		case BECORE_GEN_LPF_NORM:
 			if (becore_yuvp_lpf_norm_value(&result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_NOISE_SEED:
+			if (becore_yuvp_noise_seed_value(
+				    reg - BECORE_YUVP_NOISE_SEED_FIRST, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_GAMMA:

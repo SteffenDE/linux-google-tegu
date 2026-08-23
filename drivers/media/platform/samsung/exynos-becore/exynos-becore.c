@@ -1624,7 +1624,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1344
+#define BECORE_YUVP_GENERATED_WORDS	1345
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -5820,6 +5820,35 @@ static int becore_yuvnr_tnr_slope(const struct exynos_becore_params_yuvnr *param
 	return 0;
 }
 
+/*
+ * The bits the low-frequency stage's own branch deposits.
+ *
+ * `TranslateYuvNrCommon` writes three words from a two-armed branch, and the
+ * arm it takes is the one where @enable and @lfnr_enable are **both** set -- so
+ * each of these bits stands for the two of them together and cannot be a field
+ * of either. The generated table strips them out of those registers'
+ * constants, because a constant there would be the enabled arm's answer and
+ * every captured program has both enables on: nothing in the corpus could tell
+ * the two apart, which is exactly why the branch had to be read.
+ */
+static void
+becore_yuvnr_guarded_bits(const struct exynos_becore_params_yuvnr *params,
+			  u32 offset, u32 *word)
+{
+	static const struct becore_yuvnr_guarded guarded[] =
+		BECORE_YUVNR_GUARDED;
+	bool off = params->enable <= 0 || params->lfnr_enable <= 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(guarded); i++) {
+		if (guarded[i].offset != offset)
+			continue;
+		if (off == guarded[i].when_off)
+			*word |= guarded[i].mask;
+		return;
+	}
+}
+
 static int becore_yuvnr_value(const struct exynos_becore_params_yuvnr *params,
 			      u32 reg, u32 *value)
 {
@@ -5851,6 +5880,8 @@ static int becore_yuvnr_value(const struct exynos_becore_params_yuvnr *params,
 	if (entry->offset == BECORE_YUVNR_LUMA_GAIN_LAST ||
 	    entry->offset == BECORE_YUVNR_LUMA_GAIN_CONFIG)
 		becore_yuvnr_last_interval(params, entry->offset, &word);
+
+	becore_yuvnr_guarded_bits(params, entry->offset, &word);
 
 	*value = word;
 
@@ -5891,6 +5922,8 @@ static const struct becore_regval becore_yuvnr_derived_bits[] = {
  */
 static int becore_yuvnr_table_validate(struct device *dev)
 {
+	static const struct becore_yuvnr_guarded guarded[] =
+		BECORE_YUVNR_GUARDED;
 	u32 i, j;
 
 	for (i = 0; i < ARRAY_SIZE(becore_yuvnr_regs); i++) {
@@ -5950,6 +5983,47 @@ static int becore_yuvnr_table_validate(struct device *dev)
 				return dev_err_probe(dev, -EINVAL,
 						     "noise reducer +%#06x collides with what it derives\n",
 						     entry->offset);
+		}
+
+		/*
+		 * The same for the branch's own bits: a field over one of them
+		 * would mean the generator had decoded the branch after all,
+		 * and the two answers would fight in the register.
+		 */
+		for (j = 0; j < ARRAY_SIZE(guarded); j++) {
+			if (guarded[j].offset != entry->offset)
+				continue;
+			if (used & guarded[j].mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x collides with its own branch\n",
+						     entry->offset);
+		}
+	}
+
+	/*
+	 * And each guarded deposit needs a register in the table to land in,
+	 * for the same reason the derived bits do: becore_yuvnr_value() only
+	 * reaches them for a register it found.  It must also stay clear of
+	 * what the derived bits claim -- the two depositors are checked
+	 * against the field table but not against each other, and the order
+	 * makes that worse in one direction: becore_yuvnr_last_interval()
+	 * runs first and *reads* bit 0 of `luma_gain_config`, so a branch bit
+	 * landing there would change an answer rather than only OR into it.
+	 */
+	for (i = 0; i < ARRAY_SIZE(guarded); i++) {
+		if (!becore_yuvnr_lookup(BECORE_YUVP_PHYS_BASE +
+					 guarded[i].offset))
+			return dev_err_probe(dev, -EINVAL,
+					     "noise reducer +%#06x deposits a branch bit into a register it does not write\n",
+					     guarded[i].offset);
+		for (j = 0; j < ARRAY_SIZE(becore_yuvnr_derived_bits); j++) {
+			if (becore_yuvnr_derived_bits[j].offset !=
+			    guarded[i].offset)
+				continue;
+			if (becore_yuvnr_derived_bits[j].value & guarded[i].mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x has a branch bit over what it derives\n",
+						     guarded[i].offset);
 		}
 	}
 

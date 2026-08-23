@@ -787,17 +787,16 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
  * 49152 shorts, exactly the 96 KiB LTM grid this driver already generates as
  * an identity.
  *
- * So the block runs. Of its two curves, the guide curve is a parameters block
- * with an identity ramp under it and the second one stays in the recipe with
- * the CONFIG words; the gate, the luma weights, the grid geometry and the
- * vendor's own identity fills are stated below.
+ * So the block runs, and all 414 of its registers are now stated here: nothing
+ * of it is left in the recipe. Of its two curves the guide curve is a
+ * parameters block, with the identity ramp below under it, and the tone-adjust
+ * curve is the vendor's own sampled S-curve.
  *
- * Say what those remaining 82 words are, because it is not what this comment
- * used to claim: the invariance census over 426 programs and three cameras
- * finds 65 registers in 0x6020..0x62d8 per-frame and 82 invariant, and 64 of
- * the 65 are the guide curve. So what is left replayed is a *static profile*,
- * not live per-frame tuning, and it should retire the way DJAG did rather
- * than wait for an IPA.
+ * That the second curve and the CONFIG words could be stated at all is an
+ * invariance result rather than a decode: over 426 programs, three cameras and
+ * eighteen sessions the block has exactly 65 per-frame registers and 64 of
+ * them are the guide curve. What looked like live per-frame tuning is a static
+ * profile, and it retires the way DJAG did rather than waiting for an IPA.
  *
  * Lyric's embedded register descriptors name the whole range rgb_diablo_ltm_*,
  * and that is what fixes where each stated run ends: the gain LUT does not
@@ -805,16 +804,23 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
  * it runs to 0x66d4, which is where 122 more unity entries put it.
  *
  *   0x6000  ltm_enable                    the block runs
+ *   0x6004  enable_*, lumacalc_*_weight   GetDefaultLtm's literals
  *   0x6014  lumacalc_rgby_coeff_r/g/b     BT.601 luma at Q12
  *   0x6120  slcgrid_*                     9 words, from the image size
+ *   0x61a4  trans_slope_frac_bit, _bias   from the grid this driver writes
+ *   0x61ac  trans_scale_lut_00..08        17 entries, two to a register
+ *   0x61d0  toneadj_use_output_luma       set
+ *   0x61d4  toneadj_lut_000..064          the shipped S-curve, 129 samples
+ *   0x62d8  crecon_input_luma_thres       zero: a threshold, not a fill
  *   0x62dc  crecon_satctrl_lut            258 entries, all zero
  *   0x64e0  crecon_luma_lut               130 entries of unity Q8
  *   0x65e4  crecon_gain_lut               122 entries of unity Q8
  *
- * GetDefaultLtm fills the luma and gain LUTs with 0x0100 and clears the
- * saturation LUT, so the two identity fills are the vendor's own and not an
- * artefact of the scene this was captured from -- and neither differs between
- * the rear and front cameras, where the four grid steps do.
+ * GetDefaultLtm fills the luma and gain LUTs with 0x0100, clears the
+ * saturation LUT and holds the enables and luma weights above, so all of that
+ * is the vendor's own compiled-in default and not an artefact of the scene
+ * this was captured from -- and none of it differs between the rear and front
+ * cameras, where the four grid steps do.
  */
 #define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
 #define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)
@@ -824,6 +830,13 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
 #define BECORE_YUVP_LTM_LUMA_LAST	(BECORE_YUVP_LTM_BASE + 0x01c)
 #define BECORE_YUVP_LTM_GRID_FIRST	(BECORE_YUVP_LTM_BASE + 0x120)
 #define BECORE_YUVP_LTM_GRID_LAST	(BECORE_YUVP_LTM_BASE + 0x140)
+#define BECORE_YUVP_LTM_CONFIG_FIRST	(BECORE_YUVP_LTM_BASE + 0x004)
+#define BECORE_YUVP_LTM_CONFIG_LAST	(BECORE_YUVP_LTM_BASE + 0x010)
+#define BECORE_YUVP_LTM_TRANS_FIRST	(BECORE_YUVP_LTM_BASE + 0x1a4)
+#define BECORE_YUVP_LTM_TRANS_LAST	(BECORE_YUVP_LTM_BASE + 0x1d0)
+#define BECORE_YUVP_LTM_TONEADJ_FIRST	(BECORE_YUVP_LTM_BASE + 0x1d4)
+#define BECORE_YUVP_LTM_TONEADJ_LAST	(BECORE_YUVP_LTM_BASE + 0x2d4)
+#define BECORE_YUVP_LTM_LUMA_THRES_REG	(BECORE_YUVP_LTM_BASE + 0x2d8)
 #define BECORE_YUVP_LTM_SATCTRL_FIRST	(BECORE_YUVP_LTM_BASE + 0x2dc)
 #define BECORE_YUVP_LTM_SATCTRL_LAST	(BECORE_YUVP_LTM_BASE + 0x4dc)
 #define BECORE_YUVP_LTM_UNITY_FIRST	(BECORE_YUVP_LTM_BASE + 0x4e0)
@@ -1030,6 +1043,82 @@ static_assert(BECORE_YUVP_DEGAMMA_TOE_KNOTS < EXYNOS_BECORE_GAMMA_POINTS);
 
 static_assert((BECORE_YUVP_LTM_GMAP_LAST - BECORE_YUVP_LTM_GMAP_FIRST) / 4 +
 	      1 == EXYNOS_BECORE_LTM_CURVE_POINTS / BECORE_LTM_CURVE_PER_REG);
+
+/*
+ * The block's second curve, and the one register file in it this driver states
+ * rather than works out.
+ *
+ * It is the shipped apcamera.SCurve -- midpoint 0.1864, slope_midpoint 1.158,
+ * relative_highlight_compression 1.0, relative_shadow_crushing 0.95 -- sampled
+ * at 129 points and quantised the way TranslateLtmToneAdjust does, as
+ * clamp(round(y * 16384), 0, 16384). What is missing is the evaluator: the
+ * function that turns those four numbers into 129 floats is in none of the
+ * extracted vendor libraries, so the curve is carried as its samples. The
+ * numbers themselves are not in doubt -- they are bit-identical in all 426
+ * captured programs, on all three cameras and at every one of the eighteen
+ * captured readouts, so this is one fixed vendor profile and not a per-lens
+ * calibration or a per-frame policy.
+ *
+ * Two curve properties are worth recording, because they are what a future
+ * closed form has to reproduce: the curve is its own fixed point at the
+ * midpoint, y(0.1864) = 0.18641, and its slope there is 1.156 against the
+ * tuning's 1.158.
+ */
+#define BECORE_LTM_TONEADJ_ENTRIES	129
+#define BECORE_LTM_TONEADJ_PER_REG	2
+
+static const u16 becore_ltm_toneadj[BECORE_LTM_TONEADJ_ENTRIES] = {
+	    0,    31,    98,   188,   291,   405,   526,   652,
+	  782,   916,  1052,  1190,  1330,  1471,  1613,  1757,
+	 1901,  2046,  2192,  2338,  2484,  2631,  2779,  2927,
+	 3075,  3223,  3370,  3517,  3664,  3810,  3956,  4102,
+	 4247,  4391,  4536,  4679,  4823,  4966,  5108,  5251,
+	 5392,  5534,  5675,  5815,  5955,  6095,  6235,  6374,
+	 6512,  6650,  6788,  6925,  7062,  7199,  7335,  7471,
+	 7606,  7741,  7876,  8010,  8144,  8278,  8411,  8543,
+	 8676,  8808,  8939,  9070,  9201,  9331,  9462,  9591,
+	 9720,  9849,  9978, 10106, 10234, 10361, 10488, 10615,
+	10741, 10867, 10993, 11118, 11243, 11367, 11491, 11615,
+	11738, 11861, 11984, 12106, 12228, 12350, 12471, 12592,
+	12712, 12832, 12952, 13072, 13191, 13309, 13428, 13546,
+	13663, 13781, 13898, 14014, 14131, 14246, 14362, 14477,
+	14592, 14707, 14821, 14935, 15048, 15161, 15274, 15387,
+	15499, 15611, 15722, 15833, 15944, 16055, 16165, 16275,
+	16384,
+};
+
+/*
+ * 129 samples over 65 registers, so the last register's high half is padding
+ * and not a 130th entry: TranslateLtmToneAdjust writes kToneAdjustLutEntryCnt
+ * shorts and stops.
+ */
+static_assert((BECORE_YUVP_LTM_TONEADJ_LAST -
+	       BECORE_YUVP_LTM_TONEADJ_FIRST) / 4 + 1 ==
+	      DIV_ROUND_UP(BECORE_LTM_TONEADJ_ENTRIES,
+			   BECORE_LTM_TONEADJ_PER_REG));
+
+/*
+ * How the block is told to read the affine grid's slope and bias fields.
+ * TranslateLtm takes the largest slope and the largest bias over the grid it
+ * is about to write, raises both to at least 1.0, and then:
+ *
+ *   frac_bit    = ((int)slope) >> 14 ? 1 : (clz32((int)slope) - 1) & 0xf
+ *   bias_adjust = (int)bias < 16 ? ~min(clz32((int)bias), 31) & 3 : 3
+ *
+ * becore_ltm_grid_generate() writes unity gain and zero bias in every cell, so
+ * for this driver's own grid they are 14 and 0.
+ *
+ * That is a derivation and not a replay, and the captures show why it has to
+ * be: 401 of the 426 hold 14, and the other 25 are frames whose grid ran past
+ * unity gain. A driver that copied one program's word would be wrong the
+ * moment its grid stopped being neutral -- which is the thing to remember if
+ * a parameters block ever carries a grid: these two are constants only for as
+ * long as the grid beside them is, and nothing couples them automatically.
+ */
+#define BECORE_LTM_TRANS_SLOPE_FRAC_BIT	14
+#define BECORE_LTM_TRANS_BIAS_BIT_ADJUST 0
+/* The luma is all gray weight and no lightness weight, Q8. */
+#define BECORE_LTM_LUMACALC_GRAY_Q8	256
 
 /*
  * The colour LUT above 0x7b00, which Lyric's descriptors call
@@ -1441,7 +1530,10 @@ enum becore_generated_kind {
 	BECORE_GEN_SCALER_PHASE,	/* a scaler starting on a pixel, rounding */
 	BECORE_GEN_MCSC_INPUT_SIZE,	/* the raster MCSC reads, from YUVP */
 	BECORE_GEN_GTM,		/* RGBP's tone map, an identity */
-	BECORE_GEN_LTM,		/* YUVP's tone mapping: gate, luma, grid, identity */
+	BECORE_GEN_LTM,		/* YUVP's tone mapping, all of it bar the guide
+				 * curve: gates, luma, grid, the fields that
+				 * describe it, identity fills, tone-adjust
+				 */
 	BECORE_GEN_CLUT_1DLUT,	/* the colour LUT's per-channel input identity */
 	BECORE_GEN_CLUT,	/* the colour LUT's gate and its YUV-to-RGB matrix */
 	BECORE_GEN_INVCCM33,	/* the inverse colour matrix, an exact identity */
@@ -1465,7 +1557,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1112
+#define BECORE_YUVP_GENERATED_WORDS	1194
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1660,11 +1752,19 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SEED },
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_CONFIG_FIRST, BECORE_YUVP_LTM_CONFIG_LAST,
+	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_LUMA_FIRST, BECORE_YUVP_LTM_LUMA_LAST,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_GMAP_FIRST, BECORE_YUVP_LTM_GMAP_LAST,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_GRID_FIRST, BECORE_YUVP_LTM_GRID_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_TRANS_FIRST, BECORE_YUVP_LTM_TRANS_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_TONEADJ_FIRST, BECORE_YUVP_LTM_TONEADJ_LAST,
+	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_LTM_LUMA_THRES_REG, BECORE_YUVP_LTM_LUMA_THRES_REG,
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_SATCTRL_FIRST, BECORE_YUVP_LTM_SATCTRL_LAST,
 	  BECORE_GEN_LTM },
@@ -3602,9 +3702,10 @@ static int becore_rgbp_gtm_knot(u32 index, u32 *knot)
  * is for, rather than what one scene wanted from it: it forms a guide luma
  * from RGB, looks that up in a tone curve and applies a spatial gain grid.
  * The guide curve comes from a parameters block with the ramp below under it;
- * the second curve and the CONFIG words stay in the recipe; the gate, the luma
- * weights, the grid the frame is divided into and the vendor's own unity fills
- * are all stateable.
+ * everything else in the block is answered here -- the gate and the enables,
+ * the luma weights, the grid the frame is divided into, the fields that
+ * describe that grid to the block, the vendor's own unity fills, and its
+ * tone-adjust curve.
  */
 /*
  * How far the block steps through the grid per raster pixel, at Q16.
@@ -3649,6 +3750,16 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	case 0x000:				/* LTM_ENABLE: the block runs */
 		*value = 1;
 		return 0;
+	case 0x004:				/* ENABLE_SLICE_AFFINE_GRID */
+	case 0x008:				/* ENABLE_SATURATION_CTRL */
+		*value = 1;
+		return 0;
+	case 0x00c:				/* LUMACALC_LIGHTNESS_WEIGHT */
+		*value = 0;
+		return 0;
+	case 0x010:				/* LUMACALC_GRAY_WEIGHT */
+		*value = BECORE_LTM_LUMACALC_GRAY_Q8;
+		return 0;
 	case 0x014:				/* LUMACALC_RGBY_COEFF_R */
 		*value = BECORE_LTM_LUMA_Q12_R;
 		return 0;
@@ -3670,6 +3781,31 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 		return 0;
 	case 0x130:				/* SLCGRID_GRID_HEIGHT */
 		*value = BECORE_LTM_SLCGRID_ROWS;
+		return 0;
+	case 0x1a4:				/* TRANS_SLOPE_FRAC_BIT */
+		*value = BECORE_LTM_TRANS_SLOPE_FRAC_BIT;
+		return 0;
+	case 0x1a8:				/* TRANS_BIAS_BIT_ADJUST */
+		*value = BECORE_LTM_TRANS_BIAS_BIT_ADJUST;
+		return 0;
+	case 0x1d0:				/* TONEADJ_USE_OUTPUT_LUMA */
+		*value = 1;
+		return 0;
+	case 0x2d8:				/* CRECON_INPUT_LUMA_THRES */
+		*value = 0;
+		return 0;
+	}
+
+	if (offset >= 0x1ac && offset <= 0x1cc) {
+		/*
+		 * TRANS_SCALE_LUT_00..08: seventeen entries two to a register,
+		 * which the translator fills with
+		 * clamp(round(min_output_scale_lut[i] * 128), 0, 65535) over a
+		 * shipped tuning whose LUT is seventeen zeros on all three
+		 * cameras. The ninth register's high half is padding, as the
+		 * tone-adjust curve's last one is.
+		 */
+		*value = 0;
 		return 0;
 	}
 
@@ -3694,6 +3830,23 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 
 		*value = becore_ltm_curve_identity(index) |
 			 becore_ltm_curve_identity(index + 1) << 16;
+		return 0;
+	}
+
+	if (offset >= BECORE_YUVP_LTM_TONEADJ_FIRST - BECORE_YUVP_LTM_BASE &&
+	    offset <= BECORE_YUVP_LTM_TONEADJ_LAST - BECORE_YUVP_LTM_BASE) {
+		/*
+		 * The tone-adjust curve, two Q14 samples to a register with
+		 * the lower-numbered one in the low half. The odd sample count
+		 * leaves the last high half zero.
+		 */
+		u32 index = (offset - (BECORE_YUVP_LTM_TONEADJ_FIRST -
+				       BECORE_YUVP_LTM_BASE)) / 4 *
+			    BECORE_LTM_TONEADJ_PER_REG;
+
+		*value = becore_ltm_toneadj[index];
+		if (index + 1 < BECORE_LTM_TONEADJ_ENTRIES)
+			*value |= (u32)becore_ltm_toneadj[index + 1] << 16;
 		return 0;
 	}
 

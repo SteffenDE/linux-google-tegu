@@ -462,9 +462,12 @@ struct exynos_becore_sharpen_strength {
  * a two-dimensional tuning tree indexed by **analog gain** and **exposure
  * ratio** -- so this block is per-frame in exactly the way white balance is,
  * and an IPA computes it from the sensor's own settings rather than from the
- * scene.  What the kernel supplies underneath is, for now, the tuning the
- * driver's own program already carried, so sending nothing or sending this
- * block with %V4L2_ISP_PARAMS_FL_BLOCK_DISABLE leaves that in place.
+ * scene.  What the kernel supplies underneath is the block's bypass: send
+ * nothing, or send this block with %V4L2_ISP_PARAMS_FL_BLOCK_DISABLE, and the
+ * stage is switched off and passes its input through untouched.  That bypass
+ * is measured rather than asserted -- forcing it changes the picture, softly
+ * and only in the detail -- which is what makes it a defensible default and
+ * not a value borrowed from one capture.
  *
  * Three things the block reads are **not** here, because mainline has no
  * producer for them: the 98-word confidence map, the five face rectangles and

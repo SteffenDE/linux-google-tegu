@@ -659,6 +659,13 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_CHROMA_LPF_CTRL_REG	(BECORE_RGBP_CHROMA_LPF_BASE + 0x00)
 #define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
 #define BECORE_RGBP_CHROMA_LPF_LAST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x0c)
+/*
+ * The block's own bypass. It is asserted unless a parameters block brings
+ * tuning, and that it does something is measured rather than assumed: forcing
+ * it through the debugfs override over the vendor's own tuning softens the
+ * picture's detail and leaves its exposure and colour alone.
+ */
+#define BECORE_YUVP_SHARPEN_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x5000)
 #define BECORE_YUVP_LPF_FIRST		(BECORE_YUVP_PHYS_BASE + 0x5100)
 #define BECORE_YUVP_LPF_LAST		(BECORE_YUVP_PHYS_BASE + 0x514c)
 #define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
@@ -1423,6 +1430,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
+	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
@@ -1457,7 +1465,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	967
+#define BECORE_YUVP_GENERATED_WORDS	1112
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1577,8 +1585,9 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
 	  BECORE_GEN_NOISE_SHIFT },
-	{ BECORE_YUVP_PHYS_BASE + 0x5000, BECORE_YUVP_PHYS_BASE + 0x5000,
-	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_SHARPEN_BYPASS_REG, BECORE_YUVP_SHARPEN_BYPASS_REG,
+	  BECORE_GEN_SHARPEN },
+	BECORE_SHARPEN_TUNING_RANGES
 	{ BECORE_YUVP_PHYS_BASE + 0x5008, BECORE_YUVP_PHYS_BASE + 0x5008,
 	  BECORE_GEN_SHARPEN_DEFAULT },
 	{ BECORE_YUVP_PHYS_BASE + 0x5010, BECORE_YUVP_PHYS_BASE + 0x5010,
@@ -4320,10 +4329,9 @@ struct becore_sharpen_default {
 	u32 value;
 };
 
-#define BECORE_SHARPEN_DEFAULTS		84
+#define BECORE_SHARPEN_DEFAULTS		83
 
 static const struct becore_sharpen_default becore_sharpen_defaults[] = {
-	{ 0x5000, 0x00000000 },	/* bypass */
 	{ 0x5008, 0x00000000 },	/* mono_mode_en */
 	{ 0x5010, 0x00000000 },	/* start_crop */
 	{ 0x5018, 0x00000000 },	/* strip */
@@ -4880,6 +4888,15 @@ static const struct becore_sharpen_reg *becore_sharpen_lookup(u32 reg)
  * which is the encode's one asymmetry -- 38 of the 344 fields are signed and
  * the vendor's clamp is what says which.
  *
+ * `params` is what userspace most recently sent, or NULL for the driver's own
+ * default -- which is not a table of values but the *absence* of them: every
+ * field zero, so a register comes out as exactly the constant bits the
+ * translator deposits whatever the tuning says.  Those words are then
+ * irrelevant, because the block's bypass is asserted at the same time; what
+ * makes them worth generating rather than replaying is that a program has to
+ * carry a value for every word it writes, and a captured one would be some
+ * Android frame's tuning frozen into the kernel.
+ *
  * A value past the field saturates rather than being refused, which is what
  * `TranslateYuvSharpEnhancer` does and is not a shortcut: the phone's own
  * shipped tuning holds 2.0 for `noise_gain_lut[0]` at ordinary gains, which is
@@ -4897,6 +4914,12 @@ static int becore_sharpen_value(const struct exynos_becore_params_sharpen *param
 
 	if (!entry)
 		return -ENOENT;
+
+	/* The driver's own default: no field contributes, so the constant is it. */
+	if (!params) {
+		*value = entry->constant;
+		return 0;
+	}
 
 	word = entry->constant;
 	for (i = 0; i < entry->count; i++) {
@@ -5943,6 +5966,20 @@ static int becore_generated_value(const struct becore_device *becore,
 				    reg - BECORE_YUVP_PHYS_BASE, &result))
 				return -EINVAL;
 			break;
+		/*
+		 * The block with nothing sent to it: bypassed, and its tuning
+		 * the encode of a parameter set of all zeros. A parameters
+		 * block replaces both -- the same flag clears the bypass and
+		 * brings the values, so the two cannot disagree.
+		 */
+		case BECORE_GEN_SHARPEN:
+			if (reg == BECORE_YUVP_SHARPEN_BYPASS_REG) {
+				result = 1;
+				break;
+			}
+			if (becore_sharpen_value(NULL, reg, &result))
+				return -EINVAL;
+			break;
 		case BECORE_GEN_LPF:
 			if (becore_yuvp_lpf_value(reg - BECORE_YUVP_PHYS_BASE,
 						  &result))
@@ -6423,12 +6460,20 @@ static int becore_params_value(const struct becore_params_state *params,
 		return 0;
 	}
 	/*
-	 * The sharpener's 145 tuning words, which the recipe still replays
-	 * underneath: what a block changes is their values.
+	 * The sharpener the same way round: the driver's own default asserts
+	 * the block's bypass because it has no tuning, and a block that brings
+	 * tuning clears it.  Its 145 tuning words are generated from the same
+	 * table underneath, so what a block changes is the values in them
+	 * rather than whether they are written.
 	 */
-	if (params->sharpen_valid &&
-	    !becore_sharpen_value(&params->sharpen, reg, value))
-		return 0;
+	if (params->sharpen_valid) {
+		if (reg == BECORE_YUVP_SHARPEN_BYPASS_REG) {
+			*value = 0;
+			return 0;
+		}
+		if (!becore_sharpen_value(&params->sharpen, reg, value))
+			return 0;
+	}
 
 	return -ENOENT;
 }
@@ -10985,8 +11030,9 @@ static int becore_params_walk(struct becore_device *becore,
 				(const void *)header;
 
 			/*
-			 * Disabling this one returns the block to the tuning the
-			 * recipe still replays under it.
+			 * Disabling this one really does switch the stage off:
+			 * the block has a bypass, and that bypass is what the
+			 * driver has instead of a default tuning.
 			 */
 			if (disable) {
 				if (apply)

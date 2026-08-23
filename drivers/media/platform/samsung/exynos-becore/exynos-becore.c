@@ -53,6 +53,7 @@
 #include "exynos-becore-gtnr-recipe.h"
 #include "exynos-becore-mcsc-recipe.h"
 #include "exynos-becore-sharpen.h"
+#include "exynos-becore-yuvnr.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
 #define BECORE_GLOBAL_ENABLE_CLEAR	0x0008
@@ -526,6 +527,8 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 #define BECORE_NOISE_SLOPE_SHIFT	11
 #define BECORE_NOISE_SLOPE_MASK		GENMASK(12, 0)
 #define BECORE_NOISE_SHIFT_NIBBLES	8
+/* The knot registers are twelve bits, and a slope has to describe what fits. */
+#define BECORE_NOISE_KNOT_MAX		4095
 /*
  * A scaler that starts on a pixel. RGBP's SC, MCSC's POLY_SC0 and its POST_PC0
  * chroma converter each put two 20-bit init phase offsets at the same place in
@@ -2396,11 +2399,13 @@ struct becore_params_state {
 	u16 clut_v[EXYNOS_BECORE_CLUT_NODES];
 	u16 gamma[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
 	struct exynos_becore_params_sharpen sharpen;
+	struct exynos_becore_params_yuvnr yuvnr;
 	bool ccm_valid;
 	bool ltm_curve_valid;
 	bool clut_valid;
 	bool gamma_valid;
 	bool sharpen_valid;
+	bool yuvnr_valid;
 };
 
 struct becore_params_buffer {
@@ -4134,19 +4139,31 @@ struct becore_noise_curve {
 	u32 shift_reg;
 	u32 domain_first;	/* 0 when the curve owns its own domain */
 	bool round;		/* to nearest; false truncates */
+	/*
+	 * Whether the shift is searched for rather than fixed, and where the
+	 * curve's knots come from when a parameters block carries them.  Only
+	 * the noise reducer's two curves have either: its translator is the
+	 * one that has been read, and inventing a search for the demosaicer's
+	 * would be a guess about a block nothing here has decoded.
+	 */
+	bool search;
+	size_t params_range;	/* offsetof() the range, or 0 for none */
 };
 
 static const struct becore_noise_curve becore_noise_curves[] = {
 	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_G_REG,
-	  BECORE_RGBP_DNS_SLOPE_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG, 0, true },
+	  BECORE_RGBP_DNS_SLOPE_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG, 0, true,
+	  false, 0 },
 	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_RB_REG,
 	  BECORE_RGBP_DNS_SLOPE_RB_REG, BECORE_RGBP_DNS_SHIFT_RB_REG,
-	  BECORE_RGBP_DNS_X_RB_REG, true },
+	  BECORE_RGBP_DNS_X_RB_REG, true, false, 0 },
 	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_Y_REG,
-	  BECORE_YUVP_NR_SLOPE_Y_REG, BECORE_YUVP_NR_SHIFT_Y_REG, 0, false },
+	  BECORE_YUVP_NR_SLOPE_Y_REG, BECORE_YUVP_NR_SHIFT_Y_REG, 0, false,
+	  true, offsetof(struct exynos_becore_params_yuvnr, std_lut_y) },
 	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_UV_REG,
 	  BECORE_YUVP_NR_SLOPE_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
-	  BECORE_YUVP_NR_X_UV_REG, false },
+	  BECORE_YUVP_NR_X_UV_REG, false,
+	  true, offsetof(struct exynos_becore_params_yuvnr, std_lut_uv) },
 };
 
 static int becore_noise_curve_for(enum becore_block_id id, u32 reg, u32 kind,
@@ -4261,15 +4278,73 @@ static int becore_noise_knots_resolve(struct device *dev)
 }
 
 /*
- * One segment's slope. There are eight slope fields for seven segments, so the
- * eighth repeats the seventh: past the last knot the curve does not turn.
+ * Where a curve's knots come from.
+ *
+ * Both of the noise reducer's curves are also carried by its parameters block,
+ * and when one is in force the knots have to come from *it* rather than from
+ * the recipe words resolved at probe. Otherwise a buffer would move the knot
+ * registers and leave behind the slopes and shifts that describe them, which
+ * is a piecewise-linear curve whose segments contradict its own knots. The
+ * clamp is the one the generated field table applies when it deposits these
+ * same values into those knot registers, and it is here for the same reason:
+ * the slope has to describe the knots the hardware was given.
  */
-static int becore_noise_slope(size_t curve_index, u32 index, u32 *slope)
+static_assert(BECORE_NOISE_KNOTS == EXYNOS_BECORE_YUVNR_STD_LUT_POINTS);
+
+static const struct becore_noise_knots *
+becore_noise_knots_for(const struct becore_device *becore, size_t curve_index,
+		       struct becore_noise_knots *scratch)
 {
 	const struct becore_noise_curve *curve =
 		&becore_noise_curves[curve_index];
-	const struct becore_noise_knots *knots =
-		&becore_noise_knots[curve_index];
+	const struct exynos_becore_params_yuvnr *params = &becore->params.yuvnr;
+	const __s32 *range;
+	u32 index;
+
+	if (!curve->params_range || !becore->params.yuvnr_valid)
+		return &becore_noise_knots[curve_index];
+
+	range = (const __s32 *)((const u8 *)params + curve->params_range);
+	for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
+		scratch->x[index] = clamp(params->std_lut_x[index], 0,
+					  BECORE_NOISE_KNOT_MAX);
+		scratch->y[index] = clamp(range[index], 0,
+					  BECORE_NOISE_KNOT_MAX);
+	}
+
+	return scratch;
+}
+
+/*
+ * One segment's slope, and the number of fractional bits it is expressed at.
+ * There are eight slope fields for seven segments, so the eighth repeats the
+ * seventh: past the last knot the curve does not turn.
+ *
+ * `TranslateYuvNrCommon` starts at eleven fractional bits and gives one up at
+ * a time until the quotient fits the register's signed 13-bit field. Two
+ * details of that are the vendor's rather than the obvious thing, and both had
+ * to be read off the decompile: it truncates the quotient to `short` *before*
+ * testing the fit, and it accepts a magnitude of exactly 4095 rather than the
+ * 4096 the field would hold.
+ *
+ * No shipped tuning reaches either -- the widest quotient over the 6,174
+ * segments of this phone's own trees is 2,348, so the loop runs once and the
+ * truncation changes nothing. A parameters block can reach both, because its
+ * knots are userspace's: a full-range rise over a one-step gap is a quotient
+ * of eight million, which the truncation turns into a small negative slope
+ * that then fits. Reproducing that is the point -- it is what the hardware
+ * would have been given.
+ *
+ * The demosaicer's two curves do not search, and are left exactly as they
+ * were: their translator has not been read, and inventing a search for it
+ * would be a guess about a block nothing here has decoded.
+ */
+static int becore_noise_segment(const struct becore_noise_curve *curve,
+				const struct becore_noise_knots *knots,
+				u32 index, u32 *slope, u32 *shift)
+{
+	const s32 limit = (s32)(BECORE_NOISE_SLOPE_MASK >> 1);
+	u32 bits = BECORE_NOISE_SLOPE_SHIFT;
 	s32 magnitude;
 	s32 quotient;
 	s32 delta;
@@ -4281,26 +4356,46 @@ static int becore_noise_slope(size_t curve_index, u32 index, u32 *slope)
 	if (dx <= 0)
 		return -ERANGE;
 	delta = knots->y[index + 1] - knots->y[index];
-	magnitude = (delta < 0 ? -delta : delta) << BECORE_NOISE_SLOPE_SHIFT;
-	if (curve->round)
-		quotient = (2 * magnitude + dx) / (2 * dx);
-	else
-		quotient = magnitude / dx;
-	if (delta < 0)
-		quotient = -quotient;
-	if (quotient > (s32)(BECORE_NOISE_SLOPE_MASK >> 1) ||
-	    quotient < -(s32)(BECORE_NOISE_SLOPE_MASK >> 1) - 1)
-		return -ERANGE;
+
+	for (;;) {
+		magnitude = (delta < 0 ? -delta : delta) << bits;
+		if (curve->round)
+			quotient = (2 * magnitude + dx) / (2 * dx);
+		else
+			quotient = magnitude / dx;
+		if (delta < 0)
+			quotient = -quotient;
+
+		if (!curve->search) {
+			if (quotient > limit || quotient < -limit - 1)
+				return -ERANGE;
+			break;
+		}
+
+		quotient = (s16)quotient;
+		if ((quotient < 0 ? -quotient : quotient) <= limit)
+			break;
+		if (!bits)
+			return -ERANGE;
+		bits--;
+	}
+
 	*slope = (u32)quotient & BECORE_NOISE_SLOPE_MASK;
+	*shift = bits;
 
 	return 0;
 }
 
-static int becore_noise_value(enum becore_block_id id, u32 reg, u32 kind,
+static int becore_noise_value(const struct becore_device *becore,
+			      enum becore_block_id id, u32 reg, u32 kind,
 			      u32 *value)
 {
+	const struct becore_noise_curve *curve;
+	const struct becore_noise_knots *knots;
+	struct becore_noise_knots scratch;
 	size_t curve_index;
 	u32 packed = 0;
+	u32 shift;
 	u32 index;
 	u32 high;
 	u32 low;
@@ -4312,18 +4407,22 @@ static int becore_noise_value(enum becore_block_id id, u32 reg, u32 kind,
 	ret = becore_noise_curve_for(id, reg, kind, &curve_index);
 	if (ret)
 		return ret;
+	curve = &becore_noise_curves[curve_index];
+	knots = becore_noise_knots_for(becore, curve_index, &scratch);
+
 	if (kind == BECORE_GEN_NOISE_SHIFT) {
-		for (i = 0; i < BECORE_NOISE_SHIFT_NIBBLES; i++)
-			packed |= (u32)BECORE_NOISE_SLOPE_SHIFT << (4 * i);
+		for (i = 0; i < BECORE_NOISE_SHIFT_NIBBLES; i++) {
+			ret = becore_noise_segment(curve, knots, i, &low,
+						   &shift);
+			if (ret)
+				return ret;
+			packed |= shift << (4 * i);
+		}
 		*value = packed;
 		return 0;
 	}
 	if (kind == BECORE_GEN_NOISE_DOMAIN) {
-		const struct becore_noise_knots *knots =
-			&becore_noise_knots[curve_index];
-
-		index = (reg - becore_noise_curves[curve_index].domain_first) /
-			4 * 2;
+		index = (reg - curve->domain_first) / 4 * 2;
 		if (index + 1 >= BECORE_NOISE_KNOTS)
 			return -EINVAL;
 		*value = (((u32)knots->x[index + 1] & 0xffff) << 16) |
@@ -4331,11 +4430,11 @@ static int becore_noise_value(enum becore_block_id id, u32 reg, u32 kind,
 		return 0;
 	}
 
-	index = (reg - becore_noise_curves[curve_index].slope_first) / 4 * 2;
-	ret = becore_noise_slope(curve_index, index, &low);
+	index = (reg - curve->slope_first) / 4 * 2;
+	ret = becore_noise_segment(curve, knots, index, &low, &shift);
 	if (ret)
 		return ret;
-	ret = becore_noise_slope(curve_index, index + 1, &high);
+	ret = becore_noise_segment(curve, knots, index + 1, &high, &shift);
 	if (ret)
 		return ret;
 	*value = (high << 16) | low;
@@ -5342,6 +5441,376 @@ static int becore_sharpen_value(const struct exynos_becore_params_sharpen *param
 	return 0;
 }
 
+/* One of the noise reducer's tuning registers, or NULL if it is not one. */
+static const struct becore_yuvnr_reg *becore_yuvnr_lookup(u32 reg)
+{
+	u32 low = 0, high = ARRAY_SIZE(becore_yuvnr_regs);
+	u16 offset;
+
+	if (reg < BECORE_YUVP_PHYS_BASE)
+		return NULL;
+	if (reg - BECORE_YUVP_PHYS_BASE > U16_MAX)
+		return NULL;
+	offset = reg - BECORE_YUVP_PHYS_BASE;
+
+	while (low < high) {
+		u32 mid = low + (high - low) / 2;
+
+		if (becore_yuvnr_regs[mid].offset < offset)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	if (low == ARRAY_SIZE(becore_yuvnr_regs) ||
+	    becore_yuvnr_regs[low].offset != offset)
+		return NULL;
+
+	return &becore_yuvnr_regs[low];
+}
+
+/*
+ * Turning the low-frequency noise reducer off turns three other enables off
+ * with it.  That is the vendor's own translators rather than a choice made
+ * here, and the list is generated by measuring them -- so this reproduces a
+ * gate rather than inventing one.  It is a gate and not a mode: nothing moves,
+ * three bits stop being written.
+ */
+static bool becore_yuvnr_gated(const struct exynos_becore_params_yuvnr *params,
+			       u32 offset)
+{
+	static const u32 gated[] = BECORE_YUVNR_LFNR_GATED;
+	u32 i;
+
+	/*
+	 * The same test the register takes: `lfnr_enable` reaches the hardware
+	 * clamped to one bit, so a negative value reads as off there, and the
+	 * gate has to agree or it would write a combination the vendor's
+	 * translators cannot produce.
+	 */
+	if (params->lfnr_enable > 0)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(gated); i++)
+		if (gated[i] == offset)
+			return true;
+
+	return false;
+}
+
+/*
+ * The noise reducer's tuning, encoded.
+ *
+ * The same walk as the sharpener's, over a table generated from the vendor's
+ * own nineteen translators: field to bits, at the fixed point the UAPI names.
+ * A value past the field saturates, which is what those translators do.
+ *
+ * One field is deposited inverted -- the block's `bypass`, which is @enable
+ * the other way round -- and the flag on it is what says so, because a table
+ * that needed the driver to know which register that was would be a table with
+ * a special case in the reader.
+ *
+ * `params` is what userspace most recently sent.  There is no NULL case here
+ * and no default beside it: the words this block covers are still the recipe's
+ * until a buffer arrives, and what a buffer does is win over them.
+ */
+/*
+ * The gain curve's last interval, which the hardware wants instead of its last
+ * knot.
+ *
+ * `luma_gain_y` is 32 knots and the block carries 32 of them, but the register
+ * table holds 31 and then the *width* of the interval between the last two,
+ * with its sign in a bit of `luma_gain_config`.  That is `GAMMARGB`'s knot-axis
+ * convention applied to a value axis, and it is why nothing reads
+ * @luma_gain_y[31] through the generated table: no single member is the value
+ * the register wants.
+ *
+ * The vendor takes the difference in floating point and converts; here both
+ * knots have already been converted, so the subtraction is exact.
+ *
+ * Every shipped tuning this phone has ends its gain curve flat, so the width
+ * is zero in all 441 captured programs and this reproduces them by computing
+ * it rather than by assuming it.  What is carried here is the formula; the
+ * value it takes today is the one a constant would also have given.
+ */
+#define BECORE_YUVNR_LUMA_GAIN_CONFIG	0x351c
+#define BECORE_YUVNR_LUMA_GAIN_LAST	0x35b0
+
+static void becore_yuvnr_last_interval(const struct exynos_becore_params_yuvnr *params,
+				       u16 offset, u32 *word)
+{
+	s32 last = params->luma_gain_y[EXYNOS_BECORE_YUVNR_LUMA_GAIN_POINTS - 1];
+	s32 previous = params->luma_gain_y[EXYNOS_BECORE_YUVNR_LUMA_GAIN_POINTS - 2];
+	/*
+	 * Both knots are userspace's and unbounded, so the difference is taken
+	 * wide: at 32 bits `INT_MAX - -1` wraps to `INT_MIN`, whose `abs()` is
+	 * itself, and the widest possible interval would then encode as no
+	 * interval at all rather than saturating.
+	 */
+	s64 width = (s64)last - previous;
+
+	if (offset == BECORE_YUVNR_LUMA_GAIN_LAST) {
+		*word |= (u32)clamp(width < 0 ? -width : width, 0, 255) << 16;
+		return;
+	}
+
+	/*
+	 * The sign, and only where the curve is enabled at all -- the vendor
+	 * writes this bit inside the same test that writes bit 0.
+	 */
+	if (width < 0 && (*word & BIT(0)))
+		*word |= BIT(1);
+}
+
+/*
+ * The temporal filter's gain curve has slopes too, and the same problem: they
+ * describe @mcfp_gain_lut_y, so a block that moves it would leave them
+ * describing the curve it replaced.  Unlike the noise curve's, these registers
+ * are not generated -- they are the recipe's -- so the block derives them the
+ * way it derives the luma curve's last interval, and only while a block is in
+ * force.
+ *
+ * The knots the slopes are taken over stay the recipe's, because nothing in
+ * the block carries them: the first of them is computed from an input the
+ * driver does not have.  They are resolved once at probe so that this cannot
+ * fail per frame, and `SetTnrSlope`'s quotient truncates toward zero, which is
+ * what C division does.
+ */
+#define BECORE_YUVNR_TNR_KNOTS		EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS
+#define BECORE_YUVNR_TNR_KNOT_FIRST	0x33f8
+#define BECORE_YUVNR_TNR_KNOT_MASK	GENMASK(6, 0)
+#define BECORE_YUVNR_TNR_SLOPE_FIRST	0x340c
+#define BECORE_YUVNR_TNR_SLOPE_MASK	GENMASK(13, 0)
+#define BECORE_YUVNR_TNR_GAIN_MAX	4096
+
+static s32 becore_yuvnr_tnr_dx[BECORE_YUVNR_TNR_KNOTS - 1];
+static bool becore_yuvnr_tnr_ready;
+
+static int becore_yuvnr_tnr_resolve(struct device *dev)
+{
+	s32 knots[BECORE_YUVNR_TNR_KNOTS];
+	u32 index;
+	u32 word;
+	int ret;
+
+	for (index = 0; index < BECORE_YUVNR_TNR_KNOTS; index++) {
+		ret = becore_recipe_fixed_value(BECORE_YUVP,
+						BECORE_YUVP_PHYS_BASE +
+						BECORE_YUVNR_TNR_KNOT_FIRST +
+						(index / 2) * 4, &word);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "the temporal gain curve has no knot %u\n",
+					     index);
+		if (index & 1)
+			word >>= 16;
+		knots[index] = word & BECORE_YUVNR_TNR_KNOT_MASK;
+	}
+	for (index = 0; index + 1 < BECORE_YUVNR_TNR_KNOTS; index++) {
+		becore_yuvnr_tnr_dx[index] = knots[index + 1] - knots[index];
+		if (becore_yuvnr_tnr_dx[index] <= 0)
+			return dev_err_probe(dev, -ERANGE,
+					     "the temporal gain curve's domain does not rise\n");
+	}
+	becore_yuvnr_tnr_ready = true;
+
+	return 0;
+}
+
+static int becore_yuvnr_tnr_slope(const struct exynos_becore_params_yuvnr *params,
+				  u32 reg, u32 *value)
+{
+	s32 high, low;
+	u32 offset;
+	u32 index;
+
+	if (!becore_yuvnr_tnr_ready || reg < BECORE_YUVP_PHYS_BASE)
+		return -ENOENT;
+	offset = reg - BECORE_YUVP_PHYS_BASE;
+	if (offset < BECORE_YUVNR_TNR_SLOPE_FIRST ||
+	    (offset - BECORE_YUVNR_TNR_SLOPE_FIRST) % 4)
+		return -ENOENT;
+	index = (offset - BECORE_YUVNR_TNR_SLOPE_FIRST) / 4;
+	if (index >= ARRAY_SIZE(becore_yuvnr_tnr_dx))
+		return -ENOENT;
+
+	low = clamp(params->mcfp_gain_lut_y[index], 0,
+		    BECORE_YUVNR_TNR_GAIN_MAX);
+	high = clamp(params->mcfp_gain_lut_y[index + 1], 0,
+		     BECORE_YUVNR_TNR_GAIN_MAX);
+	*value = (u32)((high - low) / becore_yuvnr_tnr_dx[index]) &
+		 BECORE_YUVNR_TNR_SLOPE_MASK;
+
+	return 0;
+}
+
+static int becore_yuvnr_value(const struct exynos_becore_params_yuvnr *params,
+			      u32 reg, u32 *value)
+{
+	const struct becore_yuvnr_reg *entry = becore_yuvnr_lookup(reg);
+	u32 word;
+	u32 i;
+
+	if (!entry)
+		return -ENOENT;
+
+	word = entry->constant;
+	for (i = 0; i < entry->count; i++) {
+		const struct becore_yuvnr_field *field =
+			&becore_yuvnr_fields[entry->first + i];
+		s32 raw;
+
+		if (becore_yuvnr_gated(params, field->offset))
+			raw = 0;
+		else
+			raw = *(const __s32 *)((const u8 *)params + field->offset);
+
+		if (field->flags & BECORE_YUVNR_FIELD_INVERT)
+			raw = raw ? 0 : 1;
+
+		raw = clamp(raw, field->min, field->max);
+		word |= ((u32)raw & (BIT(field->width) - 1)) << field->shift;
+	}
+
+	if (entry->offset == BECORE_YUVNR_LUMA_GAIN_LAST ||
+	    entry->offset == BECORE_YUVNR_LUMA_GAIN_CONFIG)
+		becore_yuvnr_last_interval(params, entry->offset, &word);
+
+	*value = word;
+
+	return 0;
+}
+
+/*
+ * What this block writes from outside the generated field table: bits ORed
+ * into a register the table also writes, and whole registers the table does
+ * not write at all.  Naming them is what puts them under the overlap check
+ * below -- a regeneration that added a field where one of these deposits
+ * lands would otherwise corrupt the word with nothing to say so.
+ */
+static const struct becore_regval becore_yuvnr_derived_bits[] = {
+	{ BECORE_YUVNR_LUMA_GAIN_LAST, GENMASK(23, 16) },
+	{ BECORE_YUVNR_LUMA_GAIN_CONFIG, BIT(1) },
+};
+
+/*
+ * The same checks the sharpener's table gets, for the same reasons: the field
+ * range bounds becore_yuvnr_fields[], the member offset bounds the read out of
+ * the caller's block, and no two fields may claim the same bits or the loop
+ * above could not OR.
+ */
+static int becore_yuvnr_table_validate(struct device *dev)
+{
+	u32 i, j;
+
+	for (i = 0; i < ARRAY_SIZE(becore_yuvnr_regs); i++) {
+		const struct becore_yuvnr_reg *entry = &becore_yuvnr_regs[i];
+		u32 used = entry->constant;
+
+		if (i && becore_yuvnr_regs[i - 1].offset >= entry->offset)
+			return dev_err_probe(dev, -EINVAL,
+					     "noise reducer register +%#06x is out of order\n",
+					     entry->offset);
+		if (entry->first + entry->count > ARRAY_SIZE(becore_yuvnr_fields))
+			return dev_err_probe(dev, -EINVAL,
+					     "noise reducer register +%#06x runs off the field table\n",
+					     entry->offset);
+		for (j = 0; j < entry->count; j++) {
+			const struct becore_yuvnr_field *field =
+				&becore_yuvnr_fields[entry->first + j];
+			u32 mask;
+
+			if (!field->width || field->width >= 32 ||
+			    field->shift + field->width > 32)
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x field %u does not fit\n",
+						     entry->offset, j);
+			if (field->max >= (s32)BIT(field->width) ||
+			    field->min < -(s32)BIT(field->width - 1))
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x field %u has limits wider than itself\n",
+						     entry->offset, j);
+			if (field->offset % sizeof(__s32) ||
+			    field->offset + sizeof(__s32) >
+			    sizeof(struct exynos_becore_params_yuvnr))
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x field %u is outside the block\n",
+						     entry->offset, j);
+			mask = (BIT(field->width) - 1) << field->shift;
+			if (used & mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x field %u overlaps\n",
+						     entry->offset, j);
+			used |= mask;
+		}
+
+		for (j = 0; j < ARRAY_SIZE(becore_yuvnr_derived_bits); j++) {
+			const struct becore_regval *derived =
+				&becore_yuvnr_derived_bits[j];
+
+			if (derived->offset != entry->offset)
+				continue;
+			if (used & derived->value)
+				return dev_err_probe(dev, -EINVAL,
+						     "noise reducer +%#06x collides with what it derives\n",
+						     entry->offset);
+		}
+	}
+
+	/*
+	 * Each derived deposit needs a register in the table to land in --
+	 * `becore_yuvnr_value()` only reaches them for a register it found --
+	 * and the temporal slopes need the opposite, because they replace a
+	 * word rather than adding to one and the table would win over them.
+	 */
+	for (i = 0; i < ARRAY_SIZE(becore_yuvnr_derived_bits); i++) {
+		u32 reg = BECORE_YUVP_PHYS_BASE +
+			  becore_yuvnr_derived_bits[i].offset;
+
+		if (!becore_yuvnr_lookup(reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "noise reducer +%#06x derives bits into a register it does not write\n",
+					     becore_yuvnr_derived_bits[i].offset);
+	}
+	for (i = 0; i < BECORE_YUVNR_TNR_KNOTS - 1; i++) {
+		u32 reg = BECORE_YUVP_PHYS_BASE +
+			  BECORE_YUVNR_TNR_SLOPE_FIRST + i * 4;
+
+		if (becore_yuvnr_lookup(reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "the temporal gain curve's slope %u is in the field table\n",
+					     i);
+	}
+
+	/*
+	 * The noise curve's slopes and shifts replace a word the same way, and
+	 * are derived by `becore_noise_value()` rather than here -- so a
+	 * regeneration that decoded one of them would clobber a searched shift
+	 * with a field deposit, silently, because the field table wins.
+	 */
+	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
+		const struct becore_noise_curve *curve = &becore_noise_curves[i];
+		u32 reg;
+
+		if (curve->block != BECORE_YUVP)
+			continue;
+		for (reg = curve->slope_first;
+		     reg <= curve->slope_first + BECORE_NOISE_TABLE_LAST;
+		     reg += 4)
+			if (becore_yuvnr_lookup(reg))
+				return dev_err_probe(dev, -EINVAL,
+						     "a noise curve's slope +%#06x is in the field table\n",
+						     reg - BECORE_YUVP_PHYS_BASE);
+		if (becore_yuvnr_lookup(curve->shift_reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "a noise curve's shift +%#06x is in the field table\n",
+					     curve->shift_reg -
+					     BECORE_YUVP_PHYS_BASE);
+	}
+
+	return 0;
+}
+
 /*
  * The generated table, checked once at probe, because a regeneration is
  * exactly when it could start being wrong.
@@ -6301,7 +6770,8 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_NOISE_SLOPE:
 		case BECORE_GEN_NOISE_SHIFT:
 		case BECORE_GEN_NOISE_DOMAIN:
-			if (becore_noise_value(id, reg, table[i].kind, &result))
+			if (becore_noise_value(becore, id, reg, table[i].kind,
+					       &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_DJAG:
@@ -6898,6 +7368,19 @@ static int becore_params_value(const struct becore_params_state *params,
 			return 0;
 		}
 		if (!becore_sharpen_value(&params->sharpen, reg, value))
+			return 0;
+	}
+	/*
+	 * The noise reducer differs from both of those in one way that is
+	 * worth stating: its bypass is a *field* of the block rather than a
+	 * register beside it, so there is nothing to clear here.  A block that
+	 * arrives with @enable zero bypasses the stage through the same table
+	 * every other value goes through.
+	 */
+	if (params->yuvnr_valid) {
+		if (!becore_yuvnr_value(&params->yuvnr, reg, value))
+			return 0;
+		if (!becore_yuvnr_tnr_slope(&params->yuvnr, reg, value))
 			return 0;
 	}
 
@@ -8705,6 +9188,14 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 {
 	size_t output_size = becore_yuvp_output_allocation_size();
 	int ret;
+
+	ret = becore_yuvnr_table_validate(becore->dev);
+	if (ret)
+		return ret;
+
+	ret = becore_yuvnr_tnr_resolve(becore->dev);
+	if (ret)
+		return ret;
 
 	ret = becore_sharpen_table_validate(becore->dev);
 	if (ret)
@@ -10824,10 +11315,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
 	seq_printf(s,
-		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u, sharpener %u\n",
+		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u, sharpener %u, noise reducer %u\n",
 		   becore->params.ccm_valid, becore->params.ltm_curve_valid,
 		   becore->params.clut_valid, becore->params.gamma_valid,
-		   becore->params.sharpen_valid);
+		   becore->params.sharpen_valid, becore->params.yuvnr_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -11186,6 +11677,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_SHARPEN] = {
 		.size = sizeof(struct exynos_becore_params_sharpen),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_YUVNR] = {
+		.size = sizeof(struct exynos_becore_params_yuvnr),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -11347,6 +11841,38 @@ becore_params_check_gamma(struct device *dev,
 }
 
 /*
+ * The one thing this block cannot saturate its way out of.
+ *
+ * Every other value is clamped into its field and the worst a silly one can do
+ * is look wrong, but the noise curve's domain is *divided by*: the driver takes
+ * each segment's slope over the gap between two knots, and a gap of zero has no
+ * slope.  The check is on the clamped knots rather than the sent ones, because
+ * the clamp is what reaches the hardware -- two knots far past the field's top
+ * arrive as the same knot.
+ */
+static int __must_check
+becore_params_check_yuvnr(struct device *dev,
+			  const struct exynos_becore_params_yuvnr *yuvnr)
+{
+	unsigned int i;
+
+	for (i = 1; i < EXYNOS_BECORE_YUVNR_STD_LUT_POINTS; i++) {
+		s32 previous = clamp(yuvnr->std_lut_x[i - 1], 0,
+				     BECORE_NOISE_KNOT_MAX);
+		s32 knot = clamp(yuvnr->std_lut_x[i], 0, BECORE_NOISE_KNOT_MAX);
+
+		if (knot <= previous) {
+			dev_dbg(dev,
+				"noise curve domain does not rise at knot %u\n",
+				i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
  * Walk the blocks once.  `apply` distinguishes the buf_prepare pass, which
  * only says whether the buffer is acceptable, from the per-frame pass, which
  * installs it -- so that the two cannot drift apart into a buffer that
@@ -11476,6 +12002,37 @@ static int becore_params_walk(struct becore_device *becore,
 			memset(&becore->params.sharpen.header, 0,
 			       sizeof(becore->params.sharpen.header));
 			becore->params.sharpen_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_YUVNR: {
+			const struct exynos_becore_params_yuvnr *yuvnr =
+				(const void *)header;
+
+			/*
+			 * Disabling the block puts the stage back on the words
+			 * the recipe carries, which is not the same as turning
+			 * the noise reducer off -- that is @enable, inside the
+			 * block, and a buffer is how it is set either way.
+			 */
+			if (disable) {
+				if (apply)
+					becore->params.yuvnr_valid = false;
+				break;
+			}
+			ret = becore_params_check_yuvnr(becore->dev, yuvnr);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			becore->params.yuvnr = *yuvnr;
+			/*
+			 * The header belongs to the buffer rather than to the
+			 * block, and the encode reads offsets that start past
+			 * it, so keep no copy of the caller's.
+			 */
+			memset(&becore->params.yuvnr.header, 0,
+			       sizeof(becore->params.yuvnr.header));
+			becore->params.yuvnr_valid = true;
 			break;
 		}
 		default:

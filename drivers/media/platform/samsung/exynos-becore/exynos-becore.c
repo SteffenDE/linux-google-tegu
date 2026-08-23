@@ -5622,24 +5622,53 @@ static const struct becore_yuvnr_reg *becore_yuvnr_lookup(u32 reg)
  * gate rather than inventing one.  It is a gate and not a mode: nothing moves,
  * three bits stop being written.
  */
+/*
+ * Whether the block runs at all, and whether its low-frequency stage does.
+ *
+ * **The two take different truth tests**, and that is the register's doing
+ * rather than a choice here. @enable is deposited *inverted* into `bypass` and
+ * becore_yuvnr_value() inverts before it clamps, so any non-zero value --
+ * negative included -- clears the bypass and runs the block. @lfnr_enable is a
+ * plain field clamped to one bit, so a negative value reads as off there.
+ * Anything that disagrees with these two writes a combination the vendor's
+ * translators cannot produce.
+ *
+ * The low-frequency stage is `enable && lfnr_enable` and not @lfnr_enable
+ * alone: `TranslateYuvNrCommon` clears **both** bits of `yuv_yuv_nr_top`
+ * whenever @enable is zero, before any of the seventeen helpers runs, and
+ * every downstream gate reads that register bit rather than the tuning field.
+ */
+static bool becore_yuvnr_running(const struct exynos_becore_params_yuvnr *params)
+{
+	return params->enable != 0;
+}
+
+static bool becore_yuvnr_lfnr(const struct exynos_becore_params_yuvnr *params)
+{
+	return becore_yuvnr_running(params) && params->lfnr_enable > 0;
+}
+
+/*
+ * Which members a stage takes with it when it goes off.  Both lists are
+ * generated: the generator runs the translators again with the enable clear
+ * and sees which fields stop being written, so neither can drift from them.
+ */
 static bool becore_yuvnr_gated(const struct exynos_becore_params_yuvnr *params,
 			       u32 offset)
 {
-	static const u32 gated[] = BECORE_YUVNR_LFNR_GATED;
+	static const u32 enable_gated[] = BECORE_YUVNR_ENABLE_GATED;
+	static const u32 lfnr_gated[] = BECORE_YUVNR_LFNR_GATED;
 	u32 i;
 
-	/*
-	 * The same test the register takes: `lfnr_enable` reaches the hardware
-	 * clamped to one bit, so a negative value reads as off there, and the
-	 * gate has to agree or it would write a combination the vendor's
-	 * translators cannot produce.
-	 */
-	if (params->lfnr_enable > 0)
-		return false;
+	if (!becore_yuvnr_running(params))
+		for (i = 0; i < ARRAY_SIZE(enable_gated); i++)
+			if (enable_gated[i] == offset)
+				return true;
 
-	for (i = 0; i < ARRAY_SIZE(gated); i++)
-		if (gated[i] == offset)
-			return true;
+	if (!becore_yuvnr_lfnr(params))
+		for (i = 0; i < ARRAY_SIZE(lfnr_gated); i++)
+			if (lfnr_gated[i] == offset)
+				return true;
 
 	return false;
 }
@@ -5837,7 +5866,7 @@ becore_yuvnr_guarded_bits(const struct exynos_becore_params_yuvnr *params,
 {
 	static const struct becore_yuvnr_guarded guarded[] =
 		BECORE_YUVNR_GUARDED;
-	bool off = params->enable <= 0 || params->lfnr_enable <= 0;
+	bool off = !becore_yuvnr_lfnr(params);
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(guarded); i++) {

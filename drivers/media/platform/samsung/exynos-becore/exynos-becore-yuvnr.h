@@ -51,7 +51,7 @@ struct becore_yuvnr_reg {
 	u8 count;
 };
 
-#define BECORE_YUVNR_REGS		111
+#define BECORE_YUVNR_REGS		113
 #define BECORE_YUVNR_FIELDS		215
 #define BECORE_YUVNR_VALUES		194
 
@@ -812,6 +812,8 @@ static const struct becore_yuvnr_reg becore_yuvnr_regs[] = {
 	{ 0x35a8, 0x00000000, 104, 2 },	/* luma_gain_y_pnts_tbl_13 */
 	{ 0x35ac, 0x00000000, 106, 2 },	/* luma_gain_y_pnts_tbl_14 */
 	{ 0x35b0, 0x00000000, 108, 1 },	/* luma_gain_y_pnts_tbl_15 */
+	{ 0x35c4, 0x00000007, 109, 0 },	/* v_nr_en */
+	{ 0x35cc, 0x00000001, 109, 0 },	/* iir_two_coef */
 	{ 0x35d4, 0x00000000, 109, 2 },	/* vertfilterlength */
 	{ 0x35e4, 0x00000000, 111, 2 },	/* v_sigma */
 	{ 0x35e8, 0x00000000, 113, 2 },	/* v_sigma_up */
@@ -905,6 +907,8 @@ static_assert(ARRAY_SIZE(becore_yuvnr_regs) == BECORE_YUVNR_REGS);
 	BECORE_YUVNR_RANGE(0x3420, 0x3448), \
 	BECORE_YUVNR_RANGE(0x351c, 0x351c), \
 	BECORE_YUVNR_RANGE(0x3574, 0x35b0), \
+	BECORE_YUVNR_RANGE(0x35c4, 0x35c4), \
+	BECORE_YUVNR_RANGE(0x35cc, 0x35cc), \
 	BECORE_YUVNR_RANGE(0x35d4, 0x35d4), \
 	BECORE_YUVNR_RANGE(0x35e4, 0x35e8), \
 	BECORE_YUVNR_RANGE(0x3600, 0x3604), \

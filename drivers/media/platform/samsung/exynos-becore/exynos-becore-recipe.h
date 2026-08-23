@@ -3491,8 +3491,8 @@ static const struct becore_cmdq_shape becore_yuvp_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.generated_mask = 0xa2aa,
-		.fixed_mask = 0x0800,
+		.generated_mask = 0xaaaa,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1c8436f8, 0x1c843700, 0x1c843704, 0x1c843708,
 			0x1c84370c, 0x1c843758, 0x1c84375c, 0x1c843760,

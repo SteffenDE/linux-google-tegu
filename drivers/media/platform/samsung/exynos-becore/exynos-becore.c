@@ -52,6 +52,7 @@
 #include "exynos-becore-recipe.h"
 #include "exynos-becore-gtnr-recipe.h"
 #include "exynos-becore-mcsc-recipe.h"
+#include "exynos-becore-sharpen.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
 #define BECORE_GLOBAL_ENABLE_CLEAR	0x0008
@@ -2199,10 +2200,12 @@ struct becore_params_state {
 	u16 clut_u[EXYNOS_BECORE_CLUT_NODES];
 	u16 clut_v[EXYNOS_BECORE_CLUT_NODES];
 	u16 gamma[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
+	struct exynos_becore_params_sharpen sharpen;
 	bool ccm_valid;
 	bool ltm_curve_valid;
 	bool clut_valid;
 	bool gamma_valid;
+	bool sharpen_valid;
 };
 
 struct becore_params_buffer {
@@ -4840,6 +4843,143 @@ static int becore_yuvp_sharpen_default(u32 offset, u32 *value)
 	return -EINVAL;
 }
 
+/* One of the block's tuning registers, or NULL if it is not one. */
+static const struct becore_sharpen_reg *becore_sharpen_lookup(u32 reg)
+{
+	u32 low = 0, high = ARRAY_SIZE(becore_sharpen_regs);
+	u32 offset;
+
+	if (reg < BECORE_YUVP_PHYS_BASE)
+		return NULL;
+	offset = reg - BECORE_YUVP_PHYS_BASE;
+	if (offset > U16_MAX)
+		return NULL;
+
+	while (low < high) {
+		u32 middle = low + (high - low) / 2;
+
+		if (becore_sharpen_regs[middle].offset < offset)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+
+	if (low == ARRAY_SIZE(becore_sharpen_regs) ||
+	    becore_sharpen_regs[low].offset != offset)
+		return NULL;
+
+	return &becore_sharpen_regs[low];
+}
+
+/*
+ * The sharpener's tuning, encoded.
+ *
+ * The table is generated from the vendor's own translator, so this walks it
+ * rather than knowing anything: field to bits, at the fixed point the UAPI
+ * names.  A negative value is deposited two's complement in its own width,
+ * which is the encode's one asymmetry -- 38 of the 344 fields are signed and
+ * the vendor's clamp is what says which.
+ *
+ * A value past the field saturates rather than being refused, which is what
+ * `TranslateYuvSharpEnhancer` does and is not a shortcut: the phone's own
+ * shipped tuning holds 2.0 for `noise_gain_lut[0]` at ordinary gains, which is
+ * 256 at Q7 in an eight-bit field.  Refusing the buffer for that would mean
+ * every caller had to carry a copy of the table below to send the calibration
+ * the phone came with -- and where those field widths live is exactly what
+ * this interface is for.
+ */
+static int becore_sharpen_value(const struct exynos_becore_params_sharpen *params,
+				u32 reg, u32 *value)
+{
+	const struct becore_sharpen_reg *entry = becore_sharpen_lookup(reg);
+	u32 word;
+	u32 i;
+
+	if (!entry)
+		return -ENOENT;
+
+	word = entry->constant;
+	for (i = 0; i < entry->count; i++) {
+		const struct becore_sharpen_field *field =
+			&becore_sharpen_fields[entry->first + i];
+		s32 raw;
+
+		raw = *(const __s32 *)((const u8 *)params + field->offset);
+		raw = clamp(raw, field->min, field->max);
+		word |= ((u32)raw & (BIT(field->width) - 1)) << field->shift;
+	}
+
+	*value = word;
+
+	return 0;
+}
+
+/*
+ * The generated table, checked once at probe, because a regeneration is
+ * exactly when it could start being wrong.
+ *
+ * Two of these are load-bearing rather than tidy, and trimming them would put
+ * an out-of-bounds read back into becore_sharpen_value(): the field range
+ * bounds `becore_sharpen_fields[]`, and the member offset bounds the read out
+ * of the caller's block.  The rest say what the encode assumes -- that no two
+ * fields claim the same bits, so the loop can OR rather than read-modify-write,
+ * and that each field's own limits fit the width it is deposited in.
+ */
+static int becore_sharpen_table_validate(struct device *dev)
+{
+	u32 i, j;
+
+	for (i = 0; i < ARRAY_SIZE(becore_sharpen_regs); i++) {
+		const struct becore_sharpen_reg *entry = &becore_sharpen_regs[i];
+		u32 used = entry->constant;
+
+		if (i && becore_sharpen_regs[i - 1].offset >= entry->offset)
+			return dev_err_probe(dev, -EINVAL,
+					     "sharpener register +%#06x is out of order\n",
+					     entry->offset);
+		if (entry->first + entry->count >
+		    ARRAY_SIZE(becore_sharpen_fields))
+			return dev_err_probe(dev, -EINVAL,
+					     "sharpener register +%#06x runs off the field table\n",
+					     entry->offset);
+		for (j = 0; j < entry->count; j++) {
+			const struct becore_sharpen_field *field =
+				&becore_sharpen_fields[entry->first + j];
+			u32 mask;
+
+			/*
+			 * A 32-bit field would be a mask this cannot form --
+			 * BIT(32) is undefined where a long is 32 bits -- and
+			 * would need no mask in any case.
+			 */
+			if (!field->width || field->width >= 32 ||
+			    field->shift + field->width > 32)
+				return dev_err_probe(dev, -EINVAL,
+						     "sharpener +%#06x field %u does not fit\n",
+						     entry->offset, j);
+			if (field->max >= (s32)BIT(field->width) ||
+			    field->min < -(s32)BIT(field->width - 1))
+				return dev_err_probe(dev, -EINVAL,
+						     "sharpener +%#06x field %u has limits wider than itself\n",
+						     entry->offset, j);
+			if (field->offset % sizeof(__s32) ||
+			    field->offset + sizeof(__s32) >
+			    sizeof(struct exynos_becore_params_sharpen))
+				return dev_err_probe(dev, -EINVAL,
+						     "sharpener +%#06x field %u is outside the block\n",
+						     entry->offset, j);
+			mask = (BIT(field->width) - 1) << field->shift;
+			if (used & mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "sharpener +%#06x field %u overlaps\n",
+						     entry->offset, j);
+			used |= mask;
+		}
+	}
+
+	return 0;
+}
+
 /* One register of a kernel's quadrant: two taps, the lower one in the low half. */
 static int becore_yuvp_lpf_value(u32 offset, u32 *value)
 {
@@ -6282,6 +6422,13 @@ static int becore_params_value(const struct becore_params_state *params,
 		*value = 0;
 		return 0;
 	}
+	/*
+	 * The sharpener's 145 tuning words, which the recipe still replays
+	 * underneath: what a block changes is their values.
+	 */
+	if (params->sharpen_valid &&
+	    !becore_sharpen_value(&params->sharpen, reg, value))
+		return 0;
 
 	return -ENOENT;
 }
@@ -8087,6 +8234,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 {
 	size_t output_size = becore_yuvp_output_allocation_size();
 	int ret;
+
+	ret = becore_sharpen_table_validate(becore->dev);
+	if (ret)
+		return ret;
 
 	ret = becore_generated_tables_validate(becore->dev);
 	if (ret)
@@ -10202,9 +10353,10 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
 	seq_printf(s,
-		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u\n",
+		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u, sharpener %u\n",
 		   becore->params.ccm_valid, becore->params.ltm_curve_valid,
-		   becore->params.clut_valid, becore->params.gamma_valid);
+		   becore->params.clut_valid, becore->params.gamma_valid,
+		   becore->params.sharpen_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
@@ -10560,6 +10712,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_GAMMA] = {
 		.size = sizeof(struct exynos_becore_params_gamma),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_SHARPEN] = {
+		.size = sizeof(struct exynos_becore_params_sharpen),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -10823,6 +10978,32 @@ static int becore_params_walk(struct becore_device *becore,
 			memcpy(becore->params.gamma, gamma->curve,
 			       sizeof(becore->params.gamma));
 			becore->params.gamma_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_SHARPEN: {
+			const struct exynos_becore_params_sharpen *sharpen =
+				(const void *)header;
+
+			/*
+			 * Disabling this one returns the block to the tuning the
+			 * recipe still replays under it.
+			 */
+			if (disable) {
+				if (apply)
+					becore->params.sharpen_valid = false;
+				break;
+			}
+			if (!apply)
+				break;
+			becore->params.sharpen = *sharpen;
+			/*
+			 * The header belongs to the buffer rather than to the
+			 * block, and the encode reads offsets that start past
+			 * it, so keep no copy of the caller's.
+			 */
+			memset(&becore->params.sharpen.header, 0,
+			       sizeof(becore->params.sharpen.header));
+			becore->params.sharpen_valid = true;
 			break;
 		}
 		default:

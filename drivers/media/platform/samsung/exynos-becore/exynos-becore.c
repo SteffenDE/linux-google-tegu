@@ -658,7 +658,10 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_CHROMA_LPF_CTRL_REG	(BECORE_RGBP_CHROMA_LPF_BASE + 0x00)
 #define BECORE_RGBP_CHROMA_LPF_FIRST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x08)
 #define BECORE_RGBP_CHROMA_LPF_LAST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x0c)
+#define BECORE_YUVP_LPF_FIRST		(BECORE_YUVP_PHYS_BASE + 0x5100)
+#define BECORE_YUVP_LPF_LAST		(BECORE_YUVP_PHYS_BASE + 0x514c)
 #define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
+#define BECORE_SHARPEN_TAPS_PER_REG	2
 /*
  * The sharpener's per-scene inputs: a segmentation confidence map, five face
  * rectangles and five regions of interest. Each range is contiguous and the
@@ -1418,6 +1421,7 @@ enum becore_generated_kind {
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
+	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
 	BECORE_GEN_SCENE_INPUT,	/* an input nothing in mainline produces */
@@ -1451,7 +1455,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	863
+#define BECORE_YUVP_GENERATED_WORDS	883
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1571,6 +1575,8 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
 	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_YUVP_LPF_FIRST, BECORE_YUVP_LPF_LAST,
+	  BECORE_GEN_LPF },
 	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
 	  BECORE_GEN_LPF_NORM },
 	{ BECORE_YUVP_CONFMAP_FIRST, BECORE_YUVP_CONFMAP_LAST,
@@ -4191,8 +4197,84 @@ static_assert(ARRAY_SIZE(becore_clut_yuv2rgb) *
 /* [1, 2, 1] / 4 scaled by 32, one byte per tap. */
 static const u8 becore_chroma_lpf_taps[] = { 0, 32, 64, 32, 0 };
 
-/* The sharpener's three low-pass kernels sum to these; all powers of two. */
-static const u32 becore_sharpenhancer_lpf_sums[] = { 16, 512, 4096 };
+/*
+ * The sharpener's three low-pass kernels, and LPF_NORM above them.
+ *
+ * Each is square, symmetric and stored as one quadrant, row-major with the
+ * *corner* first and the centre last, two 16-bit taps to a register with the
+ * lower-numbered one in the low half; an odd quadrant leaves the last high
+ * half unused. So a span x span quadrant describes a (2 * span - 1)-tap
+ * kernel, and a tap's weight in the whole kernel is 4 unless it sits on the
+ * centre row or column.
+ *
+ * Not tuning: `TranslateYuvSharpEnhancer` never writes any of these twenty
+ * registers, so they come from `GetDefaultYuvSharpEnhancer` and are the same
+ * in all 426 captured programs. A three-scale unsharp-mask band splitter is
+ * what the block *is*.
+ *
+ * Stating them turns LPF_NORM into a real check. It is the log2 of each
+ * kernel's sum, and until now those three sums were themselves constants, so
+ * the power-of-two test was a property of the constants rather than of the
+ * kernels. Now the sums are computed from the taps: 16, 512 and 4096, which
+ * is what these quadrants really add up to, and a kernel that stopped
+ * summing to a power of two would fail the encode instead of being encoded
+ * wrong.
+ */
+struct becore_sharpen_kernel {
+	u32 first;			/* register, from BECORE_YUVP_PHYS_BASE */
+	u32 span;			/* the quadrant is span x span */
+	u32 taps;			/* ARRAY_SIZE of the quadrant below */
+	const u8 *quadrant;
+};
+
+static const u8 becore_sharpen_lpf3[] = {
+	1, 2,
+	2, 4,
+};
+
+static const u8 becore_sharpen_lpf5[] = {
+	 3, 10, 14,
+	10, 32, 44,
+	14, 44, 60,
+};
+
+static const u8 becore_sharpen_lpf9[] = {
+	 3,  8,  14,  20,  23,
+	 8, 18,  34,  49,  55,
+	14, 34,  63,  91, 104,
+	20, 49,  91, 133, 151,
+	23, 55, 104, 151, 168,
+};
+
+/*
+ * Offsets from BECORE_YUVP_PHYS_BASE, which is what the caller passes. Each
+ * row carries its quadrant's length as well as its span, so that a row naming
+ * the wrong array is caught rather than read past: becore_yuvp_lpf_value()
+ * refuses a row whose span does not square to its length.
+ */
+static const struct becore_sharpen_kernel becore_sharpen_kernels[] = {
+	{ 0x5100, 2, ARRAY_SIZE(becore_sharpen_lpf3), becore_sharpen_lpf3 },
+	{ 0x5108, 3, ARRAY_SIZE(becore_sharpen_lpf5), becore_sharpen_lpf5 },
+	{ 0x511c, 5, ARRAY_SIZE(becore_sharpen_lpf9), becore_sharpen_lpf9 },
+};
+
+/*
+ * The extents are the whole claim, so state them twice: the range in the table
+ * above says which registers are the driver's, and 2 + 5 + 13 says how many
+ * registers three quadrants of 4, 9 and 25 taps really need.
+ */
+static_assert(BECORE_YUVP_LPF_FIRST - BECORE_YUVP_PHYS_BASE == 0x5100);
+static_assert((BECORE_YUVP_LPF_LAST - BECORE_YUVP_LPF_FIRST) / 4 + 1 ==
+	      DIV_ROUND_UP(ARRAY_SIZE(becore_sharpen_lpf3),
+			   BECORE_SHARPEN_TAPS_PER_REG) +
+	      DIV_ROUND_UP(ARRAY_SIZE(becore_sharpen_lpf5),
+			   BECORE_SHARPEN_TAPS_PER_REG) +
+	      DIV_ROUND_UP(ARRAY_SIZE(becore_sharpen_lpf9),
+			   BECORE_SHARPEN_TAPS_PER_REG));
+
+static_assert(ARRAY_SIZE(becore_sharpen_lpf3) == 2 * 2);
+static_assert(ARRAY_SIZE(becore_sharpen_lpf5) == 3 * 3);
+static_assert(ARRAY_SIZE(becore_sharpen_lpf9) == 5 * 5);
 
 /*
  * round(coefficient << q), away from zero, as a signed field of its own.
@@ -4525,14 +4607,71 @@ static int becore_yuvp_noise_seed_value(u32 offset, u32 *value)
 	return 0;
 }
 
+/*
+ * What a quadrant adds up to over the whole kernel: a tap counts four times
+ * unless it is on the centre row or column, which the quadrant stores last.
+ */
+static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
+{
+	u32 total = 0;
+	u32 row, column;
+
+	if (kernel->span * kernel->span != kernel->taps)
+		return 0;	/* refused by becore_yuvp_lpf_value() as well */
+
+	for (row = 0; row < kernel->span; row++)
+		for (column = 0; column < kernel->span; column++)
+			total += (u32)kernel->quadrant[row * kernel->span +
+						       column] *
+				 (row == kernel->span - 1 ? 1 : 2) *
+				 (column == kernel->span - 1 ? 1 : 2);
+
+	return total;
+}
+
+/* One register of a kernel's quadrant: two taps, the lower one in the low half. */
+static int becore_yuvp_lpf_value(u32 offset, u32 *value)
+{
+	size_t i;
+
+	if (offset & 3)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(becore_sharpen_kernels); i++) {
+		const struct becore_sharpen_kernel *kernel =
+			&becore_sharpen_kernels[i];
+		u32 taps = kernel->taps;
+		u32 registers = DIV_ROUND_UP(taps, BECORE_SHARPEN_TAPS_PER_REG);
+		u32 index;
+
+		/* A row naming another kernel's quadrant, caught before it is read. */
+		if (kernel->span * kernel->span != taps)
+			return -EINVAL;
+
+		if (offset < kernel->first ||
+		    offset >= kernel->first + registers * sizeof(u32))
+			continue;
+
+		index = (offset - kernel->first) / sizeof(u32) *
+			BECORE_SHARPEN_TAPS_PER_REG;
+		*value = kernel->quadrant[index];
+		/* An odd quadrant leaves the last high half unused. */
+		if (index + 1 < taps)
+			*value |= (u32)kernel->quadrant[index + 1] << 16;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 /* log2 of each kernel's sum, packed at bits 0, 8 and 16. */
 static int becore_yuvp_lpf_norm_value(u32 *value)
 {
 	u32 packed = 0;
 	size_t i;
 
-	for (i = 0; i < ARRAY_SIZE(becore_sharpenhancer_lpf_sums); i++) {
-		u32 total = becore_sharpenhancer_lpf_sums[i];
+	for (i = 0; i < ARRAY_SIZE(becore_sharpen_kernels); i++) {
+		u32 total = becore_sharpen_kernel_sum(&becore_sharpen_kernels[i]);
 
 		if (!is_power_of_2(total))
 			return -EINVAL;
@@ -5448,6 +5587,11 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		}
+		case BECORE_GEN_LPF:
+			if (becore_yuvp_lpf_value(reg - BECORE_YUVP_PHYS_BASE,
+						  &result))
+				return -EINVAL;
+			break;
 		case BECORE_GEN_LPF_NORM:
 			if (becore_yuvp_lpf_norm_value(&result))
 				return -EINVAL;

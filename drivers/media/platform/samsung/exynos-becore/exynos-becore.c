@@ -660,6 +660,33 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_CHROMA_LPF_LAST	(BECORE_RGBP_CHROMA_LPF_BASE + 0x0c)
 #define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
 /*
+ * The sharpener's per-scene inputs: a segmentation confidence map, five face
+ * rectangles and five regions of interest. Each range is contiguous and the
+ * tuning either side of it is not, so the extents carry the claim.
+ */
+#define BECORE_YUVP_CONFMAP_FIRST	(BECORE_YUVP_PHYS_BASE + 0x5338)
+#define BECORE_YUVP_CONFMAP_LAST	(BECORE_YUVP_PHYS_BASE + 0x54bc)
+#define BECORE_YUVP_FACE_REGION_FIRST	(BECORE_YUVP_PHYS_BASE + 0x595c)
+#define BECORE_YUVP_FACE_REGION_LAST	(BECORE_YUVP_PHYS_BASE + 0x59a8)
+#define BECORE_YUVP_ROI_REGION_FIRST	(BECORE_YUVP_PHYS_BASE + 0x59f8)
+#define BECORE_YUVP_ROI_REGION_LAST	(BECORE_YUVP_PHYS_BASE + 0x5a44)
+#define BECORE_YUVP_CONFMAP_WORDS	98
+#define BECORE_YUVP_REGION_WORDS	20
+
+/*
+ * Four of the six edges have a zero on both sides of them in every captured
+ * program, so a range one register wide in the wrong direction would emit a
+ * program identical to today's and only the register names would catch it.
+ * The counts are a second statement of the same fact.
+ */
+static_assert((BECORE_YUVP_CONFMAP_LAST - BECORE_YUVP_CONFMAP_FIRST) / 4 + 1 ==
+	      BECORE_YUVP_CONFMAP_WORDS);
+static_assert((BECORE_YUVP_FACE_REGION_LAST - BECORE_YUVP_FACE_REGION_FIRST) /
+	      4 + 1 == BECORE_YUVP_REGION_WORDS);
+static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
+	      4 + 1 == BECORE_YUVP_REGION_WORDS);
+
+/*
  * Ten 16-bit seeds over six registers: SEED0_0..2 then SEED1_0..2, packed two
  * to a register, so the third register of each group carries one seed and a
  * reserved half.
@@ -1363,6 +1390,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
+	BECORE_GEN_SCENE_INPUT,	/* an input nothing in mainline produces */
 	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
 	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
 	BECORE_GEN_NOISE_DOMAIN,	/* a chroma domain repeating the luma one */
@@ -1393,7 +1421,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	652
+#define BECORE_YUVP_GENERATED_WORDS	790
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1515,6 +1543,12 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SHIFT },
 	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
 	  BECORE_GEN_LPF_NORM },
+	{ BECORE_YUVP_CONFMAP_FIRST, BECORE_YUVP_CONFMAP_LAST,
+	  BECORE_GEN_SCENE_INPUT },
+	{ BECORE_YUVP_FACE_REGION_FIRST, BECORE_YUVP_FACE_REGION_LAST,
+	  BECORE_GEN_SCENE_INPUT },
+	{ BECORE_YUVP_ROI_REGION_FIRST, BECORE_YUVP_ROI_REGION_LAST,
+	  BECORE_GEN_SCENE_INPUT },
 	{ BECORE_YUVP_NOISE_SEED_FIRST, BECORE_YUVP_NOISE_SEED_LAST,
 	  BECORE_GEN_NOISE_SEED },
 	{ BECORE_YUVP_LTM_ENABLE_REG, BECORE_YUVP_LTM_ENABLE_REG,
@@ -4363,6 +4397,28 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 }
 
 /*
+ * A per-scene input, empty because mainline produces no scene.
+ *
+ * All 138 of these are zero in every one of the 426 captured programs, but
+ * that is not the reason they are zero here: this driver has no face detector
+ * and no segmentation producer, so an empty rectangle and an all-zero
+ * confidence map are what the block reads by construction rather than because
+ * the capture happened to have no faces in it. The ranges in the table above
+ * are the statement of which registers those are; this only refuses one that
+ * is not on a word boundary, since a mis-stated range would otherwise be
+ * answered rather than refused.
+ */
+static int becore_yuvp_scene_input_value(u32 reg, u32 *value)
+{
+	if (reg & 3)
+		return -EINVAL;
+
+	*value = 0;
+
+	return 0;
+}
+
+/*
  * Seed n of generator g is 11111 * ((g + n) mod 5 + 1), truncated to 16 bits,
  * and the pair sharing a register is (2w, 2w + 1) of that generator's five.
  */
@@ -5318,6 +5374,10 @@ static int becore_generated_value(const struct becore_device *becore,
 		}
 		case BECORE_GEN_LPF_NORM:
 			if (becore_yuvp_lpf_norm_value(&result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_SCENE_INPUT:
+			if (becore_yuvp_scene_input_value(reg, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_NOISE_SEED:

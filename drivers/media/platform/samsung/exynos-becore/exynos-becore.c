@@ -824,6 +824,25 @@ static_assert((BECORE_YUVP_CCM_OFFSET_LAST - BECORE_YUVP_CCM_OFFSET_FIRST) / 4 +
 	      1 == EXYNOS_BECORE_CCM_OFFSETS);
 
 /*
+ * YUVP's DEGAMMARGB: the inverse of RGBP's forward square-root encode, laid
+ * out exactly as the forward gamma below it -- two gates, one table of 32
+ * pair registers closed by a delta-encoded last knot, then the shared grid --
+ * with one table rather than three, because a fixed inverse has no
+ * per-channel form.
+ */
+#define BECORE_YUVP_DEGAMMA_BASE	(BECORE_YUVP_PHYS_BASE + 0x3f00)
+#define BECORE_YUVP_DEGAMMA_GATE_FIRST	(BECORE_YUVP_DEGAMMA_BASE + 0x000)
+#define BECORE_YUVP_DEGAMMA_GATE_LAST	(BECORE_YUVP_DEGAMMA_BASE + 0x004)
+#define BECORE_YUVP_DEGAMMA_TBL_FIRST	(BECORE_YUVP_DEGAMMA_BASE + 0x00c)
+#define BECORE_YUVP_DEGAMMA_TBL_LAST	(BECORE_YUVP_DEGAMMA_BASE + 0x08c)
+#define BECORE_YUVP_DEGAMMA_X_LOW_FIRST	(BECORE_YUVP_DEGAMMA_BASE + 0x1c0)
+#define BECORE_YUVP_DEGAMMA_X_LOW_LAST	(BECORE_YUVP_DEGAMMA_BASE + 0x1ec)
+#define BECORE_YUVP_DEGAMMA_X_HIGH_FIRST (BECORE_YUVP_DEGAMMA_BASE + 0x200)
+#define BECORE_YUVP_DEGAMMA_X_HIGH_LAST	(BECORE_YUVP_DEGAMMA_BASE + 0x250)
+/* How many knots the toe covers before the exact square takes over. */
+#define BECORE_YUVP_DEGAMMA_TOE_KNOTS	15
+
+/*
  * YUVP's forward GAMMARGB: the creative tone curve, and the grid it is
  * sampled on.
  *
@@ -889,6 +908,24 @@ static_assert((BECORE_YUVP_GAMMA_G_HIGH_LAST -
 	       BECORE_YUVP_GAMMA_G_HIGH_FIRST) / 4 + 1 ==
 	      (EXYNOS_BECORE_GAMMA_POINTS - 1 -
 	       BECORE_YUVP_GAMMA_G_SPLIT_KNOT) / BECORE_GAMMA_KNOTS_PER_REG);
+
+/*
+ * The same for the inverse below this block: one table and one grid, 32 pair
+ * registers each with the last knot in a register of its own. Asserted rather
+ * than read off the addresses, because a range one register short packs a
+ * knot into a register the capture never wrote, and one too long runs off the
+ * end of the curve. They live here because they need the forward block's
+ * knot-count constants, which are declared above.
+ */
+static_assert((BECORE_YUVP_DEGAMMA_TBL_LAST - BECORE_YUVP_DEGAMMA_TBL_FIRST) /
+	      4 == (EXYNOS_BECORE_GAMMA_POINTS - 1) /
+	      BECORE_GAMMA_KNOTS_PER_REG);
+static_assert((BECORE_YUVP_DEGAMMA_X_LOW_LAST -
+	       BECORE_YUVP_DEGAMMA_X_LOW_FIRST) / 4 + 1 +
+	      (BECORE_YUVP_DEGAMMA_X_HIGH_LAST -
+	       BECORE_YUVP_DEGAMMA_X_HIGH_FIRST) / 4 ==
+	      (EXYNOS_BECORE_GAMMA_POINTS - 1) / BECORE_GAMMA_KNOTS_PER_REG);
+static_assert(BECORE_YUVP_DEGAMMA_TOE_KNOTS < EXYNOS_BECORE_GAMMA_POINTS);
 
 /*
  * The tone mapper's guide curve: 128 Q15 samples, two to a register with the
@@ -1301,6 +1338,7 @@ enum becore_generated_kind {
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
+	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SLOPE,	/* a noise curve's slopes, from its own knots */
 	BECORE_GEN_NOISE_SHIFT,	/* the shift those slopes are taken at */
@@ -1332,7 +1370,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	578
+#define BECORE_YUVP_GENERATED_WORDS	646
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1464,6 +1502,14 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_LTM },
 	{ BECORE_YUVP_LTM_UNITY_FIRST, BECORE_YUVP_LTM_UNITY_LAST,
 	  BECORE_GEN_LTM },
+	{ BECORE_YUVP_DEGAMMA_GATE_FIRST, BECORE_YUVP_DEGAMMA_GATE_LAST,
+	  BECORE_GEN_YUVP_DEGAMMA },
+	{ BECORE_YUVP_DEGAMMA_TBL_FIRST, BECORE_YUVP_DEGAMMA_TBL_LAST,
+	  BECORE_GEN_YUVP_DEGAMMA },
+	{ BECORE_YUVP_DEGAMMA_X_LOW_FIRST, BECORE_YUVP_DEGAMMA_X_LOW_LAST,
+	  BECORE_GEN_YUVP_DEGAMMA },
+	{ BECORE_YUVP_DEGAMMA_X_HIGH_FIRST, BECORE_YUVP_DEGAMMA_X_HIGH_LAST,
+	  BECORE_GEN_YUVP_DEGAMMA },
 	{ BECORE_YUVP_GAMMA_GATE_FIRST, BECORE_YUVP_GAMMA_GATE_LAST,
 	  BECORE_GEN_YUVP_GAMMA },
 	{ BECORE_YUVP_GAMMA_R_FIRST, BECORE_YUVP_GAMMA_R_DELTA_REG,
@@ -4581,6 +4627,132 @@ static int becore_yuvp_gamma_identity(u32 reg, u32 *value)
 }
 
 /*
+ * One knot of DEGAMMARGB, which undoes RGBP's square-root encode.
+ *
+ * Normalised, the encode is a square root, so its inverse is a square. Both
+ * blocks carry it in their own fixed point -- the encode at Q12, this at Q14
+ * -- so from knot 15 up (0-based, as everywhere here) the inverse is
+ * `DIV_ROUND_CLOSEST(x * x, 1 << 14)`, and that reproduces every captured
+ * value there.
+ *
+ * Below knot 15 the curve is a straight line, and the line is not arbitrary:
+ * it is the inverse of the *encode's own first segment*. That segment runs
+ * from the origin to (x[1], becore_rgbp_gamma_encode(x[1])) -- 8 to 181,
+ * since the encode is `round(sqrt(x << 12))` -- so the inverse over it has
+ * slope x[1] / 181, and that is the toe a pure square cannot have: x squared
+ * has zero slope at black and would quantise the deepest shadows away, while
+ * the forward curve is straight across its own first segment, so its exact
+ * inverse is straight there too.
+ *
+ * The two pieces do not meet. At knot 15 the toe gives 31.12 where the square
+ * gives 30.25, and every captured program takes the square, so the join is by
+ * knot index rather than at the point where the two cross -- which is at
+ * x = 724.15, between knots 15 and 16. It shows up as an enlarged step rather
+ * than a jump: the table reads 28, 30, 36 where a continued toe would have
+ * given 28, 31, 34. Why the vendor's generator breaks there is not
+ * established. What is established is that these 65 values are bit-identical
+ * on three cameras and at all eighteen captured readouts.
+ */
+static int becore_yuvp_degamma_point(u32 index, u32 *value)
+{
+	u32 first;
+	u32 slope;
+	u32 x;
+	int ret;
+
+	ret = becore_yuvp_gamma_x(index, &x);
+	if (ret)
+		return ret;
+	if (index >= BECORE_YUVP_DEGAMMA_TOE_KNOTS) {
+		*value = DIV_ROUND_CLOSEST(x * x, 1 << BECORE_YUVP_GAMMA_Q);
+		return 0;
+	}
+	ret = becore_rgbp_gamma_knot(1, &first);
+	if (ret)
+		return ret;
+	/*
+	 * The divisor is the encode's first knot rather than a literal, so
+	 * that this stays the inverse of whatever the encode actually is. It
+	 * is 181 while the grid's first step is 8; refuse a zero rather than
+	 * divide by one, because a grid that started with a zero-length
+	 * segment would have no inverse over it at all.
+	 */
+	slope = becore_rgbp_gamma_encode(first);
+	if (!slope)
+		return -EINVAL;
+	*value = DIV_ROUND_CLOSEST(x * first, slope);
+
+	return 0;
+}
+
+/* Two knots per register, the lower-numbered one in the low half. */
+static int becore_yuvp_degamma_pair(u32 index, u32 *value)
+{
+	u32 low;
+	u32 high;
+	int ret;
+
+	ret = becore_yuvp_degamma_point(index, &low);
+	if (ret)
+		return ret;
+	ret = becore_yuvp_degamma_point(index + 1, &high);
+	if (ret)
+		return ret;
+	*value = (high << 16) | low;
+
+	return 0;
+}
+
+/* The 65th knot as its distance from the 64th, as a magnitude. */
+static int becore_yuvp_degamma_delta(u32 *value)
+{
+	u32 last;
+	u32 prev;
+	int ret;
+
+	ret = becore_yuvp_degamma_point(BECORE_RGBP_GAMMA_KNOTS - 1, &last);
+	if (ret)
+		return ret;
+	ret = becore_yuvp_degamma_point(BECORE_RGBP_GAMMA_KNOTS - 2, &prev);
+	if (ret)
+		return ret;
+	*value = last > prev ? last - prev : prev - last;
+
+	return 0;
+}
+
+static int becore_yuvp_degamma_value(u32 reg, u32 *value)
+{
+	u32 offset = reg - BECORE_YUVP_DEGAMMA_BASE;
+
+	if (offset & 3)
+		return -EINVAL;
+
+	switch (offset) {
+	case 0x000:		/* BYPASS: the block runs */
+	case 0x004:		/* PEDESTAL_EN */
+		*value = 0;
+		return 0;
+	case 0x08c:		/* the curve's last-knot delta */
+		return becore_yuvp_degamma_delta(value);
+	case 0x250:		/* X_PNTS_TBL last-knot delta */
+		return becore_yuvp_gamma_x_delta(value);
+	}
+
+	if (offset >= 0x00c && offset < 0x08c)
+		return becore_yuvp_degamma_pair((offset - 0x00c) / 4 * 2,
+						value);
+	if (offset >= 0x1c0 && offset <= 0x1ec)
+		return becore_yuvp_gamma_x_pair((offset - 0x1c0) / 4 * 2,
+						value);
+	if (offset >= 0x200 && offset < 0x250)
+		return becore_yuvp_gamma_x_pair((offset - 0x200) / 4 * 2 + 24,
+						value);
+
+	return -EINVAL;
+}
+
+/*
  * The block's gates, its grid, and -- when no parameters block has carried a
  * curve -- the identity in its three tables.  A curve that has arrived is
  * substituted over this by becore_params_apply(), which runs after every
@@ -5092,6 +5264,10 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		case BECORE_GEN_YUVP_GAMMA:
 			if (becore_yuvp_gamma_value(reg, &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_YUVP_DEGAMMA:
+			if (becore_yuvp_degamma_value(reg, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_GTM:

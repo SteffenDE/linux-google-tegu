@@ -22,8 +22,10 @@ A buffer carries only what changed. A block that is not present leaves that
 part of the configuration as it was, so a steady scene needs no buffer at all,
 and a block sent with ``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns that part to
 the driver's own default. For most blocks that default is the value the driver
-would have programmed anyway; for the colour LUT it is bypass, because a
-lattice is the whole of what that stage does and there is no neutral one.
+would have programmed anyway; for the colour LUT and the sharpener it is
+bypass, because for the first a lattice is the whole of what that stage does
+and there is no neutral one, and for the second there is no set of gains that
+is honestly neutral for a stage whose job is to decide what detail looks like.
 
 The driver rejects a buffer at :c:func:`VIDIOC_QBUF` if a block is
 inconsistent, so a mistake is reported against the buffer that carried it:
@@ -31,6 +33,14 @@ every row of the colour matrix must sum to
 ``EXYNOS_BECORE_CCM_ONE``, which is what makes the matrix preserve neutrals;
 the tone curve must not decrease; and the colour LUT's samples must fit
 ``EXYNOS_BECORE_CLUT_MAX`` with both ends of its grey axis neutral.
+
+The sharpener is the exception and is deliberately not checked that way. Its
+values are fixed-point numbers in the hardware's own fields, and a value past
+the field it reaches **saturates** rather than being refused -- which is what
+the vendor's own encoder does, and what the phone's shipped calibration needs:
+one of its noise gains is 2.0 at ordinary gains where the hardware field is
+eight bits at Q7. Refusing a buffer for that would oblige every caller to
+carry its own copy of the field widths.
 
 .. code-block:: c
 

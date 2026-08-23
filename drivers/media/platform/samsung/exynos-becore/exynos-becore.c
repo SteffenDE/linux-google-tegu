@@ -1243,6 +1243,12 @@ static_assert(BECORE_CLUT_LATTICE_WORDS == BECORE_YUVP_CLUT_WORDS);
 static_assert(BECORE_YUVP_CLUT_HEADER < BECORE_YUVP_HEADER_COUNT);
 static_assert(EXYNOS_BECORE_CLUT_MAX == BECORE_CLUT_FIELD_MAX);
 
+#define BECORE_YUVP_CHAIN_IMG_SIZE_REG	(BECORE_YUVP_PHYS_BASE + 0x0200)
+#define BECORE_YUVP_GRID_DMA_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1c00)
+#define BECORE_YUVP_GRID_DMA_FORMAT_REG	(BECORE_YUVP_PHYS_BASE + 0x1c10)
+#define BECORE_YUVP_GRID_DMA_WIDTH_REG	(BECORE_YUVP_PHYS_BASE + 0x1c20)
+#define BECORE_YUVP_GRID_DMA_STRIDE_REG	(BECORE_YUVP_PHYS_BASE + 0x1c28)
+#define BECORE_YUVP_GRID_DMA_BUSINFO_REG (BECORE_YUVP_PHYS_BASE + 0x1c4c)
 #define BECORE_YUVP_GRID_REG		(BECORE_YUVP_PHYS_BASE + 0x1c50)
 #define BECORE_YUVP_OUTPUT_PLANE1_REG	(BECORE_YUVP_PHYS_BASE + 0x2450)
 #define BECORE_YUVP_OUTPUT_PLANE2_REG	(BECORE_YUVP_PHYS_BASE + 0x2490)
@@ -1547,6 +1553,8 @@ enum becore_generated_kind {
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
 	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
 	BECORE_GEN_NR_LUMA_GRID,	/* its luma-gain curve's knot grid */
+	BECORE_GEN_GRID_DMA,	/* the LTM grid RDMA, from our own buffer */
+	BECORE_GEN_YUVP_CHAIN_SIZE,	/* the raster YUVP is handed */
 	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
@@ -1585,7 +1593,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1233
+#define BECORE_YUVP_GENERATED_WORDS	1240
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1673,6 +1681,16 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 };
 
 static const struct becore_generated_range becore_yuvp_generated[] = {
+	{ BECORE_YUVP_CHAIN_IMG_SIZE_REG, BECORE_YUVP_CHAIN_IMG_SIZE_REG,
+	  BECORE_GEN_YUVP_CHAIN_SIZE },
+	{ BECORE_YUVP_GRID_DMA_EN_REG, BECORE_YUVP_GRID_DMA_EN_REG,
+	  BECORE_GEN_GRID_DMA },
+	{ BECORE_YUVP_GRID_DMA_FORMAT_REG, BECORE_YUVP_GRID_DMA_FORMAT_REG,
+	  BECORE_GEN_GRID_DMA },
+	{ BECORE_YUVP_GRID_DMA_WIDTH_REG, BECORE_YUVP_GRID_DMA_STRIDE_REG,
+	  BECORE_GEN_GRID_DMA },
+	{ BECORE_YUVP_GRID_DMA_BUSINFO_REG, BECORE_YUVP_GRID_DMA_BUSINFO_REG,
+	  BECORE_GEN_GRID_DMA },
 	{ BECORE_YUVP_COUTFIFO0_EN_REG, BECORE_YUVP_COUTFIFO0_EN_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
@@ -5131,6 +5149,38 @@ static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
 }
 
 /*
+ * The local tone mapper's grid RDMA, by offset from YUVP's base.
+ *
+ * The vendor's numbers here are this driver's own allocation: 0x800 bytes a
+ * row over 48 rows is the 96 KiB a 32 x 24 x 8 bilateral grid needs, and the
+ * stride is the row. Deriving them from the allocation rather than replaying
+ * them is what makes a DMA programmed to read past its own buffer impossible
+ * to write by accident -- the address beside them is already relocated to
+ * `becore->grid`, and this is the length that goes with it.
+ */
+static int becore_yuvp_grid_dma_value(u32 offset, u32 *value)
+{
+	switch (offset) {
+	case 0x1c00:				/* STAT_RDMA_GRID_EN */
+		*value = 1;
+		return 0;
+	case 0x1c10:				/* ..._DATA_FORMAT */
+	case 0x1c4c:				/* ..._BUSINFO */
+		*value = 0;
+		return 0;
+	case 0x1c20:				/* ..._WIDTH */
+	case 0x1c28:				/* ..._IMG_STRIDE_1P */
+		*value = BECORE_LTM_GRID_ROW_BYTES;
+		return 0;
+	case 0x1c24:				/* ..._HEIGHT */
+		*value = BECORE_LTM_GRID_ROWS;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/*
  * One knot of `YUVNR`'s luma-gain x grid, by index, called only with 0..31.
  *
  * The last one is not a knot but the *width of the last interval*, which is
@@ -5158,7 +5208,6 @@ static u32 becore_nr_luma_grid_knot(u32 knot)
  * fifteen of its sixteen registers move frame to frame in the captures --
  * the sixteenth holds the curve's first two entries, which happen never to.
  */
-
 static int becore_yuvp_nr_luma_grid(u32 offset, u32 *value)
 {
 	u32 index;
@@ -6332,6 +6381,16 @@ static int becore_generated_value(const struct becore_device *becore,
 						     BECORE_YUVP_PHYS_BASE,
 						     &result))
 				return -EINVAL;
+			break;
+		case BECORE_GEN_GRID_DMA:
+			if (becore_yuvp_grid_dma_value(reg -
+						       BECORE_YUVP_PHYS_BASE,
+						       &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_YUVP_CHAIN_SIZE:
+			result = becore_pack_size(becore_rgbp_out_width(),
+						  becore_rgbp_out_height());
 			break;
 		/*
 		 * The block with nothing sent to it: bypassed, and its tuning

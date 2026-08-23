@@ -1421,6 +1421,7 @@ enum becore_generated_kind {
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
+	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
@@ -1455,7 +1456,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	883
+#define BECORE_YUVP_GENERATED_WORDS	967
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1575,6 +1576,66 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_YUVP_NR_SHIFT_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
 	  BECORE_GEN_NOISE_SHIFT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5000, BECORE_YUVP_PHYS_BASE + 0x5000,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5008, BECORE_YUVP_PHYS_BASE + 0x5008,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5010, BECORE_YUVP_PHYS_BASE + 0x5010,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5018, BECORE_YUVP_PHYS_BASE + 0x5018,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5154, BECORE_YUVP_PHYS_BASE + 0x5158,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5160, BECORE_YUVP_PHYS_BASE + 0x5160,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5168, BECORE_YUVP_PHYS_BASE + 0x5168,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5170, BECORE_YUVP_PHYS_BASE + 0x5170,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x517c, BECORE_YUVP_PHYS_BASE + 0x5184,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x518c, BECORE_YUVP_PHYS_BASE + 0x518c,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5198, BECORE_YUVP_PHYS_BASE + 0x5198,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x51a0, BECORE_YUVP_PHYS_BASE + 0x51a8,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5200, BECORE_YUVP_PHYS_BASE + 0x5204,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x523c, BECORE_YUVP_PHYS_BASE + 0x5248,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5254, BECORE_YUVP_PHYS_BASE + 0x5254,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5268, BECORE_YUVP_PHYS_BASE + 0x5278,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5290, BECORE_YUVP_PHYS_BASE + 0x52b0,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x52d4, BECORE_YUVP_PHYS_BASE + 0x52e0,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5304, BECORE_YUVP_PHYS_BASE + 0x5314,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5328, BECORE_YUVP_PHYS_BASE + 0x5330,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5710, BECORE_YUVP_PHYS_BASE + 0x571c,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5804, BECORE_YUVP_PHYS_BASE + 0x5820,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5830, BECORE_YUVP_PHYS_BASE + 0x5830,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5840, BECORE_YUVP_PHYS_BASE + 0x5840,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5850, BECORE_YUVP_PHYS_BASE + 0x5850,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5860, BECORE_YUVP_PHYS_BASE + 0x5860,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5870, BECORE_YUVP_PHYS_BASE + 0x5884,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x5904, BECORE_YUVP_PHYS_BASE + 0x5908,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x59ac, BECORE_YUVP_PHYS_BASE + 0x59c8,
+	  BECORE_GEN_SHARPEN_DEFAULT },
+	{ BECORE_YUVP_PHYS_BASE + 0x59f0, BECORE_YUVP_PHYS_BASE + 0x59f4,
+	  BECORE_GEN_SHARPEN_DEFAULT },
 	{ BECORE_YUVP_LPF_FIRST, BECORE_YUVP_LPF_LAST,
 	  BECORE_GEN_LPF },
 	{ BECORE_YUVP_LPF_NORM_REG, BECORE_YUVP_LPF_NORM_REG,
@@ -4220,6 +4281,141 @@ static const u8 becore_chroma_lpf_taps[] = { 0, 32, 64, 32, 0 };
  * summing to a power of two would fail the encode instead of being encoded
  * wrong.
  */
+/*
+ * The rest of SHARPENHANCER that is not tuning: 84 registers
+ * `TranslateYuvSharpEnhancer` never writes, so they come from
+ * `GetDefaultYuvSharpEnhancer` and are identical in all 426 captured programs,
+ * on three cameras and at eighteen readouts.
+ *
+ * Be clear what this is and is not. It is not a derivation and it is not a
+ * hardware reset state: it is the vendor's compiled-in default, the same
+ * standing RGBP's `DMSC` tail has, and it is a bring-up default under
+ * ADR 0009 rather than something the driver worked out. What it buys is that
+ * the kernel stops carrying one captured *program* and starts carrying the
+ * block's own defaults, which is what makes the 145 registers beside them --
+ * the ones the translator does write, from the tuning tree -- the only thing
+ * left that a parameters block has to own.
+ *
+ * Two families in here are recognisable and worth recording rather than
+ * leaving as magic:
+ *
+ *  - `yuv2rgb_coeff_0..4` at 0x5804 are the BT.601 full-range inverse at Q10
+ *    in 13-bit signed fields, nine coefficients over ten halves with the last
+ *    unused, column-major by *input* channel: (1024, 1024, 1024) for Y, then
+ *    (0, -352, 1815) for U and (1436, -731, 0) for V. That is
+ *    round(2(1-Kb) * 1024) = 1815 and round(2(1-Kr) * 1024) = 1436 on the
+ *    nose. The two offsets beside them are not decoded.
+ *  - `noise_gain_lut_luma*` at 0x5710 is a monotone breakpoint ramp, two
+ *    16-bit entries to a register: 0, 16, 32, 64, 96, 128, 192, 256. The
+ *    three `*_power_luma_*` groups are the same eight numbers packed at bits
+ *    0 and 8 instead, in fields wider than a byte because the last entry is
+ *    256: 0 | 16 << 8, 32 | 64 << 8, 96 | 128 << 8, 192 | 256 << 8. Both
+ *    could be generated from the ramp; neither is today.
+ */
+struct becore_sharpen_default {
+	u32 offset;			/* from BECORE_YUVP_PHYS_BASE */
+	u32 value;
+};
+
+#define BECORE_SHARPEN_DEFAULTS		84
+
+static const struct becore_sharpen_default becore_sharpen_defaults[] = {
+	{ 0x5000, 0x00000000 },	/* bypass */
+	{ 0x5008, 0x00000000 },	/* mono_mode_en */
+	{ 0x5010, 0x00000000 },	/* start_crop */
+	{ 0x5018, 0x00000000 },	/* strip */
+	{ 0x5154, 0x00000000 },	/* wluma_pedestal_value */
+	{ 0x5158, 0x00002000 },	/* wluma_pedestal_gain */
+	{ 0x5160, 0x03340320 },	/* texture_index_1 */
+	{ 0x5168, 0x18184848 },	/* dirconf */
+	{ 0x5170, 0x02261e0d },	/* local_contrast */
+	{ 0x517c, 0x00010001 },	/* gf_sharp_epsilon */
+	{ 0x5180, 0x00000100 },	/* gf_sharp_luma_th */
+	{ 0x5184, 0x04000002 },	/* gf_sharp_luma_gain */
+	{ 0x518c, 0x00000000 },	/* fsharp_en */
+	{ 0x5198, 0x00000000 },	/* wide_sharp_lc_control_1 */
+	{ 0x51a0, 0x00000000 },	/* wide_sharp_lc_1 */
+	{ 0x51a4, 0x00000000 },	/* wide_sharp_lc_2 */
+	{ 0x51a8, 0x00000000 },	/* wide_sharp_lc_3 */
+	{ 0x5200, 0x00000000 },	/* contents_aware_en */
+	{ 0x5204, 0x003ab7fe },	/* config_0 */
+	{ 0x523c, 0x00000003 },	/* limit_parameters_1 */
+	{ 0x5240, 0x00000000 },	/* limit_parameters_2 */
+	{ 0x5244, 0x00000003 },	/* limit_parameters_3 */
+	{ 0x5248, 0x00000000 },	/* limit_parameters_4 */
+	{ 0x5254, 0x000006fc },	/* sat */
+	{ 0x5268, 0x00000000 },	/* gf_sharp_thresh_anchor_gain */
+	{ 0x526c, 0x00001000 },	/* gf_sharp_power_luma_0_to_1 */
+	{ 0x5270, 0x00004020 },	/* gf_sharp_power_luma_2_to_3 */
+	{ 0x5274, 0x00008060 },	/* gf_sharp_power_luma_4_to_5 */
+	{ 0x5278, 0x010000c0 },	/* gf_sharp_power_luma_6_to_7 */
+	{ 0x5290, 0x00000000 },	/* gf_sharp_limit_interp */
+	{ 0x5294, 0x00000000 },	/* medi_edge_thresh_anchor_gain */
+	{ 0x5298, 0x00000000 },	/* narr_edge_thresh_anchor_gain */
+	{ 0x529c, 0x00000000 },	/* medi_txtr_thresh_anchor_gain */
+	{ 0x52a0, 0x00000000 },	/* narr_txtr_thresh_anchor_gain */
+	{ 0x52a4, 0x00001000 },	/* edge_power_luma_0_to_1 */
+	{ 0x52a8, 0x00004020 },	/* edge_power_luma_2_to_3 */
+	{ 0x52ac, 0x00008060 },	/* edge_power_luma_4_to_5 */
+	{ 0x52b0, 0x010000c0 },	/* edge_power_luma_6_to_7 */
+	{ 0x52d4, 0x00001000 },	/* txtr_power_luma_0_to_1 */
+	{ 0x52d8, 0x00004020 },	/* txtr_power_luma_2_to_3 */
+	{ 0x52dc, 0x00008060 },	/* txtr_power_luma_4_to_5 */
+	{ 0x52e0, 0x010000c0 },	/* txtr_power_luma_6_to_7 */
+	{ 0x5304, 0x00000000 },	/* narr_edge_uv_limit */
+	{ 0x5308, 0x00000000 },	/* narr_txtr_uv_limit */
+	{ 0x530c, 0x3c1c3c37 },	/* edge_uv_limit */
+	{ 0x5310, 0x39143914 },	/* txtr_uv_limit */
+	{ 0x5314, 0x03030000 },	/* limit_uv_parameters */
+	{ 0x5328, 0x02000200 },	/* invs_halo_texture_weight_gain */
+	{ 0x532c, 0x00000000 },	/* invs_halo_texture_weight_min */
+	{ 0x5330, 0x01000100 },	/* invs_halo_texture_weight_max */
+	{ 0x5710, 0x00100000 },	/* noise_gain_lut_luma */
+	{ 0x5714, 0x00400020 },	/* noise_gain_lut_luma_1 */
+	{ 0x5718, 0x00800060 },	/* noise_gain_lut_luma_2 */
+	{ 0x571c, 0x010000c0 },	/* noise_gain_lut_luma_3 */
+	{ 0x5804, 0x04000400 },	/* yuv2rgb_coeff_0 */
+	{ 0x5808, 0x00000400 },	/* yuv2rgb_coeff_1 */
+	{ 0x580c, 0x07171ea0 },	/* yuv2rgb_coeff_2 */
+	{ 0x5810, 0x1d25059c },	/* yuv2rgb_coeff_3 */
+	{ 0x5814, 0x00000000 },	/* yuv2rgb_coeff_4 */
+	{ 0x5818, 0x03800000 },	/* yuv2rgb_offset_0 */
+	{ 0x581c, 0x00000380 },	/* yuv2rgb_offset_1 */
+	{ 0x5820, 0x00000000 },	/* contd_yuv2rgb_lshift */
+	{ 0x5830, 0x00152614 },	/* shift_0 */
+	{ 0x5840, 0x00152614 },	/* shift_1 */
+	{ 0x5850, 0x00060705 },	/* shift_2 */
+	{ 0x5860, 0x00060705 },	/* shift_3 */
+	{ 0x5870, 0x00242612 },	/* shift_4 */
+	{ 0x5874, 0x00000000 },	/* seg_0 */
+	{ 0x5878, 0x00000000 },	/* seg_1 */
+	{ 0x587c, 0x00000000 },	/* seg_2 */
+	{ 0x5880, 0x00000000 },	/* seg_3 */
+	{ 0x5884, 0x00000000 },	/* seg_4 */
+	{ 0x5904, 0x00000000 },	/* multiplier */
+	{ 0x5908, 0x00000000 },	/* clamp */
+	{ 0x59ac, 0x00000000 },	/* face_margin_left */
+	{ 0x59b0, 0x00000000 },	/* face_margin_left_1 */
+	{ 0x59b4, 0x00000000 },	/* face_margin_right */
+	{ 0x59b8, 0x00000000 },	/* face_margin_right_1 */
+	{ 0x59bc, 0x00000000 },	/* face_margin_up */
+	{ 0x59c0, 0x00000000 },	/* face_margin_up_1 */
+	{ 0x59c4, 0x00000000 },	/* face_margin_down */
+	{ 0x59c8, 0x00000000 },	/* face_margin_down_1 */
+	{ 0x59f0, 0x00000000 },	/* radial_gain_params */
+	{ 0x59f4, 0x00000000 },	/* weight_val_params */
+};
+
+/*
+ * Say how many, because an empty or short table fails *closed* but only on a
+ * device: the lookup refuses every register, the encode returns -EINVAL and a
+ * debugfs `run` reports nothing but "Invalid argument". This exact table
+ * reached hardware empty once, written through a shell heredoc that ate its
+ * own contents, and the generator's mirror was correct the whole time -- so
+ * nothing offline could see it.
+ */
+static_assert(ARRAY_SIZE(becore_sharpen_defaults) == BECORE_SHARPEN_DEFAULTS);
+
 struct becore_sharpen_kernel {
 	u32 first;			/* register, from BECORE_YUVP_PHYS_BASE */
 	u32 span;			/* the quadrant is span x span */
@@ -4627,6 +4823,21 @@ static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
 				 (column == kernel->span - 1 ? 1 : 2);
 
 	return total;
+}
+
+/* One of the block's compiled-in defaults, by offset from YUVP's base. */
+static int becore_yuvp_sharpen_default(u32 offset, u32 *value)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_sharpen_defaults); i++) {
+		if (becore_sharpen_defaults[i].offset != offset)
+			continue;
+		*value = becore_sharpen_defaults[i].value;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 /* One register of a kernel's quadrant: two taps, the lower one in the low half. */
@@ -5587,6 +5798,11 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		}
+		case BECORE_GEN_SHARPEN_DEFAULT:
+			if (becore_yuvp_sharpen_default(
+				    reg - BECORE_YUVP_PHYS_BASE, &result))
+				return -EINVAL;
+			break;
 		case BECORE_GEN_LPF:
 			if (becore_yuvp_lpf_value(reg - BECORE_YUVP_PHYS_BASE,
 						  &result))

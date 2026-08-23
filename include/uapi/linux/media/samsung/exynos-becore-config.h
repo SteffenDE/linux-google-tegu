@@ -24,15 +24,18 @@
  *	:c:type:`exynos_becore_params_gamma`
  * @EXYNOS_BECORE_PARAM_BLOCK_SHARPEN: The sharpener's tuning,
  *	:c:type:`exynos_becore_params_sharpen`
+ * @EXYNOS_BECORE_PARAM_BLOCK_YUVNR: The noise reducer's tuning,
+ *	:c:type:`exynos_becore_params_yuvnr`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
  * balance's own output, the guide curve is the exposure estimate's, the
  * lattice comes from a tuning tree indexed by the illuminant estimate, the
- * tone curve is the grade a calibration ships, and the sharpener's tuning
- * comes from a tree indexed by analog gain and exposure ratio. What none of
- * them carries is a register address or a program: userspace supplies values
- * in the units the block is specified in, and the driver encodes them.
+ * tone curve is the grade a calibration ships, and the sharpener's and noise
+ * reducer's tuning come from trees indexed by analog gain and exposure ratio.
+ * What none of them carries is a register address or a program: userspace
+ * supplies values in the units the block is specified in, and the driver
+ * encodes them.
  */
 enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_CCM = 0,
@@ -40,6 +43,7 @@ enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_CLUT,
 	EXYNOS_BECORE_PARAM_BLOCK_GAMMA,
 	EXYNOS_BECORE_PARAM_BLOCK_SHARPEN,
+	EXYNOS_BECORE_PARAM_BLOCK_YUVNR,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -660,6 +664,392 @@ struct exynos_becore_params_sharpen {
 	__s32 radial_face_margin_gain;
 } __attribute__((aligned(8)));
 
+/*
+ * The noise reducer carries 19 enables and 169 tuning values, and every one of
+ * them is a `float` in the vendor's own tuning proto reaching the hardware as
+ * ``round(f * scale)`` at one of nine fixed points.  Userspace does that
+ * multiplication and this block carries the result, exactly as the sharpener's
+ * does: an integer at the hardware's own scale, which is what the comment
+ * above each member names.  Every value is __s32 whatever its width, so the
+ * block is a flat sequence with no padding in it.
+ *
+ * **A value past the field it reaches saturates**, which is what the vendor's
+ * own translators do.
+ *
+ * Three things about this block are not the sharpener's, and each of them is
+ * why a member below exists or does not.
+ *
+ * **The block's slope tables are not here, because they are not tuning.**  The
+ * hardware wants a slope and a shift per segment of each noise curve, and the
+ * vendor computes both from the knots; the driver does the same arithmetic
+ * from @std_lut_x and the range beside it, and from @mcfp_gain_lut_y for the
+ * temporal curve.  Sending a slope would mean sending something that has to
+ * agree with the knots beside it, and nothing would check that it did.  The
+ * same goes for the luma curve's last interval -- see @luma_gain_y.
+ *
+ * The radial gain's *geometry* is absent for a different reason: it is the
+ * frame's size rather than tuning, so no member here could carry it.  Those
+ * two registers are still the ones the driver replays.
+ *
+ * **Two of the pyramid's arrays are at a different fixed point per level**,
+ * because each level halves the signal range, so they are three members each
+ * rather than an array of three.  Naming the levels is what lets the scale
+ * stay a property of the member.
+ *
+ * **The two-coefficient vertical IIR mode is not exposed.**  Turning it on
+ * makes six registers read a different set of tuning values -- the ``_up``
+ * variants of the vertical and horizontal sigmas, a second filter length and
+ * two row limits.  Every one of the 34 shipped tuning files that has this
+ * block has the mode off, and no captured program uses it, so the alternative
+ * has nothing to check an implementation against.  The block therefore
+ * describes the mode the hardware is actually run in, and @lfnr_enable's own
+ * gating -- which is a gate and not a mode -- is reproduced exactly.
+ */
+
+/* Eight-knot noise curves against luma, shared by the Y and UV axes. */
+#define EXYNOS_BECORE_YUVNR_STD_LUT_POINTS	8
+
+/* Three-tap low-pass kernels, and the three widths the long filter takes. */
+#define EXYNOS_BECORE_YUVNR_TAPS		3
+
+/* The guided filter's epsilon, one per vertical level. */
+#define EXYNOS_BECORE_YUVNR_GF_EPS_POINTS	3
+
+/* The luma-gain curve, sampled on a 32-point grid of luma. */
+#define EXYNOS_BECORE_YUVNR_LUMA_GAIN_POINTS	32
+
+/* The temporal filter's gain curve. */
+#define EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS	6
+
+/* Nine directional gains, one per tap of the vertical or horizontal filter. */
+#define EXYNOS_BECORE_YUVNR_GAIN_POINTS		9
+
+/**
+ * struct exynos_becore_params_yuvnr - The noise reducer's tuning
+ *
+ * @header: The parameters block header
+ * @enable: run the block at all; zero bypasses it
+ * @hfnr_enable: run the high-frequency noise reducer
+ * @lfnr_enable: run the low-frequency noise reducer. Zero also forces
+ *	@luma_gain_enable, @add_hf_y_enable and @add_hf_uv_enable off, which is
+ *	what the vendor's translators do and what the driver reproduces
+ * @luma_gain_enable: apply @luma_gain_y against luma
+ * @wavelet_nlm_relation_enable: let the wavelet stage see the non-local means
+ *	stage's decision
+ * @slope_new_enable: run the gradation detector
+ * @mcfp_weight_map_enable: take the temporal filter's weight map as an input
+ * @vert_long_th_radial_luma_enable: fall @vert_long_th off towards the corners
+ * @fallback_hpf_y_th_radial_luma_enable: the same for @fallback_hpf_y_th
+ * @fallback_long_y_th_radial_luma_enable: the same for @fallback_long_y_th
+ * @noise_addback_y_enable: add luma noise back after denoising
+ * @noise_addback_uv_enable: add chroma noise back
+ * @noise_addback_th_radial_luma_enable: fall that addition off towards the
+ *	corners
+ * @add_hf_y_enable: add high-frequency luma detail back
+ * @add_hf_uv_enable: add high-frequency chroma detail back
+ * @return_noise_y_enable: run the luma noise-return stage
+ * @return_noise_uv_enable: run the chroma one
+ * @return_noise_adaptive_coring: let its coring follow the local signal
+ * @return_noise_adaptive_power: let its amplitude follow the local signal
+ * @std_lut_x: the luma each knot of the noise curves sits at, ascending and
+ *	strictly increasing -- the driver divides by the gaps between them
+ * @std_lut_y: the luma noise standard deviation at each knot
+ * @std_lut_uv: the chroma noise standard deviation at each knot
+ * @std_factor_y: overall scale on the luma curve
+ * @std_factor_uv: overall scale on the chroma curve
+ * @y_support: the luma filter's support radius
+ * @uv_support: the chroma filter's
+ * @slope_est_support: the gradation detector's
+ * @lpf_for_y_denoise: which low-pass the luma denoiser runs on
+ * @pattern_y: which of the four fixed dither patterns to use
+ * @vert_filter_length: how many rows the vertical filter spans
+ * @lpf_y: the luma low-pass kernel's three taps
+ * @lpf_uv: the chroma low-pass kernel's three taps
+ * @fallback_long_y_filter_width: the fallback long filter's three widths
+ * @min_snr_sq_mean_ratio_y: how much of the luma mean square counts as signal
+ * @min_snr_sq_mean_ratio_uv: the same for chroma
+ * @min_snr_bin_width_y: the luma histogram's bin width
+ * @min_snr_bin_width_uv: the chroma histogram's
+ * @min_snr_pix_number_low_y: how few luma pixels a bin may hold and still count
+ * @min_snr_pix_number_low_uv: the same for chroma
+ * @min_snr_pix_number_high_y: how many it takes to count fully
+ * @min_snr_pix_number_high_uv: the same for chroma
+ * @radial_gain_a_y: the luma radial gain's first coefficient
+ * @radial_gain_b_y: its second
+ * @radial_gain_a_uv: the chroma radial gain's first coefficient
+ * @radial_gain_b_uv: its second
+ * @wavelet_th_vh_gain: gain on the wavelet threshold along the axes
+ * @wavelet_th_di_gain: gain on it along the diagonals
+ * @slope_new_thr_power: how sharply the gradation detector's threshold acts
+ * @slope_new_diff_weight_coring_th: below which a gradient is ignored
+ * @slope_new_diff_weight_gain: the gain applied above it
+ * @slope_new_diff_weight_clipping_th: where that gain stops growing
+ * @slope_new_weight_smooth_kernel: which smoothing kernel its weight uses
+ * @mcfp_weight_mean: which mean the temporal filter's weight is taken over
+ * @mcfp_weight_mean_in: any positive value selects the input-side mean; the
+ *	hardware field is one bit and takes only whether this is positive
+ * @mcfp_center_weight: how much the centre tap counts
+ * @mcfp_y_hfnr_min_ratio: the floor on luma high-frequency noise reduction
+ * @mcfp_uv_hfnr_min_ratio: the floor on the chroma one
+ * @mcfp_gain_lut_y: the temporal filter's gain at each knot
+ * @luma_gain_y: the noise gain against luma, on a 32-point grid. The hardware
+ *	takes 31 of the 32 and then the **width of the last interval**, so the
+ *	driver derives that from the last two entries -- which is why nothing
+ *	reads @luma_gain_y[31] directly
+ * @v_sigma_y: the vertical filter's luma sigma
+ * @v_sigma_uv: its chroma sigma
+ * @vertical_gf_eps: the vertical guided filter's epsilon per level
+ * @v_gain: the vertical filter's nine tap gains
+ * @wide_gain_y: the wide vertical filter's luma gain
+ * @wide_gain_uv: its chroma gain
+ * @vert_long_th_0: the long vertical filter's first threshold
+ * @vert_long_th_1: its second
+ * @vert_long_th_2: its third
+ * @vert_long_gain: the long vertical filter's three gains
+ * @h_sigma_y_level0: the horizontal filter's luma sigma at the finest level
+ * @h_sigma_uv_level0: its chroma sigma there
+ * @h_sigma_y_level1: the luma sigma one level coarser
+ * @h_sigma_uv_level1: the chroma sigma there
+ * @h_sigma_y_level2: the luma sigma at the coarsest level
+ * @h_sigma_uv_level2: the chroma sigma there
+ * @h_gain: the horizontal filter's nine tap gains
+ * @h_coring_l1_0: the first level's first coring threshold
+ * @h_coring_l1_1: its second
+ * @h_coring_l1_2: its third
+ * @h_coring_l2_0: the second level's first coring threshold
+ * @h_coring_l2_1: its second
+ * @h_coring_l2_2: its third
+ * @h_coring_gain_uv_l1: how much of the first level's coring chroma takes
+ * @h_coring_gain_uv_l2: the same for the second level
+ * @fallback_hpf_y_th: where the high-pass fallback starts to act
+ * @fallback_long_y_th: where the long fallback starts to act
+ * @fallback_hpf_y_gain: how much the high-pass fallback then applies
+ * @fallback_long_y_gain: how much the long fallback applies
+ * @noise_addback_y_th: below which no luma noise is added back
+ * @noise_addback_y_clip: the ceiling on how much is
+ * @noise_addback_y_gain: the gain it is added at
+ * @noise_addback_uv_th: below which no chroma noise is added back
+ * @noise_addback_uv_clip: the ceiling on how much is
+ * @noise_addback_uv_gain: the gain it is added at
+ * @hf_y_coring_th: below which high-frequency luma detail is not added back
+ * @hf_uv_coring_th: the same for chroma
+ * @add_hf_uv_gain: the gain chroma detail is added back at
+ * @return_noise_coring_threshold_y: below which no luma noise is returned
+ * @return_noise_coring_threshold_uv: the same for chroma
+ * @return_noise_power_y: the luma noise-return amplitude
+ * @return_noise_power_uv: the chroma one
+ * @return_noise_power_shifter_y: how far that amplitude is shifted down
+ * @return_noise_power_shifter_uv: the same for chroma
+ * @return_noise_limit_y: the ceiling on returned luma noise
+ * @return_noise_limit_uv: the ceiling on returned chroma noise
+ *
+ * The values come from a tuning tree the vendor indexes by scaler ratio,
+ * analog gain and exposure ratio, so this is a per-frame block rather than a
+ * calibration: what it carries is what a tuning tree evaluates to for the
+ * frame that is about to be processed.
+ */
+struct exynos_becore_params_yuvnr {
+	struct v4l2_isp_params_block_header header;
+
+	/* 0 or 1. */
+	__s32 enable;
+	__s32 hfnr_enable;
+	__s32 lfnr_enable;
+	__s32 luma_gain_enable;
+	__s32 wavelet_nlm_relation_enable;
+	__s32 slope_new_enable;
+	__s32 mcfp_weight_map_enable;
+	__s32 vert_long_th_radial_luma_enable;
+	__s32 fallback_hpf_y_th_radial_luma_enable;
+	__s32 fallback_long_y_th_radial_luma_enable;
+	__s32 noise_addback_y_enable;
+	__s32 noise_addback_uv_enable;
+	__s32 noise_addback_th_radial_luma_enable;
+	__s32 add_hf_y_enable;
+	__s32 add_hf_uv_enable;
+	__s32 return_noise_y_enable;
+	__s32 return_noise_uv_enable;
+	__s32 return_noise_adaptive_coring;
+	__s32 return_noise_adaptive_power;
+
+	/* Luma, on the block's own 12-bit scale. round(f * 1). */
+	__s32 std_lut_x[EXYNOS_BECORE_YUVNR_STD_LUT_POINTS];
+
+	/* Noise standard deviation over the unit interval. round(f * 4096). */
+	__s32 std_lut_y[EXYNOS_BECORE_YUVNR_STD_LUT_POINTS];
+	__s32 std_lut_uv[EXYNOS_BECORE_YUVNR_STD_LUT_POINTS];
+
+	/* Scale on the curve above. round(f * 16). */
+	__s32 std_factor_y;
+	__s32 std_factor_uv;
+
+	/* Counts and selectors, whose unit is the count. round(f * 1). */
+	__s32 y_support;
+	__s32 uv_support;
+	__s32 slope_est_support;
+	__s32 lpf_for_y_denoise;
+	__s32 pattern_y;
+	__s32 vert_filter_length;
+	__s32 lpf_y[EXYNOS_BECORE_YUVNR_TAPS];
+	__s32 lpf_uv[EXYNOS_BECORE_YUVNR_TAPS];
+	__s32 fallback_long_y_filter_width[EXYNOS_BECORE_YUVNR_TAPS];
+
+	/* A fraction of the mean square. round(f * 256). */
+	__s32 min_snr_sq_mean_ratio_y;
+	__s32 min_snr_sq_mean_ratio_uv;
+
+	/* Histogram bins and pixel counts. round(f * 1). */
+	__s32 min_snr_bin_width_y;
+	__s32 min_snr_bin_width_uv;
+	__s32 min_snr_pix_number_low_y;
+	__s32 min_snr_pix_number_low_uv;
+	__s32 min_snr_pix_number_high_y;
+	__s32 min_snr_pix_number_high_uv;
+
+	/* The radial gain's two coefficients. round(f * 1024). */
+	__s32 radial_gain_a_y;
+	__s32 radial_gain_b_y;
+	__s32 radial_gain_a_uv;
+	__s32 radial_gain_b_uv;
+
+	/* Gains on the wavelet threshold. round(f * 64). */
+	__s32 wavelet_th_vh_gain;
+	__s32 wavelet_th_di_gain;
+
+	/* The gradation detector's thresholds and gain. round(f * 256). */
+	__s32 slope_new_thr_power;
+	__s32 slope_new_diff_weight_coring_th;
+	__s32 slope_new_diff_weight_gain;
+	__s32 slope_new_diff_weight_clipping_th;
+
+	/* Which smoothing kernel it uses. round(f * 1). */
+	__s32 slope_new_weight_smooth_kernel;
+
+	/* The temporal filter's selectors and centre weight. round(f * 1). */
+	__s32 mcfp_weight_mean;
+	__s32 mcfp_weight_mean_in;
+	__s32 mcfp_center_weight;
+
+	/* Floors on high-frequency noise reduction. round(f * 256). */
+	__s32 mcfp_y_hfnr_min_ratio;
+	__s32 mcfp_uv_hfnr_min_ratio;
+
+	/* The temporal filter's gain curve. round(f * 4096). */
+	__s32 mcfp_gain_lut_y[EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS];
+
+	/* Noise gain against luma, as a plain gain. round(f * 1). */
+	__s32 luma_gain_y[EXYNOS_BECORE_YUVNR_LUMA_GAIN_POINTS];
+
+	/* The vertical filter's sigmas, epsilons and gains. round(f * 4096). */
+	__s32 v_sigma_y;
+	__s32 v_sigma_uv;
+	__s32 vertical_gf_eps[EXYNOS_BECORE_YUVNR_GF_EPS_POINTS];
+	__s32 v_gain[EXYNOS_BECORE_YUVNR_GAIN_POINTS];
+	__s32 wide_gain_y;
+	__s32 wide_gain_uv;
+
+	/* The long vertical filter's first threshold. round(f * 4096). */
+	__s32 vert_long_th_0;
+
+	/*
+	 * Its other two, which the hardware carries one bit narrower and so one
+	 * fixed point coarser. round(f * 2048).
+	 */
+	__s32 vert_long_th_1;
+	__s32 vert_long_th_2;
+
+	/* Its three gains. round(f * 16). */
+	__s32 vert_long_gain[EXYNOS_BECORE_YUVNR_TAPS];
+
+	/*
+	 * The horizontal filter's sigmas. Each level of the pyramid halves
+	 * the signal range, so each level is at its own fixed point rather
+	 * than a common one -- which is why these are six members and not two
+	 * arrays of three.
+	 */
+	/* round(f * 4096). */
+	__s32 h_sigma_y_level0;
+	__s32 h_sigma_uv_level0;
+
+	/* round(f * 8192). */
+	__s32 h_sigma_y_level1;
+	__s32 h_sigma_uv_level1;
+
+	/* round(f * 16384). */
+	__s32 h_sigma_y_level2;
+	__s32 h_sigma_uv_level2;
+
+	/* Its nine tap gains. round(f * 4096). */
+	__s32 h_gain[EXYNOS_BECORE_YUVNR_GAIN_POINTS];
+
+	/* The first coring level, whose first entry is one point finer than the
+	 * other two. round(f * 8192).
+	 */
+	__s32 h_coring_l1_0;
+
+	/* round(f * 4096). */
+	__s32 h_coring_l1_1;
+	__s32 h_coring_l1_2;
+
+	/* The second coring level, one point coarser throughout. round(f * 16384). */
+	__s32 h_coring_l2_0;
+
+	/* round(f * 8192). */
+	__s32 h_coring_l2_1;
+	__s32 h_coring_l2_2;
+
+	/* How much of that coring chroma takes. round(f * 8). */
+	__s32 h_coring_gain_uv_l1;
+	__s32 h_coring_gain_uv_l2;
+
+	/* Where the two fallbacks start to act. round(f * 4096). */
+	__s32 fallback_hpf_y_th;
+	__s32 fallback_long_y_th;
+
+	/* How much they then apply. round(f * 16). */
+	__s32 fallback_hpf_y_gain;
+	__s32 fallback_long_y_gain;
+
+	/* The luma addback's threshold and ceiling. round(f * 4096). */
+	__s32 noise_addback_y_th;
+	__s32 noise_addback_y_clip;
+
+	/* The gain it is added at. round(f * 256). */
+	__s32 noise_addback_y_gain;
+
+	/* The chroma addback's threshold and ceiling. round(f * 2048). */
+	__s32 noise_addback_uv_th;
+	__s32 noise_addback_uv_clip;
+
+	/* The gain it is added at. round(f * 256). */
+	__s32 noise_addback_uv_gain;
+
+	/* High-frequency luma coring. round(f * 4096). */
+	__s32 hf_y_coring_th;
+
+	/* High-frequency chroma coring. round(f * 2048). */
+	__s32 hf_uv_coring_th;
+
+	/* The gain chroma detail is added back at. round(f * 256). */
+	__s32 add_hf_uv_gain;
+
+	/* Where the noise-return stage starts to act. round(f * 4096). */
+	__s32 return_noise_coring_threshold_y;
+	__s32 return_noise_coring_threshold_uv;
+
+	/* Its amplitude. round(f * 1024). */
+	__s32 return_noise_power_y;
+	__s32 return_noise_power_uv;
+
+	/* How far that amplitude is shifted down. round(f * 1). */
+	__s32 return_noise_power_shifter_y;
+	__s32 return_noise_power_shifter_uv;
+
+	/* The ceiling on what it returns. round(f * 4096). */
+	__s32 return_noise_limit_y;
+	__s32 return_noise_limit_uv;
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_BECORE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -671,6 +1061,7 @@ struct exynos_becore_params_sharpen {
 	 sizeof(struct exynos_becore_params_ltm_curve) + \
 	 sizeof(struct exynos_becore_params_clut) + \
 	 sizeof(struct exynos_becore_params_gamma) + \
-	 sizeof(struct exynos_becore_params_sharpen))
+	 sizeof(struct exynos_becore_params_sharpen) + \
+	 sizeof(struct exynos_becore_params_yuvnr))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

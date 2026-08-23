@@ -498,12 +498,11 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 /*
  * The temporal filter's gain curve: six knots two to a register, five slopes
  * one per register.  Up here with the rest of the block's geography because
- * the generated-range table names the slopes, and that table is built long
- * before the arithmetic that reads them.
+ * the generated-range table names both, and that table is built long before
+ * the arithmetic that reads them.
  */
 #define BECORE_YUVNR_TNR_KNOTS		EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS
 #define BECORE_YUVNR_TNR_KNOT_FIRST	0x33f8
-#define BECORE_YUVNR_TNR_KNOT_MASK	GENMASK(6, 0)
 #define BECORE_YUVNR_TNR_SLOPE_FIRST	0x340c
 #define BECORE_YUVNR_TNR_SLOPE_MASK	GENMASK(13, 0)
 #define BECORE_YUVNR_TNR_GAIN_MAX	4096
@@ -5588,75 +5587,112 @@ static void becore_yuvnr_last_interval(const struct exynos_becore_params_yuvnr *
 }
 
 /*
- * The temporal filter's gain curve has slopes too, and the same problem: they
- * describe @mcfp_gain_lut_y, so a block that moves it would leave them
- * describing the curve it replaced.  Unlike the noise curve's, these registers
- * are not generated -- they are the recipe's -- so the block derives them the
- * way it derives the luma curve's last interval, and only while a block is in
- * force.
+ * The temporal filter's gain curve, whose domain and slopes are both derived.
  *
- * The knots the slopes are taken over stay the recipe's, because nothing in
- * the block carries them: the first of them is computed from an input the
- * driver does not have.  They are resolved once at probe so that this cannot
- * fail per frame, and `SetTnrSlope`'s quotient truncates toward zero, which is
- * what C division does.
+ * `SetTnrLut` builds six register knots out of @mcfp_gain_lut_x's five and one
+ * input.  That input is only ever read here, `GetDefaultYuvNr` builds its
+ * default with four floats of 1.0, and the knot it gives is 64 in all 441
+ * captured programs on three cameras and every geometry -- so the first knot
+ * is stated rather than carried through the interface.
+ *
+ * Each of the other five is capped at a ceiling of its own and then raised to
+ * its predecessor plus one if it does not exceed it.  The vendor tests the
+ * *raw* value against the predecessor rather than the capped one, which cannot
+ * differ: a ceiling is always above the knot before it.
+ *
+ * The sixth has no ceiling in the vendor's code -- it is *masked* into its
+ * seven-bit field, so a knot past 127 wraps below its predecessor and the
+ * curve stops rising.  Clamping instead is the rule this driver already takes
+ * for the noise curve's knots, and it is what makes the rise unconditional:
+ * the slopes below divide by the gaps, and with the rise guaranteed there is
+ * nothing for a buffer to make degenerate and no check to put in front of
+ * them.  No shipped tuning reaches the clamp -- every one of them ends this
+ * curve at 127.
  */
-static s32 becore_yuvnr_tnr_dx[BECORE_YUVNR_TNR_KNOTS - 1];
-static bool becore_yuvnr_tnr_ready;
+#define BECORE_YUVNR_TNR_FIRST_KNOT	64
+#define BECORE_YUVNR_TNR_CEILING(knot)	(122 + (knot))
+#define BECORE_YUVNR_TNR_KNOT_MAX	127
 
-static int becore_yuvnr_tnr_resolve(struct device *dev)
+static_assert(EXYNOS_BECORE_YUVNR_MCFP_LUT_X_POINTS ==
+	      BECORE_YUVNR_TNR_KNOTS - 1);
+/* Two knots to a register, so an odd count would drop the last one silently. */
+static_assert(BECORE_YUVNR_TNR_KNOTS % 2 == 0);
+
+static void becore_yuvnr_tnr_knots(const struct exynos_becore_params_yuvnr *params,
+				   s32 knots[BECORE_YUVNR_TNR_KNOTS])
+{
+	u32 knot;
+
+	knots[0] = BECORE_YUVNR_TNR_FIRST_KNOT;
+	for (knot = 1; knot < BECORE_YUVNR_TNR_KNOTS; knot++) {
+		s32 ceiling = knot < BECORE_YUVNR_TNR_KNOTS - 1 ?
+			      BECORE_YUVNR_TNR_CEILING(knot) :
+			      BECORE_YUVNR_TNR_KNOT_MAX;
+		s32 sent = clamp(params->mcfp_gain_lut_x[knot - 1], 0, ceiling);
+
+		knots[knot] = max(sent, knots[knot - 1] + 1);
+	}
+}
+
+/*
+ * Two seven-bit fields per register, low half first.  This wins over the field
+ * table rather than adding to it, the way the slopes do.
+ */
+static int becore_yuvnr_tnr_lut_x(const struct exynos_becore_params_yuvnr *params,
+				  u32 reg, u32 *value)
 {
 	s32 knots[BECORE_YUVNR_TNR_KNOTS];
+	u32 offset;
 	u32 index;
-	u32 word;
-	int ret;
 
-	for (index = 0; index < BECORE_YUVNR_TNR_KNOTS; index++) {
-		ret = becore_recipe_fixed_value(BECORE_YUVP,
-						BECORE_YUVP_PHYS_BASE +
-						BECORE_YUVNR_TNR_KNOT_FIRST +
-						(index / 2) * 4, &word);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "the temporal gain curve has no knot %u\n",
-					     index);
-		if (index & 1)
-			word >>= 16;
-		knots[index] = word & BECORE_YUVNR_TNR_KNOT_MASK;
-	}
-	for (index = 0; index + 1 < BECORE_YUVNR_TNR_KNOTS; index++) {
-		becore_yuvnr_tnr_dx[index] = knots[index + 1] - knots[index];
-		if (becore_yuvnr_tnr_dx[index] <= 0)
-			return dev_err_probe(dev, -ERANGE,
-					     "the temporal gain curve's domain does not rise\n");
-	}
-	becore_yuvnr_tnr_ready = true;
+	if (reg < BECORE_YUVP_PHYS_BASE)
+		return -ENOENT;
+	offset = reg - BECORE_YUVP_PHYS_BASE;
+	if (offset < BECORE_YUVNR_TNR_KNOT_FIRST ||
+	    (offset - BECORE_YUVNR_TNR_KNOT_FIRST) % 4)
+		return -ENOENT;
+	index = (offset - BECORE_YUVNR_TNR_KNOT_FIRST) / 4;
+	if (index >= BECORE_YUVNR_TNR_KNOTS / 2)
+		return -ENOENT;
+
+	becore_yuvnr_tnr_knots(params, knots);
+	*value = (u32)knots[index * 2] |
+		 ((u32)knots[index * 2 + 1] << 16);
 
 	return 0;
 }
 
+/*
+ * Its slopes have the same standing: they describe the curve rather than
+ * carrying values of their own, so a block that moved @mcfp_gain_lut_y or the
+ * domain above while these stayed frozen would write segments that contradict
+ * it.  `SetTnrSlope`'s quotient truncates toward zero, which is what C
+ * division does.
+ */
 static int becore_yuvnr_tnr_slope(const struct exynos_becore_params_yuvnr *params,
 				  u32 reg, u32 *value)
 {
+	s32 knots[BECORE_YUVNR_TNR_KNOTS];
 	s32 high, low;
 	u32 offset;
 	u32 index;
 
-	if (!becore_yuvnr_tnr_ready || reg < BECORE_YUVP_PHYS_BASE)
+	if (reg < BECORE_YUVP_PHYS_BASE)
 		return -ENOENT;
 	offset = reg - BECORE_YUVP_PHYS_BASE;
 	if (offset < BECORE_YUVNR_TNR_SLOPE_FIRST ||
 	    (offset - BECORE_YUVNR_TNR_SLOPE_FIRST) % 4)
 		return -ENOENT;
 	index = (offset - BECORE_YUVNR_TNR_SLOPE_FIRST) / 4;
-	if (index >= ARRAY_SIZE(becore_yuvnr_tnr_dx))
+	if (index + 1 >= BECORE_YUVNR_TNR_KNOTS)
 		return -ENOENT;
 
+	becore_yuvnr_tnr_knots(params, knots);
 	low = clamp(params->mcfp_gain_lut_y[index], 0,
 		    BECORE_YUVNR_TNR_GAIN_MAX);
 	high = clamp(params->mcfp_gain_lut_y[index + 1], 0,
 		     BECORE_YUVNR_TNR_GAIN_MAX);
-	*value = (u32)((high - low) / becore_yuvnr_tnr_dx[index]) &
+	*value = (u32)((high - low) / (knots[index + 1] - knots[index])) &
 		 BECORE_YUVNR_TNR_SLOPE_MASK;
 
 	return 0;
@@ -5818,6 +5854,15 @@ static int becore_yuvnr_table_validate(struct device *dev)
 			return dev_err_probe(dev, -EINVAL,
 					     "the temporal gain curve's slope %u is in the field table\n",
 					     i);
+	}
+	for (i = 0; i < BECORE_YUVNR_TNR_KNOTS / 2; i++) {
+		u32 reg = BECORE_YUVP_PHYS_BASE +
+			  BECORE_YUVNR_TNR_KNOT_FIRST + i * 4;
+
+		if (becore_yuvnr_lookup(reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "the temporal gain curve's knots +%#06x are in the field table\n",
+					     BECORE_YUVNR_TNR_KNOT_FIRST + i * 4);
 	}
 
 	/*
@@ -6917,13 +6962,15 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		case BECORE_GEN_YUVNR:
 			/*
-			 * The same pair the per-frame path uses, so the
+			 * The same three the per-frame path uses, so the
 			 * default and a buffer of zeros cannot diverge: the
-			 * field table first, then the one derivation whose
+			 * field table first, then the two derivations whose
 			 * registers the table does not hold.
 			 */
 			if (becore_yuvnr_value(&becore_yuvnr_off, reg,
 					       &result) &&
+			    becore_yuvnr_tnr_lut_x(&becore_yuvnr_off, reg,
+						   &result) &&
 			    becore_yuvnr_tnr_slope(&becore_yuvnr_off, reg,
 						   &result))
 				return -EINVAL;
@@ -7431,6 +7478,8 @@ static int becore_params_value(const struct becore_params_state *params,
 	 */
 	if (params->yuvnr_valid) {
 		if (!becore_yuvnr_value(&params->yuvnr, reg, value))
+			return 0;
+		if (!becore_yuvnr_tnr_lut_x(&params->yuvnr, reg, value))
 			return 0;
 		if (!becore_yuvnr_tnr_slope(&params->yuvnr, reg, value))
 			return 0;
@@ -9242,10 +9291,6 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
-	if (ret)
-		return ret;
-
-	ret = becore_yuvnr_tnr_resolve(becore->dev);
 	if (ret)
 		return ret;
 
@@ -11901,12 +11946,22 @@ becore_params_check_gamma(struct device *dev,
  * slope.  The check is on the clamped knots rather than the sent ones, because
  * the clamp is what reaches the hardware -- two knots far past the field's top
  * arrive as the same knot.
+ *
+ * The temporal gain curve's domain is divided by too and needs no check of its
+ * own: the vendor's own fix-up raises each knot to its predecessor plus one,
+ * and clamping the last into its field rather than masking it is what makes
+ * that rise unconditional.  See becore_yuvnr_tnr_knots().
  */
 static int __must_check
 becore_params_check_yuvnr(struct device *dev,
 			  const struct exynos_becore_params_yuvnr *yuvnr)
 {
 	unsigned int i;
+
+	if (yuvnr->reserved) {
+		dev_dbg(dev, "the noise reducer's reserved word is not zero\n");
+		return -EINVAL;
+	}
 
 	for (i = 1; i < EXYNOS_BECORE_YUVNR_STD_LUT_POINTS; i++) {
 		s32 previous = clamp(yuvnr->std_lut_x[i - 1], 0,

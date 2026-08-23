@@ -51,7 +51,7 @@ struct becore_yuvnr_reg {
 	u8 count;
 };
 
-#define BECORE_YUVNR_REGS		110
+#define BECORE_YUVNR_REGS		111
 #define BECORE_YUVNR_FIELDS		215
 #define BECORE_YUVNR_VALUES		194
 
@@ -79,6 +79,28 @@ static_assert(sizeof(struct exynos_becore_params_yuvnr) ==
 	{ BECORE_YUVNR_AT(luma_gain_enable), \
 	  BECORE_YUVNR_AT(add_hf_y_enable), \
 	  BECORE_YUVNR_AT(add_hf_uv_enable) }
+
+/*
+ * The bits the low-frequency stage's own branch deposits, which are not fields
+ * because no single member carries one: `TranslateYuvNrCommon` writes these
+ * three words from a two-armed branch and the arm taken is the one where
+ * `enable` and `lfnr_enable` are *both* set, so each bit stands for the two of
+ * them together.  @when_off says the bits stand where the stage is off.
+ *
+ * They are here rather than in the constants above because the constant would
+ * be the enabled arm's answer, and every captured program has both enables on
+ * -- so nothing in the corpus could tell the two apart.
+ */
+struct becore_yuvnr_guarded {
+	u16 offset;
+	u32 mask;
+	bool when_off;
+};
+
+#define BECORE_YUVNR_GUARDED		\
+	{ { 0x3704, 0x80000000, false }, \
+	  { 0x3708, 0x80000000, false }, \
+	  { 0x3758, 0x000000c6, true } }
 
 static const struct becore_yuvnr_field becore_yuvnr_fields[] = {
 	/* +0x3200 bypass [0] x1 */
@@ -810,9 +832,10 @@ static const struct becore_yuvnr_reg becore_yuvnr_regs[] = {
 	{ 0x36f4, 0x00000000, 140, 2 },	/* hf_y_coring_th */
 	{ 0x36f8, 0x00000000, 142, 2 },	/* hf_u_coring_th */
 	{ 0x3700, 0x00000000, 144, 2 },	/* hf_v_coring_th */
-	{ 0x3704, 0x80000000, 146, 3 },	/* filtersweights_param0 */
-	{ 0x3708, 0x80000000, 149, 3 },	/* filterweights_param1 */
+	{ 0x3704, 0x00000000, 146, 3 },	/* filtersweights_param0 */
+	{ 0x3708, 0x00000000, 149, 3 },	/* filterweights_param1 */
 	{ 0x370c, 0x00000000, 152, 3 },	/* filterweights_param2 */
+	{ 0x3758, 0x00000000, 155, 0 },	/* tuning_param4 */
 	{ 0x375c, 0x00000000, 155, 4 },	/* output_param0 */
 	{ 0x3760, 0x00000000, 159, 1 },	/* output_param1 */
 	{ 0x3764, 0x00000000, 160, 2 },	/* output_param2 */
@@ -894,7 +917,7 @@ static_assert(ARRAY_SIZE(becore_yuvnr_regs) == BECORE_YUVNR_REGS);
 	BECORE_YUVNR_RANGE(0x36ec, 0x36ec), \
 	BECORE_YUVNR_RANGE(0x36f4, 0x36f8), \
 	BECORE_YUVNR_RANGE(0x3700, 0x370c), \
-	BECORE_YUVNR_RANGE(0x375c, 0x3780), \
+	BECORE_YUVNR_RANGE(0x3758, 0x3780), \
 	BECORE_YUVNR_RANGE(0x378c, 0x37d0),
 
 #endif /* __EXYNOS_BECORE_YUVNR_H */

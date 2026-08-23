@@ -496,10 +496,24 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_YUVP_NR_SLOPE_UV_REG	(BECORE_YUVP_NR_BASE + 0x2a4)
 #define BECORE_YUVP_NR_SHIFT_UV_REG	(BECORE_YUVP_NR_BASE + 0x2b4)
 /*
+ * The block's radial geometry, which describes the *crop* rather than the
+ * raster YUVP reads: the fall-off reasons in the crop's coordinates and
+ * @BECORE_YUVNR_BINNING is what converts a chain pixel into one.  Up here
+ * with the rest of the block's geography because the generated-range table
+ * names it, and that table is built long before the arithmetic that fills it.
+ */
+#define BECORE_YUVNR_BINNING		0x332c
+#define BECORE_YUVNR_RADIAL_CENTER	0x3354
+#define BECORE_YUVNR_BINNING_Q		1024
+#define BECORE_YUVNR_BINNING_MASK	GENMASK(13, 0)
+#define BECORE_YUVNR_BINNING_Y_SHIFT	14
+#define BECORE_YUVNR_BUCKET_SHIFT	28
+#define BECORE_YUVNR_CENTRE_MASK	GENMASK(14, 0)
+
+/*
  * The temporal filter's gain curve: six knots two to a register, five slopes
- * one per register.  Up here with the rest of the block's geography because
- * the generated-range table names both, and that table is built long before
- * the arithmetic that reads them.
+ * one per register.  Up here for the same reason -- the range table names
+ * both.
  */
 #define BECORE_YUVNR_TNR_KNOTS		EXYNOS_BECORE_YUVNR_MCFP_LUT_POINTS
 #define BECORE_YUVNR_TNR_KNOT_FIRST	0x33f8
@@ -1569,6 +1583,7 @@ enum becore_generated_kind {
 	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
 	BECORE_GEN_YUVNR,	/* the noise reducer bypassed, its tuning at zero */
 	BECORE_GEN_NR_LUMA_GRID,	/* its luma-gain curve's knot grid */
+	BECORE_GEN_NR_GEOMETRY,	/* its radial pair, from the crop and chain */
 	BECORE_GEN_GRID_DMA,	/* the LTM grid RDMA, from our own buffer */
 	BECORE_GEN_YUVP_CHAIN_SIZE,	/* the raster YUVP is handed */
 	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
@@ -1609,7 +1624,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1342
+#define BECORE_YUVP_GENERATED_WORDS	1344
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1779,6 +1794,16 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_NR_DEFAULT },	/* h_nr_en */
 	{ BECORE_YUVP_PHYS_BASE + 0x3784, BECORE_YUVP_PHYS_BASE + 0x3788,
 	  BECORE_GEN_NR_DEFAULT },	/* filterweights_param3..filterweights_param4 */
+	/*
+	 * The block's radial geometry, which no parameters block could carry
+	 * because it is the frame's shape rather than its tuning.
+	 */
+	{ BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_BINNING,
+	  BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_BINNING,
+	  BECORE_GEN_NR_GEOMETRY },
+	{ BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_RADIAL_CENTER,
+	  BECORE_YUVP_PHYS_BASE + BECORE_YUVNR_RADIAL_CENTER,
+	  BECORE_GEN_NR_GEOMETRY },
 	BECORE_YUVNR_TUNING_RANGES
 	/*
 	 * The temporal gain curve, which the generated list above cannot carry
@@ -5353,6 +5378,99 @@ static int becore_yuvp_nr_luma_grid(u32 offset, u32 *value)
 	return 0;
 }
 
+/*
+ * `YUVNR`'s radial geometry: the frame's shape rather than its tuning, so no
+ * member of the parameters block could carry it and the driver derives it.
+ *
+ * Both registers describe the **crop** -- RGBP's DMSCCROP window -- and not
+ * the raster YUVP reads. `RADIAL_CENTER` is the crop's centre in two 15-bit
+ * fields, and `BINNING`'s two Q10 fields are the crop over the chain per axis,
+ * which is what turns a pixel of the raster the block is processing into a
+ * position in the crop the fall-off is defined over. The vendor takes the
+ * scaler's ratios from the crop the same way, and the eighteen captured
+ * readouts settle it: the array and the crop coincide on some of them and the
+ * crop and the chain on others, so no single one of the three would do.
+ *
+ * The top three bits of `BINNING` are a **radius bucket**: `lower_bound` over
+ * eight ascending radii compiled into `liblyric_iq.so` at 0x4a410, each about
+ * root two times the last, against the crop's diagonal -- and then that index
+ * **minus one**, floored at zero. The minus one is not a detail to leave out
+ * of this comment: `BYR_DNS`'s lookup a few hundred lines up searches the same
+ * kind of table and takes the plain index.
+ *
+ * Both halves of the lookup had to be read rather than assumed: the radius is
+ * *rounded*, and the search counts edges strictly below it. Truncating and
+ * counting `edge <= radius` gives the same answer for every geometry in the
+ * captures, which is exactly why reading it mattered.
+ *
+ * All 18 captured readouts across three cameras reproduce both words exactly,
+ * over crop-to-chain ratios from 1.0 to 2.0 and four of the eight bucket
+ * values.
+ */
+static const u16 becore_yuvnr_radii[] = {
+	650, 1150, 1618, 2296, 3243, 4578, 6474, 9190,
+};
+
+/*
+ * The square is a u64 and the root comes from int_sqrt64() because the rasters
+ * here are not this driver's to bound: they come from a profile table, and a
+ * profile with a dimension past 46,341 would overflow a u32 square silently
+ * and pick a bucket from a wrapped radius. The correction below is exact
+ * round-to-nearest -- `square - root * root > root` is `square >= root^2 +
+ * root + 1`, which is `sqrt(square) >= root + 0.5` -- and a tie cannot happen,
+ * since `(root + 0.5)^2` is never an integer.
+ */
+static u32 becore_yuvnr_radius_bucket(u32 width, u32 height)
+{
+	u64 square = (u64)width * width + (u64)height * height;
+	u64 radius = int_sqrt64(square);
+	u32 index;
+
+	if (square - radius * radius > radius)
+		radius++;
+	for (index = 0; index < ARRAY_SIZE(becore_yuvnr_radii); index++)
+		if (becore_yuvnr_radii[index] >= radius)
+			break;
+
+	return index ? index - 1 : 0;
+}
+
+static int
+becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
+			    u32 offset, u32 *value)
+{
+	struct becore_rect crop;
+	int ret;
+	s32 x;
+	s32 y;
+
+	ret = becore_rgbp_crop(profile, &crop);
+	if (ret)
+		return ret;
+
+	switch (offset) {
+	case BECORE_YUVNR_BINNING:
+		x = DIV_ROUND_CLOSEST(BECORE_YUVNR_BINNING_Q * crop.width,
+				      becore_rgbp_out_width());
+		y = DIV_ROUND_CLOSEST(BECORE_YUVNR_BINNING_Q * crop.height,
+				      becore_rgbp_out_height());
+		*value = ((u32)x & BECORE_YUVNR_BINNING_MASK) |
+			 (((u32)y & BECORE_YUVNR_BINNING_MASK) <<
+			  BECORE_YUVNR_BINNING_Y_SHIFT) |
+			 (becore_yuvnr_radius_bucket(crop.width, crop.height) <<
+			  BECORE_YUVNR_BUCKET_SHIFT);
+		return 0;
+	case BECORE_YUVNR_RADIAL_CENTER:
+		x = -(s32)(crop.width >> 1);
+		y = -(s32)(crop.height >> 1);
+		*value = (((u32)y & BECORE_YUVNR_CENTRE_MASK) << 16) |
+			 ((u32)x & BECORE_YUVNR_CENTRE_MASK);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 /* One of YUVNR's fixed-output words, by offset from YUVP's base. */
 static int becore_yuvp_nr_default(u32 offset, u32 *value)
 {
@@ -6932,6 +7050,12 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_NR_DEFAULT:
 			if (becore_yuvp_nr_default(reg - BECORE_YUVP_PHYS_BASE,
 						   &result))
+				return -EINVAL;
+			break;
+		case BECORE_GEN_NR_GEOMETRY:
+			if (becore_yuvnr_geometry_value(input,
+							reg - BECORE_YUVP_PHYS_BASE,
+							&result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_NR_LUMA_GRID:

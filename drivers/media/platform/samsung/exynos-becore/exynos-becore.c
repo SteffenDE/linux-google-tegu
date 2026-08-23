@@ -4033,6 +4033,14 @@ static const struct becore_csc_coefficient {
  * G = Y - Kb/(1 - Kr - Kb) * 2(1 - Kb) U - Kr/(1 - Kr - Kb) * 2(1 - Kr) V, and
  * B = Y + 2(1 - Kb) U. The colour LUT converts to RGB before it looks a colour
  * up, which is why a YUV block carries this at all.
+ *
+ * This one stays exact where the forward table above had to become the
+ * vendor's decimals, and the difference is measured rather than assumed: the
+ * two forms are indistinguishable in all nine coefficients up to Q15 and first
+ * diverge at Q16, in G's U coefficient. The three blocks that read this table
+ * are at Q10 and Q12, so there is four binary places of headroom -- adding
+ * another copy is only a hazard if the hardware ever carries this matrix at
+ * Q16, which nothing here does.
  */
 static const struct becore_csc_coefficient
 becore_clut_yuv2rgb[3][3] = {

@@ -1105,24 +1105,39 @@ static_assert((BECORE_YUVP_LTM_GMAP_LAST - BECORE_YUVP_LTM_GMAP_FIRST) / 4 +
 	      1 == EXYNOS_BECORE_LTM_CURVE_POINTS / BECORE_LTM_CURVE_PER_REG);
 
 /*
- * The block's second curve, and the one register file in it this driver states
- * rather than works out.
+ * The block's second curve: the tone adjustment the local map is applied
+ * through, and the one register file here whose words the driver carries
+ * rather than computes.
  *
  * It is the shipped apcamera.SCurve -- midpoint 0.1864, slope_midpoint 1.158,
  * relative_highlight_compression 1.0, relative_shadow_crushing 0.95 -- sampled
- * at 129 points and quantised the way TranslateLtmToneAdjust does, as
- * clamp(round(y * 16384), 0, 16384). What is missing is the evaluator: the
- * function that turns those four numbers into 129 floats is in none of the
- * extracted vendor libraries, so the curve is carried as its samples. The
- * numbers themselves are not in doubt -- they are bit-identical in all 426
- * captured programs, on all three cameras and at every one of the eighteen
- * captured readouts, so this is one fixed vendor profile and not a per-lens
- * calibration or a per-frame policy.
+ * at x = i / 128 and quantised the way TranslateLtmToneAdjust does, as
+ * clamp(round(y * 16384), 0, 16384).
  *
- * Two curve properties are worth recording, because they are what a future
- * closed form has to reproduce: the curve is its own fixed point at the
- * midpoint, y(0.1864) = 0.18641, and its slope there is 1.156 against the
- * tuning's 1.158.
+ * The evaluator those four numbers drive is three control points and a
+ * spline. The midpoint is a fixed point, so the curve passes through (m, m)
+ * at the tuning's slope, and both ends are pinned:
+ *
+ *	(0,	  0,	    (1 / slope_midpoint) * (1 - relative_shadow_crushing))
+ *	(midpoint, midpoint, slope_midpoint)
+ *	(1,	  1,	    1 + (white - 1) * relative_highlight_compression)
+ *
+ * where white is the slope that a logarithmic compression of the upper span,
+ * ln(1 + k * x) / ln(1 + k), leaves at its end: that span's own chord slope
+ * times k / ((k + 1) * ln(k + 1)), the chord being 1 here only because both
+ * of its ends sit on y = x. Between two control points the interpolant is
+ * Stineman's, which the vendor's own file name says -- with L the chord and
+ * T0, T1 the endpoint tangents, A = T0 - L, B = T1 - L, and
+ * y = L + A * B / (A + B).
+ *
+ * It stays a table for two reasons. The arithmetic is float32 throughout,
+ * including a logf and a degree-5 polynomial for k whose error the shipped
+ * curve carries; and there is no per-frame input to it -- the tuning is
+ * byte-identical on all three cameras, and the 129 words are bit-identical in
+ * all 426 captured programs and at every one of the eighteen captured
+ * readouts, so this is one fixed vendor profile rather than a per-lens
+ * calibration or a per-frame policy. tools/camera-ltm-scurve.py is the
+ * evaluator, and its --check regenerates exactly this table.
  */
 #define BECORE_LTM_TONEADJ_ENTRIES	129
 #define BECORE_LTM_TONEADJ_PER_REG	2

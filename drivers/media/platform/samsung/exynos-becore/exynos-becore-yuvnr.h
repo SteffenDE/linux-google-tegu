@@ -65,6 +65,39 @@ static_assert(sizeof(struct exynos_becore_params_yuvnr) ==
 	      sizeof(struct v4l2_isp_params_block_header) +
 	      BECORE_YUVNR_VALUES * sizeof(__s32));
 
+/*
+ * The noise curve a stream with no parameters buffer runs on.
+ *
+ * Every other value in this block defaults to zero, and zero is a value.  This
+ * curve's domain is not: the driver takes each segment's slope over the gap
+ * between two knots, so a domain of eight zeros is a division by nothing
+ * rather than a flat curve, and the same check that refuses it in a buffer
+ * would have to refuse the driver's own default.
+ *
+ * So the default is read rather than chosen.  `SetDefaultTuningCommon`
+ * (`liblyric_iq.so` `0x1742d0`) fills a default-constructed
+ * `apcamera.YuvNrTuning` with compiled-in literals and `GetDefaultYuvNr` runs
+ * the translator over it, which makes these the knots behind the vendor's own
+ * default program, as the floats it compiles in:
+ *
+ *   std_lut_x   0, 185, 530, 837, 1190, 2000, 3029, 4095
+ *   std_lut_y   0.5, 0.300122112, 0.100122102, 0.0500610508, 0.0200244207,
+ *               0.0109890113, 0.0100122103, 0.00903540943
+ *   std_lut_uv  the same 8
+ *
+ * The range is written as counts over a 12-bit full scale -- every one of
+ * those floats bar the first is exactly n/4095 -- so at the x4096 the hardware
+ * takes it, the numerator is what lands in the register.
+ *
+ * The same function's `luma_gain_x` is the 32-knot grid the driver already
+ * states from three independent counts, which is what says this parse lands on
+ * the fields it names.
+ */
+#define BECORE_YUVNR_DEFAULT_CURVE \
+	.std_lut_x = { 0, 185, 530, 837, 1190, 2000, 3029, 4095 }, \
+	.std_lut_y = { 2048, 1229, 410, 205, 82, 45, 41, 37 }, \
+	.std_lut_uv = { 2048, 1229, 410, 205, 82, 45, 41, 37 }
+
 #define BECORE_YUVNR_AT(member)	\
 	offsetof(struct exynos_becore_params_yuvnr, member)
 
@@ -892,20 +925,21 @@ static_assert(ARRAY_SIZE(becore_yuvnr_regs) == BECORE_YUVNR_REGS);
  * The same registers as ranges, for the generated table in the driver and for
  * the recipe generator that has to agree with it.
  *
- * The noise curve's own knots are *not* here even though the table encodes
- * them.  The driver resolves them out of the recipe at probe and derives the
- * curve's slopes and shifts from them whenever no parameters block is in
- * force; a generated word reads back as zero, and a domain that does not rise
- * is an arithmetic it refuses.  Twelve words therefore stay replayed until
- * there is a default noise curve to state in their place, and the chroma
- * domain stays BECORE_GEN_NOISE_DOMAIN, which repeats the luma one.
+ * The noise curve's chroma domain at +0x3274..+0x3280 is the one run the table
+ * encodes and this list does not carry.  It is the luma domain written a
+ * second time rather than an axis of its own, the driver generates it as
+ * BECORE_GEN_NOISE_DOMAIN out of the knots its slopes are taken over, and a
+ * range here would collide with that one.
  *
- * A range added here has to stay clear of the one reader of the recipe left,
- * becore_noise_knots_resolve(), which is why the twelve above are held back.
- * The temporal gain curve's knots at +0x33f8..+0x3400 were a second reader
- * until the driver started deriving them from `mcfp_gain_lut_x`; they are not
- * field deposits, so they are still not in this list, and the driver names
- * their range beside the slopes it derives the same way.
+ * The curve's *knots* are here, and were not until the driver had a default
+ * curve to state: they are what its slopes and shifts are derived from
+ * whenever no parameters block is in force, so a generated word reading back
+ * as zero would have left the driver dividing by a domain that does not rise.
+ * See BECORE_YUVNR_DEFAULT_CURVE above.
+ *
+ * The temporal gain curve's knots at +0x33f8..+0x3400 are not field deposits,
+ * so they are not in this list either; the driver names their range beside the
+ * slopes it derives the same way.
  */
 #define BECORE_YUVNR_RANGE(first, last)	\
 	{ BECORE_YUVP_PHYS_BASE + (first),	\
@@ -914,6 +948,8 @@ static_assert(ARRAY_SIZE(becore_yuvnr_regs) == BECORE_YUVNR_REGS);
 #define BECORE_YUVNR_TUNING_RANGES \
 	BECORE_YUVNR_RANGE(0x3200, 0x3204), \
 	BECORE_YUVNR_RANGE(0x320c, 0x3210), \
+	BECORE_YUVNR_RANGE(0x3220, 0x323c), \
+	BECORE_YUVNR_RANGE(0x3284, 0x3290), \
 	BECORE_YUVNR_RANGE(0x32c8, 0x32c8), \
 	BECORE_YUVNR_RANGE(0x32d8, 0x32dc), \
 	BECORE_YUVNR_RANGE(0x32ec, 0x32ec), \

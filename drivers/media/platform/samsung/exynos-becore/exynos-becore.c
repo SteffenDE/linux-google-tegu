@@ -1180,11 +1180,7 @@ static const u32 becore_yuvp_output_regs[] = {
 struct becore_gtnr_dma_profile {
 	u32 width;
 	u32 height;
-	u32 data_format;
-	u32 comp_control;
-	u32 lossy_byte32num;
 	u32 votf_enable;
-	u32 stride;
 	u32 businfo;
 	u32 max_mo;
 	u32 max_bl;
@@ -1200,11 +1196,7 @@ struct becore_gtnr_dma_profile {
 static const struct becore_gtnr_dma_profile becore_gtnr_input = {
 	.width = BECORE_CHAIN_WIDTH,
 	.height = BECORE_CHAIN_HEIGHT,
-	.data_format = 0x2000,
-	.comp_control = 0xa,
-	.lossy_byte32num = 2,
 	.votf_enable = 1,
-	.stride = 0x2080,
 	.businfo = 1,
 	.max_mo = 0x100,
 	.max_bl = 0x10,
@@ -1214,10 +1206,6 @@ static const struct becore_gtnr_dma_profile becore_gtnr_input = {
 static const struct becore_gtnr_dma_profile becore_gtnr_output = {
 	.width = BECORE_CHAIN_WIDTH,
 	.height = BECORE_CHAIN_HEIGHT,
-	.data_format = 0x2000,
-	.comp_control = 0xa,
-	.lossy_byte32num = 2,
-	.stride = 0x2080,
 	.businfo = 0,
 	.max_mo = 0x100,
 	.max_bl = 0x10,
@@ -1349,7 +1337,6 @@ struct becore_mcsc_dma_profile {
 	u32 comp_control;
 	u32 lossy_byte32num;
 	u32 votf_enable;
-	u32 stride;
 	u32 businfo;
 	u32 max_bl;
 	u32 enable;
@@ -1365,11 +1352,7 @@ struct becore_mcsc_dma_profile {
 static const struct becore_mcsc_dma_profile becore_mcsc_input = {
 	.width = BECORE_CHAIN_WIDTH,
 	.height = BECORE_CHAIN_HEIGHT,
-	.data_format = 0x2000,
-	.comp_control = 0xa,
-	.lossy_byte32num = 2,
 	.votf_enable = 0x00400001,
-	.stride = 0x2080,
 	.businfo = 2,
 	.max_bl = 0x10,
 	.enable = 1,
@@ -1391,7 +1374,6 @@ static const struct becore_mcsc_dma_profile becore_mcsc_output = {
 	.height = 3000,
 	.data_format = 0x800,
 	.comp_control = 0,
-	.stride = 0xfc0,
 	.businfo = 0,
 	.max_bl = 4,
 	.enable = 1,
@@ -2503,6 +2485,29 @@ becore_yuvp_output_stride(const struct becore_yuvp_output_profile *profile)
 	return profile->width * profile->bytes_per_pixel;
 }
 
+/*
+ * The chain surface: what YUVP writes and GTNR and MCSC read back.  One
+ * surface, so one description, and the profile that writes it is the one that
+ * knows it -- a reader that states the format again is a second answer to a
+ * question already answered, and it is the answer that goes wrong silently,
+ * because a reader that disagrees about a layout still reads a frame's worth
+ * of bytes and produces a picture.
+ *
+ * It is always the lossy-SBWC profile, not whichever one is active: MCSC is
+ * refused a run against any other (see becore_run_frame()), and GTNR's program
+ * is written against this one.  So this names the surface rather than taking
+ * the caller's, which also lets a value function with no device pointer ask.
+ */
+static const struct becore_yuvp_output_profile *becore_chain_surface(void)
+{
+	return &becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
+}
+
+static u32 becore_chain_stride(void)
+{
+	return becore_yuvp_output_stride(becore_chain_surface());
+}
+
 static size_t
 becore_yuvp_output_plane2_offset(const struct becore_yuvp_output_profile *profile)
 {
@@ -2646,13 +2651,13 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		*value = becore_gtnr_input.votf_enable;
 		break;
 	case BECORE_GTNR_INPUT_FORMAT:
-		*value = becore_gtnr_input.data_format;
+		*value = becore_chain_surface()->data_format;
 		break;
 	case BECORE_GTNR_INPUT_LOSSY:
-		*value = becore_gtnr_input.lossy_byte32num;
+		*value = becore_chain_surface()->lossy_byte32num;
 		break;
 	case BECORE_GTNR_INPUT_COMP:
-		*value = becore_gtnr_input.comp_control;
+		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_GTNR_INPUT_WIDTH:
 		*value = becore_gtnr_input.width;
@@ -2662,7 +2667,7 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		break;
 	case BECORE_GTNR_INPUT_STRIDE1:
 	case BECORE_GTNR_INPUT_STRIDE2:
-		*value = becore_gtnr_input.stride;
+		*value = becore_chain_stride();
 		break;
 	case BECORE_GTNR_INPUT_BUSINFO:
 		*value = becore_gtnr_input.businfo;
@@ -2677,13 +2682,13 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		*value = becore_gtnr_input.enable;
 		break;
 	case BECORE_GTNR_OUTPUT_FORMAT:
-		*value = becore_gtnr_output.data_format;
+		*value = becore_chain_surface()->data_format;
 		break;
 	case BECORE_GTNR_OUTPUT_LOSSY:
-		*value = becore_gtnr_output.lossy_byte32num;
+		*value = becore_chain_surface()->lossy_byte32num;
 		break;
 	case BECORE_GTNR_OUTPUT_COMP:
-		*value = becore_gtnr_output.comp_control;
+		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_GTNR_OUTPUT_WIDTH:
 		*value = becore_gtnr_output.width;
@@ -2693,7 +2698,7 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		break;
 	case BECORE_GTNR_OUTPUT_STRIDE1:
 	case BECORE_GTNR_OUTPUT_STRIDE2:
-		*value = becore_gtnr_output.stride;
+		*value = becore_chain_stride();
 		break;
 	case BECORE_GTNR_OUTPUT_BUSINFO:
 		*value = becore_gtnr_output.businfo;
@@ -2714,14 +2719,29 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 	return 0;
 }
 
+/*
+ * The scaled output's stride: its width rounded up to 64 bytes, one byte to a
+ * luma sample.  4000 becomes 4032, which is what the vendor's every captured
+ * program writes and what the driver used to carry as 0xfc0.  It is the
+ * node's `bytesperline` as well, so a stated one would be a promise to
+ * userspace that the DMA had stopped keeping.
+ */
+#define BECORE_MCSC_OUTPUT_STRIDE_ALIGN	64
+
+static u32 becore_mcsc_output_stride(void)
+{
+	return ALIGN(becore_mcsc_output.width,
+		     BECORE_MCSC_OUTPUT_STRIDE_ALIGN);
+}
+
 static size_t becore_mcsc_output_plane2_offset(void)
 {
-	return (size_t)becore_mcsc_output.stride * becore_mcsc_output.height;
+	return (size_t)becore_mcsc_output_stride() * becore_mcsc_output.height;
 }
 
 static size_t becore_mcsc_output_active_size(void)
 {
-	size_t chroma = (size_t)becore_mcsc_output.stride *
+	size_t chroma = (size_t)becore_mcsc_output_stride() *
 			DIV_ROUND_UP(becore_mcsc_output.height, 2);
 
 	return becore_mcsc_output_plane2_offset() + chroma;
@@ -2779,13 +2799,13 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 			 becore_mcsc_votf_enable(requested_token);
 		break;
 	case BECORE_MCSC_INPUT_FORMAT:
-		*value = becore_mcsc_input.data_format;
+		*value = becore_chain_surface()->data_format;
 		break;
 	case BECORE_MCSC_INPUT_LOSSY:
-		*value = becore_mcsc_input.lossy_byte32num;
+		*value = becore_chain_surface()->lossy_byte32num;
 		break;
 	case BECORE_MCSC_INPUT_COMP:
-		*value = becore_mcsc_input.comp_control;
+		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_MCSC_INPUT_WIDTH:
 		*value = becore_mcsc_input.width;
@@ -2795,7 +2815,7 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		break;
 	case BECORE_MCSC_INPUT_STRIDE1:
 	case BECORE_MCSC_INPUT_STRIDE2:
-		*value = becore_mcsc_input.stride;
+		*value = becore_chain_stride();
 		break;
 	case BECORE_MCSC_INPUT_BUSINFO:
 		*value = becore_mcsc_input.businfo;
@@ -2820,7 +2840,7 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		break;
 	case BECORE_MCSC_OUTPUT_STRIDE1:
 	case BECORE_MCSC_OUTPUT_STRIDE2:
-		*value = becore_mcsc_output.stride;
+		*value = becore_mcsc_output_stride();
 		break;
 	case BECORE_MCSC_OUTPUT_BUSINFO:
 		*value = becore_mcsc_output.businfo;
@@ -7831,8 +7851,6 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 {
 	const u8 *header = becore->gtnr_recipe;
 	const u8 *record = header + BECORE_GTNR_RECIPE_HEADER_BYTES;
-	const struct becore_yuvp_output_profile *input =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
 	u32 address_count = 0;
 	u32 generated_count = 0;
 	u32 typed_count = 0;
@@ -7848,13 +7866,7 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 	    get_unaligned_le32(header + 24) || get_unaligned_le32(header + 28))
 		return -EINVAL;
 	if (becore->output.size < becore_gtnr_surface_size() ||
-	    becore->gtnr_output.size != becore_gtnr_surface_size() ||
-	    becore_gtnr_input.width != input->width ||
-	    becore_gtnr_input.height != input->height ||
-	    becore_gtnr_input.stride != becore_yuvp_output_stride(input) ||
-	    becore_gtnr_output.width != input->width ||
-	    becore_gtnr_output.height != input->height ||
-	    becore_gtnr_output.stride != becore_yuvp_output_stride(input))
+	    becore->gtnr_output.size != becore_gtnr_surface_size())
 		return -EINVAL;
 
 	for (i = 0; i < BECORE_GTNR_HEADER_COUNT;
@@ -11159,7 +11171,7 @@ static void becore_video_fill_pix(struct v4l2_pix_format *pix)
 	pix->height = becore_mcsc_output.height;
 	pix->pixelformat = V4L2_PIX_FMT_NV21;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = becore_mcsc_output.stride;
+	pix->bytesperline = becore_mcsc_output_stride();
 	pix->sizeimage = becore_mcsc_output_active_size();
 	/* The captured recipe uses a full-range BT.601 RGB-to-YUV matrix. */
 	pix->colorspace = V4L2_COLORSPACE_SRGB;

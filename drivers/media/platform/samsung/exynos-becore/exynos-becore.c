@@ -2426,6 +2426,9 @@ static u32 becore_scaler_init_phase(u32 ratio)
 /* One bound, so the two fields it is the bound for have to be one width. */
 static_assert(BECORE_YUVNR_CENTRE_MASK == BECORE_RGBP_DNS_CENTRE_MASK);
 
+/* See becore_chain_validate(); the chroma plane is what asks for the four. */
+#define BECORE_CHAIN_WIDTH_ALIGN	4U
+
 static int becore_raster_validate(struct device *dev, const char *name,
 				  const struct becore_raster *raster, u32 max)
 {
@@ -2441,6 +2444,38 @@ static int becore_raster_validate(struct device *dev, const char *name,
 		return dev_err_probe(dev, -EINVAL,
 				     "%s raster %ux%u exceeds %u\n",
 				     name, raster->width, raster->height, max);
+
+	return 0;
+}
+
+/*
+ * The chain raster is the one with a width alignment of its own, and it is
+ * four rather than the two an even extent gives.  The chain surface carries
+ * 4:2:0 chroma interleaved at half the luma width, and the DMA blocks that
+ * plane the same way it blocks luma, so a merely even width leaves the chroma
+ * with an odd sample count.
+ *
+ * MCSC's stage then never completes at all: not an error interrupt but a
+ * timeout, which spends the run's whole budget and leaves the processors
+ * unproven, so it is much better refused.  Measured across widths at every
+ * residue -- 2578, 2582, 2586, 4158, 4162, 1506 and 1510 all hang where 2576,
+ * 2580, 2584, 4160 and 1508 all run -- and it is the width alone: the chain's
+ * height and both of the scaled output's extents are fine at merely even.
+ * Every captured chain raster is a multiple of four.  [HW 2026-08-24]
+ */
+static int becore_chain_validate(struct device *dev,
+				 const struct becore_raster *chain)
+{
+	int ret = becore_raster_validate(dev, "chain", chain,
+					 BECORE_RASTER_EXTENT_MAX);
+
+	if (ret)
+		return ret;
+	if (chain->width % BECORE_CHAIN_WIDTH_ALIGN)
+		return dev_err_probe(dev, -EINVAL,
+				     "chain raster %ux%u has a width that is not a multiple of %u\n",
+				     chain->width, chain->height,
+				     BECORE_CHAIN_WIDTH_ALIGN);
 
 	return 0;
 }
@@ -9769,8 +9804,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 				     BECORE_ARRAY_EXTENT_MAX);
 	if (ret)
 		return ret;
-	ret = becore_raster_validate(becore->dev, "chain", &becore->chain,
-				     BECORE_RASTER_EXTENT_MAX);
+	ret = becore_chain_validate(becore->dev, &becore->chain);
 	if (ret)
 		return ret;
 	ret = becore_c2serv_tokens_validate(becore->dev);
@@ -12677,8 +12711,7 @@ static int becore_geometry_apply(struct becore_device *becore,
 
 	lockdep_assert_held(&becore->lock);
 
-	ret = becore_raster_validate(becore->dev, "chain", chain,
-				     BECORE_RASTER_EXTENT_MAX);
+	ret = becore_chain_validate(becore->dev, chain);
 	if (ret)
 		return ret;
 	ret = becore_raster_validate(becore->dev, "scaled", scaled,

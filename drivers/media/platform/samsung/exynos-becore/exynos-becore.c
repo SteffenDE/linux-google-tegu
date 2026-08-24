@@ -55,6 +55,7 @@
 #include "exynos-becore-mcsc-recipe.h"
 #include "exynos-becore-sharpen.h"
 #include "exynos-becore-yuvnr.h"
+#include "exynos-becore-byrdns.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
 #define BECORE_GLOBAL_ENABLE_CLEAR	0x0008
@@ -358,7 +359,6 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_WDMAY_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2400)
 #define BECORE_RGBP_WDMAUV_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2600)
 #define BECORE_RGBP_DTP_MODE_REG	(BECORE_RGBP_PHYS_BASE + 0x3000)
-#define BECORE_RGBP_DNS_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3100)
 #define BECORE_RGBP_DNS_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x31c4)
 #define BECORE_RGBP_DMSC_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3200)
 #define BECORE_RGBP_DMSC_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x3278)
@@ -682,6 +682,8 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 #define BECORE_RGBP_DNS_BINNING_UNITY	1024	/* Q10 */
 #define BECORE_RGBP_DNS_BIQUAD_REG	(BECORE_RGBP_DNS_BASE + 0x1a8)
 #define BECORE_RGBP_DNS_BIQUAD_MAX	7
+/* The subtracter arrives at Q8, so an octave is 256 and the fraction is kept. */
+#define BECORE_RGBP_DNS_BIQUAD_Q	256
 #define BECORE_RGBP_DNS_CENTRE_MASK	GENMASK(14, 0)
 #define BECORE_RGBP_CSC_BASE		(BECORE_RGBP_PHYS_BASE + 0x3b00)
 /* YUVP carries the same twenty words, bit for bit, 0x100 lower. */
@@ -1734,6 +1736,7 @@ enum becore_generated_kind {
 	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_DNS_BIQUAD,	/* the biquad filter's resolution octave */
+	BECORE_GEN_BYR_DNS,	/* the Bayer denoiser bypassed, its tuning at zero */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
@@ -1786,7 +1789,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	301
+#define BECORE_RGBP_GENERATED_WORDS	323
 #define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
@@ -1805,10 +1808,9 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_DTP_MODE_REG, BECORE_RGBP_DTP_MODE_REG,
 	  BECORE_GEN_OFF },
-	{ BECORE_RGBP_DNS_BYPASS_REG, BECORE_RGBP_DNS_BYPASS_REG,
-	  BECORE_GEN_RUNNING },
 	{ BECORE_RGBP_DMSC_BYPASS_REG, BECORE_RGBP_DMSC_BYPASS_REG,
 	  BECORE_GEN_RUNNING },
+	BECORE_BYR_DNS_TUNING_RANGES
 	{ BECORE_RGBP_DMSC_MODE_FIRST, BECORE_RGBP_DMSC_MODE_LAST,
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_SC_CTRL0_REG, BECORE_RGBP_SC_CTRL0_REG,
@@ -1817,6 +1819,9 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_BAYER_PHASE },
 	{ BECORE_RGBP_DMSC_PHASE_REG, BECORE_RGBP_DMSC_PHASE_REG,
 	  BECORE_GEN_BAYER_PHASE },
+	{ BECORE_RGBP_DNS_X_G_REG,
+	  BECORE_RGBP_DNS_X_G_REG + BECORE_NOISE_TABLE_LAST,
+	  BECORE_GEN_NOISE_DOMAIN },
 	{ BECORE_RGBP_DNS_SLOPE_G_REG,
 	  BECORE_RGBP_DNS_SLOPE_G_REG + BECORE_NOISE_TABLE_LAST,
 	  BECORE_GEN_NOISE_SLOPE },
@@ -2741,12 +2746,14 @@ struct becore_params_state {
 	u16 gamma[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
 	struct exynos_becore_params_sharpen sharpen;
 	struct exynos_becore_params_yuvnr yuvnr;
+	struct exynos_becore_params_byr_dns byr_dns;
 	bool ccm_valid;
 	bool ltm_curve_valid;
 	bool clut_valid;
 	bool gamma_valid;
 	bool sharpen_valid;
 	bool yuvnr_valid;
+	bool byr_dns_valid;
 };
 
 struct becore_params_buffer {
@@ -2915,6 +2922,21 @@ struct becore_device {
 	 * ultrawide's, which is the camera every captured program came from.
 	 */
 	u32 input_code;
+	/*
+	 * The white balance the back end encodes against: the Bayer denoiser's
+	 * noise factors are its tuning times these gains.  Written by the
+	 * control op rather than copied at STREAMON, so that there is one
+	 * writer rather than a second source for a fact the controls already
+	 * hold.  Green is unity, which is what normalises the other two.
+	 *
+	 * Both controls are grabbed for the length of a *stream*, so a video
+	 * frame cannot see one move.  The offline loop is the other way round
+	 * -- it runs precisely when nothing is streaming -- so these are read
+	 * and written once each, and the worst a concurrent ioctl can do is
+	 * give one offline frame a gain an ioctl old.
+	 */
+	u32 encode_balance_red;
+	u32 encode_balance_blue;
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct vb2_queue queue;
@@ -4498,6 +4520,20 @@ static const struct exynos_becore_params_yuvnr becore_yuvnr_off = {
 };
 
 /*
+ * Which parameters block carries a curve's knots.
+ *
+ * A curve whose knots the recipe still carries reads them once at probe; one a
+ * block carries has to be re-read whenever a buffer arrives, because a slope
+ * that describes knots the hardware was not given is a piecewise-linear curve
+ * whose segments contradict itself.
+ */
+enum becore_noise_source {
+	BECORE_NOISE_FROM_RECIPE,
+	BECORE_NOISE_FROM_YUVNR,
+	BECORE_NOISE_FROM_BYR_DNS,
+};
+
+/*
  * Each entry names the knots its slopes come from, so a chroma curve whose own
  * domain registers this table generates points at the luma copy it repeats
  * rather than at itself -- those would read back as zero.
@@ -4508,34 +4544,62 @@ struct becore_noise_curve {
 	u32 y_first;
 	u32 slope_first;
 	u32 shift_reg;
-	u32 domain_first;	/* 0 when the curve owns its own domain */
+	u32 domain_first;	/* 0 when nothing here generates the domain */
 	bool round;		/* to nearest; false truncates */
 	/*
-	 * Whether the shift is searched for rather than fixed, and where the
-	 * curve's knots come from when a parameters block carries them.  Only
-	 * the noise reducer's two curves have either: its translator is the
-	 * one that has been read, and inventing a search for the demosaicer's
-	 * would be a guess about a block nothing here has decoded.
+	 * Whether the shift is searched for rather than fixed.  Both
+	 * translators search, from eleven fractional bits down until the
+	 * quotient fits, and both truncate the quotient to `short` before
+	 * testing the fit -- no shipped tuning reaches either, but a
+	 * parameters block's knots are userspace's and can.
 	 */
 	bool search;
-	size_t params_range;	/* offsetof() the range, or 0 for none */
+	/* Where the range comes from when a parameters block carries it. */
+	enum becore_noise_source source;
+	size_t params_range;	/* offsetof() the range within that block */
 };
 
 static const struct becore_noise_curve becore_noise_curves[] = {
 	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_G_REG,
-	  BECORE_RGBP_DNS_SLOPE_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG, 0, true,
-	  false, 0 },
+	  BECORE_RGBP_DNS_SLOPE_G_REG, BECORE_RGBP_DNS_SHIFT_G_REG,
+	  BECORE_RGBP_DNS_X_G_REG, true, true, BECORE_NOISE_FROM_BYR_DNS,
+	  offsetof(struct exynos_becore_params_byr_dns, std_lut_y_g) },
 	{ BECORE_RGBP, BECORE_RGBP_DNS_X_G_REG, BECORE_RGBP_DNS_Y_RB_REG,
 	  BECORE_RGBP_DNS_SLOPE_RB_REG, BECORE_RGBP_DNS_SHIFT_RB_REG,
-	  BECORE_RGBP_DNS_X_RB_REG, true, false, 0 },
+	  BECORE_RGBP_DNS_X_RB_REG, true, true, BECORE_NOISE_FROM_BYR_DNS,
+	  offsetof(struct exynos_becore_params_byr_dns, std_lut_y_rb) },
 	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_Y_REG,
 	  BECORE_YUVP_NR_SLOPE_Y_REG, BECORE_YUVP_NR_SHIFT_Y_REG, 0, false,
-	  true, offsetof(struct exynos_becore_params_yuvnr, std_lut_y) },
+	  true, BECORE_NOISE_FROM_YUVNR,
+	  offsetof(struct exynos_becore_params_yuvnr, std_lut_y) },
 	{ BECORE_YUVP, BECORE_YUVP_NR_X_Y_REG, BECORE_YUVP_NR_Y_UV_REG,
 	  BECORE_YUVP_NR_SLOPE_UV_REG, BECORE_YUVP_NR_SHIFT_UV_REG,
-	  BECORE_YUVP_NR_X_UV_REG, false,
-	  true, offsetof(struct exynos_becore_params_yuvnr, std_lut_uv) },
+	  BECORE_YUVP_NR_X_UV_REG, false, true, BECORE_NOISE_FROM_YUVNR,
+	  offsetof(struct exynos_becore_params_yuvnr, std_lut_uv) },
 };
+
+/*
+ * The Bayer denoiser's knot domain, which is not tuning: `ByrDnsDynamicParam`
+ * has no x array at all and `lyric::TranslateByrDns` writes these eight
+ * twelve-bit literals behind a guard that both y arrays are exactly eight
+ * long.  Both of its curves share the one copy -- the rb registers repeat it
+ * -- so a parameters block carries ranges and nothing else.
+ */
+static const s32 becore_byr_dns_domain[BECORE_NOISE_KNOTS] = {
+	0, 150, 300, 500, 1000, 1800, 2500, 4095,
+};
+
+/*
+ * The biquad filter's resolution ladder, each rung about root two times the
+ * last, so a step is a factor of two in area.  `TranslateByrDns` runs
+ * `lower_bound` over it with the shorter axis of the block's input.
+ */
+static const u32 becore_byr_dns_ladder[] = {
+	486, 686, 972, 1374, 1944, 2748, 3888, 5498,
+};
+
+static_assert(ARRAY_SIZE(becore_byr_dns_ladder) ==
+	      BECORE_RGBP_DNS_BIQUAD_MAX + 1);
 
 static int becore_noise_curve_for(enum becore_block_id id, u32 reg, u32 kind,
 				  size_t *found)
@@ -4603,18 +4667,45 @@ static int becore_noise_read_knot(enum becore_block_id id, u32 first,
 	return 0;
 }
 
-/* Every knot of a curve a parameters block carries, clamped as it is sent. */
+/*
+ * Every knot of a curve a parameters block carries, clamped as it is sent.
+ *
+ * The two blocks differ in where the *domain* comes from and only there: the
+ * noise reducer's is tuning and travels in its block, the Bayer denoiser's is
+ * the vendor's own compiled-in literals and belongs to the driver.
+ */
 static void
-becore_noise_knots_from_params(const struct exynos_becore_params_yuvnr *params,
+becore_noise_knots_from_params(const void *block,
 			       const struct becore_noise_curve *curve,
 			       struct becore_noise_knots *knots)
 {
-	const __s32 *range = (const __s32 *)((const u8 *)params +
+	const __s32 *range = (const __s32 *)((const u8 *)block +
 					     curve->params_range);
+	const __s32 *domain;
 	u32 index;
 
+	switch (curve->source) {
+	case BECORE_NOISE_FROM_YUVNR:
+		domain = ((const struct exynos_becore_params_yuvnr *)block)
+				 ->std_lut_x;
+		break;
+	case BECORE_NOISE_FROM_BYR_DNS:
+		domain = becore_byr_dns_domain;
+		break;
+	default:
+		/*
+		 * A curve whose knots no block carries has no business here,
+		 * and a source added without a case would otherwise take the
+		 * Bayer denoiser's literals in silence.
+		 */
+		WARN_ONCE(1, "noise curve source %u carries no domain\n",
+			  curve->source);
+		domain = becore_byr_dns_domain;
+		break;
+	}
+
 	for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
-		knots->x[index] = clamp(params->std_lut_x[index], 0,
+		knots->x[index] = clamp(domain[index], 0,
 					BECORE_NOISE_KNOT_MAX);
 		knots->y[index] = clamp(range[index], 0, BECORE_NOISE_KNOT_MAX);
 	}
@@ -4654,16 +4745,21 @@ static int becore_noise_knots_from_recipe(struct device *dev, size_t curve_index
  * the luma copy it repeats -- and it is worth failing probe over rather than
  * discovering at the first STREAMON.
  *
- * The noise reducer's two curves do not come from the recipe at all: the
- * driver generates their knot registers now, so the recipe no longer carries
- * them, and what a stream with no parameters buffer writes there is
- * becore_yuvnr_off's stated default. Resolving them out of the same block the
- * field table encodes is what keeps the slopes describing the knots the
- * hardware was given -- the same reason becore_noise_knots_for() takes a
- * buffer's knots over these.
+ * No curve comes from the recipe any more: the driver generates all four
+ * blocks' knot registers, so the recipe no longer carries them, and what a
+ * stream with no parameters buffer writes there is the block's own default --
+ * becore_yuvnr_off's stated curve, and for the Bayer denoiser a parameter set
+ * of all zeros over the domain the driver states. Resolving them out of the
+ * same block the field table encodes is what keeps the slopes describing the
+ * knots the hardware was given -- the same reason becore_noise_knots_for()
+ * takes a buffer's knots over these.
+ *
+ * becore_noise_knots_from_recipe() is kept for a curve that has neither, which
+ * is the state every one of these was in until its translator was read.
  */
 static int becore_noise_knots_resolve(struct device *dev)
 {
+	static const struct exynos_becore_params_byr_dns byr_dns_off = {};
 	size_t i;
 	u32 index;
 	int ret;
@@ -4671,8 +4767,11 @@ static int becore_noise_knots_resolve(struct device *dev)
 	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
 		const struct becore_noise_curve *curve = &becore_noise_curves[i];
 
-		if (curve->params_range) {
+		if (curve->source == BECORE_NOISE_FROM_YUVNR) {
 			becore_noise_knots_from_params(&becore_yuvnr_off, curve,
+						       &becore_noise_knots[i]);
+		} else if (curve->source == BECORE_NOISE_FROM_BYR_DNS) {
+			becore_noise_knots_from_params(&byr_dns_off, curve,
 						       &becore_noise_knots[i]);
 		} else {
 			ret = becore_noise_knots_from_recipe(dev, i,
@@ -4696,16 +4795,17 @@ static int becore_noise_knots_resolve(struct device *dev)
 /*
  * Where a curve's knots come from.
  *
- * Both of the noise reducer's curves are also carried by its parameters block,
- * and when one is in force the knots have to come from *it* rather than from
- * the recipe words resolved at probe. Otherwise a buffer would move the knot
- * registers and leave behind the slopes and shifts that describe them, which
- * is a piecewise-linear curve whose segments contradict its own knots. The
- * clamp is the one the generated field table applies when it deposits these
- * same values into those knot registers, and it is here for the same reason:
- * the slope has to describe the knots the hardware was given.
+ * Every one of these curves is also carried by a parameters block, and when
+ * one is in force the knots have to come from *it* rather than from the
+ * defaults resolved at probe. Otherwise a buffer would move the knot registers
+ * and leave behind the slopes and shifts that describe them, which is a
+ * piecewise-linear curve whose segments contradict its own knots. The clamp is
+ * the one the generated field table applies when it deposits these same values
+ * into those knot registers, and it is here for the same reason: the slope has
+ * to describe the knots the hardware was given.
  */
 static_assert(BECORE_NOISE_KNOTS == EXYNOS_BECORE_YUVNR_STD_LUT_POINTS);
+static_assert(BECORE_NOISE_KNOTS == EXYNOS_BECORE_BYR_DNS_STD_LUT_POINTS);
 
 static const struct becore_noise_knots *
 becore_noise_knots_for(const struct becore_device *becore, size_t curve_index,
@@ -4714,10 +4814,16 @@ becore_noise_knots_for(const struct becore_device *becore, size_t curve_index,
 	const struct becore_noise_curve *curve =
 		&becore_noise_curves[curve_index];
 
-	if (!curve->params_range || !becore->params.yuvnr_valid)
+	if (curve->source == BECORE_NOISE_FROM_YUVNR &&
+	    becore->params.yuvnr_valid)
+		becore_noise_knots_from_params(&becore->params.yuvnr, curve,
+					       scratch);
+	else if (curve->source == BECORE_NOISE_FROM_BYR_DNS &&
+		 becore->params.byr_dns_valid)
+		becore_noise_knots_from_params(&becore->params.byr_dns, curve,
+					       scratch);
+	else
 		return &becore_noise_knots[curve_index];
-
-	becore_noise_knots_from_params(&becore->params.yuvnr, curve, scratch);
 
 	return scratch;
 }
@@ -4742,9 +4848,12 @@ becore_noise_knots_for(const struct becore_device *becore, size_t curve_index,
  * that then fits. Reproducing that is the point -- it is what the hardware
  * would have been given.
  *
- * The demosaicer's two curves do not search, and are left exactly as they
- * were: their translator has not been read, and inventing a search for it
- * would be a guess about a block nothing here has decoded.
+ * `TranslateByrDns` does the same thing from the same eleven bits against the
+ * same 4095, with one difference the census made worth reproducing: it *rounds*
+ * the quotient where the noise reducer truncates it. Assuming one block's rule
+ * for the other reproduces every exact division and misses by one everywhere
+ * else, which is precisely the kind of error no offline check would have
+ * found while both blocks replayed their slopes.
  */
 static int becore_noise_segment(const struct becore_noise_curve *curve,
 				const struct becore_noise_knots *knots,
@@ -5593,49 +5702,6 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 	}
 
 	return -EINVAL;
-}
-
-/*
- * The biquad filter's resolution ladder, each rung about root two times the
- * last, so a step is a factor of two in area.  `lyric::TranslateByrDns` runs
- * `lower_bound` over it with the shorter axis of the block's input.
- */
-static const u32 becore_byr_dns_ladder[] = {
-	486, 686, 972, 1374, 1944, 2748, 3888, 5498,
-};
-
-static_assert(ARRAY_SIZE(becore_byr_dns_ladder) ==
-	      BECORE_RGBP_DNS_BIQUAD_MAX + 1);
-
-/*
- * BIQUAD_SCALE_SHIFT_ADDER, which is a resolution octave rather than a number.
- *
- * `TranslateByrDns` takes `lower_bound` over that ladder indexed by the shorter
- * axis of the block's input and caps the rung at seven, then subtracts the
- * tuning's own offset and clamps what is left into the field's three bits.
- * Each rung is a factor of two in area, so this is what tells the filter how
- * much of the picture one of its taps covers.  The offset is zero at every leaf
- * of every shipped tuning tree on all three cameras, and until this block's
- * tuning comes from userspace there is nowhere else for one to arrive from.
- *
- * It is not a constant, which is what the invariance census is for: it takes
- * four distinct values -- rungs 3 to 6 -- over the 574 captured RGBP programs,
- * and the captured 6 is right at eight of the eighteen captured readouts and
- * wrong at the other ten.
- */
-static int
-becore_byr_dns_biquad_value(const struct becore_rgbp_input_profile *profile,
-			    u32 *value)
-{
-	u32 shorter = min(profile->width, profile->height);
-	u32 rung;
-
-	for (rung = 0; rung < ARRAY_SIZE(becore_byr_dns_ladder); rung++)
-		if (becore_byr_dns_ladder[rung] >= shorter)
-			break;
-	*value = min_t(u32, rung, BECORE_RGBP_DNS_BIQUAD_MAX);
-
-	return 0;
 }
 
 /*
@@ -6553,6 +6619,238 @@ static int becore_yuvnr_table_validate(struct device *dev)
 					     curve->shift_reg -
 					     BECORE_YUVP_PHYS_BASE);
 	}
+
+	return 0;
+}
+
+/* One of the Bayer denoiser's tuning registers, or NULL if it is not one. */
+static const struct becore_byr_dns_reg *becore_byr_dns_lookup(u32 reg)
+{
+	u32 low = 0, high = ARRAY_SIZE(becore_byr_dns_regs);
+	u32 offset;
+
+	if (reg < BECORE_RGBP_PHYS_BASE)
+		return NULL;
+	offset = reg - BECORE_RGBP_PHYS_BASE;
+	if (offset > U16_MAX)
+		return NULL;
+
+	while (low < high) {
+		u32 middle = low + (high - low) / 2;
+
+		if (becore_byr_dns_regs[middle].offset < offset)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+
+	if (low == ARRAY_SIZE(becore_byr_dns_regs) ||
+	    becore_byr_dns_regs[low].offset != offset)
+		return NULL;
+
+	return &becore_byr_dns_regs[low];
+}
+
+/*
+ * The three noise factors are the tuning times the white balance in front of
+ * the block, which is the whole reason this block reads the AWB at all: photon
+ * noise scales with the per-channel gain applied to it.  So the value that
+ * travels in a parameters buffer is the tuning alone and this is where the
+ * gain meets it -- Q12 against Q12, times the sixteen the field is expressed
+ * at, rounded to nearest as `TranslateByrDns` does.  Green's gain is unity by
+ * construction: the AWB normalises it, which the corpus confirms to the bit on
+ * two of the three cameras.
+ */
+static s32 becore_byr_dns_balanced(const struct becore_device *becore,
+				   const struct becore_byr_dns_field *field,
+				   s32 raw)
+{
+	u64 gain = EXYNOS_BECORE_WBG_UNITY_Q12;
+	u64 product;
+
+	if (raw < 0)
+		return 0;
+	if (field->flags & BECORE_BYR_DNS_FIELD_RED)
+		gain = READ_ONCE(becore->encode_balance_red);
+	else if (field->flags & BECORE_BYR_DNS_FIELD_BLUE)
+		gain = READ_ONCE(becore->encode_balance_blue);
+
+	product = (u64)raw * gain * 16 + (1ULL << 23);
+
+	return (s32)min(product >> 24, (u64)S32_MAX);
+}
+
+/*
+ * The Bayer denoiser's tuning, encoded.
+ *
+ * The table is generated from the vendor's own translator, so this walks it
+ * rather than knowing anything: field to bits, at the fixed point the UAPI
+ * names.  `params` is what userspace most recently sent, or NULL for the
+ * driver's own default -- which is the absence of values rather than a table
+ * of them, and because the block's `enable` reaches its register inverted,
+ * that absence is the denoiser bypassed.
+ *
+ * A value past the field saturates rather than being refused, as it does for
+ * the sharpener and for the same reason: the vendor's own translator clamps,
+ * and the shipped tuning reaches the clamp.  Four fields are the exception in
+ * the vendor's direction rather than ours -- `g_lpf`, `rb_lpf` and the two
+ * `min_snr_pix_number_*` pairs are *masked* there rather than clamped, so an
+ * out-of-range value wraps for the vendor and saturates here.  The generated
+ * table's limits for those rows are the field's width, not a clamp the
+ * translator performs.
+ */
+static int becore_byrdns_value(const struct becore_device *becore,
+			       const struct exynos_becore_params_byr_dns *params,
+			       u32 reg, u32 *value)
+{
+	const struct becore_byr_dns_reg *entry = becore_byr_dns_lookup(reg);
+	u32 word;
+	u32 i;
+
+	if (!entry)
+		return -ENOENT;
+
+	word = entry->constant;
+	for (i = 0; i < entry->count; i++) {
+		const struct becore_byr_dns_field *field =
+			&becore_byr_dns_fields[entry->first + i];
+		s32 raw = 0;
+
+		if (params)
+			raw = *(const __s32 *)((const u8 *)params +
+					       field->offset);
+		if (field->flags & (BECORE_BYR_DNS_FIELD_RED |
+				    BECORE_BYR_DNS_FIELD_GREEN |
+				    BECORE_BYR_DNS_FIELD_BLUE))
+			raw = becore_byr_dns_balanced(becore, field, raw);
+		if (field->flags & BECORE_BYR_DNS_FIELD_INVERT)
+			raw = raw ? 0 : 1;
+
+		raw = clamp(raw, field->min, field->max);
+		word |= ((u32)raw & (BIT(field->width) - 1)) << field->shift;
+	}
+
+	*value = word;
+
+	return 0;
+}
+
+/*
+ * BIQUAD_SCALE_SHIFT_ADDER, which is a resolution octave rather than a number.
+ *
+ * `TranslateByrDns` takes `lower_bound` over a root-two ladder indexed by the
+ * shorter axis of the block's input, caps the rung at seven, subtracts the
+ * tuning's own offset and clamps what is left into the field's three bits --
+ * truncating, where every value it *deposits* rounds.  Each rung is a factor
+ * of two in area, so this is what tells the filter how much of the picture one
+ * of its taps covers.
+ *
+ * It is the one word of this block that is neither tuning nor invariant: the
+ * census finds four distinct values -- rungs 3 to 6 -- over the 574 captured
+ * RGBP programs, and the captured 6 is right at eight of the eighteen captured
+ * readouts and wrong at the other ten.
+ */
+static int
+becore_byr_dns_biquad_value(const struct becore_rgbp_input_profile *profile,
+			    const struct exynos_becore_params_byr_dns *params,
+			    u32 *value)
+{
+	s32 subtracter = params ? params->biquad_scale_shift_subtracter : 0;
+	u32 shorter = min(profile->width, profile->height);
+	s32 octaves;
+	u32 rung;
+
+	for (rung = 0; rung < ARRAY_SIZE(becore_byr_dns_ladder); rung++)
+		if (becore_byr_dns_ladder[rung] >= shorter)
+			break;
+	rung = min_t(u32, rung, BECORE_RGBP_DNS_BIQUAD_MAX);
+
+	octaves = (s32)(rung * BECORE_RGBP_DNS_BIQUAD_Q) - subtracter;
+	octaves = clamp(octaves, 0,
+			BECORE_RGBP_DNS_BIQUAD_MAX * BECORE_RGBP_DNS_BIQUAD_Q);
+	*value = (u32)octaves / BECORE_RGBP_DNS_BIQUAD_Q;
+
+	return 0;
+}
+
+/*
+ * The same checks the other two generated tables get, for the same reasons:
+ * the field range bounds becore_byr_dns_fields[], the member offset bounds the
+ * read out of the caller's block, and no two fields may claim the same bits or
+ * the loop above could not OR.  The last one is this block's own: the noise
+ * curves' slopes and shifts are derived by becore_noise_value() and replace a
+ * word rather than adding to one, so a regeneration that decoded a slope would
+ * clobber a searched shift with a field deposit and nothing would say so.
+ */
+static int becore_byr_dns_table_validate(struct device *dev)
+{
+	u32 i, j;
+
+	for (i = 0; i < ARRAY_SIZE(becore_byr_dns_regs); i++) {
+		const struct becore_byr_dns_reg *entry = &becore_byr_dns_regs[i];
+		u32 used = entry->constant;
+
+		if (i && becore_byr_dns_regs[i - 1].offset >= entry->offset)
+			return dev_err_probe(dev, -EINVAL,
+					     "Bayer denoiser register +%#06x is out of order\n",
+					     entry->offset);
+		if (entry->first + entry->count >
+		    ARRAY_SIZE(becore_byr_dns_fields))
+			return dev_err_probe(dev, -EINVAL,
+					     "Bayer denoiser register +%#06x runs off the field table\n",
+					     entry->offset);
+		for (j = 0; j < entry->count; j++) {
+			const struct becore_byr_dns_field *field =
+				&becore_byr_dns_fields[entry->first + j];
+			u32 mask;
+
+			if (!field->width || field->width >= 32 ||
+			    field->shift + field->width > 32)
+				return dev_err_probe(dev, -EINVAL,
+						     "Bayer denoiser +%#06x field %u does not fit\n",
+						     entry->offset, j);
+			if (field->max >= (s64)BIT_ULL(field->width) ||
+			    field->min < -(s64)BIT_ULL(field->width - 1))
+				return dev_err_probe(dev, -EINVAL,
+						     "Bayer denoiser +%#06x field %u has limits wider than itself\n",
+						     entry->offset, j);
+			if (field->offset % sizeof(__s32) ||
+			    field->offset + sizeof(__s32) >
+			    sizeof(struct exynos_becore_params_byr_dns))
+				return dev_err_probe(dev, -EINVAL,
+						     "Bayer denoiser +%#06x field %u is outside the block\n",
+						     entry->offset, j);
+			mask = (BIT(field->width) - 1) << field->shift;
+			if (used & mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "Bayer denoiser +%#06x field %u overlaps\n",
+						     entry->offset, j);
+			used |= mask;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
+		const struct becore_noise_curve *curve = &becore_noise_curves[i];
+		u32 reg;
+
+		if (curve->block != BECORE_RGBP)
+			continue;
+		for (reg = curve->slope_first;
+		     reg <= curve->slope_first + BECORE_NOISE_TABLE_LAST;
+		     reg += 4)
+			if (becore_byr_dns_lookup(reg))
+				return dev_err_probe(dev, -EINVAL,
+						     "a noise curve's slope +%#06x is in the field table\n",
+						     reg - BECORE_RGBP_PHYS_BASE);
+		if (becore_byr_dns_lookup(curve->shift_reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "a noise curve's shift +%#06x is in the field table\n",
+					     curve->shift_reg -
+					     BECORE_RGBP_PHYS_BASE);
+	}
+	if (becore_byr_dns_lookup(BECORE_RGBP_DNS_BIQUAD_REG))
+		return dev_err_probe(dev, -EINVAL,
+				     "the biquad scale shift is both derived and a field\n");
 
 	return 0;
 }
@@ -7584,7 +7882,18 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		}
 		case BECORE_GEN_DNS_BIQUAD:
-			if (becore_byr_dns_biquad_value(input, &result))
+			if (becore_byr_dns_biquad_value(input, NULL, &result))
+				return -EINVAL;
+			break;
+		/*
+		 * The block with nothing sent to it, as the sharpener is: its
+		 * tuning the encode of a parameter set of all zeros, which the
+		 * inverted `enable` turns into the denoiser bypassed.  A
+		 * parameters block replaces both through the same table, so
+		 * the bypass and the values cannot disagree.
+		 */
+		case BECORE_GEN_BYR_DNS:
+			if (becore_byrdns_value(becore, NULL, reg, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_SHARPEN_DEFAULT:
@@ -8104,9 +8413,10 @@ static int becore_yuvp_gamma_curve_value(const struct becore_params_state *param
  * there, which is what makes a parameters buffer additive rather than a
  * wholesale replacement of the program.
  */
-static int becore_params_value(const struct becore_params_state *params,
+static int becore_params_value(const struct becore_device *becore,
 			       u32 reg, u32 *value)
 {
+	const struct becore_params_state *params = &becore->params;
 	u32 index;
 
 	if (params->ccm_valid &&
@@ -8180,6 +8490,24 @@ static int becore_params_value(const struct becore_params_state *params,
 		if (!becore_yuvnr_tnr_slope(&params->yuvnr, reg, value))
 			return 0;
 	}
+	/*
+	 * The Bayer denoiser is the noise reducer's shape with one addition:
+	 * its scale shift is a *derivation* the tuning only offsets, so the
+	 * block has a value that reaches a register the field table does not
+	 * carry -- and it needs the geometry as well as the buffer, which is
+	 * why this function takes the device.
+	 */
+	if (params->byr_dns_valid) {
+		const struct becore_rgbp_input_profile *input =
+			becore_rgbp_input_profile(becore);
+
+		if (!becore_byrdns_value(becore, &params->byr_dns, reg, value))
+			return 0;
+		if (reg == BECORE_RGBP_DNS_BIQUAD_REG)
+			return becore_byr_dns_biquad_value(input,
+							   &params->byr_dns,
+							   value);
+	}
 
 	return -ENOENT;
 }
@@ -8235,7 +8563,6 @@ static void becore_params_apply(const struct becore_device *becore,
 				const struct becore_cmdq_shape *shape,
 				u8 *payload)
 {
-	const struct becore_params_state *params = &becore->params;
 	u32 word;
 
 	for (word = 0; word < shape->valid_words; word++) {
@@ -8247,7 +8574,7 @@ static void becore_params_apply(const struct becore_device *becore,
 		if ((shape->address_mask | shape->typed_mask) & BIT(word))
 			continue;
 		if (becore_shape_register(shape, word, &reg) ||
-		    becore_params_value(params, reg, &value))
+		    becore_params_value(becore, reg, &value))
 			continue;
 		put_unaligned_le32(value, payload + word * 4);
 	}
@@ -10009,6 +10336,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
+	if (ret)
+		return ret;
+
+	ret = becore_byr_dns_table_validate(becore->dev);
 	if (ret)
 		return ret;
 
@@ -11789,6 +12120,33 @@ static void becore_video_return_all(struct becore_device *becore,
 	}
 }
 
+/*
+ * The two gains the Bayer denoiser's noise factors are multiplied by, kept
+ * where the encoder can reach them without taking the control handler's lock
+ * under the device's.  Both controls are grabbed for the length of a stream,
+ * so this cannot move under a frame.
+ */
+static int becore_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct becore_device *becore =
+		container_of(ctrl->handler, struct becore_device, ctrl_handler);
+
+	switch (ctrl->id) {
+	case V4L2_CID_RED_BALANCE:
+		WRITE_ONCE(becore->encode_balance_red, ctrl->val);
+		return 0;
+	case V4L2_CID_BLUE_BALANCE:
+		WRITE_ONCE(becore->encode_balance_blue, ctrl->val);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops becore_ctrl_ops = {
+	.s_ctrl = becore_s_ctrl,
+};
+
 static void becore_video_controls_snapshot(struct becore_device *becore,
 					   struct exynos_becore_input_stream_config *config)
 {
@@ -12736,6 +13094,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_YUVNR] = {
 		.size = sizeof(struct exynos_becore_params_yuvnr),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS] = {
+		.size = sizeof(struct exynos_becore_params_byr_dns),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -13068,6 +13429,35 @@ static int becore_params_walk(struct becore_device *becore,
 			memset(&becore->params.sharpen.header, 0,
 			       sizeof(becore->params.sharpen.header));
 			becore->params.sharpen_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS: {
+			const struct exynos_becore_params_byr_dns *byr_dns =
+				(const void *)header;
+
+			/*
+			 * Disabling the block puts the stage back on the words
+			 * the driver's own default writes, which is the
+			 * denoiser bypassed -- not the same thing as @enable
+			 * inside the block, which is how a buffer says the
+			 * same in the other direction.
+			 */
+			if (disable) {
+				if (apply)
+					becore->params.byr_dns_valid = false;
+				break;
+			}
+			if (!apply)
+				break;
+			becore->params.byr_dns = *byr_dns;
+			/*
+			 * The header belongs to the buffer rather than to the
+			 * block, and the encode reads offsets that start past
+			 * it, so keep no copy of the caller's.
+			 */
+			memset(&becore->params.byr_dns.header, 0,
+			       sizeof(becore->params.byr_dns.header));
+			becore->params.byr_dns_valid = true;
 			break;
 		}
 		case EXYNOS_BECORE_PARAM_BLOCK_YUVNR: {
@@ -13497,15 +13887,22 @@ static int becore_video_register(struct becore_device *becore)
 	if (ret)
 		goto err_v4l2;
 	becore->red_balance =
-		v4l2_ctrl_new_std(handler, NULL, V4L2_CID_RED_BALANCE,
+		v4l2_ctrl_new_std(handler, &becore_ctrl_ops, V4L2_CID_RED_BALANCE,
 				  EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
 				  EXYNOS_BECORE_WBG_GAIN_MAX_Q12, 1,
 				  EXYNOS_BECORE_WBG_RED_DEFAULT_Q12);
 	becore->blue_balance =
-		v4l2_ctrl_new_std(handler, NULL, V4L2_CID_BLUE_BALANCE,
+		v4l2_ctrl_new_std(handler, &becore_ctrl_ops, V4L2_CID_BLUE_BALANCE,
 				  EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
 				  EXYNOS_BECORE_WBG_GAIN_MAX_Q12, 1,
 				  EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12);
+	/*
+	 * The control op has not run yet, so seed these with the same defaults
+	 * the controls were created at.  The offline loop encodes without ever
+	 * setting one.
+	 */
+	becore->encode_balance_red = EXYNOS_BECORE_WBG_RED_DEFAULT_Q12;
+	becore->encode_balance_blue = EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12;
 	if (handler->error) {
 		ret = handler->error;
 		goto err_ctrl;

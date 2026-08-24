@@ -56,6 +56,7 @@
 #include "exynos-becore-sharpen.h"
 #include "exynos-becore-yuvnr.h"
 #include "exynos-becore-byrdns.h"
+#include "exynos-becore-dmsc.h"
 
 #define BECORE_GLOBAL_ENABLE		0x0000
 #define BECORE_GLOBAL_ENABLE_CLEAR	0x0008
@@ -362,8 +363,8 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_DNS_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x31c4)
 #define BECORE_RGBP_DMSC_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3200)
 #define BECORE_RGBP_DMSC_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x3278)
-#define BECORE_RGBP_DMSC_MODE_FIRST	(BECORE_RGBP_PHYS_BASE + 0x3204)
-#define BECORE_RGBP_DMSC_MODE_LAST	(BECORE_RGBP_PHYS_BASE + 0x3208)
+/* LOW_POWER_EN at +0x3204 is a field of the parameters block, not a mode. */
+#define BECORE_RGBP_DMSC_OP_MODE_REG	(BECORE_RGBP_PHYS_BASE + 0x3208)
 #define BECORE_RGBP_DECOMP_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3e00)
 #define BECORE_RGBP_DECOMP_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x3e08)
 #define BECORE_RGBP_SC_CTRL0_REG	(BECORE_RGBP_PHYS_BASE + 0x4400)
@@ -1737,6 +1738,7 @@ enum becore_generated_kind {
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
 	BECORE_GEN_DNS_BIQUAD,	/* the biquad filter's resolution octave */
 	BECORE_GEN_BYR_DNS,	/* the Bayer denoiser bypassed, its tuning at zero */
+	BECORE_GEN_BYR_DMSC,	/* the demosaic bypassed, its tuning at zero */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
@@ -1789,7 +1791,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	323
+#define BECORE_RGBP_GENERATED_WORDS	348
 #define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
@@ -1808,11 +1810,10 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_DTP_MODE_REG, BECORE_RGBP_DTP_MODE_REG,
 	  BECORE_GEN_OFF },
-	{ BECORE_RGBP_DMSC_BYPASS_REG, BECORE_RGBP_DMSC_BYPASS_REG,
-	  BECORE_GEN_RUNNING },
-	BECORE_BYR_DNS_TUNING_RANGES
-	{ BECORE_RGBP_DMSC_MODE_FIRST, BECORE_RGBP_DMSC_MODE_LAST,
+	{ BECORE_RGBP_DMSC_OP_MODE_REG, BECORE_RGBP_DMSC_OP_MODE_REG,
 	  BECORE_GEN_OFF },
+	BECORE_BYR_DNS_TUNING_RANGES
+	BECORE_DMSC_TUNING_RANGES
 	{ BECORE_RGBP_SC_CTRL0_REG, BECORE_RGBP_SC_CTRL0_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_DNS_PHASE_REG, BECORE_RGBP_DNS_PHASE_REG,
@@ -1835,14 +1836,27 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_NOISE_SLOPE },
 	{ BECORE_RGBP_DNS_SHIFT_RB_REG, BECORE_RGBP_DNS_SHIFT_RB_REG,
 	  BECORE_GEN_NOISE_SHIFT },
-	{ BECORE_RGBP_DMSC_BASE + 0x20c, BECORE_RGBP_DMSC_BASE + 0x20c,
-	  BECORE_GEN_DMSC },			/* BASE_CONFIG */
+	/*
+	 * The whole of what GetDefaultDmsc deposits, which is 23 registers
+	 * rather than the fourteen this used to state.  The other nine are the
+	 * same kind of literal read out of the same function; the conservative
+	 * subset was a bring-up state, not a distinction the vendor makes.
+	 */
+	{ BECORE_RGBP_DMSC_BASE + 0x20c, BECORE_RGBP_DMSC_BASE + 0x218,
+	  BECORE_GEN_DMSC },			/* BASE_CONFIG, PRE_DEMOSAICING */
+	{ BECORE_RGBP_DMSC_BASE + 0x220, BECORE_RGBP_DMSC_BASE + 0x224,
+	  BECORE_GEN_DMSC },			/* IGNORE_RB, _RB_1 */
+	{ BECORE_RGBP_DMSC_BASE + 0x22c, BECORE_RGBP_DMSC_BASE + 0x230,
+	  BECORE_GEN_DMSC },			/* DIR_DETECT_HV_LINEAR,
+						 * CONTRAST_MINIMUM
+						 */
 	{ BECORE_RGBP_DMSC_BASE + 0x238, BECORE_RGBP_DMSC_BASE + 0x238,
 	  BECORE_GEN_DMSC },			/* EXTRACT_COLORS_CONFIG */
-	{ BECORE_RGBP_DMSC_BASE + 0x24c, BECORE_RGBP_DMSC_BASE + 0x250,
-	  BECORE_GEN_DMSC },			/* GREEN_HUE, GREEN_SAT */
-	{ BECORE_RGBP_DMSC_BASE + 0x258, BECORE_RGBP_DMSC_BASE + 0x258,
-	  BECORE_GEN_DMSC },			/* POST_PROCESS_CONFIG */
+	{ BECORE_RGBP_DMSC_BASE + 0x24c, BECORE_RGBP_DMSC_BASE + 0x258,
+	  BECORE_GEN_DMSC },			/* GREEN_HUE, GREEN_SAT,
+						 * GREEN_SELECTIVITY,
+						 * POST_PROCESS_CONFIG
+						 */
 	{ BECORE_RGBP_DMSC_BASE + 0x264, BECORE_RGBP_DMSC_BASE + 0x264,
 	  BECORE_GEN_DMSC },			/* DIR_DETECT_SELECTION */
 	{ BECORE_RGBP_DMSC_BASE + 0x26c, BECORE_RGBP_DMSC_BASE + 0x274,
@@ -1853,8 +1867,10 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_DMSC },			/* RED_PRESERVE_EN; its GAIN
 						 * at 0x2a4 is tuning
 						 */
-	{ BECORE_RGBP_DMSC_BASE + 0x2a8, BECORE_RGBP_DMSC_BASE + 0x2ac,
-	  BECORE_GEN_DMSC },			/* RED_PRESERVE_THRES, _LIMIT */
+	{ BECORE_RGBP_DMSC_BASE + 0x2a8, BECORE_RGBP_DMSC_BASE + 0x2b0,
+	  BECORE_GEN_DMSC },			/* RED_PRESERVE_THRES, _LIMIT,
+						 * DESAT_LUMA_GAIN
+						 */
 	{ BECORE_RGBP_DMSC_BASE + 0x2b4, BECORE_RGBP_DMSC_BASE + 0x2b4,
 	  BECORE_GEN_DMSC },			/* ADD_YBLUR */
 	{ BECORE_RGBP_DNS_BINNING_REG, BECORE_RGBP_DNS_BINNING_REG,
@@ -2747,6 +2763,7 @@ struct becore_params_state {
 	struct exynos_becore_params_sharpen sharpen;
 	struct exynos_becore_params_yuvnr yuvnr;
 	struct exynos_becore_params_byr_dns byr_dns;
+	struct exynos_becore_params_dmsc dmsc;
 	bool ccm_valid;
 	bool ltm_curve_valid;
 	bool clut_valid;
@@ -2754,6 +2771,7 @@ struct becore_params_state {
 	bool sharpen_valid;
 	bool yuvnr_valid;
 	bool byr_dns_valid;
+	bool dmsc_valid;
 };
 
 struct becore_params_buffer {
@@ -4964,24 +4982,14 @@ static const u8 becore_djag_dither_ramp[] = { 0, 0, 1, 2, 3, 4, 6, 7, 8 };
 
 /*
  * The literals GetDefaultDmsc(DmscRgbpOutput&) writes once the tuning path has
- * run, so they are the same whatever the scene was.
+ * run, so they are the same whatever the scene was.  Generated from that
+ * function beside the block's encode table, all 23 of them.
  */
 static const struct becore_regval becore_dmsc_defaults[] = {
-	{ 0x20c, 0x36a },		/* BASE_CONFIG */
-	{ 0x238, 0x07f },		/* EXTRACT_COLORS_CONFIG */
-	{ 0x24c, 0x00d500b4 },		/* GREEN_HUE: min 0xb4, max 0xd5 */
-	{ 0x250, 0x0dac0046 },		/* GREEN_SAT: min 0x46, max 0xdac */
-	{ 0x258, 0xfff },		/* POST_PROCESS_CONFIG */
-	{ 0x264, 0x508 },		/* DIR_DETECT_SELECTION */
-	{ 0x26c, 0x000600a0 },		/* ADD_COLORS_GREEN */
-	{ 0x270, 0x120 },		/* FALSE_COLORS */
-	{ 0x274, 0x003 },		/* SHARPENING_CONFIG */
-	{ 0x288, 0x001 },		/* NEAR_EDGE_DESAT_EN */
-	{ 0x2a0, 0x001 },		/* EDGE_DESAT_RED_PRESERVE_EN */
-	{ 0x2a8, 0x000 },		/* EDGE_DESAT_RED_PRESERVE_THRES */
-	{ 0x2ac, 0x800 },		/* EDGE_DESAT_RED_PRESERVE_LIMIT */
-	{ 0x2b4, 0x011 },		/* ADD_YBLUR */
+	BECORE_DMSC_DEFAULTS
 };
+
+static_assert(ARRAY_SIZE(becore_dmsc_defaults) == BECORE_DMSC_DEFAULT_COUNT);
 
 static int becore_mcsc_djag_value(u32 offset, u32 *value)
 {
@@ -6773,6 +6781,152 @@ becore_byr_dns_biquad_value(const struct becore_rgbp_input_profile *profile,
 	return 0;
 }
 
+/* One of the demosaic's tuning registers, or NULL if it is not one. */
+static const struct becore_dmsc_reg *becore_dmsc_lookup(u32 reg)
+{
+	u32 low = 0, high = ARRAY_SIZE(becore_dmsc_regs);
+	u32 offset;
+
+	if (reg < BECORE_RGBP_PHYS_BASE)
+		return NULL;
+	offset = reg - BECORE_RGBP_PHYS_BASE;
+	if (offset > U16_MAX)
+		return NULL;
+
+	while (low < high) {
+		u32 middle = low + (high - low) / 2;
+
+		if (becore_dmsc_regs[middle].offset < offset)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+
+	if (low == ARRAY_SIZE(becore_dmsc_regs) ||
+	    becore_dmsc_regs[low].offset != offset)
+		return NULL;
+
+	return &becore_dmsc_regs[low];
+}
+
+/*
+ * The demosaic's tuning, encoded.
+ *
+ * The Bayer denoiser's shape with nothing added: no white balance, no
+ * geometry, no derivation -- every value in this block is a clamp and a
+ * deposit, which is why this walks the generated table and knows nothing else.
+ *
+ * `params` is what userspace most recently sent, or becore_dmsc_neutral for
+ * the driver's own default.
+ *
+ * That default is *not* the all-zero parameter set the sharpener's and the
+ * Bayer denoiser's are, and the difference was measured rather than argued.
+ * ADR 0009 asks for identity or bypass and says which one a block means is a
+ * claim to settle; this block means neither.  Bypassing it leaves ten times
+ * the Nyquist energy the running block does -- the Bayer mosaic itself, dot
+ * for dot -- and the picture comes out entirely grayscale, because this is the
+ * block that makes RGB from a mosaic and nothing downstream can do it instead.
+ * What *is* neutral is the block running with every directional weight,
+ * sharpening gain and desaturation limit at zero: a plain interpolation, with
+ * colour, no mosaic, and less grain than the vendor's tuning, which restores
+ * detail deliberately.  So the default is one field set and the rest zero
+ * (research/data/camera-dmsc-default-2026-08-24/README.md).
+ */
+static const struct exynos_becore_params_dmsc becore_dmsc_neutral = {
+	.enable = 1,
+};
+
+static int becore_dmsc_value(const struct exynos_becore_params_dmsc *params,
+			     u32 reg, u32 *value)
+{
+	const struct becore_dmsc_reg *entry = becore_dmsc_lookup(reg);
+	u32 word;
+	u32 i;
+
+	if (!entry)
+		return -ENOENT;
+
+	word = entry->constant;
+	for (i = 0; i < entry->count; i++) {
+		const struct becore_dmsc_field *field =
+			&becore_dmsc_fields[entry->first + i];
+		s32 raw = *(const __s32 *)((const u8 *)params + field->offset);
+
+		if (field->flags & BECORE_DMSC_FIELD_INVERT)
+			raw = raw ? 0 : 1;
+
+		raw = clamp(raw, field->min, field->max);
+		word |= ((u32)raw & (BIT(field->width) - 1)) << field->shift;
+	}
+
+	*value = word;
+
+	return 0;
+}
+
+/*
+ * The same checks the other generated tables get, plus one this block needs on
+ * its own: its literals and its tuning come out of the same 43-register
+ * context, so a register may be in one list or the other and never in both.
+ */
+static int becore_dmsc_table_validate(struct device *dev)
+{
+	u32 i, j;
+
+	for (i = 0; i < ARRAY_SIZE(becore_dmsc_regs); i++) {
+		const struct becore_dmsc_reg *entry = &becore_dmsc_regs[i];
+		u32 used = entry->constant;
+
+		if (i && becore_dmsc_regs[i - 1].offset >= entry->offset)
+			return dev_err_probe(dev, -EINVAL,
+					     "demosaic register +%#06x is out of order\n",
+					     entry->offset);
+		if (entry->first + entry->count > ARRAY_SIZE(becore_dmsc_fields))
+			return dev_err_probe(dev, -EINVAL,
+					     "demosaic register +%#06x runs off the field table\n",
+					     entry->offset);
+		for (j = 0; j < entry->count; j++) {
+			const struct becore_dmsc_field *field =
+				&becore_dmsc_fields[entry->first + j];
+			u32 mask;
+
+			if (!field->width || field->width >= 32 ||
+			    field->shift + field->width > 32)
+				return dev_err_probe(dev, -EINVAL,
+						     "demosaic +%#06x field %u does not fit\n",
+						     entry->offset, j);
+			if (field->max >= (s64)BIT_ULL(field->width) ||
+			    field->min < -(s64)BIT_ULL(field->width - 1))
+				return dev_err_probe(dev, -EINVAL,
+						     "demosaic +%#06x field %u has limits wider than itself\n",
+						     entry->offset, j);
+			if (field->offset % sizeof(__s32) ||
+			    field->offset + sizeof(__s32) >
+			    sizeof(struct exynos_becore_params_dmsc))
+				return dev_err_probe(dev, -EINVAL,
+						     "demosaic +%#06x field %u is outside the block\n",
+						     entry->offset, j);
+			mask = (BIT(field->width) - 1) << field->shift;
+			if (used & mask)
+				return dev_err_probe(dev, -EINVAL,
+						     "demosaic +%#06x field %u overlaps\n",
+						     entry->offset, j);
+			used |= mask;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(becore_dmsc_defaults); i++) {
+		u32 reg = BECORE_RGBP_DMSC_BASE + becore_dmsc_defaults[i].offset;
+
+		if (becore_dmsc_lookup(reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "demosaic +%#06x is both a literal and a field\n",
+					     becore_dmsc_defaults[i].offset);
+	}
+
+	return 0;
+}
+
 /*
  * The same checks the other two generated tables get, for the same reasons:
  * the field range bounds becore_byr_dns_fields[], the member offset bounds the
@@ -7896,6 +8050,16 @@ static int becore_generated_value(const struct becore_device *becore,
 			if (becore_byrdns_value(becore, NULL, reg, &result))
 				return -EINVAL;
 			break;
+		/*
+		 * And the demosaic, over the one parameter set in this driver
+		 * that is not all zeros -- see becore_dmsc_neutral, and the
+		 * measurement that settled it.
+		 */
+		case BECORE_GEN_BYR_DMSC:
+			if (becore_dmsc_value(&becore_dmsc_neutral, reg,
+					      &result))
+				return -EINVAL;
+			break;
 		case BECORE_GEN_SHARPEN_DEFAULT:
 			if (becore_yuvp_sharpen_default(
 				    reg - BECORE_YUVP_PHYS_BASE, &result))
@@ -8497,6 +8661,8 @@ static int becore_params_value(const struct becore_device *becore,
 	 * carry -- and it needs the geometry as well as the buffer, which is
 	 * why this function takes the device.
 	 */
+	if (params->dmsc_valid && !becore_dmsc_value(&params->dmsc, reg, value))
+		return 0;
 	if (params->byr_dns_valid) {
 		const struct becore_rgbp_input_profile *input =
 			becore_rgbp_input_profile(becore);
@@ -10336,6 +10502,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
+	if (ret)
+		return ret;
+
+	ret = becore_dmsc_table_validate(becore->dev);
 	if (ret)
 		return ret;
 
@@ -13097,6 +13267,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS] = {
 		.size = sizeof(struct exynos_becore_params_byr_dns),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_DMSC] = {
+		.size = sizeof(struct exynos_becore_params_dmsc),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -13429,6 +13602,35 @@ static int becore_params_walk(struct becore_device *becore,
 			memset(&becore->params.sharpen.header, 0,
 			       sizeof(becore->params.sharpen.header));
 			becore->params.sharpen_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_DMSC: {
+			const struct exynos_becore_params_dmsc *dmsc =
+				(const void *)header;
+
+			/*
+			 * Disabling puts the stage back on the driver's own
+			 * default, which for this block is the demosaic
+			 * *running* with no tuning rather than bypassed.
+			 * @enable inside the block is how a buffer turns it
+			 * off, and doing that leaves a mosaic in the picture.
+			 */
+			if (disable) {
+				if (apply)
+					becore->params.dmsc_valid = false;
+				break;
+			}
+			if (!apply)
+				break;
+			becore->params.dmsc = *dmsc;
+			/*
+			 * The header belongs to the buffer rather than to the
+			 * block, and the encode reads offsets that start past
+			 * it, so keep no copy of the caller's.
+			 */
+			memset(&becore->params.dmsc.header, 0,
+			       sizeof(becore->params.dmsc.header));
+			becore->params.dmsc_valid = true;
 			break;
 		}
 		case EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS: {

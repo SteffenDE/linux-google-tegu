@@ -7093,10 +7093,11 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 		goto err_vdev;
 
 	/*
-	 * The back end's input joins this graph, off the same source pad the
-	 * raw node hangs from -- the side output and the raw output are one
-	 * stream. It needs the mosaic this receiver negotiated and had no way
-	 * to see it.
+	 * The whole back end joins this graph -- its input off the same source
+	 * pad the raw node hangs from, since the side output and the raw output
+	 * are one stream, and its two video nodes on this v4l2_device.  It
+	 * needs the mosaic this receiver negotiated and had no way to see it,
+	 * and one media device per pipeline is what a consumer expects.
 	 */
 	ret = exynos_becore_input_register_graph(ispfe->backend_input,
 						 &ispfe->v4l2_dev,
@@ -7124,6 +7125,8 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 
 err_nf:
 	v4l2_async_nf_cleanup(&ispfe->notifier);
+	/* Sever the callbacks before the node whose teardown can raise one. */
+	exynos_becore_input_disconnect(ispfe->backend_input);
 	exynos_becore_input_unregister_graph(ispfe->backend_input);
 err_stats:
 	/* Releases the queue too, which a bare unregister would not. */
@@ -7164,7 +7167,7 @@ static void ispfe_media_unregister(struct ispfe_device *ispfe)
 	cancel_work_sync(&ispfe->stats_work);
 	v4l2_async_nf_unregister(&ispfe->notifier);
 	v4l2_async_nf_cleanup(&ispfe->notifier);
-	/* Before the media device goes, since it holds the back end's entity. */
+	/* Before the media device goes, since it holds the back end's three. */
 	exynos_becore_input_unregister_graph(ispfe->backend_input);
 	media_device_unregister(&ispfe->mdev);
 	media_entity_cleanup(&ispfe->stats_vdev.entity);

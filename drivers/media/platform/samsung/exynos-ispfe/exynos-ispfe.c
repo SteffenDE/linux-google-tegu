@@ -43,6 +43,7 @@
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
@@ -2196,6 +2197,43 @@ static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 		schedule_work(&ispfe->backend_fill_work);
 }
 
+/*
+ * Tell userspace a frame has started, and which one.  This is the only moment
+ * at which a sensor register write can be placed against a known frame: the
+ * IMX712 latches exposure and gain at a frame boundary, so a value written
+ * during frame n reaches frame n + 2, and without this event the only anchor
+ * userspace has is when a *completed* buffer arrived -- two frame boundaries
+ * later, with no way to tell which side of the nearer one a write fell.
+ *
+ * The number is the frame-start count rather than the end-of-frame counter the
+ * buffers carry, because the two are separate interrupts and this one must not
+ * read a value the other is writing.  They agree: both are reset together for
+ * a session and both count every frame, so frame start n is the frame a buffer
+ * numbered n will carry.
+ *
+ * This is the one thing an interrupt handler here reaches outside the device
+ * structure, so the lifetime is worth stating.  The handler exists only
+ * between ispfe_start() and ispfe_stop(), and free_irq() waits for one that is
+ * running -- so the node it queues into has to outlive the stop, not the
+ * probe.  It does for both owners that a user can reach: a V4L2 stream is
+ * stopped by vb2_video_unregister_device(), which ispfe_media_unregister()
+ * calls before it gets as far as the subdev, and a back-end stream is stopped
+ * earlier still, in ->remove before that function is called at all.  The
+ * debugfs owner is stopped after it, which would be a window if ->remove were
+ * reachable; it is not, because this driver is built in and suppresses bind
+ * attributes.  A driver that gains an unbind path has to close that, and
+ * v4l2_event_queue() tolerating a NULL devnode is not enough on its own.
+ */
+static void ispfe_frame_sync(struct ispfe_device *ispfe, u32 sequence)
+{
+	struct v4l2_event ev = {
+		.type = V4L2_EVENT_FRAME_SYNC,
+		.u.frame_sync.frame_sequence = sequence,
+	};
+
+	v4l2_event_queue(ispfe->sd.devnode, &ev);
+}
+
 static irqreturn_t ispfe_link_isr(int irq, void *data)
 {
 	struct ispfe_device *ispfe = data;
@@ -2208,7 +2246,7 @@ static irqreturn_t ispfe_link_isr(int irq, void *data)
 	fe = ispfe_ack(link, CSIS_FE_SRC);
 
 	if (fs) {
-		atomic_inc(&ispfe->frame_start);
+		ispfe_frame_sync(ispfe, atomic_inc_return(&ispfe->frame_start));
 
 		/*
 		 * Advance the descriptor head on frame *start*, not frame end.
@@ -6848,7 +6886,31 @@ static const struct v4l2_subdev_video_ops ispfe_subdev_video_ops = {
 	.s_stream = v4l2_subdev_s_stream_helper,
 };
 
+/*
+ * One event deep.  A consumer of frame start uses it to place a control write
+ * inside the frame it names, so a queue of stale ones is worth less than the
+ * knowledge that the newest was dropped -- which is what the sequence number
+ * in each event says.
+ */
+#define ISPFE_FRAME_SYNC_EVENTS		1
+
+static int ispfe_sd_subscribe_event(struct v4l2_subdev *sd,
+				    struct v4l2_fh *fh,
+				    struct v4l2_event_subscription *sub)
+{
+	if (sub->type != V4L2_EVENT_FRAME_SYNC)
+		return -EINVAL;
+
+	return v4l2_event_subscribe(fh, sub, ISPFE_FRAME_SYNC_EVENTS, NULL);
+}
+
+static const struct v4l2_subdev_core_ops ispfe_subdev_core_ops = {
+	.subscribe_event = ispfe_sd_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+};
+
 static const struct v4l2_subdev_ops ispfe_subdev_ops = {
+	.core = &ispfe_subdev_core_ops,
 	.video = &ispfe_subdev_video_ops,
 	.pad = &ispfe_subdev_pad_ops,
 };
@@ -7020,7 +7082,7 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	ispfe->sd.internal_ops = &ispfe_subdev_internal_ops;
 	ispfe->sd.owner = THIS_MODULE;
 	ispfe->sd.dev = ispfe->dev;
-	ispfe->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
+	ispfe->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
 	ispfe->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
 	ispfe->sd.entity.ops = &ispfe_subdev_entity_ops;
 	snprintf(ispfe->sd.name, sizeof(ispfe->sd.name), "exynos-ispfe csis%u",

@@ -680,6 +680,8 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 #define BECORE_RGBP_DNS_BINNING_REG	(BECORE_RGBP_DNS_BASE + 0x1a4)
 #define BECORE_RGBP_DNS_CENTRE_REG	(BECORE_RGBP_DNS_BASE + 0x1c0)
 #define BECORE_RGBP_DNS_BINNING_UNITY	1024	/* Q10 */
+#define BECORE_RGBP_DNS_BIQUAD_REG	(BECORE_RGBP_DNS_BASE + 0x1a8)
+#define BECORE_RGBP_DNS_BIQUAD_MAX	7
 #define BECORE_RGBP_DNS_CENTRE_MASK	GENMASK(14, 0)
 #define BECORE_RGBP_CSC_BASE		(BECORE_RGBP_PHYS_BASE + 0x3b00)
 /* YUVP carries the same twenty words, bit for bit, 0x100 lower. */
@@ -1731,6 +1733,7 @@ enum becore_generated_kind {
 	BECORE_GEN_DJAG,	/* MCSC DJAG at Samsung's neutral profile */
 	BECORE_GEN_DMSC,	/* what GetDefaultDmsc writes after the tuning */
 	BECORE_GEN_DNS_GEOMETRY,	/* binning and radial centre, from the array */
+	BECORE_GEN_DNS_BIQUAD,	/* the biquad filter's resolution octave */
 	BECORE_GEN_GAMMA,	/* RGBP's forward gamma, a square-root encode */
 	BECORE_GEN_YUVP_GAMMA,	/* YUVP's tone-curve gates and its x grid */
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
@@ -1783,7 +1786,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	300
+#define BECORE_RGBP_GENERATED_WORDS	301
 #define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
@@ -1853,6 +1856,8 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_DNS_GEOMETRY },
 	{ BECORE_RGBP_DNS_CENTRE_REG, BECORE_RGBP_DNS_CENTRE_REG,
 	  BECORE_GEN_DNS_GEOMETRY },
+	{ BECORE_RGBP_DNS_BIQUAD_REG, BECORE_RGBP_DNS_BIQUAD_REG,
+	  BECORE_GEN_DNS_BIQUAD },
 	{ BECORE_RGBP_GAMMA_CTRL_FIRST, BECORE_RGBP_GAMMA_CTRL_LAST,
 	  BECORE_GEN_GAMMA },
 	{ BECORE_RGBP_GAMMA_TBL_FIRST, BECORE_RGBP_GAMMA_TBL_LAST,
@@ -5591,6 +5596,49 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 }
 
 /*
+ * The biquad filter's resolution ladder, each rung about root two times the
+ * last, so a step is a factor of two in area.  `lyric::TranslateByrDns` runs
+ * `lower_bound` over it with the shorter axis of the block's input.
+ */
+static const u32 becore_byr_dns_ladder[] = {
+	486, 686, 972, 1374, 1944, 2748, 3888, 5498,
+};
+
+static_assert(ARRAY_SIZE(becore_byr_dns_ladder) ==
+	      BECORE_RGBP_DNS_BIQUAD_MAX + 1);
+
+/*
+ * BIQUAD_SCALE_SHIFT_ADDER, which is a resolution octave rather than a number.
+ *
+ * `TranslateByrDns` takes `lower_bound` over that ladder indexed by the shorter
+ * axis of the block's input and caps the rung at seven, then subtracts the
+ * tuning's own offset and clamps what is left into the field's three bits.
+ * Each rung is a factor of two in area, so this is what tells the filter how
+ * much of the picture one of its taps covers.  The offset is zero at every leaf
+ * of every shipped tuning tree on all three cameras, and until this block's
+ * tuning comes from userspace there is nowhere else for one to arrive from.
+ *
+ * It is not a constant, which is what the invariance census is for: it takes
+ * four distinct values -- rungs 3 to 6 -- over the 574 captured RGBP programs,
+ * and the captured 6 is right at eight of the eighteen captured readouts and
+ * wrong at the other ten.
+ */
+static int
+becore_byr_dns_biquad_value(const struct becore_rgbp_input_profile *profile,
+			    u32 *value)
+{
+	u32 shorter = min(profile->width, profile->height);
+	u32 rung;
+
+	for (rung = 0; rung < ARRAY_SIZE(becore_byr_dns_ladder); rung++)
+		if (becore_byr_dns_ladder[rung] >= shorter)
+			break;
+	*value = min_t(u32, rung, BECORE_RGBP_DNS_BIQUAD_MAX);
+
+	return 0;
+}
+
+/*
  * A per-scene input, empty because mainline produces no scene.
  *
  * All 138 of these are zero in every one of the 426 captured programs, but
@@ -7535,6 +7583,10 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		}
+		case BECORE_GEN_DNS_BIQUAD:
+			if (becore_byr_dns_biquad_value(input, &result))
+				return -EINVAL;
+			break;
 		case BECORE_GEN_SHARPEN_DEFAULT:
 			if (becore_yuvp_sharpen_default(
 				    reg - BECORE_YUVP_PHYS_BASE, &result))

@@ -13,6 +13,8 @@ struct exynos_becore_input;
 
 #define EXYNOS_BECORE_WBG_GAIN_MIN_Q12		1U
 #define EXYNOS_BECORE_WBG_GAIN_MAX_Q12		32751U
+/* What the green channels are held at, and so what normalises the other two. */
+#define EXYNOS_BECORE_WBG_UNITY_Q12		4096U
 #define EXYNOS_BECORE_WBG_RED_DEFAULT_Q12	8473U
 #define EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12	6851U
 

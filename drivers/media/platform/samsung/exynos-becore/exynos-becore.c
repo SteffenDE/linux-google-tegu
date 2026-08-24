@@ -2166,6 +2166,18 @@ static const u32 becore_rgbp_input_regs[] = {
 	[BECORE_RGBP_INPUT_STORAGE_WIDTH] = BECORE_RGBP_INPUT_WIDTH_REG,
 };
 
+/*
+ * The chain raster: what RGBP's scaler hands YUVP, what YUVP writes, what MCSC
+ * reads back and what DJAG crops from. Those are one raster, and it was stated
+ * four times -- in both YUVP output profiles, in MCSC's input profile and in
+ * DJAG's crop, and it is also the surface GTNR's dormant startup program
+ * reads and writes. Six copies of one number, so a geometry that moved five of
+ * them would have programmed a chain disagreeing with itself, in a way only a
+ * picture would show. State it once.
+ */
+#define BECORE_CHAIN_WIDTH		4160U
+#define BECORE_CHAIN_HEIGHT		3120U
+
 struct becore_yuvp_output_profile {
 	u32 width;
 	u32 height;
@@ -2189,8 +2201,8 @@ enum becore_yuvp_output_profile_id {
 /* Pixel uses a combined, two-plane WDMA where Pablo v1.1 uses split blocks. */
 static const struct becore_yuvp_output_profile becore_yuvp_outputs[] = {
 	[BECORE_YUVP_OUTPUT_SBWCL] = {
-		.width = 4160,
-		.height = 3120,
+		.width = BECORE_CHAIN_WIDTH,
+		.height = BECORE_CHAIN_HEIGHT,
 		.data_format = 0x2000,
 		.mode = 0xa,
 		.lossy_byte32num = 2,
@@ -2202,8 +2214,8 @@ static const struct becore_yuvp_output_profile becore_yuvp_outputs[] = {
 		.businfo = 0,
 	},
 	[BECORE_YUVP_OUTPUT_P010] = {
-		.width = 4160,
-		.height = 3120,
+		.width = BECORE_CHAIN_WIDTH,
+		.height = BECORE_CHAIN_HEIGHT,
 		.data_format = 0x2000,
 		.mode = 0,
 		.lossy_byte32num = 0,
@@ -2261,8 +2273,8 @@ struct becore_gtnr_dma_profile {
  * power, reset, interrupt, and cross-block completion lifecycle is established.
  */
 static const struct becore_gtnr_dma_profile becore_gtnr_input = {
-	.width = 4160,
-	.height = 3120,
+	.width = BECORE_CHAIN_WIDTH,
+	.height = BECORE_CHAIN_HEIGHT,
 	.data_format = 0x2000,
 	.comp_control = 0xa,
 	.lossy_byte32num = 2,
@@ -2275,8 +2287,8 @@ static const struct becore_gtnr_dma_profile becore_gtnr_input = {
 };
 
 static const struct becore_gtnr_dma_profile becore_gtnr_output = {
-	.width = 4160,
-	.height = 3120,
+	.width = BECORE_CHAIN_WIDTH,
+	.height = BECORE_CHAIN_HEIGHT,
 	.data_format = 0x2000,
 	.comp_control = 0xa,
 	.lossy_byte32num = 2,
@@ -2426,8 +2438,8 @@ struct becore_mcsc_dma_profile {
  * control so MCSC reads the completed driver-owned surface from memory.
  */
 static const struct becore_mcsc_dma_profile becore_mcsc_input = {
-	.width = 4160,
-	.height = 3120,
+	.width = BECORE_CHAIN_WIDTH,
+	.height = BECORE_CHAIN_HEIGHT,
 	.data_format = 0x2000,
 	.comp_control = 0xa,
 	.lossy_byte32num = 2,
@@ -2475,8 +2487,8 @@ struct becore_mcsc_djag_profile {
 };
 
 static const struct becore_mcsc_djag_profile becore_mcsc_djag = {
-	.crop_width = 4160,
-	.crop_height = 3120,
+	.crop_width = BECORE_CHAIN_WIDTH,
+	.crop_height = BECORE_CHAIN_HEIGHT,
 };
 
 enum becore_mcsc_input_transport {

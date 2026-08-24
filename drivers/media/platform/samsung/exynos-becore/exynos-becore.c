@@ -844,9 +844,14 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
 	(BECORE_RGBP_PHYS_BASE + 0x1c34)
 #define BECORE_RGBP_INPUT_BUSINFO_REG	(BECORE_RGBP_PHYS_BASE + 0x1c4c)
 /*
- * Two gates YUVP leaves in a state that does not depend on the scene, named
- * from Samsung YUVP v1.20: DTP asserts its own BYPASS -- it is a test-pattern
- * generator, and nothing wants one -- and COUTFIFO0 is left disabled.
+ * Three gates YUVP leaves in a state that does not depend on the scene, named
+ * from Samsung YUVP v1.20 and Lyric's descriptors: DTP asserts its own BYPASS
+ * -- it is a test-pattern generator, and nothing wants one -- and both output
+ * FIFOs are left disabled. Lyric calls them COUTFIFO_GSE and COUTFIFO_MCSC,
+ * which says what each would feed on the fly; neither path exists here,
+ * because the frame reaches MCSC through memory or through the VOTF fabric
+ * rather than through a FIFO. Enabling the MCSC one in the offline loop leaves
+ * the frame byte-identical, which is what a FIFO nothing drains does.
  *
  * The third candidate was 0x6000..0x65fc, which Samsung's tables call DRCDIST
  * and whose first register reads as RGB_DRCDIST_BYPASS = 1 -- 359 table words,
@@ -902,7 +907,8 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
  * this was captured from -- and none of it differs between the rear and front
  * cameras, where the four grid steps do.
  */
-#define BECORE_YUVP_COUTFIFO0_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
+#define BECORE_YUVP_COUTFIFO_GSE_EN_REG	(BECORE_YUVP_PHYS_BASE + 0x1200)
+#define BECORE_YUVP_COUTFIFO_MCSC_EN_REG (BECORE_YUVP_PHYS_BASE + 0x1400)
 #define BECORE_YUVP_DTP_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x3000)
 #define BECORE_YUVP_LTM_BASE		(BECORE_YUVP_PHYS_BASE + 0x6000)
 #define BECORE_YUVP_LTM_ENABLE_REG	(BECORE_YUVP_LTM_BASE + 0x000)
@@ -1664,7 +1670,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	297
-#define BECORE_YUVP_GENERATED_WORDS	1359
+#define BECORE_YUVP_GENERATED_WORDS	1360
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1772,7 +1778,9 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  BECORE_GEN_GRID_DMA },
 	{ BECORE_YUVP_GRID_DMA_BUSINFO_REG, BECORE_YUVP_GRID_DMA_BUSINFO_REG,
 	  BECORE_GEN_GRID_DMA },
-	{ BECORE_YUVP_COUTFIFO0_EN_REG, BECORE_YUVP_COUTFIFO0_EN_REG,
+	{ BECORE_YUVP_COUTFIFO_GSE_EN_REG, BECORE_YUVP_COUTFIFO_GSE_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_YUVP_COUTFIFO_MCSC_EN_REG, BECORE_YUVP_COUTFIFO_MCSC_EN_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_YUVP_DTP_BYPASS_REG, BECORE_YUVP_DTP_BYPASS_REG,
 	  BECORE_GEN_BYPASS },

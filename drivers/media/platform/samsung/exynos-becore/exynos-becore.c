@@ -2287,6 +2287,71 @@ static const struct becore_gtnr_dma_profile becore_gtnr_output = {
 	.enable = 1,
 };
 
+/*
+ * The seven DMA channels GTNR's *first-frame* program does not use, and the
+ * compression control that travels with three of them. A merge with no
+ * previous frame reads no previous frame (PRE0, PRE1), no second current
+ * plane (CUR1), no motion or noise map (MMNP), no pyramid level (L0, L14) and
+ * no time-of-flight input; it writes no temporal output (TNROUT) and no
+ * pyramid back.
+ *
+ * Read that scope literally, because the census is emphatic about it: of the
+ * 581 captured GTNR programs only ten -- the first-frame ones -- clear all
+ * fifteen. The other 571 set every enable to 1 and every compression control
+ * to the same lossy-SBWC 0xa the two channels in use get. So this is not a
+ * property of the block or of the registers; it is what a merge with nothing
+ * to merge against does, and the day the normal temporal program lands these
+ * fifteen become its most ordinary values. It is scoped to becore_gtnr_shape,
+ * the thirteen-header startup recipe, and a second recipe must bring its own
+ * answer rather than reach for this one.
+ *
+ * These fifteen were the whole of what the startup recipe still replayed, so
+ * with them stated it carries no captured value at all -- only the command
+ * shape, the four image addresses and the typed words that describe the two
+ * surfaces the merge does use. They cannot be checked the way the other three
+ * blocks' can: GTNR has no MMIO, power or interrupt here and its program is
+ * encoded and never submitted, so the recipe generator's own comparison
+ * against the capture is the whole of the evidence.
+ */
+#define BECORE_GTNR_GENERATED_WORDS	15
+
+static const u32 becore_gtnr_startup_off_regs[] = {
+	BECORE_GTNR_PHYS_BASE + 0x1800,	/* RDMA_MMNP_EN */
+	BECORE_GTNR_PHYS_BASE + 0x1a00,	/* RDMA_PRE0_EN */
+	BECORE_GTNR_PHYS_BASE + 0x1a04,	/* RDMA_PRE0_COMP_CONTROL */
+	BECORE_GTNR_PHYS_BASE + 0x1c00,	/* RDMA_PRE1_EN */
+	BECORE_GTNR_PHYS_BASE + 0x1c04,	/* RDMA_PRE1_COMP_CONTROL */
+	BECORE_GTNR_PHYS_BASE + 0x2000,	/* RDMA_CUR1_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2004,	/* RDMA_CUR1_COMP_CONTROL */
+	BECORE_GTNR_PHYS_BASE + 0x2200,	/* RDMA_L0_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2400,	/* RDMA_L14_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2600,	/* RDMA_TOF_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2800,	/* WDMA_TNROUT_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2804,	/* WDMA_TNROUT_COMP_CONTROL */
+	BECORE_GTNR_PHYS_BASE + 0x2a00,	/* WDMA_L0_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2c00,	/* WDMA_L14_EN */
+	BECORE_GTNR_PHYS_BASE + 0x2e00,	/* WDMA_TOF_EN */
+};
+
+static_assert(ARRAY_SIZE(becore_gtnr_startup_off_regs) ==
+	      BECORE_GTNR_GENERATED_WORDS);
+
+/* Zero, if the startup program leaves this channel off; -EINVAL if not. */
+static int becore_gtnr_startup_off_value(u32 reg, u32 *value)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_gtnr_startup_off_regs); i++) {
+		if (becore_gtnr_startup_off_regs[i] != reg)
+			continue;
+		if (value)
+			*value = 0;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 enum becore_gtnr_dma_word {
 	BECORE_GTNR_INPUT_VOTF,
 	BECORE_GTNR_INPUT_FORMAT,
@@ -8253,6 +8318,7 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 	const struct becore_yuvp_output_profile *input =
 		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
 	u32 address_count = 0;
+	u32 generated_count = 0;
 	u32 typed_count = 0;
 	u32 i;
 
@@ -8289,13 +8355,16 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 		if (get_unaligned_le32(record) != shape->mode ||
 		    get_unaligned_le32(record + 4) != shape->target ||
 		    get_unaligned_le32(record + 8) != shape->type_map ||
-		    shape->generated_mask ||
 		    (shape->address_mask & ~used_mask) ||
 		    (shape->typed_mask & ~used_mask) ||
+		    (shape->generated_mask & ~used_mask) ||
 		    (shape->fixed_mask & ~used_mask) ||
 		    (shape->address_mask & shape->typed_mask) ||
+		    (shape->address_mask & shape->generated_mask) ||
 		    (shape->address_mask & shape->fixed_mask) ||
-		    (shape->typed_mask & shape->fixed_mask))
+		    (shape->typed_mask & shape->generated_mask) ||
+		    (shape->typed_mask & shape->fixed_mask) ||
+		    (shape->generated_mask & shape->fixed_mask))
 			return -EINVAL;
 
 		for (word = 0; word < 16; word++) {
@@ -8325,6 +8394,16 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 					return -EINVAL;
 				typed_count++;
 			}
+			if (shape->generated_mask & BIT(word)) {
+				u32 reg;
+
+				if (shape->mode != 0x00090000 || !(word & 1))
+					return -EINVAL;
+				reg = shape->pair_registers[word / 2];
+				if (becore_gtnr_startup_off_value(reg, NULL))
+					return -EINVAL;
+				generated_count++;
+			}
 			if (shape->address_mask & BIT(word)) {
 				u32 reg;
 
@@ -8339,7 +8418,8 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 		}
 	}
 
-	if (address_count != 4 || typed_count != BECORE_GTNR_DMA_WORD_COUNT)
+	if (address_count != 4 || typed_count != BECORE_GTNR_DMA_WORD_COUNT ||
+	    generated_count != BECORE_GTNR_GENERATED_WORDS)
 		return -EINVAL;
 
 	return 0;
@@ -8392,6 +8472,13 @@ static int becore_encode_gtnr(struct becore_device *becore)
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
 				typed_count++;
+				continue;
+			}
+			if (shape->generated_mask & BIT(word)) {
+				reg = shape->pair_registers[word / 2];
+				if (becore_gtnr_startup_off_value(reg, &value))
+					return -EINVAL;
+				put_unaligned_le32(value, payload + word * 4);
 				continue;
 			}
 			if (!(shape->address_mask & BIT(word)))

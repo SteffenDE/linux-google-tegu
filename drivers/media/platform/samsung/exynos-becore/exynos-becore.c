@@ -39,7 +39,6 @@
 #include <linux/workqueue.h>
 
 #include <media/exynos-becore.h>
-#include <media/media-device.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
@@ -2926,14 +2925,14 @@ struct becore_device {
 	struct becore_c2serv_link_state c2serv_done;
 	struct dev_pm_domain_list *pm_domains;
 	struct dentry *debugfs;
-	struct media_device mdev;
-	struct v4l2_device v4l2_dev;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *red_balance;
 	struct v4l2_ctrl *blue_balance;
 	struct v4l2_subdev sd;
 	struct media_pad sink_pad;
 	bool sd_registered;
+	/* Set once the entities exist; probe can return success without them. */
+	bool video_ready;
 	/*
 	 * The mosaic the producer says it is sending, latched when a stream
 	 * starts. Without a producer -- the offline loop -- it stays at the
@@ -10682,7 +10681,16 @@ exynos_becore_input_map(struct device *backend, struct device *producer,
 		}
 	}
 	mutex_lock(&becore->lock);
-	if (becore->reset_failed) {
+	/*
+	 * Two separate refusals. Probe returns success on two paths that never
+	 * reach the video setup -- a processor that would not reset, and one
+	 * that would not power down -- and on both of them there is no
+	 * subdevice and no node here for a producer to put on its graph. And
+	 * reset_failed is not probe-only: a runtime suspend or a run teardown
+	 * can set it long afterwards, which a producer that has not attached
+	 * yet must still be refused for.
+	 */
+	if (!becore->video_ready || becore->reset_failed) {
 		ret = -EIO;
 		mutex_unlock(&becore->lock);
 		goto err_mappings;
@@ -10841,14 +10849,29 @@ size_t exynos_becore_input_size(struct exynos_becore_input *input)
 EXPORT_SYMBOL_GPL(exynos_becore_input_size);
 
 /*
- * The back end's sink pad joins the *producer's* graph rather than its own.
- * One media device per pipeline is what a controller-aware consumer expects,
- * and it is the only arrangement in which a link between the two blocks can
- * exist at all: media_create_pad_link() needs both entities in one graph.
+ * The whole back end joins the *producer's* graph: the sink pad, and the two
+ * video nodes with it.
  *
- * The back end keeps its own media device for its video nodes, which is a
- * bring-up state rather than an end state -- see the media graph item in
- * docs/subsystems/camera/open.md.
+ * One media device per pipeline is what a controller-aware consumer expects.
+ * A libcamera pipeline handler matches *a* media device and walks that
+ * device's graph, so a back end on a second one is a pipeline it cannot see;
+ * and one graph is the only arrangement in which the link between the two
+ * blocks can exist at all, because media_create_pad_link() needs both
+ * entities in it.
+ *
+ * So this device has no media device of its own, and its nodes exist exactly
+ * while a producer is bound.  Probe builds everything that does not need a
+ * v4l2_device -- the queues, the controls, the entities and their pads -- and
+ * this adds the three things that do.
+ *
+ * Both video devices are stamped from their templates at probe, and
+ * video_register_device() consumes fields of them that cannot be handed to it
+ * twice -- valid_ioctls is an input on the way in and the result on the way
+ * out, and the embedded struct device is kobject_init()ed -- so this registers
+ * once for the device's lifetime, and a failure here consumes them just as a
+ * success does.  The unregister below is teardown rather than a point to
+ * rebind from, which is the only shape either driver has: both are built in
+ * and suppress unbind.
  */
 int exynos_becore_input_register_graph(struct exynos_becore_input *input,
 				       struct v4l2_device *v4l2_dev,
@@ -10871,13 +10894,38 @@ int exynos_becore_input_register_graph(struct exynos_becore_input *input,
 	ret = media_create_pad_link(source, source_pad, &becore->sd.entity, 0,
 				    MEDIA_LNK_FL_ENABLED |
 				    MEDIA_LNK_FL_IMMUTABLE);
-	if (ret) {
-		v4l2_device_unregister_subdev(&becore->sd);
-		return ret;
-	}
+	if (ret)
+		goto err_sd;
+
+	/*
+	 * This pointer outlives the registration: v4l2_release() and the
+	 * device's own release callback both walk it, and either can run long
+	 * after an unregister if userspace still holds the node open. So it is
+	 * set here and never cleared.
+	 */
+	becore->vdev.v4l2_dev = v4l2_dev;
+	ret = video_register_device(&becore->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		goto err_sd;
+
+	becore->params_vdev.v4l2_dev = v4l2_dev;
+	ret = video_register_device(&becore->params_vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		goto err_vdev;
+
 	becore->sd_registered = true;
 
 	return 0;
+
+err_vdev:
+	/* Releases the queue with it, which a bare unregister would not. */
+	vb2_video_unregister_device(&becore->vdev);
+	/* Which stops a stream, and a stop schedules this once. */
+	cancel_work_sync(&becore->params_work);
+err_sd:
+	/* Drops the link created above with the entity it was created on. */
+	v4l2_device_unregister_subdev(&becore->sd);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_register_graph);
 
@@ -10890,6 +10938,20 @@ void exynos_becore_input_unregister_graph(struct exynos_becore_input *input)
 	becore = input->becore;
 	if (!becore->sd_registered)
 		return;
+
+	/*
+	 * These release the queues too, which a bare unregister would not:
+	 * the capture teardown is what stops a stream still running.
+	 */
+	vb2_video_unregister_device(&becore->params_vdev);
+	vb2_video_unregister_device(&becore->vdev);
+	/*
+	 * The capture teardown above can have scheduled it one last time, and
+	 * so can the offline loop afterwards -- debugfs outlives the graph. So
+	 * this bounds the work rather than ending it; what runs later finds an
+	 * empty list.
+	 */
+	cancel_work_sync(&becore->params_work);
 	v4l2_device_unregister_subdev(&becore->sd);
 	becore->sd_registered = false;
 }
@@ -13994,7 +14056,7 @@ static const struct video_device becore_params_template = {
 	.vfl_dir = VFL_DIR_TX,
 };
 
-static int becore_params_register(struct becore_device *becore)
+static int becore_params_init(struct becore_device *becore)
 {
 	struct vb2_queue *q = &becore->params_queue;
 	size_t type;
@@ -14027,67 +14089,52 @@ static int becore_params_register(struct becore_device *becore)
 	if (ret)
 		return ret;
 
+	/* The producer's v4l2_device is filled in when it registers. */
 	becore->params_vdev = becore_params_template;
-	becore->params_vdev.v4l2_dev = &becore->v4l2_dev;
 	becore->params_vdev.queue = q;
 	becore->params_vdev.lock = &becore->params_lock;
 	becore->params_vdev.entity.function = MEDIA_ENT_F_IO_V4L;
 	video_set_drvdata(&becore->params_vdev, becore);
 
 	becore->params_pad.flags = MEDIA_PAD_FL_SOURCE;
-	ret = media_entity_pads_init(&becore->params_vdev.entity, 1,
-				     &becore->params_pad);
-	if (ret)
-		return ret;
 
-	ret = video_register_device(&becore->params_vdev, VFL_TYPE_VIDEO, -1);
-	if (ret)
-		media_entity_cleanup(&becore->params_vdev.entity);
-
-	return ret;
+	return media_entity_pads_init(&becore->params_vdev.entity, 1,
+				      &becore->params_pad);
 }
 
-static void becore_video_unregister(void *data)
+static void becore_video_cleanup(void *data)
 {
 	struct becore_device *becore = data;
 
-	vb2_video_unregister_device(&becore->params_vdev);
-	media_entity_cleanup(&becore->params_vdev.entity);
-	vb2_video_unregister_device(&becore->vdev);
-	/* The capture teardown above can have scheduled it one last time. */
-	cancel_work_sync(&becore->params_work);
-	media_device_unregister(&becore->mdev);
-	media_entity_cleanup(&becore->vdev.entity);
 	/*
-	 * The producer unregisters the subdevice from its own graph on the way
-	 * out; this only releases what probe built.
+	 * Both drivers are built in and suppress unbind, so this runs only on
+	 * a probe-failure unwind, before any producer has put these entities on
+	 * a graph and so before either node has streamed.  The two cancels are
+	 * for the offline loop, which is the one thing that can queue work with
+	 * no node registered at all.
 	 */
+	cancel_work_sync(&becore->params_work);
+	cancel_work_sync(&becore->video_work);
+	media_entity_cleanup(&becore->params_vdev.entity);
+	media_entity_cleanup(&becore->vdev.entity);
 	v4l2_subdev_cleanup(&becore->sd);
 	media_entity_cleanup(&becore->sd.entity);
 	v4l2_ctrl_handler_free(&becore->ctrl_handler);
-	v4l2_device_unregister(&becore->v4l2_dev);
-	media_device_cleanup(&becore->mdev);
 }
 
-static int becore_video_register(struct becore_device *becore)
+/*
+ * Everything a video node needs except the v4l2_device it hangs from, which
+ * this device does not own -- see exynos_becore_input_register_graph().
+ */
+static int becore_video_init(struct becore_device *becore)
 {
 	struct v4l2_ctrl_handler *handler = &becore->ctrl_handler;
 	struct vb2_queue *q = &becore->queue;
 	int ret;
 
-	becore->mdev.dev = becore->dev;
-	strscpy(becore->mdev.model, "zumapro BE-core",
-		sizeof(becore->mdev.model));
-	media_device_init(&becore->mdev);
-	becore->v4l2_dev.mdev = &becore->mdev;
-
-	ret = v4l2_device_register(becore->dev, &becore->v4l2_dev);
-	if (ret)
-		goto err_mdev;
-
 	ret = v4l2_ctrl_handler_init(handler, 2);
 	if (ret)
-		goto err_v4l2;
+		return ret;
 	becore->red_balance =
 		v4l2_ctrl_new_std(handler, &becore_ctrl_ops, V4L2_CID_RED_BALANCE,
 				  EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
@@ -14124,8 +14171,8 @@ static int becore_video_register(struct becore_device *becore)
 	if (ret)
 		goto err_ctrl;
 
+	/* The producer's v4l2_device is filled in when it registers. */
 	becore->vdev = becore_video_template;
-	becore->vdev.v4l2_dev = &becore->v4l2_dev;
 	becore->vdev.ctrl_handler = &becore->ctrl_handler;
 	becore->vdev.queue = q;
 	becore->vdev.lock = &becore->video_lock;
@@ -14163,26 +14210,18 @@ static int becore_video_register(struct becore_device *becore)
 	if (ret)
 		goto err_sd;
 
-	ret = video_register_device(&becore->vdev, VFL_TYPE_VIDEO, -1);
+	ret = becore_params_init(becore);
 	if (ret)
 		goto err_entity;
 
-	ret = becore_params_register(becore);
+	ret = devm_add_action_or_reset(becore->dev,
+				       becore_video_cleanup, becore);
 	if (ret)
-		goto err_vdev;
+		return ret;
+	becore->video_ready = true;
 
-	ret = media_device_register(&becore->mdev);
-	if (ret)
-		goto err_params;
+	return 0;
 
-	return devm_add_action_or_reset(becore->dev,
-					becore_video_unregister, becore);
-
-err_params:
-	video_unregister_device(&becore->params_vdev);
-	media_entity_cleanup(&becore->params_vdev.entity);
-err_vdev:
-	video_unregister_device(&becore->vdev);
 err_entity:
 	media_entity_cleanup(&becore->vdev.entity);
 err_sd:
@@ -14191,10 +14230,6 @@ err_sd_entity:
 	media_entity_cleanup(&becore->sd.entity);
 err_ctrl:
 	v4l2_ctrl_handler_free(&becore->ctrl_handler);
-err_v4l2:
-	v4l2_device_unregister(&becore->v4l2_dev);
-err_mdev:
-	media_device_cleanup(&becore->mdev);
 	return ret;
 }
 
@@ -14383,7 +14418,7 @@ static int becore_probe(struct platform_device *pdev)
 		return 0;
 	}
 
-	ret = becore_video_register(becore);
+	ret = becore_video_init(becore);
 	if (ret)
 		return ret;
 

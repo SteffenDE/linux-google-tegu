@@ -10997,6 +10997,22 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 			ret = -EINVAL;
 			goto record_error;
 		}
+	} else if (run_mcsc) {
+		/*
+		 * The driver's own surface gets the same check, because it is
+		 * no longer allocated for the device's lifetime: a geometry
+		 * change that could not take its surfaces back leaves this one
+		 * freed, and a run must refuse rather than program a DMA at
+		 * zero.
+		 */
+		becore->mcsc_dest_dma = becore->mcsc_output.dma;
+		if (!becore->mcsc_dest_dma ||
+		    upper_32_bits(becore->mcsc_dest_dma) ||
+		    upper_32_bits(becore->mcsc_dest_dma +
+				  becore_mcsc_output_active_size(&becore->scaled) - 1)) {
+			ret = -EINVAL;
+			goto record_error;
+		}
 	} else {
 		becore->mcsc_dest_dma = becore->mcsc_output.dma;
 	}
@@ -12538,6 +12554,193 @@ static const struct file_operations becore_override_fops = {
 	.release = becore_override_release,
 };
 
+/*
+ * The chain and the scaled output, read and set as one.
+ *
+ * Everything from RGBP's crop down is derived from these two and from the
+ * array, and they are only meaningful together: set one at a time, the driver
+ * would spend the gap describing a geometry nobody asked for.  The array is
+ * not settable here -- it is the producer's, taken from the sink pad at
+ * STREAMON -- and it is printed so a reader sees all three at once.
+ *
+ * This is what makes a second geometry something to try rather than something
+ * to rebuild for.  Every derivation between the three rasters has been
+ * runtime arithmetic for a while now, but the surfaces those numbers size
+ * were taken once at probe, so the only way to reach another readout was to
+ * change the constants and boot.
+ *
+ * Two states refuse a set outright rather than let it fail somewhere useful.
+ * reset_failed and output_quarantined both mean a processor was not proven
+ * stopped, so a DMA may still be in flight into the surfaces this would free
+ * -- which is precisely the case the stop path bounds by leaving the IOVA
+ * mapped until the pages are released, and freeing them here would spend that
+ * bound.  A queue with buffers refuses too: MCSC writes a capture buffer
+ * directly, so a scaled raster that grew past what REQBUFS allocated would
+ * overrun it.
+ *
+ * On a failure the previous geometry goes back and is allocated again.  If
+ * even that fails the surfaces stay freed, and a run refuses rather than
+ * programming a DMA at zero -- becore_run_frame() checks both destination
+ * addresses before it writes any of them.
+ */
+static int becore_geometry_show(struct seq_file *s, void *unused)
+{
+	struct becore_device *becore = s->private;
+
+	mutex_lock(&becore->lock);
+	seq_printf(s, "array  %u %u\n", becore->array.width,
+		   becore->array.height);
+	seq_printf(s, "chain  %u %u\n", becore->chain.width,
+		   becore->chain.height);
+	seq_printf(s, "scaled %u %u\n", becore->scaled.width,
+		   becore->scaled.height);
+	mutex_unlock(&becore->lock);
+
+	return 0;
+}
+
+static int becore_geometry_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, becore_geometry_show, inode->i_private);
+}
+
+static int becore_geometry_apply(struct becore_device *becore,
+				 const struct becore_raster *chain,
+				 const struct becore_raster *scaled)
+{
+	struct becore_raster old_chain = becore->chain;
+	struct becore_raster old_scaled = becore->scaled;
+	struct becore_rect crop;
+	u32 ratio;
+	int ret;
+
+	lockdep_assert_held(&becore->lock);
+
+	ret = becore_raster_validate(becore->dev, "chain", chain,
+				     BECORE_RASTER_EXTENT_MAX);
+	if (ret)
+		return ret;
+	ret = becore_raster_validate(becore->dev, "scaled", scaled,
+				     BECORE_RASTER_EXTENT_MAX);
+	if (ret)
+		return ret;
+	/*
+	 * The three derivations that a *pair* of rasters can fail on their own,
+	 * which bounding each extent separately cannot reach: RGBP's crop of
+	 * the array onto the chain; YUVNR's binning, which is that crop over
+	 * the chain at Q10 in fourteen bits, so the crop may be at most 15.999
+	 * times the chain; and DJAG's ratio of the chain onto the scaled
+	 * output, which is Q20 and refuses past a 4096x downscale. Everything
+	 * else is either bounded by one extent or a plain repacking of one.
+	 *
+	 * YUVNR's is the reason a crop check alone is not enough: with the
+	 * default array, any chain narrower than 260 passes the crop and the
+	 * ratio and then refuses every run afterwards with a bare -EINVAL.
+	 */
+	ret = becore_rgbp_crop(&becore->array, chain, &crop);
+	if (ret) {
+		dev_err(becore->dev, "no crop of %ux%u reaches a %ux%u chain\n",
+			becore->array.width, becore->array.height,
+			chain->width, chain->height);
+		return ret;
+	}
+	ret = becore_yuvnr_geometry_value(&becore->array, chain,
+					  BECORE_YUVNR_BINNING, &ratio);
+	if (ret) {
+		dev_err(becore->dev,
+			"a %ux%u crop of %ux%u is too much for a %ux%u chain to bin\n",
+			crop.width, crop.height,
+			becore->array.width, becore->array.height,
+			chain->width, chain->height);
+		return ret;
+	}
+	ret = becore_zoom_ratio(chain->width, scaled->width, &ratio);
+	if (!ret)
+		ret = becore_zoom_ratio(chain->height, scaled->height, &ratio);
+	if (ret) {
+		dev_err(becore->dev, "no scaler ratio takes %ux%u to %ux%u\n",
+			chain->width, chain->height,
+			scaled->width, scaled->height);
+		return ret;
+	}
+
+	becore->chain = *chain;
+	becore->scaled = *scaled;
+	becore_free_surfaces(becore);
+	ret = becore_alloc_surfaces(becore);
+	if (!ret)
+		return 0;
+
+	becore->chain = old_chain;
+	becore->scaled = old_scaled;
+	becore_free_surfaces(becore);
+	if (becore_alloc_surfaces(becore)) {
+		/*
+		 * A second failure can stop partway too, so free once more:
+		 * "the back end has no surfaces" is a state a run refuses
+		 * cleanly, and a half-allocated set is not.
+		 */
+		becore_free_surfaces(becore);
+		dev_crit(becore->dev,
+			 "cannot take the previous surfaces back; the back end has none\n");
+	}
+
+	return ret;
+}
+
+static ssize_t becore_geometry_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct becore_device *becore =
+		((struct seq_file *)file->private_data)->private;
+	struct becore_raster chain;
+	struct becore_raster scaled;
+	char text[64];
+	char *line;
+	char tail;
+	int ret;
+
+	if (count >= sizeof(text))
+		return -EFBIG;
+	if (copy_from_user(text, buf, count))
+		return -EFAULT;
+	text[count] = '\0';
+	line = strim(text);
+	/*
+	 * busybox splits `printf '%s\n'` into the line and then its newline,
+	 * so a write with nothing in it is the tail of one already accepted.
+	 */
+	if (!*line)
+		return count;
+	/* The %c matches only if something follows the four, and refuses it. */
+	if (sscanf(line, "%u %u %u %u %c", &chain.width, &chain.height,
+		   &scaled.width, &scaled.height, &tail) != 4)
+		return -EINVAL;
+
+	mutex_lock(&becore->video_lock);
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed || becore->output_quarantined)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming ||
+		 vb2_is_busy(&becore->queue))
+		ret = -EBUSY;
+	else
+		ret = becore_geometry_apply(becore, &chain, &scaled);
+	mutex_unlock(&becore->lock);
+	mutex_unlock(&becore->video_lock);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations becore_geometry_fops = {
+	.owner = THIS_MODULE,
+	.open = becore_geometry_open,
+	.read = seq_read,
+	.write = becore_geometry_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int becore_stream_crc_show(struct seq_file *s, void *unused)
 {
 	struct becore_device *becore = s->private;
@@ -13545,6 +13748,8 @@ static int becore_debugfs_init(struct becore_device *becore)
 			    &becore_stream_crc_fops);
 	debugfs_create_file("override", 0600, dir, becore,
 			    &becore_override_fops);
+	debugfs_create_file("geometry", 0600, dir, becore,
+			    &becore_geometry_fops);
 	debugfs_create_u32("input_profile", 0644, dir,
 			   &becore->input_profile);
 	debugfs_create_u32("votf", 0644, dir, &becore->votf);

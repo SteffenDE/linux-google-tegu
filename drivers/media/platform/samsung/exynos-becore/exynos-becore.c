@@ -622,6 +622,36 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 #define BECORE_MCSC_WDMA_W4_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2800)
 /* Each unused channel is quiesced by its enable and its compression control. */
 #define BECORE_MCSC_WDMA_OFF_LAST	0x04
+/*
+ * And the two channels that *are* used are quiesced first, by the same pair of
+ * registers, before the typed DMA words below configure and start them. The
+ * value is not a state the hardware ends in -- the typed words overwrite both
+ * within the same command buffer, which is why becore_override_check() refuses
+ * these two registers outright -- so what the driver states here is the order,
+ * not a setting.
+ */
+#define BECORE_MCSC_RDMA_R0_FIRST	(BECORE_MCSC_PHYS_BASE + 0x1800)
+#define BECORE_MCSC_WDMA_W0_FIRST	(BECORE_MCSC_PHYS_BASE + 0x2000)
+/*
+ * MCSC has five output ports, and each carries a poly-phase scaler at
+ * +0x5N00 and a post-processing chroma converter at +0x6N00. The driver drives
+ * port 0 alone: its POST_PC0 is off, and so are the four ports' converters
+ * after it. Lyric's descriptors name port 0's pair; the recipe's own header
+ * alternates +0x51N00 and +0x61N00 for N = 1..4, which is what places the
+ * other four. The coefficient control belongs to the converter that is off,
+ * and setting it alone changes nothing; with the converter on, it does.
+ */
+#define BECORE_MCSC_PC0_CTRL_REG	(BECORE_MCSC_PHYS_BASE + 0x6000)
+#define BECORE_MCSC_PC0_COEFF_CTRL_REG	(BECORE_MCSC_PHYS_BASE + 0x6020)
+#define BECORE_MCSC_PC1_CTRL_REG	(BECORE_MCSC_PHYS_BASE + 0x6100)
+#define BECORE_MCSC_PC4_CTRL_REG	(BECORE_MCSC_PHYS_BASE + 0x6400)
+/*
+ * Two more MCSC words that describe the job rather than tune it: no hardware
+ * frame connector drives our frame start, and the pipeline is not a secure
+ * one, so its sequence id is zero.
+ */
+#define BECORE_MCSC_SECU_SEQID_REG	(BECORE_MCSC_PHYS_BASE + 0x0b00)
+#define BECORE_MCSC_HWFC_START_REG	(BECORE_MCSC_PHYS_BASE + 0x704c)
 #define BECORE_MCSC_DJAG_BASE		(BECORE_MCSC_PHYS_BASE + 0x4000)
 #define BECORE_MCSC_DJAG_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x000)
 #define BECORE_MCSC_DJAG_PS_FIRST	(BECORE_MCSC_DJAG_BASE + 0x01c)
@@ -630,6 +660,13 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 #define BECORE_MCSC_DJAG_TUNE_LAST	(BECORE_MCSC_DJAG_BASE + 0x068)
 #define BECORE_MCSC_DJAG_RECOM_CTRL_REG	(BECORE_MCSC_DJAG_BASE + 0x080)
 #define BECORE_MCSC_DJAG_RECOM_WEIGHT_REG (BECORE_MCSC_DJAG_BASE + 0x088)
+/* The radial gain inside that stage, off with it: centre, two biquad factors
+ * and its own enable. Setting all four in the offline loop leaves the frame
+ * byte-identical, which is what a gain inside a stage that does not run does.
+ */
+#define BECORE_MCSC_DJAG_RADIAL_CENTRE_REG (BECORE_MCSC_DJAG_BASE + 0x0a4)
+#define BECORE_MCSC_DJAG_RADIAL_FIRST	(BECORE_MCSC_DJAG_BASE + 0x0ac)
+#define BECORE_MCSC_DJAG_RADIAL_LAST	(BECORE_MCSC_DJAG_BASE + 0x0b4)
 #define BECORE_DJAG_DITHER_FIELD_BITS	6
 #define BECORE_DJAG_SAT_CTRL		5
 #define BECORE_DJAG_DITHER_THRES	5
@@ -1689,7 +1726,7 @@ struct becore_generated_range {
  */
 #define BECORE_RGBP_GENERATED_WORDS	297
 #define BECORE_YUVP_GENERATED_WORDS	1363
-#define BECORE_MCSC_GENERATED_WORDS	99
+#define BECORE_MCSC_GENERATED_WORDS	116
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_CINFIFO_FRAME_IN_REG, BECORE_RGBP_CINFIFO_FRAME_IN_REG,
@@ -2058,6 +2095,22 @@ static const struct becore_generated_range becore_mcsc_generated[] = {
 	{ BECORE_MCSC_WDMA_W4_FIRST,
 	  BECORE_MCSC_WDMA_W4_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
 	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_RDMA_R0_FIRST,
+	  BECORE_MCSC_RDMA_R0_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_WDMA_W0_FIRST,
+	  BECORE_MCSC_WDMA_W0_FIRST + BECORE_MCSC_WDMA_OFF_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_SECU_SEQID_REG, BECORE_MCSC_SECU_SEQID_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_HWFC_START_REG, BECORE_MCSC_HWFC_START_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_PC0_CTRL_REG, BECORE_MCSC_PC0_CTRL_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_PC0_COEFF_CTRL_REG, BECORE_MCSC_PC0_COEFF_CTRL_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_MCSC_PC1_CTRL_REG, BECORE_MCSC_PC4_CTRL_REG,
+	  BECORE_GEN_OFF },
 	{ BECORE_MCSC_SC0_PHASE_FIRST,
 	  BECORE_MCSC_SC0_PHASE_FIRST + BECORE_SCALER_PHASE_LAST,
 	  BECORE_GEN_SCALER_PHASE },
@@ -2073,6 +2126,10 @@ static const struct becore_generated_range becore_mcsc_generated[] = {
 	{ BECORE_MCSC_DJAG_RECOM_CTRL_REG, BECORE_MCSC_DJAG_RECOM_CTRL_REG,
 	  BECORE_GEN_DJAG },
 	{ BECORE_MCSC_DJAG_RECOM_WEIGHT_REG, BECORE_MCSC_DJAG_RECOM_WEIGHT_REG,
+	  BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_RADIAL_CENTRE_REG,
+	  BECORE_MCSC_DJAG_RADIAL_CENTRE_REG, BECORE_GEN_DJAG },
+	{ BECORE_MCSC_DJAG_RADIAL_FIRST, BECORE_MCSC_DJAG_RADIAL_LAST,
 	  BECORE_GEN_DJAG },
 	{ BECORE_MCSC_SC0_SRC_POS_REG, BECORE_MCSC_SC0_SRC_POS_REG,
 	  BECORE_GEN_CHAIN_ORIGIN },
@@ -4674,6 +4731,12 @@ static int becore_mcsc_djag_value(u32 offset, u32 *value)
 	case 0x020:		/* PS_V_INIT_PHASE_OFFSET */
 	case 0x080:		/* RECOM_CTRL: detail restoration is off */
 	case 0x088:		/* RECOM_WEIGHT: and off by its weight too */
+	case 0x0a4:		/* RECOM_RADIAL_CENTER */
+	case 0x0ac:		/* RECOM_RADIAL_BIQUAD_FACTOR_A */
+	case 0x0b0:		/* RECOM_RADIAL_BIQUAD_FACTOR_B */
+	case 0x0b4:		/* RECOM_RADIAL_GAIN_ENABLE: and its radial gain
+				 * with it, all four
+				 */
 		*value = 0;
 		return 0;
 	case 0x024:		/* PS_ROUND_MODE */

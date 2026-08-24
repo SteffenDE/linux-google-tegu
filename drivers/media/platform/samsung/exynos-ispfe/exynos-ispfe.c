@@ -114,16 +114,27 @@
 #define CSIS_INT0_MSK_VAL		0x01fff1ff
 #define CSIS_INT1_MSK_VAL		0x0000007e
 
-#define CSIS_ISP_CONFIG_CH(n)		(0x0040 + (n) * 0x10)
-#define CSIS_ISPCFG_DATAFORMAT(fmt)	((fmt) << 2)
 /*
+ * One demultiplexer slot per (virtual channel, data type) the link should
+ * accept.  The slot index is not the virtual channel: the field at 16 says
+ * which channel feeds the slot, so the main camera's three slots are VC0
+ * RAW10, VC1 RAW10 for its phase-detect stream, and VC0 again for the
+ * embedded-data line -- and an IMX712's two are both VC0, told apart by data
+ * type alone.
+ *
  * Pixel mode reads 3 where imx-mipi-csis knows only single, dual and quad --
- * a later-version extension -- and every sensor uses it.  Carried as a whole
- * word rather than picked apart, together with a bit at 15 that only the
- * embedded-data channel sets.
+ * a later-version extension -- and every sensor uses it.  The embedded-data
+ * slot additionally asks for 64-bit parallel mode, which is what Samsung's
+ * own driver for this IP version sets when a slot carries packets rather than
+ * an image.
  */
-#define CSIS_ISPCFG_COMMON		0x3000
-#define CSIS_ISPCFG_EMBEDDED		0x8000
+#define CSIS_ISP_CONFIG_CH(n)		(0x0040 + (n) * 0x10)
+#define CSIS_ISPCFG_VIRTUAL_CHANNEL(n)	((n) << 16)
+#define CSIS_ISPCFG_PARALLEL_MODE(n)	((n) << 14)
+#define CSIS_ISPCFG_PIXEL_MODE(n)	((n) << 12)
+#define CSIS_ISPCFG_DATAFORMAT(fmt)	((fmt) << 2)
+#define CSIS_ISPCFG_PIXEL_MODE_VAL	3
+#define CSIS_ISPCFG_PARALLEL_64BIT	2
 #define CSIS_DT_RAW10			0x2b
 #define CSIS_DT_EMBEDDED8		0x12
 
@@ -131,14 +142,17 @@
 #define CSIS_ISP_RESOL(w, h)		(((h) << 16) | (w))
 
 /*
- * Written once per link before the channels, meaning unknown, and not a
- * constant: both IMX712s get 0x7fff7fff and the main camera gets 0x80020002.
- * Like the master PHY block's +0x10, this needs splitting before a C-PHY
- * source can be described.
+ * Low-power spacer insertion, from Samsung's register table for this IP
+ * version.  The enable is at 31 and the two spacer counts are 15 bits each --
+ * so the IMX712s' 0x7fff7fff is the feature off with both counts saturated,
+ * and the main camera's 0x80020002 turns it on with two spacers each, which is
+ * a C-PHY link asking for a shorter gap than the default.  Only the disabled
+ * form is written here; a C-PHY source will want the other.
  */
-#define CSIS_LINE_INTERVAL		0x0600
-#define CSIS_LINE_INTERVAL_VAL		0x7fff7fff
-#define CSIS_DMA_CLK_CTRL		0x0690
+#define CSIS_LRTE_CONFIG		0x0600
+#define CSIS_LRTE_CONFIG_OFF		0x7fff7fff
+/* Debug options, cleared rather than left at whatever the last session set. */
+#define CSIS_DBG_OPTION_SUITE		0x0690
 
 /*
  * The nine D/C-PHYs live inside the csis-link-phy window rather than behind a
@@ -1835,29 +1849,33 @@ static void ispfe_phy_link_stop(struct ispfe_device *ispfe)
 }
 
 /*
- * One CSIS link.  Two virtual channels: the image in RAW10 and the sensor's
- * one line of embedded data, which the receiver has to be told about or the
- * image channel is handed a frame that is one line too tall.
+ * One CSIS link, and two demultiplexer slots on its first virtual channel: the
+ * image in RAW10 and the sensor's one line of embedded data, which the
+ * receiver has to be told about or the image slot is handed a frame that is
+ * one line too tall.  Nothing consumes the second slot -- it has no logical
+ * channel behind it, which is also what the vendor stack does with it.
  */
 static void ispfe_link_start(struct ispfe_device *ispfe)
 {
 	void __iomem *link = ispfe_link(ispfe);
 	u32 ctrl;
 
-	writel_relaxed(0, link + CSIS_DMA_CLK_CTRL);
+	writel_relaxed(0, link + CSIS_DBG_OPTION_SUITE);
 
-	writel_relaxed(CSIS_ISPCFG_COMMON | CSIS_ISPCFG_DATAFORMAT(CSIS_DT_RAW10),
+	writel_relaxed(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) |
+		       CSIS_ISPCFG_DATAFORMAT(CSIS_DT_RAW10),
 		       link + CSIS_ISP_CONFIG_CH(0));
 	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, ispfe->active.height),
 		       link + CSIS_ISP_RESOL_CH(0));
 
-	writel_relaxed(CSIS_ISPCFG_COMMON | CSIS_ISPCFG_EMBEDDED |
+	writel_relaxed(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) |
+		       CSIS_ISPCFG_PARALLEL_MODE(CSIS_ISPCFG_PARALLEL_64BIT) |
 		       CSIS_ISPCFG_DATAFORMAT(CSIS_DT_EMBEDDED8),
 		       link + CSIS_ISP_CONFIG_CH(1));
 	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, 1),
 		       link + CSIS_ISP_RESOL_CH(1));
 
-	writel_relaxed(CSIS_LINE_INTERVAL_VAL, link + CSIS_LINE_INTERVAL);
+	writel_relaxed(CSIS_LRTE_CONFIG_OFF, link + CSIS_LRTE_CONFIG);
 	writel_relaxed(CSIS_CLK_CTRL_VAL, link + CSIS_CLK_CTRL);
 
 	ctrl = CSIS_CMN_CTRL_COMMON | CSIS_CMN_CTRL_CSI_EN |

@@ -7092,6 +7092,19 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_vdev;
 
+	/*
+	 * The back end's input joins this graph, off the same source pad the
+	 * raw node hangs from -- the side output and the raw output are one
+	 * stream. It needs the mosaic this receiver negotiated and had no way
+	 * to see it.
+	 */
+	ret = exynos_becore_input_register_graph(ispfe->backend_input,
+						 &ispfe->v4l2_dev,
+						 &ispfe->sd.entity,
+						 ISPFE_PAD_SOURCE);
+	if (ret)
+		goto err_stats;
+
 	v4l2_async_nf_init(&ispfe->notifier, &ispfe->v4l2_dev);
 	asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
 					      struct v4l2_async_connection);
@@ -7111,6 +7124,8 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 
 err_nf:
 	v4l2_async_nf_cleanup(&ispfe->notifier);
+	exynos_becore_input_unregister_graph(ispfe->backend_input);
+err_stats:
 	/* Releases the queue too, which a bare unregister would not. */
 	vb2_video_unregister_device(&ispfe->stats_vdev);
 	media_entity_cleanup(&ispfe->stats_vdev.entity);
@@ -7149,6 +7164,8 @@ static void ispfe_media_unregister(struct ispfe_device *ispfe)
 	cancel_work_sync(&ispfe->stats_work);
 	v4l2_async_nf_unregister(&ispfe->notifier);
 	v4l2_async_nf_cleanup(&ispfe->notifier);
+	/* Before the media device goes, since it holds the back end's entity. */
+	exynos_becore_input_unregister_graph(ispfe->backend_input);
 	media_device_unregister(&ispfe->mdev);
 	media_entity_cleanup(&ispfe->stats_vdev.entity);
 	media_entity_cleanup(&ispfe->vdev.entity);

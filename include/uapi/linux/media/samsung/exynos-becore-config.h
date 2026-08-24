@@ -26,6 +26,8 @@
  *	:c:type:`exynos_becore_params_sharpen`
  * @EXYNOS_BECORE_PARAM_BLOCK_YUVNR: The noise reducer's tuning,
  *	:c:type:`exynos_becore_params_yuvnr`
+ * @EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS: The Bayer denoiser's tuning,
+ *	:c:type:`exynos_becore_params_byr_dns`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
@@ -44,6 +46,7 @@ enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_GAMMA,
 	EXYNOS_BECORE_PARAM_BLOCK_SHARPEN,
 	EXYNOS_BECORE_PARAM_BLOCK_YUVNR,
+	EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -1092,6 +1095,115 @@ struct exynos_becore_params_yuvnr {
 	__s32 reserved;
 } __attribute__((aligned(8)));
 
+/*
+ * The eight-knot noise curve each channel pair carries.  Only the range is
+ * here: the domain the vendor's translator writes is eight compiled-in
+ * literals rather than tuning -- the proto has no x array at all -- so the
+ * driver states it and both curves share the one copy.
+ */
+#define EXYNOS_BECORE_BYR_DNS_STD_LUT_POINTS	8
+
+/**
+ * struct exynos_becore_params_byr_dns - The Bayer denoiser's tuning
+ *
+ * @header: The parameters block header
+ * @enable: run the block at all; zero bypasses it
+ * @enable_low_power: run it in its low-power mode
+ * @std_lut_y_g: the green noise standard deviation at each knot of the curve
+ * @std_lut_y_rb: the same for the red and blue channels
+ * @std_factor_r: overall scale on the red channel's noise curve
+ * @std_factor_g: the same for green
+ * @std_factor_b: the same for blue
+ * @biquad_factor_a_g: the green biquad filter's first coefficient
+ * @biquad_factor_a_uv: the chroma one's first
+ * @biquad_factor_b_g: the green biquad filter's second coefficient
+ * @biquad_factor_b_uv: the chroma one's second
+ * @radial_thresh_limit_g: the ceiling on green's radial threshold
+ * @radial_thresh_limit_rb: the ceiling on red and blue's
+ * @g_lpf: which low-pass the green denoiser runs on
+ * @rb_lpf: which one the red and blue denoiser runs on
+ * @min_snr_bin_width_g: the green minimum-SNR histogram's bin width
+ * @min_snr_bin_width_rb: the red and blue one's
+ * @min_snr_pix_number_high_g: green's upper pixel-count threshold
+ * @min_snr_pix_number_high_rb: red and blue's
+ * @min_snr_pix_number_low_g: green's lower pixel-count threshold
+ * @min_snr_pix_number_low_rb: red and blue's
+ * @biquad_scale_shift_subtracter: how far below the resolution's own octave
+ *	the biquad filter's scale shift is taken -- see below
+ *
+ * This is the only block in the back end whose registers are a function of the
+ * **white balance**, which is physically what a denoiser wants: photon noise
+ * scales with the per-channel gain applied in front of it. So @std_factor_r,
+ * @std_factor_g and @std_factor_b are the tuning alone, and the driver
+ * multiplies each by the gain the stream latched from %V4L2_CID_RED_BALANCE
+ * and %V4L2_CID_BLUE_BALANCE before encoding it. Green takes unity. Sending
+ * the product instead would put a live value in a tuning block and give the
+ * driver two sources for one gain.
+ *
+ * @biquad_scale_shift_subtracter is not a register either. The hardware takes
+ * a resolution octave -- the block's own scale shift is the rung the input's
+ * shorter axis reaches on a root-two ladder, so each step is a factor of two
+ * in area -- and the tuning may take the filter one or more octaves below it.
+ * The driver derives the rung from the format and subtracts this.
+ *
+ * The values come from a tuning tree the vendor indexes by brightness, analog
+ * gain and exposure ratio, so this is a per-frame block rather than a
+ * calibration.
+ *
+ * The block's size is part of the interface: `v4l2_isp_params_validate_buffer`
+ * requires a block to be exactly its type's size, so a member added here would
+ * refuse every buffer written against the old one. A value this block does not
+ * yet carry belongs in a new block type rather than in a wider version of this
+ * one, which is what makes them cheap.
+ */
+struct exynos_becore_params_byr_dns {
+	struct v4l2_isp_params_block_header header;
+
+	/* 0 or 1. */
+	__s32 enable;
+	__s32 enable_low_power;
+
+	/* Noise standard deviation over the unit interval. round(f * 4096). */
+	__s32 std_lut_y_g[EXYNOS_BECORE_BYR_DNS_STD_LUT_POINTS];
+	__s32 std_lut_y_rb[EXYNOS_BECORE_BYR_DNS_STD_LUT_POINTS];
+
+	/*
+	 * Scale on the curves above, before the white balance the driver
+	 * applies on top of it. round(f * 4096).
+	 */
+	__s32 std_factor_r;
+	__s32 std_factor_g;
+	__s32 std_factor_b;
+
+	/* The biquad filter's coefficients, as plain numbers. round(f * 1). */
+	__s32 biquad_factor_a_g;
+	__s32 biquad_factor_a_uv;
+	__s32 biquad_factor_b_g;
+	__s32 biquad_factor_b_uv;
+
+	/* Ceilings on the radial threshold, in the same units. round(f * 1). */
+	__s32 radial_thresh_limit_g;
+	__s32 radial_thresh_limit_rb;
+
+	/* Which low-pass kernel each denoiser runs on. round(f * 1). */
+	__s32 g_lpf;
+	__s32 rb_lpf;
+
+	/* Histogram bins and pixel counts, whose unit is the count. round(f * 1). */
+	__s32 min_snr_bin_width_g;
+	__s32 min_snr_bin_width_rb;
+	__s32 min_snr_pix_number_high_g;
+	__s32 min_snr_pix_number_high_rb;
+	__s32 min_snr_pix_number_low_g;
+	__s32 min_snr_pix_number_low_rb;
+
+	/*
+	 * Octaves below the input's own rung, so a whole number is a factor of
+	 * two in area and the fraction is kept. round(f * 256).
+	 */
+	__s32 biquad_scale_shift_subtracter;
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_BECORE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -1104,6 +1216,7 @@ struct exynos_becore_params_yuvnr {
 	 sizeof(struct exynos_becore_params_clut) + \
 	 sizeof(struct exynos_becore_params_gamma) + \
 	 sizeof(struct exynos_becore_params_sharpen) + \
-	 sizeof(struct exynos_becore_params_yuvnr))
+	 sizeof(struct exynos_becore_params_yuvnr) + \
+	 sizeof(struct exynos_becore_params_byr_dns))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

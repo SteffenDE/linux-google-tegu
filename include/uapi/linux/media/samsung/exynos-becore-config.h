@@ -28,6 +28,8 @@
  *	:c:type:`exynos_becore_params_yuvnr`
  * @EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS: The Bayer denoiser's tuning,
  *	:c:type:`exynos_becore_params_byr_dns`
+ * @EXYNOS_BECORE_PARAM_BLOCK_DMSC: The demosaic's tuning,
+ *	:c:type:`exynos_becore_params_dmsc`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
@@ -47,6 +49,7 @@ enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_SHARPEN,
 	EXYNOS_BECORE_PARAM_BLOCK_YUVNR,
 	EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS,
+	EXYNOS_BECORE_PARAM_BLOCK_DMSC,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -1205,6 +1208,117 @@ struct exynos_becore_params_byr_dns {
 } __attribute__((aligned(8)));
 
 /**
+ * struct exynos_becore_params_dmsc - The demosaic's tuning
+ *
+ * @header: The parameters block header
+ * @enable: run the block at all; zero bypasses it, and a bypassed demosaic
+ *	leaves the mosaic in the picture
+ * @enable_low_power: run it in its low-power mode
+ * @hpf_power: how much of the high-pass the interpolation follows
+ * @gradient_weight: how much the gradient direction counts in the merge
+ * @mono_weight: how much the monochrome direction counts
+ * @diagonal_weight: how much the diagonal directions count
+ * @merge_dir_contrast_threshold: the contrast a direction needs before the
+ *	merge trusts it
+ * @desat_strength: how hard the false-colour stage desaturates
+ * @alias_detect_threshold: where the alias detector starts to act
+ * @desat_limit: the ceiling on that desaturation
+ * @extract_sat_power: how sharply colour extraction follows saturation
+ * @green_detect_power: the same for the green detector
+ * @extract_grid_hv: the horizontal and vertical weight colour extraction takes
+ *	from the grid
+ * @extract_grid_hv_protect: how much of that weight is protected
+ * @extract_dir_hv: the same weight taken from the direction estimate
+ * @extract_dir_hv_threshold: where that estimate starts to count
+ * @add_colors_saturation_power: how sharply the colour-adding stage follows
+ *	saturation
+ * @edge_desat_fsharp_gain_p: the near-edge desaturation gain the fine
+ *	sharpener takes on its positive limb
+ * @edge_desat_fsharp_gain_m: the same on its negative limb
+ * @edge_desat_fsharp_thres_p: where that limb starts to act
+ * @edge_desat_fsharp_thres_m: where the negative one does
+ * @edge_desat_ogsharp_gain_p: the same four for the original-grid sharpener
+ * @edge_desat_ogsharp_gain_m: its negative limb's gain
+ * @edge_desat_ogsharp_thres_p: its positive limb's threshold
+ * @edge_desat_ogsharp_thres_m: its negative limb's threshold
+ * @edge_desat_limit_p: the ceiling on near-edge desaturation, positive limb
+ * @edge_desat_limit_m: the same on the negative limb
+ * @edge_desat_red_preserve_gain: how much red is held back from it
+ *
+ * A real demosaic rather than a pass-through: high-pass, gradient and merge
+ * direction, colour extraction, alias detection, false-colour correction, RGB
+ * sharpening and near-edge desaturation. What this block does *not* carry is
+ * the mosaic phase -- that is derived from the format the producer negotiated,
+ * because a params block that also carried it would give the driver two
+ * sources for one fact that can disagree.
+ *
+ * The values come from a tuning tree the vendor indexes by brightness, analog
+ * gain and exposure ratio, so this is a per-frame block rather than a
+ * calibration. Four of its registers move only on the rear camera, which is
+ * the only 1.6 um sensor of the three: what fills them is a per-sensor tuning
+ * table in userspace, not something the kernel could derive.
+ *
+ * As for every block here, the size is part of the interface -- a member added
+ * to this struct would refuse every buffer written against the old one, so a
+ * value it does not yet carry belongs in a new block type.
+ */
+struct exynos_becore_params_dmsc {
+	struct v4l2_isp_params_block_header header;
+
+	/* 0 or 1. */
+	__s32 enable;
+	__s32 enable_low_power;
+
+	/* A fraction of the high-pass. round(f * 31). */
+	__s32 hpf_power;
+
+	/* Direction weights and strengths over the unit interval. round(f * 127). */
+	__s32 gradient_weight;
+	__s32 mono_weight;
+	__s32 diagonal_weight;
+	__s32 desat_strength;
+
+	/*
+	 * A contrast over the unit interval, at a fixed point the hardware
+	 * carries one step past unity. round(f * 256).
+	 */
+	__s32 merge_dir_contrast_threshold;
+
+	/* Thresholds against a 12-bit signal. round(f * 4095). */
+	__s32 alias_detect_threshold;
+	__s32 extract_dir_hv_threshold;
+	__s32 edge_desat_fsharp_thres_p;
+	__s32 edge_desat_fsharp_thres_m;
+	__s32 edge_desat_ogsharp_thres_p;
+	__s32 edge_desat_ogsharp_thres_m;
+
+	/* A desaturation ceiling that reaches unity in a five-bit field. round(f * 16). */
+	__s32 desat_limit;
+
+	/* Powers and weights over the unit interval. round(f * 255). */
+	__s32 extract_sat_power;
+	__s32 green_detect_power;
+	__s32 extract_grid_hv;
+	__s32 extract_grid_hv_protect;
+	__s32 extract_dir_hv;
+	__s32 add_colors_saturation_power;
+
+	/* Gains over the unit interval. round(f * 1023). */
+	__s32 edge_desat_fsharp_gain_p;
+	__s32 edge_desat_fsharp_gain_m;
+	__s32 edge_desat_ogsharp_gain_p;
+	__s32 edge_desat_ogsharp_gain_m;
+	__s32 edge_desat_red_preserve_gain;
+
+	/*
+	 * Limits that reach unity, so the hardware carries them one bit wider
+	 * than the gains above. round(f * 4096).
+	 */
+	__s32 edge_desat_limit_p;
+	__s32 edge_desat_limit_m;
+} __attribute__((aligned(8)));
+
+/**
  * define EXYNOS_BECORE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
  * One of each block type. A buffer larger than this is refused, and one
@@ -1217,6 +1331,7 @@ struct exynos_becore_params_byr_dns {
 	 sizeof(struct exynos_becore_params_gamma) + \
 	 sizeof(struct exynos_becore_params_sharpen) + \
 	 sizeof(struct exynos_becore_params_yuvnr) + \
-	 sizeof(struct exynos_becore_params_byr_dns))
+	 sizeof(struct exynos_becore_params_byr_dns) + \
+	 sizeof(struct exynos_becore_params_dmsc))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

@@ -2111,10 +2111,16 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	/*
 	 * The frame counter, not a count of buffers handed back: frames that
 	 * landed in the dump slot because nothing was queued then show up as a
-	 * gap, which is what a sequence number is for.  The timestamp is this
-	 * end-of-frame, so it trails the buffer's own frame by the credit
-	 * latency.  A statistics buffer for the same frame carries both, which
-	 * is what pairs the two.
+	 * gap, which is what a sequence number is for.  A statistics buffer for
+	 * the same frame carries both, which is what pairs the two.
+	 *
+	 * Both name this buffer's own frame at the default credit latency,
+	 * which is what a consumer pairing a frame with the sensor settings it
+	 * was taken at depends on.  The counter advanced at this same
+	 * end-of-frame, and the buffer being handed back is the one the credit
+	 * before the newest placed -- so the two cancel, and they stop
+	 * cancelling by one frame for every credit of latency above the
+	 * default.
 	 */
 	buf->vb.vb2_buf.timestamp = timestamp;
 	buf->vb.sequence = ispfe->sequence;

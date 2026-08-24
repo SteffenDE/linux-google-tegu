@@ -312,13 +312,13 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
 /* The knot registers are twelve bits, and a slope has to describe what fits. */
 #define BECORE_NOISE_KNOT_MAX		4095
 /*
- * A scaler that starts on a pixel. RGBP's SC, MCSC's POLY_SC0 and its POST_PC0
- * chroma converter each put two 20-bit init phase offsets at the same place in
- * their register map, and all six words are the field table's POR zero: no
- * sub-pixel origin. Nothing here is scene-dependent, and a sub-pixel origin
- * would need a reason none of these blocks has at this geometry -- though note
- * that is a single-geometry observation, since POLY_SC0 and POST_PC0 run at
- * unity here and DJAG does the scaling.
+ * Where a scaler starts. RGBP's SC, MCSC's POLY_SC0 and its POST_PC0 chroma
+ * converter each put two 20-bit init phase offsets at the same place in their
+ * register map. All six are zero in every capture -- but so is the ratio
+ * beside them in all but four, and where POLY_SC0 does stretch it writes half
+ * that ratio. becore_scaler_init_phase() is the rule; POLY_SC0 and POST_PC0
+ * run at unity here because DJAG does the scaling, so it comes out zero.
+ * Nothing here is scene-dependent.
  *
  * The two MCSC blocks put a round-mode bit after the offsets, also at POR, and
  * those are stated too. RGBP's scaler does not: its round mode is bit 0 of
@@ -1125,6 +1125,8 @@ static_assert(EXYNOS_BECORE_CLUT_MAX == BECORE_CLUT_FIELD_MAX);
 #define BECORE_MCSC_DJAG_PS_H_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4014)
 #define BECORE_MCSC_DJAG_PS_V_RATIO_REG	(BECORE_MCSC_PHYS_BASE + 0x4018)
 #define BECORE_RATIO_SHIFT		20
+/* A scaler that neither shrinks nor stretches, which is the sign of both. */
+#define BECORE_RATIO_UNITY		BIT(BECORE_RATIO_SHIFT)
 /*
  * MCSC's chain below DJAG, named from Samsung MCSC v10.1. DJAG has already
  * produced the output raster, so the POLY_SC0 scaler and the POST_PC0 chroma

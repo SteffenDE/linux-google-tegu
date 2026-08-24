@@ -335,8 +335,6 @@ static int becore_bayer_phase(u32 code)
 }
 
 struct becore_rgbp_input_profile {
-	u32 width;
-	u32 height;
 	u32 data_format;
 	u32 comp_control;
 	u32 sbwc_block_width;
@@ -365,8 +363,6 @@ enum becore_rgbp_input_profile_id {
 static const struct becore_rgbp_input_profile
 becore_rgbp_inputs[BECORE_RGBP_INPUT_PROFILE_COUNT] = {
 	[BECORE_RGBP_INPUT_SBWC] = {
-		.width = 4208,
-		.height = 3120,
 		.data_format = 0x18,
 		.comp_control = 0x9,
 		.sbwc_block_width = 256,
@@ -391,8 +387,6 @@ becore_rgbp_inputs[BECORE_RGBP_INPUT_PROFILE_COUNT] = {
 	 * decode payload as pixels.
 	 */
 	[BECORE_RGBP_INPUT_LINEAR] = {
-		.width = 4208,
-		.height = 3120,
 		.data_format = 0x1a,
 		.comp_control = 0,
 		.sbwc_block_width = 1,
@@ -1101,10 +1095,13 @@ static const u32 becore_rgbp_input_regs[] = {
 };
 
 /*
- * What the chain raster is set to while nothing negotiates it: the readout the
- * whole captured corpus came from.  It is a default assigned once at probe,
- * not a description of anything -- becore->chain is what the driver reads.
+ * What the two rasters are set to while nothing negotiates them: the readout
+ * the whole captured corpus came from.  They are defaults assigned once at
+ * probe, not descriptions of anything -- becore->array and becore->chain are
+ * what the driver reads.
  */
+#define BECORE_ARRAY_WIDTH		4208U
+#define BECORE_ARRAY_HEIGHT		3120U
 #define BECORE_CHAIN_WIDTH		4160U
 #define BECORE_CHAIN_HEIGHT		3120U
 
@@ -1741,6 +1738,12 @@ struct becore_device {
 	 * number across as many compiled-in profiles, and a geometry that moved
 	 * five of them would have programmed a chain disagreeing with itself.
 	 */
+	/*
+	 * The Bayer array the front end sends, and the raster the chain runs
+	 * at.  Both were fields of the profiles that describe the *formats*
+	 * involved; a format is the same at any size, so neither belongs there.
+	 */
+	struct becore_raster array;
 	struct becore_raster chain;
 	struct v4l2_subdev sd;
 	struct media_pad sink_pad;
@@ -2177,32 +2180,36 @@ static const u8 *becore_recipe_records(const struct becore_device *becore,
 }
 
 static u32
-becore_rgbp_input_storage_width(const struct becore_rgbp_input_profile *profile)
+becore_rgbp_input_storage_width(const struct becore_rgbp_input_profile *profile,
+				const struct becore_raster *array)
 {
-	return ALIGN(profile->width, profile->sbwc_block_width);
+	return ALIGN(array->width, profile->sbwc_block_width);
 }
 
 static u32
-becore_rgbp_input_stride(const struct becore_rgbp_input_profile *profile)
+becore_rgbp_input_stride(const struct becore_rgbp_input_profile *profile,
+			 const struct becore_raster *array)
 {
-	return becore_rgbp_input_storage_width(profile) *
+	return becore_rgbp_input_storage_width(profile, array) *
 	       profile->bytes_per_pixel;
 }
 
 static size_t
-becore_rgbp_input_image_offset(const struct becore_rgbp_input_profile *profile)
+becore_rgbp_input_image_offset(const struct becore_rgbp_input_profile *profile,
+			       const struct becore_raster *array)
 {
-	return (size_t)profile->header_stride * profile->height;
+	return (size_t)profile->header_stride * array->height;
 }
 
 static size_t
-becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile)
+becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile,
+		       const struct becore_raster *array)
 {
-	size_t image_bytes = (size_t)becore_rgbp_input_stride(profile) *
-			     profile->height;
+	size_t image_bytes = (size_t)becore_rgbp_input_stride(profile, array) *
+			     array->height;
 
-	return ALIGN(becore_rgbp_input_image_offset(profile) + image_bytes,
-		     SZ_4K);
+	return ALIGN(becore_rgbp_input_image_offset(profile, array) +
+		     image_bytes, SZ_4K);
 }
 
 /*
@@ -2212,9 +2219,10 @@ becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile)
  * fit inside that allocation rather than resize it, which is what
  * becore_input_profiles_validate() checks once at probe.
  */
-static size_t becore_input_allocation_size(void)
+static size_t becore_input_allocation_size(const struct becore_raster *array)
 {
-	return becore_rgbp_input_size(&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC]);
+	return becore_rgbp_input_size(&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC],
+				      array);
 }
 
 static int becore_stream_crc_validate(struct device *dev)
@@ -2247,26 +2255,31 @@ static int becore_stream_crc_validate(struct device *dev)
 	return 0;
 }
 
-static int becore_input_profiles_validate(struct device *dev)
+static int becore_input_profiles_validate(struct device *dev,
+					  const struct becore_raster *array)
 {
 	unsigned int i;
+
+	if (!array->width || !array->height || (array->width | array->height) & 1)
+		return dev_err_probe(dev, -EINVAL,
+				     "array raster %ux%u is not a whole number of Bayer quads\n",
+				     array->width, array->height);
 
 	for (i = 0; i < BECORE_RGBP_INPUT_PROFILE_COUNT; i++) {
 		const struct becore_rgbp_input_profile *profile =
 			&becore_rgbp_inputs[i];
 
-		if (!profile->width || !profile->height ||
-		    !profile->bytes_per_pixel ||
+		if (!profile->bytes_per_pixel ||
 		    !is_power_of_2(profile->sbwc_block_width))
 			return dev_err_probe(dev, -EINVAL,
 					     "input profile %u is degenerate\n",
 					     i);
-		if (becore_rgbp_input_size(profile) >
-		    becore_input_allocation_size())
+		if (becore_rgbp_input_size(profile, array) >
+		    becore_input_allocation_size(array))
 			return dev_err_probe(dev, -EINVAL,
 					     "input profile %u wants %zu bytes, the slot holds %zu\n",
-					     i, becore_rgbp_input_size(profile),
-					     becore_input_allocation_size());
+					     i, becore_rgbp_input_size(profile, array),
+					     becore_input_allocation_size(array));
 	}
 
 	return 0;
@@ -2316,12 +2329,12 @@ static u32 becore_zoom_ratio(u32 in, u32 out)
  * therefore unreachable by construction and is kept as a guard on that
  * reasoning rather than on the arithmetic.
  */
-static int becore_rgbp_crop(const struct becore_rgbp_input_profile *profile,
+static int becore_rgbp_crop(const struct becore_raster *array,
 			    const struct becore_raster *chain,
 			    struct becore_rect *crop)
 {
-	u32 array_w = profile->width;
-	u32 array_h = profile->height;
+	u32 array_w = array->width;
+	u32 array_h = array->height;
 	u32 out_w = chain->width;
 	u32 out_h = chain->height;
 	u32 width;
@@ -2374,6 +2387,7 @@ static int becore_rgbp_crop(const struct becore_rgbp_input_profile *profile,
  * are the only ones never checked before the hardware sees them.
  */
 static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
+				   const struct becore_raster *array,
 				   const struct becore_raster *chain,
 				   u32 index, u32 reg, u32 *value)
 {
@@ -2385,7 +2399,7 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 
 	switch (index) {
 	case BECORE_RGBP_CHAIN_SRC_SIZE:
-		result = becore_pack_size(profile->width, profile->height);
+		result = becore_pack_size(array->width, array->height);
 		break;
 	case BECORE_RGBP_CHAIN_DST_SIZE:
 	case BECORE_RGBP_SC_DST_SIZE:
@@ -2396,7 +2410,7 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 	case BECORE_RGBP_SC_H_RATIO:
 	case BECORE_RGBP_SC_V_RATIO: {
 		struct becore_rect crop;
-		int ret = becore_rgbp_crop(profile, chain, &crop);
+		int ret = becore_rgbp_crop(array, chain, &crop);
 
 		if (ret)
 			return ret;
@@ -2419,13 +2433,13 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 		result = profile->comp_control;
 		break;
 	case BECORE_RGBP_INPUT_ACTIVE_WIDTH:
-		result = profile->width;
+		result = array->width;
 		break;
 	case BECORE_RGBP_INPUT_HEIGHT:
-		result = profile->height;
+		result = array->height;
 		break;
 	case BECORE_RGBP_INPUT_STRIDE:
-		result = becore_rgbp_input_stride(profile);
+		result = becore_rgbp_input_stride(profile, array);
 		break;
 	case BECORE_RGBP_INPUT_HEADER_STRIDE:
 		result = profile->header_stride;
@@ -2437,7 +2451,7 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 		result = 1;
 		break;
 	case BECORE_RGBP_INPUT_STORAGE_WIDTH:
-		result = becore_rgbp_input_storage_width(profile);
+		result = becore_rgbp_input_storage_width(profile, array);
 		break;
 	default:
 		return -EINVAL;
@@ -2964,8 +2978,8 @@ static int becore_typed_value(struct becore_device *becore,
 {
 	if (id == BECORE_RGBP)
 		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
-					       &becore->chain, index, reg,
-					       value);
+					       &becore->array, &becore->chain,
+					       index, reg, value);
 	if (id == BECORE_YUVP)
 		return becore_yuvp_output_value(becore, index, reg, value);
 
@@ -4539,7 +4553,7 @@ static int becore_rgbp_chroma_lpf_value(u32 offset, u32 *value)
 }
 
 static int
-becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
+becore_rgbp_dns_geometry_value(const struct becore_raster *array,
 			       u32 offset, u32 *value)
 {
 	s32 x;
@@ -4561,8 +4575,8 @@ becore_rgbp_dns_geometry_value(const struct becore_rgbp_input_profile *profile,
 	 * difference: every one of them halves to an even number already.
 	 */
 	case 0x1c0:
-		x = -(s32)(profile->width >> 1);
-		y = -(s32)(profile->height >> 1);
+		x = -(s32)(array->width >> 1);
+		y = -(s32)(array->height >> 1);
 		*value = ((y & BECORE_RGBP_DNS_CENTRE_MASK) << 16) |
 			 (x & BECORE_RGBP_DNS_CENTRE_MASK);
 		return 0;
@@ -4788,7 +4802,7 @@ static u32 becore_yuvnr_radius_bucket(u32 width, u32 height)
  * exists: it is what converts one into the other.
  */
 static int
-becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
+becore_sharpen_geometry_value(const struct becore_raster *array,
 			      const struct becore_raster *chain,
 			      u32 reg, u32 *value)
 {
@@ -4797,7 +4811,7 @@ becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
 	u32 chain_h = chain->height;
 	int ret;
 
-	ret = becore_rgbp_crop(profile, chain, &crop);
+	ret = becore_rgbp_crop(array, chain, &crop);
 	if (ret)
 		return ret;
 	if (!chain_w || !chain_h)
@@ -4822,7 +4836,7 @@ becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
 }
 
 static int
-becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
+becore_yuvnr_geometry_value(const struct becore_raster *array,
 			    const struct becore_raster *chain,
 			    u32 offset, u32 *value)
 {
@@ -4831,7 +4845,7 @@ becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
 	s32 x;
 	s32 y;
 
-	ret = becore_rgbp_crop(profile, chain, &crop);
+	ret = becore_rgbp_crop(array, chain, &crop);
 	if (ret)
 		return ret;
 
@@ -5620,12 +5634,12 @@ static int becore_byrdns_value(const struct becore_device *becore,
  * readouts and wrong at the other ten.
  */
 static int
-becore_byr_dns_biquad_value(const struct becore_rgbp_input_profile *profile,
+becore_byr_dns_biquad_value(const struct becore_raster *array,
 			    const struct exynos_becore_params_byr_dns *params,
 			    u32 *value)
 {
 	s32 subtracter = params ? params->biquad_scale_shift_subtracter : 0;
-	u32 shorter = min(profile->width, profile->height);
+	u32 shorter = min(array->width, array->height);
 	s32 octaves;
 	u32 rung;
 
@@ -6718,7 +6732,8 @@ static int becore_sc_ratio(const struct becore_device *becore,
 		index = vertical ? BECORE_RGBP_SC_V_RATIO :
 				   BECORE_RGBP_SC_H_RATIO;
 		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
-					       &becore->chain, index,
+					       &becore->array, &becore->chain,
+					       index,
 					       becore_rgbp_input_regs[index],
 					       ratio);
 	}
@@ -6790,8 +6805,6 @@ static int becore_generated_tables_validate(struct device *dev)
 static int becore_generated_value(const struct becore_device *becore,
 				  enum becore_block_id id, u32 reg, u32 *value)
 {
-	const struct becore_rgbp_input_profile *input =
-		becore_rgbp_input_profile(becore);
 	const struct becore_generated_range *table;
 	size_t count;
 	size_t i;
@@ -6825,7 +6838,8 @@ static int becore_generated_value(const struct becore_device *becore,
 			result = 0;
 			break;
 		case BECORE_GEN_DECOMP_SIZE:
-			result = becore_pack_size(input->height, input->width);
+			result = becore_pack_size(becore->array.height,
+						  becore->array.width);
 			break;
 		case BECORE_GEN_NOISE_SLOPE:
 		case BECORE_GEN_NOISE_SHIFT:
@@ -6891,13 +6905,13 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_DNS_GEOMETRY: {
 			u32 offset = reg - BECORE_RGBP_DNS_BASE;
 
-			if (becore_rgbp_dns_geometry_value(input, offset,
+			if (becore_rgbp_dns_geometry_value(&becore->array, offset,
 							   &result))
 				return -EINVAL;
 			break;
 		}
 		case BECORE_GEN_DNS_BIQUAD:
-			if (becore_byr_dns_biquad_value(input, NULL, &result))
+			if (becore_byr_dns_biquad_value(&becore->array, NULL, &result))
 				return -EINVAL;
 			break;
 		/*
@@ -6932,7 +6946,7 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		case BECORE_GEN_NR_GEOMETRY:
-			if (becore_yuvnr_geometry_value(input, &becore->chain,
+			if (becore_yuvnr_geometry_value(&becore->array, &becore->chain,
 							reg - BECORE_YUVP_PHYS_BASE,
 							&result))
 				return -EINVAL;
@@ -6971,7 +6985,7 @@ static int becore_generated_value(const struct becore_device *becore,
 			result = 0;
 			break;
 		case BECORE_GEN_SHARPEN_GEOMETRY:
-			if (becore_sharpen_geometry_value(input, &becore->chain,
+			if (becore_sharpen_geometry_value(&becore->array, &becore->chain,
 							  reg, &result))
 				return -EINVAL;
 			break;
@@ -7137,7 +7151,8 @@ static dma_addr_t becore_address_dma(struct becore_device *becore, u32 reg)
 
 	switch (reg) {
 	case BECORE_RGBP_INPUT_IMAGE_REG:
-		return input->dma + becore_rgbp_input_image_offset(profile);
+		return input->dma +
+		       becore_rgbp_input_image_offset(profile, &becore->array);
 	/*
 	 * A profile with no header plane leaves the image at offset zero, so
 	 * these two name the same page.  That is the right answer rather than
@@ -7307,7 +7322,8 @@ static int becore_recipe_validate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *input = &becore->run_input->buffer;
 	size_t wanted =
-		becore_rgbp_input_size(becore_rgbp_input_profile(becore));
+		becore_rgbp_input_size(becore_rgbp_input_profile(becore),
+				       &becore->array);
 
 	/*
 	 * The staged length is the check that the frame and the profile agree.
@@ -7527,13 +7543,10 @@ static int becore_params_value(const struct becore_device *becore,
 	if (params->dmsc_valid && !becore_dmsc_value(&params->dmsc, reg, value))
 		return 0;
 	if (params->byr_dns_valid) {
-		const struct becore_rgbp_input_profile *input =
-			becore_rgbp_input_profile(becore);
-
 		if (!becore_byrdns_value(becore, &params->byr_dns, reg, value))
 			return 0;
 		if (reg == BECORE_RGBP_DNS_BIQUAD_REG)
-			return becore_byr_dns_biquad_value(input,
+			return becore_byr_dns_biquad_value(&becore->array,
 							   &params->byr_dns,
 							   value);
 	}
@@ -9291,7 +9304,7 @@ static int becore_alloc_shared_input(struct becore_device *becore)
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
 		struct becore_dma_buffer *input = &becore->inputs[i].buffer;
 
-		input->size = becore_input_allocation_size();
+		input->size = becore_input_allocation_size(&becore->array);
 		input->sgt = dma_alloc_noncontiguous(becore->dev, input->size,
 						     DMA_BIDIRECTIONAL,
 						     GFP_KERNEL, 0);
@@ -9377,7 +9390,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	ret = becore_generated_tables_validate(becore->dev);
 	if (ret)
 		return ret;
-	ret = becore_input_profiles_validate(becore->dev);
+	ret = becore_input_profiles_validate(becore->dev, &becore->array);
 	if (ret)
 		return ret;
 	ret = becore_stream_crc_validate(becore->dev);
@@ -11080,14 +11093,12 @@ static int becore_latch_input_code(struct becore_device *becore)
 static int becore_sd_init_state(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *state)
 {
-	const struct becore_rgbp_input_profile *profile =
-		&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC];
 	struct v4l2_mbus_framefmt *sink =
 		v4l2_subdev_state_get_format(state, 0);
 
 	sink->code = BECORE_INPUT_DEFAULT_CODE;
-	sink->width = profile->width;
-	sink->height = profile->height;
+	sink->width = BECORE_ARRAY_WIDTH;
+	sink->height = BECORE_ARRAY_HEIGHT;
 	sink->field = V4L2_FIELD_NONE;
 	sink->colorspace = V4L2_COLORSPACE_RAW;
 	sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
@@ -11826,7 +11837,8 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",
 		   READ_ONCE(becore->input_profile),
 		   becore->active_input_profile,
-		   becore_rgbp_input_size(becore_rgbp_input_profile(becore)));
+		   becore_rgbp_input_size(becore_rgbp_input_profile(becore),
+					  &becore->array));
 	seq_printf(s, "output_profile   %u requested, %u active\n",
 		   READ_ONCE(becore->output_profile),
 		   becore->active_output_profile);
@@ -13181,6 +13193,8 @@ static int becore_probe(struct platform_device *pdev)
 	 * as six copies in as many profiles: nothing negotiates it yet, and
 	 * what changes when something does is this one assignment.
 	 */
+	becore->array.width = BECORE_ARRAY_WIDTH;
+	becore->array.height = BECORE_ARRAY_HEIGHT;
 	becore->chain.width = BECORE_CHAIN_WIDTH;
 	becore->chain.height = BECORE_CHAIN_HEIGHT;
 	mutex_init(&becore->lock);

@@ -2325,6 +2325,35 @@ static int becore_zoom_ratio(u32 in, u32 out, u32 *ratio)
 }
 
 /*
+ * Where MCSC's scaler starts, which is a function of its ratio rather than a
+ * constant: half a source step when it stretches and nothing when it shrinks.
+ * Ten captured POLY_SC0 programs say so -- the six that shrink write zero, and
+ * the four that stretch write half the ratio, odd values included, 0x0ffdf4
+ * giving 0x0007fefa.
+ *
+ * **It is three scalers' rule and not all four's**, which is the thing not to
+ * generalise from the register's name. DJAG's pre-scaler has the same field in
+ * the same shape and does not follow it: seven captured programs run it as a
+ * stretcher, at ratios from 889105 to 974302 against a unity of 1048576, and
+ * every one of them writes an origin of zero where this would put 444552 to
+ * 487151. So becore_mcsc_djag_value() states zero because that is what the
+ * silicon is told, not because nothing has moved yet.
+ *
+ * Two sources say so and they agree.  Samsung's kernel driver carries
+ * `if (hratio < RATIO_X8_8) h_phase_offset = hratio >> 1;` in
+ * is_scaler_set_poly_scaler_coef() and is_scaler_set_post_scaler_coef(), while
+ * every caller of is_scaler_set_djag_init_phase_offset() passes a literal 0 --
+ * four of them, unconditionally, on the line after the ratio is set.  And
+ * Lyric, which is what actually programs this silicon, has no ratio arithmetic
+ * in its DJAG function at all: lyric::McscCropAndUpScaleBlock's writes two
+ * literal zeros and then the round mode's 1.
+ */
+static u32 becore_scaler_init_phase(u32 ratio)
+{
+	return ratio < BECORE_RATIO_UNITY ? ratio >> 1 : 0;
+}
+
+/*
  * What a raster has to be before anything derives a register from it.  Every
  * clause here is a silent failure rather than a loud one, which is why they
  * are checked at all: none of them is reachable while the three rasters are
@@ -3995,6 +4024,12 @@ static int becore_mcsc_djag_value(u32 offset, u32 *value)
 	case 0x000:		/* CTRL: DJAG, its pre-scaler and EZ post on */
 		*value = BIT(0) | BIT(1) | BIT(10);
 		return 0;
+	/*
+	 * Zero at every ratio and not only at unity: seven captured programs
+	 * run this pre-scaler as a stretcher and all seven write zero, where
+	 * POLY_SC0's rule would put half the ratio.  See
+	 * becore_scaler_init_phase().
+	 */
 	case 0x01c:		/* PS_H_INIT_PHASE_OFFSET */
 	case 0x020:		/* PS_V_INIT_PHASE_OFFSET */
 	case 0x080:		/* RECOM_CTRL: detail restoration is off */
@@ -4058,7 +4093,24 @@ static const u32 becore_scaler_phase_first[] = {
 	BECORE_MCSC_PC0_PHASE_FIRST,
 };
 
-static int becore_scaler_phase_value(u32 reg, u32 *value)
+/*
+ * The ratios are the caller's because they are the block's rather than the
+ * register's: one pair covers whichever of that block's scalers this register
+ * belongs to. Taking them from becore_sc_ratio() is what stops the origin and
+ * the poly-phase filter describing different scalings, which is the reason the
+ * coefficients take it from there too.
+ *
+ * All three of these follow the rule, RGBP's included, and no capture could
+ * have said so: all twelve captured RGBP programs shrink, so every one writes
+ * the same zero either reading predicts. Lyric settles it, and
+ * lyric::YuvscDriver::ConfigureYuvscBlock() is where -- it divides the crop by
+ * the destination, converts at Q20, and selects between `ratio >> 1` and zero
+ * on the sign of the comparison, with the same `ubfx #1, #20` and `csel` that
+ * lyric::McscScalerChain::ConfigureCropAndScaleBlockInternal() uses for
+ * POLY_SC0. Samsung's is_scaler_set_post_scaler_coef() is the third.
+ */
+static int becore_scaler_phase_value(u32 reg, u32 h_ratio, u32 v_ratio,
+				     u32 *value)
 {
 	size_t i;
 
@@ -4068,9 +4120,10 @@ static int becore_scaler_phase_value(u32 reg, u32 *value)
 		if (reg < first || reg > first + BECORE_SCALER_PHASE_LAST)
 			continue;
 		switch (reg - first) {
-		case 0x00:	/* H_INIT_PHASE_OFFSET: no sub-pixel origin */
+		case 0x00:	/* H_INIT_PHASE_OFFSET */
 		case 0x04:	/* V_INIT_PHASE_OFFSET */
-			*value = 0;
+			*value = becore_scaler_init_phase((reg - first) ?
+							  v_ratio : h_ratio);
 			return 0;
 		case 0x08:	/* ROUND_MODE, on the MCSC blocks only */
 			*value = 1;
@@ -7013,10 +7066,22 @@ static int becore_generated_value(const struct becore_device *becore,
 				    reg - BECORE_YUVP_DITHER420_BASE, &result))
 				return -EINVAL;
 			break;
-		case BECORE_GEN_SCALER_PHASE:
-			if (becore_scaler_phase_value(reg, &result))
-				return -EINVAL;
+		case BECORE_GEN_SCALER_PHASE: {
+			u32 h_ratio;
+			u32 v_ratio;
+			int err = becore_sc_ratio(becore, id, false, &h_ratio);
+
+			if (!err)
+				err = becore_sc_ratio(becore, id, true,
+						      &v_ratio);
+			if (!err)
+				err = becore_scaler_phase_value(reg, h_ratio,
+								v_ratio,
+								&result);
+			if (err)
+				return err;
 			break;
+		}
 		case BECORE_GEN_MCSC_INPUT_SIZE:
 			if (reg == BECORE_MCSC_IN_WIDTH_REG)
 				result = becore->chain.width;

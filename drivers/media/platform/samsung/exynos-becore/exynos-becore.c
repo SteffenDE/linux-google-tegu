@@ -784,6 +784,28 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
  */
 #define BECORE_YUVP_SHARPEN_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x5000)
 /*
+ * The sharpener's two geometry words, which describe the *crop* and how a
+ * chain pixel maps into it -- the same pair YUVNR carries, and the same
+ * conversion: BECORE_YUVNR_BINNING is 1024 x crop / chain and this step is the
+ * identical ratio at eight fractional bits instead of ten.
+ *
+ * SENSOR is the crop's size with the height in the high half, the way DECOMP's
+ * frame size is and the way CHAIN_SRC_IMG_SIZE is not. STEP packs the vertical
+ * ratio above the horizontal one, which is only visible where the two differ:
+ * of the sixteen captured camera/geometry pairs exactly one does, the
+ * ultrawide's 4208 x 2368 readout at 0x018c018b, and it is the vertical axis
+ * that reads 0x18c.
+ *
+ * Both hold on all sixteen, and the second was found by running the offline
+ * loop at a second chain raster on hardware: the driver replayed 0x01000100
+ * where the vendor writes 0x01980198, which is a word that would have been
+ * wrong at every readout but the one it was captured at.
+ */
+#define BECORE_YUVP_SHARPEN_SENSOR_REG	(BECORE_YUVP_PHYS_BASE + 0x500c)
+#define BECORE_YUVP_SHARPEN_STEP_REG	(BECORE_YUVP_PHYS_BASE + 0x5014)
+#define BECORE_SHARPEN_STEP_Q		256
+#define BECORE_SHARPEN_STEP_MASK	GENMASK(15, 0)
+/*
  * Three registers of the sharpener that nothing writes. Each falls in a gap
  * between two runs of exynos-becore-sharpen.h -- the table
  * tools/camera-sharpener-encode.py recovers from the vendor's own
@@ -1688,6 +1710,7 @@ enum becore_generated_kind {
 	BECORE_GEN_UNWRITTEN,	/* a register of a block we program that no
 				 * vendor code writes at all: its reset value
 				 */
+	BECORE_GEN_SHARPEN_GEOMETRY,	/* the sharpener's crop and its ratio */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
@@ -1725,7 +1748,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	297
-#define BECORE_YUVP_GENERATED_WORDS	1363
+#define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1934,6 +1957,10 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  (BECORE_YUVNR_TNR_KNOTS - 2) * 4, BECORE_GEN_YUVNR },
 	{ BECORE_YUVP_SHARPEN_BYPASS_REG, BECORE_YUVP_SHARPEN_BYPASS_REG,
 	  BECORE_GEN_SHARPEN },
+	{ BECORE_YUVP_SHARPEN_SENSOR_REG, BECORE_YUVP_SHARPEN_SENSOR_REG,
+	  BECORE_GEN_SHARPEN_GEOMETRY },
+	{ BECORE_YUVP_SHARPEN_STEP_REG, BECORE_YUVP_SHARPEN_STEP_REG,
+	  BECORE_GEN_SHARPEN_GEOMETRY },
 	{ BECORE_YUVP_SHARPEN_CONT_CONFIG4_REG,
 	  BECORE_YUVP_SHARPEN_CONT_CONFIG4_REG, BECORE_GEN_UNWRITTEN },
 	{ BECORE_YUVP_SHARPEN_SKIN_B_GAIN_REG,
@@ -5724,6 +5751,45 @@ static u32 becore_yuvnr_radius_bucket(u32 width, u32 height)
 	return index ? index - 1 : 0;
 }
 
+/*
+ * The sharpener's crop size and its chain-to-crop ratio. Reported for the
+ * whole crop rather than the scaled raster because that is the frame the
+ * tuning's spatial terms are expressed over, which is also why the step
+ * exists: it is what converts one into the other.
+ */
+static int
+becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
+			      u32 reg, u32 *value)
+{
+	struct becore_rect crop;
+	u32 chain_w = becore_rgbp_out_width();
+	u32 chain_h = becore_rgbp_out_height();
+	int ret;
+
+	ret = becore_rgbp_crop(profile, &crop);
+	if (ret)
+		return ret;
+	if (!chain_w || !chain_h)
+		return -EINVAL;
+
+	if (reg == BECORE_YUVP_SHARPEN_SENSOR_REG) {
+		*value = (crop.height << 16) | crop.width;
+		return 0;
+	}
+	if (reg == BECORE_YUVP_SHARPEN_STEP_REG) {
+		u32 horizontal = DIV_ROUND_CLOSEST(BECORE_SHARPEN_STEP_Q *
+						   crop.width, chain_w);
+		u32 vertical = DIV_ROUND_CLOSEST(BECORE_SHARPEN_STEP_Q *
+						 crop.height, chain_h);
+
+		*value = ((vertical & BECORE_SHARPEN_STEP_MASK) << 16) |
+			 (horizontal & BECORE_SHARPEN_STEP_MASK);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int
 becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
 			    u32 offset, u32 *value)
@@ -7468,6 +7534,10 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		case BECORE_GEN_UNWRITTEN:
 			result = 0;
+			break;
+		case BECORE_GEN_SHARPEN_GEOMETRY:
+			if (becore_sharpen_geometry_value(input, reg, &result))
+				return -EINVAL;
 			break;
 		case BECORE_GEN_YUVNR:
 			/*

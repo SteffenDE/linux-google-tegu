@@ -746,6 +746,21 @@ static_assert((BECORE_YUVP_NR_LUMA_GRID_LAST -
  * picture's detail and leaves its exposure and colour alone.
  */
 #define BECORE_YUVP_SHARPEN_BYPASS_REG	(BECORE_YUVP_PHYS_BASE + 0x5000)
+/*
+ * Three registers of the sharpener that nothing writes. Each falls in a gap
+ * between two runs of exynos-becore-sharpen.h -- the table
+ * tools/camera-sharpener-encode.py recovers from the vendor's own
+ * SharpenerBlock::ConfigureWith -- so the vendor programs the register either
+ * side of each and not these: CONT_CONFIG3 but not _CONFIG4, SKIN_FACE_
+ * BRIGHTNESS_GAIN but not the SKIN_B one after it, APPLY_DESAT_1 but not
+ * _DESAT_3. They are invariant across all 426 captured programs, and forcing
+ * each to a saturated value in the offline loop leaves the frame
+ * byte-identical, so they are the block's reset state rather than a tuning
+ * whose zero happens to be neutral.
+ */
+#define BECORE_YUVP_SHARPEN_CONT_CONFIG4_REG (BECORE_YUVP_PHYS_BASE + 0x5930)
+#define BECORE_YUVP_SHARPEN_SKIN_B_GAIN_REG (BECORE_YUVP_PHYS_BASE + 0x5958)
+#define BECORE_YUVP_SHARPEN_APPLY_DESAT3_REG (BECORE_YUVP_PHYS_BASE + 0x5aa8)
 #define BECORE_YUVP_LPF_FIRST		(BECORE_YUVP_PHYS_BASE + 0x5100)
 #define BECORE_YUVP_LPF_LAST		(BECORE_YUVP_PHYS_BASE + 0x514c)
 #define BECORE_YUVP_LPF_NORM_REG	(BECORE_YUVP_PHYS_BASE + 0x5150)
@@ -1633,6 +1648,9 @@ enum becore_generated_kind {
 	BECORE_GEN_GRID_DMA,	/* the LTM grid RDMA, from our own buffer */
 	BECORE_GEN_YUVP_CHAIN_SIZE,	/* the raster YUVP is handed */
 	BECORE_GEN_SHARPEN,	/* the sharpener bypassed, and its tuning at zero */
+	BECORE_GEN_UNWRITTEN,	/* a register of a block we program that no
+				 * vendor code writes at all: its reset value
+				 */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
@@ -1670,7 +1688,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	297
-#define BECORE_YUVP_GENERATED_WORDS	1360
+#define BECORE_YUVP_GENERATED_WORDS	1363
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -1879,6 +1897,12 @@ static const struct becore_generated_range becore_yuvp_generated[] = {
 	  (BECORE_YUVNR_TNR_KNOTS - 2) * 4, BECORE_GEN_YUVNR },
 	{ BECORE_YUVP_SHARPEN_BYPASS_REG, BECORE_YUVP_SHARPEN_BYPASS_REG,
 	  BECORE_GEN_SHARPEN },
+	{ BECORE_YUVP_SHARPEN_CONT_CONFIG4_REG,
+	  BECORE_YUVP_SHARPEN_CONT_CONFIG4_REG, BECORE_GEN_UNWRITTEN },
+	{ BECORE_YUVP_SHARPEN_SKIN_B_GAIN_REG,
+	  BECORE_YUVP_SHARPEN_SKIN_B_GAIN_REG, BECORE_GEN_UNWRITTEN },
+	{ BECORE_YUVP_SHARPEN_APPLY_DESAT3_REG,
+	  BECORE_YUVP_SHARPEN_APPLY_DESAT3_REG, BECORE_GEN_UNWRITTEN },
 	BECORE_SHARPEN_TUNING_RANGES
 	{ BECORE_YUVP_PHYS_BASE + 0x5008, BECORE_YUVP_PHYS_BASE + 0x5008,
 	  BECORE_GEN_SHARPEN_DEFAULT },
@@ -7301,6 +7325,9 @@ static int becore_generated_value(const struct becore_device *becore,
 			}
 			if (becore_sharpen_value(NULL, reg, &result))
 				return -EINVAL;
+			break;
+		case BECORE_GEN_UNWRITTEN:
+			result = 0;
 			break;
 		case BECORE_GEN_YUVNR:
 			/*

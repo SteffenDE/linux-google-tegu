@@ -67,28 +67,34 @@
  * which is not a geometry any measured link uses.
  *
  * What works is `YUVP -> TNR`'s pair, 12 and 4 against 48 and 16.  It is the
- * vendor's only captured link with a two-plane SBWC producer -- the shape
- * this one has -- and the reason it works is arithmetic: 3120 lines in tokens
- * of 12 is 260 tokens, and in tokens of 48 is 65, an exact factor of four, so
- * both ends agree about how many tokens a frame is.  MCSC's own captured
- * pairing, 64 and 32 against GDC0's producer, does not divide that way once
- * YUVP is the producer: 260 producer tokens against 48.75 consumer ones.
+ * vendor's only captured link with a two-plane SBWC producer, which is the
+ * shape this one has.  MCSC's own captured pairing, 64 and 32, was taken
+ * against GDC0, whose producer token is 1, and putting YUVP in front of it
+ * fails: the link half-forms, one plane reaching VOTF_CONNECT and the other
+ * sitting in WAIT_TOKEN_ACK, and at a limit large enough to paper over that
+ * the consumer runs about a third ahead of the data and the picture goes to
+ * fill part way down.
  *
- * That mismatch is not a subtlety, it is the whole difference between working
- * and not.  With 64/32 the link half-forms -- one plane connects and the
- * other sits in WAIT_TOKEN_ACK -- and at a limit large enough to paper over
- * it the consumer runs about a third ahead of the data and the picture goes
- * to fill part way down.  With 48/16 the frame is byte-identical to the
- * memory path at the vendor's own limit of 1.
+ * What separates the two is a whole number of producer tokens per consumer
+ * one.  48 over 12 is 4 and 16 over 4 is 4; 64 over 12 is 5.33, and it is
+ * exactly the plane whose ratio is not whole that loses.  Every captured
+ * endpoint pair holds that ratio -- 48/12 and 16/4, 64/1 and 32/1, 16/1 and
+ * 8/1 -- and so does every plane count against its own producer token: 3000
+ * over 12 and 1500 over 4, 510 over 1 and 255 over 1.
  *
- * **This pair is a function of a 3120-line frame and is not linked to one.**
- * becore_c2serv_program_link() writes becore->chain.height into the consumer's
- * line count while these stay put, and the divisibility the paragraph above
- * rests on holds for 3120 and not in general: a chain height that is not a
- * multiple of 48 puts the two ends back to disagreeing about how many tokens a
- * frame is, with the symptom described above and no error anywhere.  Whatever
- * comes to set the raster has to derive these or refuse a height that does not
- * divide.  It is unreachable today only because nothing sets it.
+ * The consumer's token divides nothing.  All three links were captured at
+ * 3000/1500 or 510/255 lines, where 48 gives 62.5 tokens, 16 gives 93.75, 64
+ * and 32 give 46.875 and 16 and 8 give 31.875 -- not one of the six captured
+ * planes comes out whole, and the link this driver runs is byte-identical to
+ * the memory path with a chroma plane of 1560 lines in tokens of 16, which is
+ * 97.5.  So a partial last consumer token is what the hardware does, and the
+ * two ends emphatically do not agree on how many tokens a frame is.
+ *
+ * That leaves two invariants.  The pair's ratio is a property of these two
+ * tables and becore_c2serv_tokens_validate() checks it at probe.  The chain
+ * height against the producer's token is the one a negotiated raster can
+ * break, and becore_c2serv_chain_fits() decides it per frame, because it says
+ * which path the frame takes rather than whether the device works.
  */
 static const u32 becore_c2serv_tws_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
 	12, 4,
@@ -2547,6 +2553,60 @@ static const struct becore_yuvp_output_profile *becore_chain_surface(void)
 static u32 becore_chain_stride(const struct becore_raster *chain)
 {
 	return becore_yuvp_output_stride(becore_chain_surface(), chain);
+}
+
+/*
+ * The VOTF token geometry, and the chain raster against it.  Checked at probe
+ * rather than at link time because neither failure is a failed register write:
+ * see becore_c2serv_tws_lines_in_token for what each of the two refusals
+ * costs when it is not made, and for the captured links they come from.
+ *
+ * The debugfs overrides are deliberately not checked.  They exist to sweep
+ * this geometry against what the fabric reports, and a sweep that cannot reach
+ * a failing point cannot characterise the failure -- which is how these two
+ * numbers were found in the first place.
+ */
+static int becore_c2serv_tokens_validate(struct device *dev)
+{
+	unsigned int n;
+
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		u32 tws = becore_c2serv_tws_lines_in_token[n];
+		u32 trs = becore_c2serv_trs_lines_in_token[n];
+
+		if (!tws || !trs || trs % tws)
+			return dev_err_probe(dev, -EINVAL,
+					     "VOTF plane %u gives the consumer %u lines to the producer's %u, which is not a whole number of tokens\n",
+					     n, trs, tws);
+	}
+
+	return 0;
+}
+
+/*
+ * And the raster against them, which is a property of the fabric and not of
+ * the device: the memory path carries any height correctly, and a frame the
+ * fabric cannot describe simply goes that way instead.  Refusing to probe over
+ * it would deny the memory path, the offline oracle and the debugfs sweep for
+ * a switch none of them uses.
+ *
+ * The overrides are not consulted, for the reason above them: a sweep has to
+ * be able to reach a failing point, and this decides which path a frame takes
+ * rather than what the fabric is told.
+ */
+static bool becore_c2serv_chain_fits(const struct becore_raster *chain)
+{
+	unsigned int n;
+
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		u32 tws = becore_c2serv_tws_lines_in_token[n];
+		u32 lines = n ? DIV_ROUND_UP(chain->height, 2) : chain->height;
+
+		if (!tws || lines % tws)
+			return false;
+	}
+
+	return true;
 }
 
 static size_t
@@ -8934,8 +8994,10 @@ static void becore_c2serv_link_sample(struct becore_device *becore,
  * frame because that is where the vendor programs a link, and because the
  * things it depends on are resolved per run.
  *
- * What it does *not* yet depend on is the token geometry beside it, which is
- * a constant chosen for a 3120-line frame.  See becore_c2serv_tws_lines_in_token.
+ * The token geometry beside it does not move with the height, and does not
+ * have to: it says how the producer packets a plane, not how tall the plane
+ * is.  A height it cannot packet does not reach here at all --
+ * becore_c2serv_chain_fits() sends that frame through memory.
  */
 static void becore_c2serv_program_link(struct becore_device *becore)
 {
@@ -9445,6 +9507,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 		return ret;
 	ret = becore_raster_validate(becore->dev, "chain", &becore->chain,
 				     BECORE_RASTER_EXTENT_MAX);
+	if (ret)
+		return ret;
+	ret = becore_c2serv_tokens_validate(becore->dev);
 	if (ret)
 		return ret;
 	ret = becore_raster_validate(becore->dev, "scaled", &becore->scaled,
@@ -10788,7 +10853,13 @@ static int becore_run_frame(struct becore_device *becore, u32 input_profile,
 	use_votf = run_mcsc && READ_ONCE(becore->votf) &&
 		   output_profile == BECORE_YUVP_OUTPUT_SBWCL &&
 		   becore->c2serv_state[BECORE_C2SERV_YUVP].ready &&
-		   becore->c2serv_state[BECORE_C2SERV_MCSC].ready;
+		   becore->c2serv_state[BECORE_C2SERV_MCSC].ready &&
+		   becore_c2serv_chain_fits(&becore->chain);
+	if (!use_votf && run_mcsc && READ_ONCE(becore->votf) &&
+	    !becore_c2serv_chain_fits(&becore->chain))
+		dev_warn_once(becore->dev,
+			      "chain raster %ux%u is not a whole number of VOTF producer tokens; using memory\n",
+			      becore->chain.width, becore->chain.height);
 	becore->active_votf = use_votf;
 	if (use_votf)
 		becore_c2serv_program_link(becore);

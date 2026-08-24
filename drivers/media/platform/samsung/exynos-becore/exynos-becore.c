@@ -319,18 +319,32 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_SC_H_RATIO_REG	(BECORE_RGBP_PHYS_BASE + 0x4420)
 #define BECORE_RGBP_SC_V_RATIO_REG	(BECORE_RGBP_PHYS_BASE + 0x4424)
 /*
- * Ten registers that say which RGBP blocks run, named from Samsung RGBP v1.20.
- * None needs a value from the capture: an enable the program leaves clear is
- * zero and an asserted bypass is one.
+ * Sixteen registers that say which RGBP blocks run, named from Samsung RGBP
+ * v1.20 and from Lyric's own register descriptors. None needs a value from the
+ * capture: an enable the program leaves clear is zero and an asserted bypass
+ * is one.
  *
  * OTF_CROP_CTRL is the one that reads backwards. Its only field is
  * RGB_DMSCCROP_BYPASS, whose vendor default is 1, and the capture clears it --
  * so zero here is what keeps the 48-column demosaic crop above *running*.
  * Do not fold it in with the asserted bypasses.
  *
- * UPSC_CTRL0 is a control word rather than a bare enable: bit 0 enables, bit 8
- * bypasses and two more disable clock gates. Zero leaves the upscaler neither
- * enabled nor bypassed, which is what the capture does.
+ * UPSC_CTRL0 and SC_CTRL0 are control words rather than bare enables: bit 0
+ * enables, bit 8 bypasses and two more disable clock gates. Zero leaves the
+ * scaler neither enabled nor bypassed, which is what the capture does and what
+ * the chain needs -- setting SC_CTRL0's bit 0 in the offline loop leaves the
+ * main output byte-identical and empties the low-resolution branch below it,
+ * because an enabled scaler scales rather than passing its raster through.
+ *
+ * DTP's mode selects a test pattern instead of the sensor's pixels. Zero is
+ * the generator off; forcing it to 1 signs every stage of both processors with
+ * a constant, which is the pattern rather than the picture.
+ *
+ * The two bypasses at +0x3100 and +0x3200 are DNS's and DMSC's, and zero keeps
+ * both blocks running: asserting either changes that block's stream signature
+ * and every one below it. DMSC's other two mode words select a cheaper
+ * demosaic (LOW_POWER_EN) and a whole-block operating mode whose 1 reproduces
+ * the bypass exactly, so zero is full-quality demosaic in the normal mode.
  *
  * DECOMP's frame size is not a tuning either. It is the Bayer input's, packed
  * with the height in the high half: RGBP v1.20 gives DECOMP width bits [13:0]
@@ -342,8 +356,14 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_WDMADECOMP_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2000)
 #define BECORE_RGBP_WDMAY_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2400)
 #define BECORE_RGBP_WDMAUV_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2600)
+#define BECORE_RGBP_DTP_MODE_REG	(BECORE_RGBP_PHYS_BASE + 0x3000)
+#define BECORE_RGBP_DNS_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3100)
+#define BECORE_RGBP_DMSC_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3200)
+#define BECORE_RGBP_DMSC_MODE_FIRST	(BECORE_RGBP_PHYS_BASE + 0x3204)
+#define BECORE_RGBP_DMSC_MODE_LAST	(BECORE_RGBP_PHYS_BASE + 0x3208)
 #define BECORE_RGBP_DECOMP_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3e00)
 #define BECORE_RGBP_DECOMP_SIZE_REG	(BECORE_RGBP_PHYS_BASE + 0x3e08)
+#define BECORE_RGBP_SC_CTRL0_REG	(BECORE_RGBP_PHYS_BASE + 0x4400)
 #define BECORE_RGBP_GAMMALR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4600)
 #define BECORE_RGBP_UPSC_CTRL0_REG	(BECORE_RGBP_PHYS_BASE + 0x4800)
 #define BECORE_RGBP_GAMMAHR_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x4a00)
@@ -1643,7 +1663,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	291
+#define BECORE_RGBP_GENERATED_WORDS	297
 #define BECORE_YUVP_GENERATED_WORDS	1359
 #define BECORE_MCSC_GENERATED_WORDS	99
 
@@ -1659,6 +1679,16 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	{ BECORE_RGBP_WDMAY_EN_REG, BECORE_RGBP_WDMAY_EN_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_WDMAUV_EN_REG, BECORE_RGBP_WDMAUV_EN_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DTP_MODE_REG, BECORE_RGBP_DTP_MODE_REG,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DNS_BYPASS_REG, BECORE_RGBP_DNS_BYPASS_REG,
+	  BECORE_GEN_RUNNING },
+	{ BECORE_RGBP_DMSC_BYPASS_REG, BECORE_RGBP_DMSC_BYPASS_REG,
+	  BECORE_GEN_RUNNING },
+	{ BECORE_RGBP_DMSC_MODE_FIRST, BECORE_RGBP_DMSC_MODE_LAST,
+	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_SC_CTRL0_REG, BECORE_RGBP_SC_CTRL0_REG,
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_DNS_SLOPE_G_REG,
 	  BECORE_RGBP_DNS_SLOPE_G_REG + BECORE_NOISE_TABLE_LAST,

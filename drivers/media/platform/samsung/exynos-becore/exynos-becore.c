@@ -45,6 +45,7 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-isp.h>
+#include <media/v4l2-subdev.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
@@ -358,7 +359,9 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_RGBP_WDMAUV_EN_REG	(BECORE_RGBP_PHYS_BASE + 0x2600)
 #define BECORE_RGBP_DTP_MODE_REG	(BECORE_RGBP_PHYS_BASE + 0x3000)
 #define BECORE_RGBP_DNS_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3100)
+#define BECORE_RGBP_DNS_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x31c4)
 #define BECORE_RGBP_DMSC_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3200)
+#define BECORE_RGBP_DMSC_PHASE_REG	(BECORE_RGBP_PHYS_BASE + 0x3278)
 #define BECORE_RGBP_DMSC_MODE_FIRST	(BECORE_RGBP_PHYS_BASE + 0x3204)
 #define BECORE_RGBP_DMSC_MODE_LAST	(BECORE_RGBP_PHYS_BASE + 0x3208)
 #define BECORE_RGBP_DECOMP_BYPASS_REG	(BECORE_RGBP_PHYS_BASE + 0x3e00)
@@ -1587,6 +1590,38 @@ struct becore_rect {
 	u32 height;
 };
 
+/*
+ * The four Bayer orders, numbered the way Samsung's OTF_INPUT_ORDER_BAYER_*
+ * enum numbers them, which is what BYR_DNS and BYR_DMSC take: the index into
+ * this table is the register value. The three cameras' captured programs write
+ * 0, 1 and 2, and the one sensor with a driver settles which is which -- the
+ * ultrawide's IMX712 reads out RGGB with both flip bits clear, and its
+ * captured phase is 1.
+ *
+ * The fourth is unused by any of the three and is here because the field is
+ * two bits wide and a table with a hole in it is worse than one without.
+ */
+static const u32 becore_input_codes[] = {
+	MEDIA_BUS_FMT_SGRBG10_1X10,	/* the main camera's */
+	MEDIA_BUS_FMT_SRGGB10_1X10,	/* the ultrawide's */
+	MEDIA_BUS_FMT_SBGGR10_1X10,	/* the front's */
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+};
+
+#define BECORE_INPUT_DEFAULT_CODE	MEDIA_BUS_FMT_SRGGB10_1X10
+
+/* The CFA phase a media-bus code means, or -EINVAL for one we cannot place. */
+static int becore_bayer_phase(u32 code)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(becore_input_codes); i++)
+		if (becore_input_codes[i] == code)
+			return i;
+
+	return -EINVAL;
+}
+
 struct becore_rgbp_input_profile {
 	u32 width;
 	u32 height;
@@ -1711,6 +1746,7 @@ enum becore_generated_kind {
 				 * vendor code writes at all: its reset value
 				 */
 	BECORE_GEN_SHARPEN_GEOMETRY,	/* the sharpener's crop and its ratio */
+	BECORE_GEN_BAYER_PHASE,	/* the mosaic the producer negotiated */
 	BECORE_GEN_LPF,		/* the sharpener's three low-pass kernels */
 	BECORE_GEN_LPF_NORM,	/* log2 of the sharpener's three kernel sums */
 	BECORE_GEN_NOISE_SEED,	/* the sharpener noise generator's ten seeds */
@@ -1747,7 +1783,7 @@ struct becore_generated_range {
  * rather than in the generated table so that a recipe which quietly stopped
  * carrying one of them fails validation instead of programming the capture.
  */
-#define BECORE_RGBP_GENERATED_WORDS	297
+#define BECORE_RGBP_GENERATED_WORDS	300
 #define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
@@ -1774,6 +1810,10 @@ static const struct becore_generated_range becore_rgbp_generated[] = {
 	  BECORE_GEN_OFF },
 	{ BECORE_RGBP_SC_CTRL0_REG, BECORE_RGBP_SC_CTRL0_REG,
 	  BECORE_GEN_OFF },
+	{ BECORE_RGBP_DNS_PHASE_REG, BECORE_RGBP_DNS_PHASE_REG,
+	  BECORE_GEN_BAYER_PHASE },
+	{ BECORE_RGBP_DMSC_PHASE_REG, BECORE_RGBP_DMSC_PHASE_REG,
+	  BECORE_GEN_BAYER_PHASE },
 	{ BECORE_RGBP_DNS_SLOPE_G_REG,
 	  BECORE_RGBP_DNS_SLOPE_G_REG + BECORE_NOISE_TABLE_LAST,
 	  BECORE_GEN_NOISE_SLOPE },
@@ -2861,6 +2901,15 @@ struct becore_device {
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *red_balance;
 	struct v4l2_ctrl *blue_balance;
+	struct v4l2_subdev sd;
+	struct media_pad sink_pad;
+	bool sd_registered;
+	/*
+	 * The mosaic the producer says it is sending, latched when a stream
+	 * starts. Without a producer -- the offline loop -- it stays at the
+	 * ultrawide's, which is the camera every captured program came from.
+	 */
+	u32 input_code;
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct vb2_queue queue;
@@ -7539,6 +7588,14 @@ static int becore_generated_value(const struct becore_device *becore,
 			if (becore_sharpen_geometry_value(input, reg, &result))
 				return -EINVAL;
 			break;
+		case BECORE_GEN_BAYER_PHASE: {
+			int phase = becore_bayer_phase(becore->input_code);
+
+			if (phase < 0)
+				return -EINVAL;
+			result = phase;
+			break;
+		}
 		case BECORE_GEN_YUVNR:
 			/*
 			 * The same three the per-frame path uses, in the same
@@ -10230,6 +10287,61 @@ size_t exynos_becore_input_size(struct exynos_becore_input *input)
 }
 EXPORT_SYMBOL_GPL(exynos_becore_input_size);
 
+/*
+ * The back end's sink pad joins the *producer's* graph rather than its own.
+ * One media device per pipeline is what a controller-aware consumer expects,
+ * and it is the only arrangement in which a link between the two blocks can
+ * exist at all: media_create_pad_link() needs both entities in one graph.
+ *
+ * The back end keeps its own media device for its video nodes, which is a
+ * bring-up state rather than an end state -- see the media graph item in
+ * docs/subsystems/camera/open.md.
+ */
+int exynos_becore_input_register_graph(struct exynos_becore_input *input,
+				       struct v4l2_device *v4l2_dev,
+				       struct media_entity *source,
+				       u16 source_pad)
+{
+	struct becore_device *becore;
+	int ret;
+
+	if (!input || !v4l2_dev || !source)
+		return -EINVAL;
+	becore = input->becore;
+	if (becore->sd_registered)
+		return -EBUSY;
+
+	ret = v4l2_device_register_subdev(v4l2_dev, &becore->sd);
+	if (ret)
+		return ret;
+
+	ret = media_create_pad_link(source, source_pad, &becore->sd.entity, 0,
+				    MEDIA_LNK_FL_ENABLED |
+				    MEDIA_LNK_FL_IMMUTABLE);
+	if (ret) {
+		v4l2_device_unregister_subdev(&becore->sd);
+		return ret;
+	}
+	becore->sd_registered = true;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_register_graph);
+
+void exynos_becore_input_unregister_graph(struct exynos_becore_input *input)
+{
+	struct becore_device *becore;
+
+	if (!input)
+		return;
+	becore = input->becore;
+	if (!becore->sd_registered)
+		return;
+	v4l2_device_unregister_subdev(&becore->sd);
+	becore->sd_registered = false;
+}
+EXPORT_SYMBOL_GPL(exynos_becore_input_unregister_graph);
+
 static struct becore_input_slot *
 becore_input_ticket(struct exynos_becore_input *input,
 		    const struct exynos_becore_input_buffer *buffer)
@@ -11418,6 +11530,179 @@ static int becore_cancel_set(void *data, u64 value)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(becore_cancel_fops, NULL, becore_cancel_set, "%llu\n");
 
+/* ---- the input subdevice ------------------------------------------------ */
+
+/*
+ * A sink pad on the producer's graph, and the reason the back end needs one:
+ * everything it knows about the frame arriving from the front end is a
+ * compiled-in profile, including the Bayer phase, which differs between the
+ * three cameras. The front end already negotiates the mosaic on its own pads.
+ * The fact exists in the system and the back end could not see it.
+ *
+ * The pad carries no format of its own. A sink whose producer is a fixed
+ * hardware path has nothing to negotiate: what arrives is what the front end
+ * sends, so get_fmt reports the remote pad's format and set_fmt is get_fmt.
+ * That is deliberate -- offering a settable format here would let userspace
+ * tell the driver something the hardware contradicts, with no way to arbitrate.
+ */
+/* The format the producer says it is sending, or -EPIPE if nothing is. */
+static int becore_input_format(struct becore_device *becore,
+			       struct v4l2_mbus_framefmt *format)
+{
+	struct v4l2_subdev_format remote = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+	};
+	struct media_pad *pad;
+	struct v4l2_subdev *sd;
+	int ret;
+
+	pad = media_pad_remote_pad_first(&becore->sink_pad);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return -EPIPE;
+	sd = media_entity_to_v4l2_subdev(pad->entity);
+	remote.pad = pad->index;
+	ret = v4l2_subdev_call_state_active(sd, pad, get_fmt, &remote);
+	if (ret)
+		return ret;
+
+	*format = remote.format;
+
+	return 0;
+}
+
+/*
+ * Take the producer's mosaic for this stream, or keep the compiled-in one if
+ * there is no producer to ask -- which is the offline loop, where the staged
+ * frame is the ultrawide's and so is the default.
+ *
+ * A code the table cannot place is refused rather than guessed. The phase
+ * decides which of the four quads the demosaic reads as red, so a wrong one is
+ * not a subtle error, and a refusal at STREAMON is a far better failure than a
+ * picture with its colours swapped.
+ */
+static int becore_latch_input_code(struct becore_device *becore)
+{
+	struct v4l2_mbus_framefmt format;
+	int ret;
+
+	lockdep_assert_held(&becore->lock);
+
+	ret = becore_input_format(becore, &format);
+	if (ret == -EPIPE) {
+		becore->input_code = BECORE_INPUT_DEFAULT_CODE;
+		return 0;
+	}
+	if (ret)
+		return ret;
+	if (becore_bayer_phase(format.code) < 0) {
+		dev_err(becore->dev, "producer sends mosaic 0x%04x, which this driver cannot place\n",
+			format.code);
+		return -EINVAL;
+	}
+	becore->input_code = format.code;
+
+	return 0;
+}
+
+static int becore_sd_init_state(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *state)
+{
+	const struct becore_rgbp_input_profile *profile =
+		&becore_rgbp_inputs[BECORE_RGBP_INPUT_SBWC];
+	struct v4l2_mbus_framefmt *sink =
+		v4l2_subdev_state_get_format(state, 0);
+
+	sink->code = BECORE_INPUT_DEFAULT_CODE;
+	sink->width = profile->width;
+	sink->height = profile->height;
+	sink->field = V4L2_FIELD_NONE;
+	sink->colorspace = V4L2_COLORSPACE_RAW;
+	sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	sink->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	sink->xfer_func = V4L2_XFER_FUNC_NONE;
+
+	return 0;
+}
+
+static int becore_sd_enum_mbus_code(struct v4l2_subdev *sd,
+				    struct v4l2_subdev_state *state,
+				    struct v4l2_subdev_mbus_code_enum *code)
+{
+	if (code->pad || code->index >= ARRAY_SIZE(becore_input_codes))
+		return -EINVAL;
+	code->code = becore_input_codes[code->index];
+
+	return 0;
+}
+
+/*
+ * The producer decides, so a set is a get, and what is reported is what link
+ * validation last saw the producer send.
+ *
+ * **This must not ask the remote.** `v4l2_subdev_link_validate()` locks both
+ * subdevs' states and then calls the sink's `get_fmt`, so a `get_fmt` that
+ * fetches the source's format takes a lock its own caller is holding. That is
+ * a self-deadlock, and it hangs `STREAMON` on the *producer's* video node --
+ * where the back end is only a pad on the graph and nothing about it is being
+ * used. The stored format is kept in step from `link_validate` below instead.
+ */
+static int becore_sd_get_fmt(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *state,
+			     struct v4l2_subdev_format *format)
+{
+	if (format->pad)
+		return -EINVAL;
+	format->format = *v4l2_subdev_state_get_format(state, 0);
+
+	return 0;
+}
+
+/*
+ * Take the producer's format rather than compare against it.
+ *
+ * A sink whose producer is a fixed hardware path has nothing to negotiate:
+ * what arrives is what the front end sends, so the default validation -- which
+ * refuses a link whose two ends disagree -- would refuse every pipeline until
+ * userspace had told the back end what the hardware was already doing.
+ *
+ * Nothing is refused here, and that is deliberate too. The back end cannot
+ * place every mosaic, but the producer's raw path does not go through the back
+ * end at all, so a code this driver cannot demosaic is no reason to stop a raw
+ * capture. becore_latch_input_code() refuses it at the back end's own
+ * STREAMON, which is where it matters.
+ */
+static int becore_sd_link_validate(struct v4l2_subdev *sd,
+				   struct media_link *link,
+				   struct v4l2_subdev_format *source_fmt,
+				   struct v4l2_subdev_format *sink_fmt)
+{
+	struct v4l2_subdev_state *state = v4l2_subdev_get_locked_active_state(sd);
+
+	if (state)
+		*v4l2_subdev_state_get_format(state, 0) = source_fmt->format;
+
+	return 0;
+}
+
+static const struct v4l2_subdev_pad_ops becore_subdev_pad_ops = {
+	.enum_mbus_code = becore_sd_enum_mbus_code,
+	.get_fmt = becore_sd_get_fmt,
+	.set_fmt = becore_sd_get_fmt,
+	.link_validate = becore_sd_link_validate,
+};
+
+static const struct v4l2_subdev_ops becore_subdev_ops = {
+	.pad = &becore_subdev_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops becore_subdev_internal_ops = {
+	.init_state = becore_sd_init_state,
+};
+
+static const struct media_entity_operations becore_subdev_entity_ops = {
+	.link_validate = v4l2_subdev_link_validate,
+};
+
 /* ---- processed NV21 capture queue -------------------------------------- */
 
 static void becore_video_fill_pix(struct v4l2_pix_format *pix)
@@ -11715,6 +12000,19 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	becore->completed_generation = 0;
 	becore->completed_output_size = 0;
 	becore_video_controls_snapshot(becore, &stream_config);
+	/*
+	 * Latch the mosaic here, with the rest of the per-stream state, rather
+	 * than reading it per frame: the demosaic's phase must not change under
+	 * a running stream, and a producer that is about to send frames has
+	 * already settled its format.
+	 */
+	ret = becore_latch_input_code(becore);
+	if (ret) {
+		becore->video_streaming = false;
+		becore_stream_power_put(becore);
+		becore_input_callback_put(input);
+		goto unlock;
+	}
 	becore->video_streaming = true;
 	mutex_unlock(&becore->lock);
 
@@ -13116,6 +13414,12 @@ static void becore_video_unregister(void *data)
 	cancel_work_sync(&becore->params_work);
 	media_device_unregister(&becore->mdev);
 	media_entity_cleanup(&becore->vdev.entity);
+	/*
+	 * The producer unregisters the subdevice from its own graph on the way
+	 * out; this only releases what probe built.
+	 */
+	v4l2_subdev_cleanup(&becore->sd);
+	media_entity_cleanup(&becore->sd.entity);
 	v4l2_ctrl_handler_free(&becore->ctrl_handler);
 	v4l2_device_unregister(&becore->v4l2_dev);
 	media_device_cleanup(&becore->mdev);
@@ -13177,11 +13481,36 @@ static int becore_video_register(struct becore_device *becore)
 	becore->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
 	video_set_drvdata(&becore->vdev, becore);
 
+	/*
+	 * The input subdevice is initialised here and registered later, by the
+	 * producer, on the producer's graph: this device has nothing to link it
+	 * to on its own.
+	 */
+	v4l2_subdev_init(&becore->sd, &becore_subdev_ops);
+	becore->sd.internal_ops = &becore_subdev_internal_ops;
+	becore->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
+	becore->sd.entity.function = MEDIA_ENT_F_PROC_VIDEO_PIXEL_FORMATTER;
+	becore->sd.entity.ops = &becore_subdev_entity_ops;
+	becore->sd.owner = THIS_MODULE;
+	becore->sd.dev = becore->dev;
+	strscpy(becore->sd.name, "exynos-becore input", sizeof(becore->sd.name));
+	v4l2_set_subdevdata(&becore->sd, becore);
+	becore->input_code = BECORE_INPUT_DEFAULT_CODE;
+
+	becore->sink_pad.flags = MEDIA_PAD_FL_SINK;
+	ret = media_entity_pads_init(&becore->sd.entity, 1, &becore->sink_pad);
+	if (ret)
+		goto err_ctrl;
+
+	ret = v4l2_subdev_init_finalize(&becore->sd);
+	if (ret)
+		goto err_sd_entity;
+
 	becore->vdev_pad.flags = MEDIA_PAD_FL_SINK;
 	ret = media_entity_pads_init(&becore->vdev.entity, 1,
 				     &becore->vdev_pad);
 	if (ret)
-		goto err_ctrl;
+		goto err_sd;
 
 	ret = video_register_device(&becore->vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
@@ -13205,6 +13534,10 @@ err_vdev:
 	video_unregister_device(&becore->vdev);
 err_entity:
 	media_entity_cleanup(&becore->vdev.entity);
+err_sd:
+	v4l2_subdev_cleanup(&becore->sd);
+err_sd_entity:
+	media_entity_cleanup(&becore->sd.entity);
 err_ctrl:
 	v4l2_ctrl_handler_free(&becore->ctrl_handler);
 err_v4l2:

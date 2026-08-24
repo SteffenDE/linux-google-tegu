@@ -5,6 +5,8 @@
 #include <linux/types.h>
 
 struct device;
+struct media_entity;
+struct v4l2_device;
 
 /* Private attachment returned to one camera-front-end producer. */
 struct exynos_becore_input;
@@ -43,6 +45,26 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input);
 void exynos_becore_input_unmap(struct exynos_becore_input *input);
 
 size_t exynos_becore_input_size(struct exynos_becore_input *input);
+
+/*
+ * Put the back end's input on the producer's media graph.
+ *
+ * The back end has to know the mosaic the front end is sending -- the demosaic
+ * needs the CFA phase, which differs between this board's three cameras -- and
+ * the front end has already negotiated it on its own pads.  Rather than pass
+ * the format across this interface, where it would become a second source of
+ * truth with no way to arbitrate, the back end registers a sink pad on the
+ * producer's graph and reads the remote pad.
+ *
+ * Call after the producer's own subdevice is registered and before its media
+ * device is; the link is created enabled and immutable, because the two blocks
+ * are wired to each other in silicon.
+ */
+int exynos_becore_input_register_graph(struct exynos_becore_input *input,
+				       struct v4l2_device *v4l2_dev,
+				       struct media_entity *source,
+				       u16 source_pad);
+void exynos_becore_input_unregister_graph(struct exynos_becore_input *input);
 
 int exynos_becore_input_producer_acquire(struct exynos_becore_input *input,
 					 struct exynos_becore_input_buffer *buffer);

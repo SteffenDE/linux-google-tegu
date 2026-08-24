@@ -9410,20 +9410,46 @@ static int becore_request_irqs(struct platform_device *pdev,
 	return 0;
 }
 
+static void becore_free_dma_buffer(struct becore_device *becore,
+				   struct becore_dma_buffer *buffer)
+{
+	if (buffer->cpu)
+		dma_free_coherent(becore->dev, buffer->size, buffer->cpu,
+				  buffer->dma);
+	buffer->cpu = NULL;
+	buffer->dma = 0;
+	buffer->size = 0;
+	buffer->staged_bytes = 0;
+}
+
+/*
+ * Not dmam_alloc_coherent(), and the reason is the size rather than the
+ * lifetime: three of these are sized from a raster, and devres can only
+ * release an allocation once, at unbind.  An explicit pair can run again when
+ * the raster it was sized from moves.
+ *
+ * What devres also took care of is that a buffer was allocated once.  Nothing
+ * enforces that now except the callers, so say it here: allocating over a live
+ * buffer would leak tens of megabytes with no other symptom.
+ */
 static int becore_alloc_dma_buffer(struct becore_device *becore,
 				   struct becore_dma_buffer *buffer,
 				   size_t size, const char *name)
 {
-	buffer->cpu = dmam_alloc_coherent(becore->dev, size, &buffer->dma,
-					  GFP_KERNEL);
+	if (WARN_ON_ONCE(buffer->cpu))
+		return -EEXIST;
+	buffer->cpu = dma_alloc_coherent(becore->dev, size, &buffer->dma,
+					 GFP_KERNEL);
 	if (!buffer->cpu)
 		return dev_err_probe(becore->dev, -ENOMEM,
 				     "cannot allocate %s buffer\n", name);
 	buffer->size = size;
 	if (upper_32_bits(buffer->dma) ||
-	    upper_32_bits(buffer->dma + buffer->size - 1))
+	    upper_32_bits(buffer->dma + buffer->size - 1)) {
+		becore_free_dma_buffer(becore, buffer);
 		return dev_err_probe(becore->dev, -ERANGE,
 				     "%s buffer is outside 32-bit DMA\n", name);
+	}
 
 	return 0;
 }
@@ -9479,9 +9505,8 @@ static int becore_ltm_grid_generate(struct becore_device *becore)
 	return 0;
 }
 
-static void becore_free_shared_input(void *data)
+static void becore_free_shared_input(struct becore_device *becore)
 {
-	struct becore_device *becore = data;
 	unsigned int i;
 
 	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
@@ -9494,6 +9519,9 @@ static void becore_free_shared_input(void *data)
 					       input->sgt, DMA_BIDIRECTIONAL);
 		input->cpu = NULL;
 		input->sgt = NULL;
+		input->dma = 0;
+		input->size = 0;
+		input->staged_bytes = 0;
 	}
 }
 
@@ -9528,14 +9556,102 @@ static int becore_alloc_shared_input(struct becore_device *becore)
 		}
 	}
 
-	ret = devm_add_action_or_reset(becore->dev,
-				       becore_free_shared_input, becore);
-	return ret;
+	return 0;
 
 err_free:
 	becore_free_shared_input(becore);
 	return dev_err_probe(becore->dev, ret,
 			     "cannot allocate Bayer input slot %u\n", i);
+}
+
+/*
+ * The three surfaces the chain and the scaled output size, allocated and freed
+ * together because they move together: none of them survives a raster change,
+ * and each is written by a DMA programmed from the same numbers.
+ *
+ * The input slots are deliberately not here.  Their size is a contract with
+ * the producer -- ISPFE checks the size it is handed at its own probe and then
+ * holds mappings of these exact pages in its own IOMMU domain -- so they are
+ * sized once and a raster they cannot hold is refused rather than resized.
+ */
+static void becore_free_surfaces(struct becore_device *becore)
+{
+	becore_free_dma_buffer(becore, &becore->mcsc_output);
+	becore_free_dma_buffer(becore, &becore->gtnr_output);
+	becore_free_dma_buffer(becore, &becore->output);
+	becore->mcsc_dest_dma = 0;
+	becore->active_output_dma = 0;
+	becore->active_output_size = 0;
+	becore->active_capture_size = 0;
+	/*
+	 * What a run left in those surfaces went with them, and the two
+	 * debugfs readers are gated on these rather than on a pointer: a
+	 * completed length surviving the buffer it described would read the
+	 * next allocation at the previous one's length.
+	 */
+	becore->completed_generation = 0;
+	becore->completed_output_size = 0;
+	becore->mcsc_completed_generation = 0;
+	becore->mcsc_completed_output_size = 0;
+	/*
+	 * And so did the encoded programs, which carry these surfaces'
+	 * addresses.  The RGBP and YUVP readers gate on completed_generation
+	 * above; GTNR's and MCSC's have freshness counters of their own, and a
+	 * program that names a freed buffer must not read back as current --
+	 * these files are what says what the driver encoded.
+	 */
+	becore->gtnr_encoded_generation = 0;
+	becore->mcsc_encoded_generation = 0;
+}
+
+static int becore_alloc_surfaces(struct becore_device *becore)
+{
+	int ret;
+
+	ret = becore_alloc_dma_buffer(becore, &becore->output,
+				      becore_yuvp_output_allocation_size(&becore->chain),
+				      "YUVP output");
+	if (ret)
+		return ret;
+	ret = becore_alloc_dma_buffer(becore, &becore->gtnr_output,
+				      becore_gtnr_surface_size(&becore->chain),
+				      "GTNR output");
+	if (ret)
+		return ret;
+	ret = becore_alloc_dma_buffer(becore, &becore->mcsc_output,
+				      becore_mcsc_output_size(&becore->scaled),
+				      "MCSC output");
+	if (ret)
+		return ret;
+
+	/*
+	 * What a run has produced, reported until the first one replaces it.
+	 * Derived from the same two rasters the surfaces were just sized from,
+	 * so it belongs with them rather than with the caller.
+	 */
+	becore->mcsc_dest_dma = becore->mcsc_output.dma;
+	becore->active_output_dma = becore->output.dma;
+	becore->active_output_size = becore_active_output_size(becore);
+	becore->active_capture_size =
+		becore_mcsc_output_active_size(&becore->scaled);
+
+	return 0;
+}
+
+/*
+ * One teardown for everything becore_alloc_dma_buffer() and the input slots
+ * produced, registered before the first of them so a partial failure unwinds
+ * through the same path.  Every free below tolerates a buffer that was never
+ * allocated.
+ */
+static void becore_free_buffers(void *data)
+{
+	struct becore_device *becore = data;
+
+	becore_free_surfaces(becore);
+	becore_free_dma_buffer(becore, &becore->grid);
+	becore->grid_generation = 0;
+	becore_free_shared_input(becore);
 }
 
 static int becore_alloc_cmdq_buffer(struct becore_device *becore,
@@ -9569,7 +9685,6 @@ static int becore_alloc_cmdq_program(struct becore_device *becore,
 
 static int becore_alloc_diagnostic(struct becore_device *becore)
 {
-	size_t output_size;
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
@@ -9609,8 +9724,6 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	ret = becore_input_profiles_validate(becore->dev, &becore->array);
 	if (ret)
 		return ret;
-	/* Every size below is derived, so none of them is taken any earlier. */
-	output_size = becore_yuvp_output_allocation_size(&becore->chain);
 	ret = becore_stream_crc_validate(becore->dev);
 	if (ret)
 		return ret;
@@ -9638,6 +9751,10 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 		return dev_err_probe(becore->dev, ret,
 				     "invalid built-in MCSC recipe\n");
 
+	ret = devm_add_action_or_reset(becore->dev, becore_free_buffers,
+				       becore);
+	if (ret)
+		return ret;
 	ret = becore_alloc_shared_input(becore);
 	if (ret)
 		return ret;
@@ -9649,19 +9766,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (ret)
 		return dev_err_probe(becore->dev, ret,
 				     "cannot generate neutral YUVP grid\n");
-	ret = becore_alloc_dma_buffer(becore, &becore->output,
-				      output_size, "YUVP output");
+	ret = becore_alloc_surfaces(becore);
 	if (ret)
 		return ret;
-	ret = becore_alloc_dma_buffer(becore, &becore->gtnr_output,
-				      becore_gtnr_surface_size(&becore->chain), "GTNR output");
-	if (ret)
-		return ret;
-	ret = becore_alloc_dma_buffer(becore, &becore->mcsc_output,
-				      becore_mcsc_output_size(&becore->scaled), "MCSC output");
-	if (ret)
-		return ret;
-	becore->mcsc_dest_dma = becore->mcsc_output.dma;
 	ret = becore_alloc_cmdq_program(becore, BECORE_RGBP,
 					BECORE_RGBP_HEADER_COUNT);
 	if (ret)
@@ -13506,11 +13613,6 @@ static int becore_probe(struct platform_device *pdev)
 	ret = becore_alloc_diagnostic(becore);
 	if (ret)
 		return ret;
-	/* Derived from the three rasters, so after the check on them. */
-	becore->active_output_size = becore_active_output_size(becore);
-	becore->active_capture_size =
-		becore_mcsc_output_active_size(&becore->scaled);
-	becore->active_output_dma = becore->output.dma;
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)

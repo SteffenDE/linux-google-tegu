@@ -690,8 +690,8 @@ struct exynos_becore_params_sharpen {
  * become.
  *
  * The radial gain's *geometry* is absent for a different reason: it is the
- * frame's size rather than tuning, so no member here could carry it.  Those
- * two registers are still the ones the driver replays.
+ * frame's size rather than tuning, so no member here could carry it.  The
+ * driver derives those two registers from the crop it was configured with.
  *
  * **Two of the pyramid's arrays are at a different fixed point per level**,
  * because each level halves the signal range, so they are three members each
@@ -954,11 +954,16 @@ struct exynos_becore_params_yuvnr {
 
 	/*
 	 * Where that curve's knots sit, on the block's own scale. round(f * 1).
-	 * The hardware *truncates* this one -- and @std_lut_x above -- rather
-	 * than rounding it, so a tuning value of 103.6 reaches the register as
-	 * 103. Both are integers in every shipped tuning, which is why the
-	 * distinction shows up nowhere until userspace sends a value that is
-	 * not.
+	 * The hardware *truncates* this one rather than rounding it, so a
+	 * tuning value of 103.6 reaches the register as 103. It is an integer
+	 * in every shipped tuning, which is why the distinction shows up
+	 * nowhere until userspace sends a value that is not.
+	 *
+	 * @std_lut_x has the same shape and no single answer: the vendor
+	 * truncates it into the luma copy of the knots and *rounds* it into
+	 * the chroma copy, so 103.6 would reach one register as 103 and the
+	 * other as 104. That is why this interface takes those knots as the
+	 * integers they already are: an integer cannot tell the two apart.
 	 */
 	__s32 mcfp_gain_lut_x[EXYNOS_BECORE_YUVNR_MCFP_LUT_X_POINTS];
 

@@ -1134,7 +1134,13 @@ struct becore_yuvp_output_profile {
 	u32 mode;
 	u32 lossy_byte32num;
 	u32 votf_enable;
+	/*
+	 * A compressed surface has no bytes per pixel and does not set this;
+	 * its stride is a count of blocks.  A plausible 2 left here is what the
+	 * chain surface's stride was once derived from.
+	 */
 	u32 bytes_per_pixel;
+	u32 block_width;
 	u32 block_height;
 	u32 luma_height_align;
 	u32 plane_gap;
@@ -1154,7 +1160,7 @@ static const struct becore_yuvp_output_profile becore_yuvp_outputs[] = {
 		.mode = 0xa,
 		.lossy_byte32num = 2,
 		.votf_enable = 3,
-		.bytes_per_pixel = 2,
+		.block_width = 32,
 		.block_height = 4,
 		.luma_height_align = 16,
 		.plane_gap = 0x40,
@@ -2287,6 +2293,41 @@ static int becore_input_profiles_validate(struct device *dev,
 }
 
 /*
+ * The same for the surfaces YUVP writes, and it is the divisors that make it
+ * worth having: a compressed profile's stride and both plane sizes divide by
+ * its block geometry, and its stride is only the expression written above
+ * while the compressed rate is even.
+ */
+static int becore_output_profiles_validate(struct device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < BECORE_YUVP_OUTPUT_PROFILE_COUNT; i++) {
+		const struct becore_yuvp_output_profile *profile =
+			&becore_yuvp_outputs[i];
+
+		if (!profile->mode) {
+			if (!profile->bytes_per_pixel)
+				return dev_err_probe(dev, -EINVAL,
+						     "output profile %u is uncompressed and has no pixel size\n",
+						     i);
+			continue;
+		}
+		if (!profile->block_width || !profile->block_height ||
+		    !profile->luma_height_align)
+			return dev_err_probe(dev, -EINVAL,
+					     "output profile %u is compressed and has no block geometry\n",
+					     i);
+		if (!profile->lossy_byte32num || profile->lossy_byte32num & 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "output profile %u has a compressed rate of %u, and becore_yuvp_output_stride() states only even ones\n",
+					     i, profile->lossy_byte32num);
+	}
+
+	return 0;
+}
+
+/*
  * Two conventions the Exynos ISP blocks share, so they live here rather than
  * with any one of them.
  *
@@ -2576,7 +2617,24 @@ static u32
 becore_yuvp_output_stride(const struct becore_yuvp_output_profile *profile,
 			  const struct becore_raster *chain)
 {
-	return chain->width * profile->bytes_per_pixel;
+	if (!profile->mode)
+		return chain->width * profile->bytes_per_pixel;
+
+	/*
+	 * A compressed surface's stride is a count of whole blocks, each of a
+	 * fixed compressed size -- Samsung's is_hw_dma_get_payload_stride()
+	 * for a lossy 32x4 surface.  A width that does not fill its last block
+	 * still occupies one.
+	 *
+	 * That function branches on a 32- or 64-byte alignment, and the two
+	 * branches collapse to this one expression while lossy_byte32num is
+	 * even: the odd-rate correction term vanishes and both alignments
+	 * become no-ops.  Ours is 2, so the alignment does not have to be
+	 * known -- which is the only reason it is not carried here.  An odd
+	 * rate would need both, and is refused where the profiles are checked.
+	 */
+	return DIV_ROUND_UP(chain->width, profile->block_width) *
+	       profile->lossy_byte32num * profile->block_width;
 }
 
 /*
@@ -9723,6 +9781,9 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (ret)
 		return ret;
 	ret = becore_input_profiles_validate(becore->dev, &becore->array);
+	if (ret)
+		return ret;
+	ret = becore_output_profiles_validate(becore->dev);
 	if (ret)
 		return ret;
 	ret = becore_stream_crc_validate(becore->dev);

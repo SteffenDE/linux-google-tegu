@@ -80,6 +80,15 @@
  * it the consumer runs about a third ahead of the data and the picture goes
  * to fill part way down.  With 48/16 the frame is byte-identical to the
  * memory path at the vendor's own limit of 1.
+ *
+ * **This pair is a function of a 3120-line frame and is not linked to one.**
+ * becore_c2serv_program_link() writes becore->chain.height into the consumer's
+ * line count while these stay put, and the divisibility the paragraph above
+ * rests on holds for 3120 and not in general: a chain height that is not a
+ * multiple of 48 puts the two ends back to disagreeing about how many tokens a
+ * frame is, with the symptom described above and no error anywhere.  Whatever
+ * comes to set the raster has to derive these or refuse a height that does not
+ * divide.  It is unreachable today only because nothing sets it.
  */
 static const u32 becore_c2serv_tws_lines_in_token[BECORE_C2SERV_LINK_PLANES] = {
 	12, 4,
@@ -1092,20 +1101,28 @@ static const u32 becore_rgbp_input_regs[] = {
 };
 
 /*
- * The chain raster: what RGBP's scaler hands YUVP, what YUVP writes, what MCSC
- * reads back and what DJAG crops from. Those are one raster, and it was stated
- * four times -- in both YUVP output profiles, in MCSC's input profile and in
- * DJAG's crop, and it is also the surface GTNR's dormant startup program
- * reads and writes. Six copies of one number, so a geometry that moved five of
- * them would have programmed a chain disagreeing with itself, in a way only a
- * picture would show. State it once.
+ * What the chain raster is set to while nothing negotiates it: the readout the
+ * whole captured corpus came from.  It is a default assigned once at probe,
+ * not a description of anything -- becore->chain is what the driver reads.
  */
 #define BECORE_CHAIN_WIDTH		4160U
 #define BECORE_CHAIN_HEIGHT		3120U
 
-struct becore_yuvp_output_profile {
+/*
+ * A raster the chain works on, carried rather than compiled in.  The blocks
+ * below describe *formats* -- how a surface is laid out and compressed -- and
+ * a format is the same whatever size the picture is, so the size is not one of
+ * their fields.  Passing it beside the profile is the shape the input side
+ * already has, and it is what lets the encoders stay pure functions of what
+ * they are given: the offline loop can then encode for a geometry the hardware
+ * is not currently running.
+ */
+struct becore_raster {
 	u32 width;
 	u32 height;
+};
+
+struct becore_yuvp_output_profile {
 	u32 data_format;
 	u32 mode;
 	u32 lossy_byte32num;
@@ -1126,8 +1143,6 @@ enum becore_yuvp_output_profile_id {
 /* Pixel uses a combined, two-plane WDMA where Pablo v1.1 uses split blocks. */
 static const struct becore_yuvp_output_profile becore_yuvp_outputs[] = {
 	[BECORE_YUVP_OUTPUT_SBWCL] = {
-		.width = BECORE_CHAIN_WIDTH,
-		.height = BECORE_CHAIN_HEIGHT,
 		.data_format = 0x2000,
 		.mode = 0xa,
 		.lossy_byte32num = 2,
@@ -1139,8 +1154,6 @@ static const struct becore_yuvp_output_profile becore_yuvp_outputs[] = {
 		.businfo = 0,
 	},
 	[BECORE_YUVP_OUTPUT_P010] = {
-		.width = BECORE_CHAIN_WIDTH,
-		.height = BECORE_CHAIN_HEIGHT,
 		.data_format = 0x2000,
 		.mode = 0,
 		.lossy_byte32num = 0,
@@ -1178,8 +1191,6 @@ static const u32 becore_yuvp_output_regs[] = {
 };
 
 struct becore_gtnr_dma_profile {
-	u32 width;
-	u32 height;
 	u32 votf_enable;
 	u32 businfo;
 	u32 max_mo;
@@ -1194,8 +1205,6 @@ struct becore_gtnr_dma_profile {
  * power, reset, interrupt, and cross-block completion lifecycle is established.
  */
 static const struct becore_gtnr_dma_profile becore_gtnr_input = {
-	.width = BECORE_CHAIN_WIDTH,
-	.height = BECORE_CHAIN_HEIGHT,
 	.votf_enable = 1,
 	.businfo = 1,
 	.max_mo = 0x100,
@@ -1204,8 +1213,6 @@ static const struct becore_gtnr_dma_profile becore_gtnr_input = {
 };
 
 static const struct becore_gtnr_dma_profile becore_gtnr_output = {
-	.width = BECORE_CHAIN_WIDTH,
-	.height = BECORE_CHAIN_HEIGHT,
 	.businfo = 0,
 	.max_mo = 0x100,
 	.max_bl = 0x10,
@@ -1331,6 +1338,11 @@ static const u32 becore_gtnr_dma_regs[] = {
 };
 
 struct becore_mcsc_dma_profile {
+	/*
+	 * The output's raster.  MCSC's *input* is the chain surface and takes
+	 * its size from becore->chain, so becore_mcsc_input leaves these unset
+	 * -- read them only through becore_mcsc_output.
+	 */
 	u32 width;
 	u32 height;
 	u32 data_format;
@@ -1350,8 +1362,6 @@ struct becore_mcsc_dma_profile {
  * control so MCSC reads the completed driver-owned surface from memory.
  */
 static const struct becore_mcsc_dma_profile becore_mcsc_input = {
-	.width = BECORE_CHAIN_WIDTH,
-	.height = BECORE_CHAIN_HEIGHT,
 	.votf_enable = 0x00400001,
 	.businfo = 2,
 	.max_bl = 0x10,
@@ -1378,24 +1388,6 @@ static const struct becore_mcsc_dma_profile becore_mcsc_output = {
 	.max_bl = 4,
 	.enable = 1,
 	.dither = 0x10,
-};
-
-/*
- * How much of DJAG's input the output is taken from. The captured program
- * crops 3536 x 2652 out of the 4160 x 3120 YUVP surface and scales that up to
- * fill 4000 x 3000, reserving a margin the vendor spends on electronic
- * stabilisation. This driver has no stabilisation to spend it on, so it takes
- * the whole raster and downscales instead, covering the full field. The
- * window is centred, so only its size is a parameter.
- */
-struct becore_mcsc_djag_profile {
-	u32 crop_width;
-	u32 crop_height;
-};
-
-static const struct becore_mcsc_djag_profile becore_mcsc_djag = {
-	.crop_width = BECORE_CHAIN_WIDTH,
-	.crop_height = BECORE_CHAIN_HEIGHT,
 };
 
 enum becore_mcsc_input_transport {
@@ -1743,6 +1735,13 @@ struct becore_device {
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *red_balance;
 	struct v4l2_ctrl *blue_balance;
+	/*
+	 * What RGBP hands YUVP, what YUVP writes, what MCSC reads back and what
+	 * DJAG crops from: one raster, resolved once.  It was six copies of one
+	 * number across as many compiled-in profiles, and a geometry that moved
+	 * five of them would have programmed a chain disagreeing with itself.
+	 */
+	struct becore_raster chain;
 	struct v4l2_subdev sd;
 	struct media_pad sink_pad;
 	bool sd_registered;
@@ -2298,24 +2297,6 @@ static u32 becore_zoom_ratio(u32 in, u32 out)
 }
 
 /*
- * What RGBP hands downstream. It is the geometry YUVP then carries, so it is
- * taken from the YUVP profile rather than repeated here -- if the two ever
- * disagreed the chain would be describing two different images. Both YUVP
- * output profiles share it deliberately: this is the chain's geometry, not a
- * property of how the surface is encoded, so the diagnostic P010 selector must
- * not move it.
- */
-static u32 becore_rgbp_out_width(void)
-{
-	return becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL].width;
-}
-
-static u32 becore_rgbp_out_height(void)
-{
-	return becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL].height;
-}
-
-/*
  * DMSCCROP's window: the largest centred rectangle of the Bayer array that
  * has the aspect ratio the chain hands downstream. Cropping is what makes the
  * two aspects agree, so only one axis is ever narrowed; the other keeps the
@@ -2336,12 +2317,13 @@ static u32 becore_rgbp_out_height(void)
  * reasoning rather than on the arithmetic.
  */
 static int becore_rgbp_crop(const struct becore_rgbp_input_profile *profile,
+			    const struct becore_raster *chain,
 			    struct becore_rect *crop)
 {
 	u32 array_w = profile->width;
 	u32 array_h = profile->height;
-	u32 out_w = becore_rgbp_out_width();
-	u32 out_h = becore_rgbp_out_height();
+	u32 out_w = chain->width;
+	u32 out_h = chain->height;
 	u32 width;
 
 	if (!out_w || !out_h || !array_w || !array_h)
@@ -2392,6 +2374,7 @@ static int becore_rgbp_crop(const struct becore_rgbp_input_profile *profile,
  * are the only ones never checked before the hardware sees them.
  */
 static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
+				   const struct becore_raster *chain,
 				   u32 index, u32 reg, u32 *value)
 {
 	u32 result;
@@ -2406,15 +2389,14 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 		break;
 	case BECORE_RGBP_CHAIN_DST_SIZE:
 	case BECORE_RGBP_SC_DST_SIZE:
-		result = becore_pack_size(becore_rgbp_out_width(),
-					  becore_rgbp_out_height());
+		result = becore_pack_size(chain->width, chain->height);
 		break;
 	case BECORE_RGBP_CROP_SIZE:
 	case BECORE_RGBP_CROP_START:
 	case BECORE_RGBP_SC_H_RATIO:
 	case BECORE_RGBP_SC_V_RATIO: {
 		struct becore_rect crop;
-		int ret = becore_rgbp_crop(profile, &crop);
+		int ret = becore_rgbp_crop(profile, chain, &crop);
 
 		if (ret)
 			return ret;
@@ -2424,10 +2406,10 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 			result = becore_pack_size(crop.x, crop.y);
 		else if (index == BECORE_RGBP_SC_H_RATIO)
 			result = becore_zoom_ratio(crop.width,
-						   becore_rgbp_out_width());
+						   chain->width);
 		else
 			result = becore_zoom_ratio(crop.height,
-						   becore_rgbp_out_height());
+						   chain->height);
 		break;
 	}
 	case BECORE_RGBP_INPUT_FORMAT:
@@ -2480,9 +2462,10 @@ becore_yuvp_output_profile(const struct becore_device *becore)
 }
 
 static u32
-becore_yuvp_output_stride(const struct becore_yuvp_output_profile *profile)
+becore_yuvp_output_stride(const struct becore_yuvp_output_profile *profile,
+			  const struct becore_raster *chain)
 {
-	return profile->width * profile->bytes_per_pixel;
+	return chain->width * profile->bytes_per_pixel;
 }
 
 /*
@@ -2503,32 +2486,34 @@ static const struct becore_yuvp_output_profile *becore_chain_surface(void)
 	return &becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
 }
 
-static u32 becore_chain_stride(void)
+static u32 becore_chain_stride(const struct becore_raster *chain)
 {
-	return becore_yuvp_output_stride(becore_chain_surface());
+	return becore_yuvp_output_stride(becore_chain_surface(), chain);
 }
 
 static size_t
-becore_yuvp_output_plane2_offset(const struct becore_yuvp_output_profile *profile)
+becore_yuvp_output_plane2_offset(const struct becore_yuvp_output_profile *profile,
+				 const struct becore_raster *chain)
 {
-	u32 stride = becore_yuvp_output_stride(profile);
+	u32 stride = becore_yuvp_output_stride(profile, chain);
 	u32 luma_height;
 	u32 luma_rows;
 
 	if (!profile->mode)
-		return ALIGN((size_t)stride * profile->height, SZ_4K);
+		return ALIGN((size_t)stride * chain->height, SZ_4K);
 
-	luma_height = ALIGN(profile->height, profile->luma_height_align);
+	luma_height = ALIGN(chain->height, profile->luma_height_align);
 	luma_rows = DIV_ROUND_UP(luma_height, profile->block_height);
 
 	return (size_t)stride * luma_rows + profile->plane_gap;
 }
 
 static size_t
-becore_yuvp_output_size(const struct becore_yuvp_output_profile *profile)
+becore_yuvp_output_size(const struct becore_yuvp_output_profile *profile,
+			const struct becore_raster *chain)
 {
-	u32 stride = becore_yuvp_output_stride(profile);
-	u32 chroma_height = DIV_ROUND_UP(profile->height, 2);
+	u32 stride = becore_yuvp_output_stride(profile, chain);
+	u32 chroma_height = DIV_ROUND_UP(chain->height, 2);
 	u32 chroma_rows;
 	size_t chroma_bytes;
 
@@ -2538,23 +2523,25 @@ becore_yuvp_output_size(const struct becore_yuvp_output_profile *profile)
 		chroma_rows = chroma_height;
 	chroma_bytes = (size_t)stride * chroma_rows;
 
-	return ALIGN(becore_yuvp_output_plane2_offset(profile) + chroma_bytes,
-		     SZ_4K);
+	return ALIGN(becore_yuvp_output_plane2_offset(profile, chain) +
+		     chroma_bytes, SZ_4K);
 }
 
 static size_t
-becore_yuvp_packed_plane2_offset(const struct becore_yuvp_output_profile *profile)
+becore_yuvp_packed_plane2_offset(const struct becore_yuvp_output_profile *profile,
+				 const struct becore_raster *chain)
 {
-	return (size_t)becore_yuvp_output_stride(profile) * profile->height;
+	return (size_t)becore_yuvp_output_stride(profile, chain) * chain->height;
 }
 
 static size_t
-becore_yuvp_packed_output_size(const struct becore_yuvp_output_profile *profile)
+becore_yuvp_packed_output_size(const struct becore_yuvp_output_profile *profile,
+			       const struct becore_raster *chain)
 {
-	u32 chroma_height = DIV_ROUND_UP(profile->height, 2);
+	u32 chroma_height = DIV_ROUND_UP(chain->height, 2);
 
-	return becore_yuvp_packed_plane2_offset(profile) +
-	       (size_t)becore_yuvp_output_stride(profile) * chroma_height;
+	return becore_yuvp_packed_plane2_offset(profile, chain) +
+	       (size_t)becore_yuvp_output_stride(profile, chain) * chroma_height;
 }
 
 static size_t becore_active_output_plane2_offset(const struct becore_device *becore)
@@ -2563,9 +2550,9 @@ static size_t becore_active_output_plane2_offset(const struct becore_device *bec
 		becore_yuvp_output_profile(becore);
 
 	if (becore->active_output_packed)
-		return becore_yuvp_packed_plane2_offset(profile);
+		return becore_yuvp_packed_plane2_offset(profile, &becore->chain);
 
-	return becore_yuvp_output_plane2_offset(profile);
+	return becore_yuvp_output_plane2_offset(profile, &becore->chain);
 }
 
 static size_t becore_active_output_size(const struct becore_device *becore)
@@ -2574,20 +2561,21 @@ static size_t becore_active_output_size(const struct becore_device *becore)
 		becore_yuvp_output_profile(becore);
 
 	if (becore->active_output_packed)
-		return becore_yuvp_packed_output_size(profile);
+		return becore_yuvp_packed_output_size(profile, &becore->chain);
 
-	return becore_yuvp_output_size(profile);
+	return becore_yuvp_output_size(profile, &becore->chain);
 }
 
-static size_t becore_yuvp_output_allocation_size(void)
+static size_t
+becore_yuvp_output_allocation_size(const struct becore_raster *chain)
 {
 	const struct becore_yuvp_output_profile *sbwcl =
 		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
 	const struct becore_yuvp_output_profile *p010 =
 		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_P010];
 
-	return max(becore_yuvp_output_size(sbwcl),
-		   becore_yuvp_output_size(p010));
+	return max(becore_yuvp_output_size(sbwcl, chain),
+		   becore_yuvp_output_size(p010, chain));
 }
 
 static int becore_yuvp_output_value(struct becore_device *becore, u32 index,
@@ -2616,14 +2604,14 @@ static int becore_yuvp_output_value(struct becore_device *becore, u32 index,
 		*value = profile->mode;
 		break;
 	case BECORE_YUVP_OUTPUT_WIDTH:
-		*value = profile->width;
+		*value = becore->chain.width;
 		break;
 	case BECORE_YUVP_OUTPUT_HEIGHT:
-		*value = profile->height;
+		*value = becore->chain.height;
 		break;
 	case BECORE_YUVP_OUTPUT_STRIDE1:
 	case BECORE_YUVP_OUTPUT_STRIDE2:
-		*value = becore_yuvp_output_stride(profile);
+		*value = becore_yuvp_output_stride(profile, &becore->chain);
 		break;
 	case BECORE_YUVP_OUTPUT_BUSINFO:
 		*value = profile->businfo;
@@ -2638,7 +2626,8 @@ static int becore_yuvp_output_value(struct becore_device *becore, u32 index,
 	return 0;
 }
 
-static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
+static int becore_gtnr_dma_value(const struct becore_raster *chain, u32 index,
+				 u32 reg, u32 *value)
 {
 	if (index >= BECORE_GTNR_DMA_WORD_COUNT ||
 	    reg != becore_gtnr_dma_regs[index])
@@ -2660,14 +2649,14 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_GTNR_INPUT_WIDTH:
-		*value = becore_gtnr_input.width;
+		*value = chain->width;
 		break;
 	case BECORE_GTNR_INPUT_HEIGHT:
-		*value = becore_gtnr_input.height;
+		*value = chain->height;
 		break;
 	case BECORE_GTNR_INPUT_STRIDE1:
 	case BECORE_GTNR_INPUT_STRIDE2:
-		*value = becore_chain_stride();
+		*value = becore_chain_stride(chain);
 		break;
 	case BECORE_GTNR_INPUT_BUSINFO:
 		*value = becore_gtnr_input.businfo;
@@ -2691,14 +2680,14 @@ static int becore_gtnr_dma_value(u32 index, u32 reg, u32 *value)
 		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_GTNR_OUTPUT_WIDTH:
-		*value = becore_gtnr_output.width;
+		*value = chain->width;
 		break;
 	case BECORE_GTNR_OUTPUT_HEIGHT:
-		*value = becore_gtnr_output.height;
+		*value = chain->height;
 		break;
 	case BECORE_GTNR_OUTPUT_STRIDE1:
 	case BECORE_GTNR_OUTPUT_STRIDE2:
-		*value = becore_chain_stride();
+		*value = becore_chain_stride(chain);
 		break;
 	case BECORE_GTNR_OUTPUT_BUSINFO:
 		*value = becore_gtnr_output.businfo;
@@ -2753,17 +2742,40 @@ static size_t becore_mcsc_output_size(void)
 }
 
 /*
+ * How much of DJAG's input the output is taken from. The captured program
+ * crops 3536 x 2652 out of the 4160 x 3120 YUVP surface and scales that up to
+ * fill 4000 x 3000, reserving a margin the vendor spends on electronic
+ * stabilisation. This driver has no stabilisation to spend it on, so it takes
+ * the whole raster and downscales instead, covering the full field.
+ *
+ * These say that against the raster rather than beside it. A margin carried
+ * separately would have gone on describing the raster the driver was built
+ * against, and DJAG would have cropped a window larger than its own input the
+ * first time the raster moved.
+ */
+static u32 becore_mcsc_djag_crop_width(const struct becore_raster *chain)
+{
+	return chain->width;
+}
+
+static u32 becore_mcsc_djag_crop_height(const struct becore_raster *chain)
+{
+	return chain->height;
+}
+
+/*
  * The crop is centred in the scaler's input, so its origin is derived rather
  * than carried. An odd margin would land the window off a chroma boundary on a
  * 4:2:0 output, so refuse it instead of silently rounding.
  */
-static int becore_mcsc_djag_origin(u32 *x, u32 *y)
+static int becore_mcsc_djag_origin(const struct becore_raster *chain,
+				   u32 *x, u32 *y)
 {
-	if (becore_mcsc_djag.crop_width > becore_mcsc_input.width ||
-	    becore_mcsc_djag.crop_height > becore_mcsc_input.height)
+	if (becore_mcsc_djag_crop_width(chain) > chain->width ||
+	    becore_mcsc_djag_crop_height(chain) > chain->height)
 		return -ERANGE;
-	*x = (becore_mcsc_input.width - becore_mcsc_djag.crop_width) / 2;
-	*y = (becore_mcsc_input.height - becore_mcsc_djag.crop_height) / 2;
+	*x = (chain->width - becore_mcsc_djag_crop_width(chain)) / 2;
+	*y = (chain->height - becore_mcsc_djag_crop_height(chain)) / 2;
 	if ((*x | *y) & 1)
 		return -ERANGE;
 
@@ -2771,7 +2783,7 @@ static int becore_mcsc_djag_origin(u32 *x, u32 *y)
 }
 
 static int
-becore_mcsc_dma_value(u32 index, u32 reg,
+becore_mcsc_dma_value(const struct becore_raster *chain, u32 index, u32 reg,
 		      enum becore_mcsc_input_transport transport,
 		      const u32 *requested_token, u32 *value)
 {
@@ -2808,14 +2820,14 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		*value = becore_chain_surface()->mode;
 		break;
 	case BECORE_MCSC_INPUT_WIDTH:
-		*value = becore_mcsc_input.width;
+		*value = chain->width;
 		break;
 	case BECORE_MCSC_INPUT_HEIGHT:
-		*value = becore_mcsc_input.height;
+		*value = chain->height;
 		break;
 	case BECORE_MCSC_INPUT_STRIDE1:
 	case BECORE_MCSC_INPUT_STRIDE2:
-		*value = becore_chain_stride();
+		*value = becore_chain_stride(chain);
 		break;
 	case BECORE_MCSC_INPUT_BUSINFO:
 		*value = becore_mcsc_input.businfo;
@@ -2855,12 +2867,11 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		*value = becore_mcsc_output.dither;
 		break;
 	case BECORE_MCSC_DJAG_IMG_SIZE:
-		*value = becore_pack_size(becore_mcsc_input.width,
-						 becore_mcsc_input.height);
+		*value = becore_pack_size(chain->width, chain->height);
 		break;
 	case BECORE_MCSC_DJAG_PS_SRC_POS: {
 		u32 x, y;
-		int ret = becore_mcsc_djag_origin(&x, &y);
+		int ret = becore_mcsc_djag_origin(chain, &x, &y);
 
 		if (ret)
 			return ret;
@@ -2868,20 +2879,20 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 		break;
 	}
 	case BECORE_MCSC_DJAG_PS_SRC_SIZE:
-		*value = becore_pack_size(becore_mcsc_djag.crop_width,
-						 becore_mcsc_djag.crop_height);
+		*value = becore_pack_size(becore_mcsc_djag_crop_width(chain),
+					  becore_mcsc_djag_crop_height(chain));
 		break;
 	case BECORE_MCSC_DJAG_PS_DST_SIZE:
 		*value = becore_pack_size(becore_mcsc_output.width,
 						 becore_mcsc_output.height);
 		break;
 	case BECORE_MCSC_DJAG_PS_H_RATIO:
-		*value = becore_zoom_ratio(becore_mcsc_djag.crop_width,
-						  becore_mcsc_output.width);
+		*value = becore_zoom_ratio(becore_mcsc_djag_crop_width(chain),
+					   becore_mcsc_output.width);
 		break;
 	case BECORE_MCSC_DJAG_PS_V_RATIO:
-		*value = becore_zoom_ratio(becore_mcsc_djag.crop_height,
-						  becore_mcsc_output.height);
+		*value = becore_zoom_ratio(becore_mcsc_djag_crop_height(chain),
+					   becore_mcsc_output.height);
 		break;
 	default:
 		return -EINVAL;
@@ -2890,20 +2901,15 @@ becore_mcsc_dma_value(u32 index, u32 reg,
 	return 0;
 }
 
-static size_t becore_gtnr_surface_plane2_offset(void)
+static size_t
+becore_gtnr_surface_plane2_offset(const struct becore_raster *chain)
 {
-	const struct becore_yuvp_output_profile *profile =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
-
-	return becore_yuvp_output_plane2_offset(profile);
+	return becore_yuvp_output_plane2_offset(becore_chain_surface(), chain);
 }
 
-static size_t becore_gtnr_surface_size(void)
+static size_t becore_gtnr_surface_size(const struct becore_raster *chain)
 {
-	const struct becore_yuvp_output_profile *profile =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
-
-	return becore_yuvp_output_size(profile);
+	return becore_yuvp_output_size(becore_chain_surface(), chain);
 }
 
 static dma_addr_t becore_gtnr_address_dma(struct becore_device *becore, u32 reg)
@@ -2912,12 +2918,12 @@ static dma_addr_t becore_gtnr_address_dma(struct becore_device *becore, u32 reg)
 	case BECORE_GTNR_INPUT_PLANE1_REG:
 		return becore->output.dma;
 	case BECORE_GTNR_INPUT_PLANE2_REG:
-		return becore->output.dma + becore_gtnr_surface_plane2_offset();
+		return becore->output.dma + becore_gtnr_surface_plane2_offset(&becore->chain);
 	case BECORE_GTNR_OUTPUT_PLANE1_REG:
 		return becore->gtnr_output.dma;
 	case BECORE_GTNR_OUTPUT_PLANE2_REG:
 		return becore->gtnr_output.dma +
-		       becore_gtnr_surface_plane2_offset();
+		       becore_gtnr_surface_plane2_offset(&becore->chain);
 	default:
 		return DMA_MAPPING_ERROR;
 	}
@@ -2925,14 +2931,13 @@ static dma_addr_t becore_gtnr_address_dma(struct becore_device *becore, u32 reg)
 
 static dma_addr_t becore_mcsc_address_dma(struct becore_device *becore, u32 reg)
 {
-	const struct becore_yuvp_output_profile *input =
-		&becore_yuvp_outputs[BECORE_YUVP_OUTPUT_SBWCL];
-
 	switch (reg) {
 	case BECORE_MCSC_INPUT_PLANE1_REG:
 		return becore->output.dma;
 	case BECORE_MCSC_INPUT_PLANE2_REG:
-		return becore->output.dma + becore_yuvp_output_plane2_offset(input);
+		return becore->output.dma +
+		       becore_yuvp_output_plane2_offset(becore_chain_surface(),
+							&becore->chain);
 	case BECORE_MCSC_OUTPUT_PLANE1_REG:
 		return becore->mcsc_dest_dma;
 	case BECORE_MCSC_OUTPUT_PLANE2_REG:
@@ -2959,7 +2964,8 @@ static int becore_typed_value(struct becore_device *becore,
 {
 	if (id == BECORE_RGBP)
 		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
-					       index, reg, value);
+					       &becore->chain, index, reg,
+					       value);
 	if (id == BECORE_YUVP)
 		return becore_yuvp_output_value(becore, index, reg, value);
 
@@ -3071,7 +3077,8 @@ static u32 becore_ltm_curve_identity(u32 index)
 				 EXYNOS_BECORE_LTM_CURVE_POINTS - 1);
 }
 
-static int becore_yuvp_ltm_value(u32 offset, u32 *value)
+static int becore_yuvp_ltm_value(const struct becore_raster *chain, u32 offset,
+				 u32 *value)
 {
 	u32 scale;
 	int ret;
@@ -3200,7 +3207,7 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	case 0x134:				/* SLCGRID_GRID_X_SCALE */
 	case 0x138:				/* ..._X_SCALE_HALF */
 		ret = becore_ltm_grid_scale(BECORE_LTM_SLCGRID_COLUMNS,
-					    becore_rgbp_out_width(), &scale);
+					    chain->width, &scale);
 		if (ret)
 			return ret;
 		*value = offset == 0x134 ? scale : scale >> 1;
@@ -3208,7 +3215,7 @@ static int becore_yuvp_ltm_value(u32 offset, u32 *value)
 	case 0x13c:				/* SLCGRID_GRID_Y_SCALE */
 	case 0x140:				/* ..._Y_SCALE_HALF */
 		ret = becore_ltm_grid_scale(BECORE_LTM_SLCGRID_ROWS,
-					    becore_rgbp_out_height(), &scale);
+					    chain->height, &scale);
 		if (ret)
 			return ret;
 		*value = offset == 0x13c ? scale : scale >> 1;
@@ -4782,14 +4789,15 @@ static u32 becore_yuvnr_radius_bucket(u32 width, u32 height)
  */
 static int
 becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
+			      const struct becore_raster *chain,
 			      u32 reg, u32 *value)
 {
 	struct becore_rect crop;
-	u32 chain_w = becore_rgbp_out_width();
-	u32 chain_h = becore_rgbp_out_height();
+	u32 chain_w = chain->width;
+	u32 chain_h = chain->height;
 	int ret;
 
-	ret = becore_rgbp_crop(profile, &crop);
+	ret = becore_rgbp_crop(profile, chain, &crop);
 	if (ret)
 		return ret;
 	if (!chain_w || !chain_h)
@@ -4815,6 +4823,7 @@ becore_sharpen_geometry_value(const struct becore_rgbp_input_profile *profile,
 
 static int
 becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
+			    const struct becore_raster *chain,
 			    u32 offset, u32 *value)
 {
 	struct becore_rect crop;
@@ -4822,16 +4831,16 @@ becore_yuvnr_geometry_value(const struct becore_rgbp_input_profile *profile,
 	s32 x;
 	s32 y;
 
-	ret = becore_rgbp_crop(profile, &crop);
+	ret = becore_rgbp_crop(profile, chain, &crop);
 	if (ret)
 		return ret;
 
 	switch (offset) {
 	case BECORE_YUVNR_BINNING:
 		x = DIV_ROUND_CLOSEST(BECORE_YUVNR_BINNING_Q * crop.width,
-				      becore_rgbp_out_width());
+				      chain->width);
 		y = DIV_ROUND_CLOSEST(BECORE_YUVNR_BINNING_Q * crop.height,
-				      becore_rgbp_out_height());
+				      chain->height);
 		*value = ((u32)x & BECORE_YUVNR_BINNING_MASK) |
 			 (((u32)y & BECORE_YUVNR_BINNING_MASK) <<
 			  BECORE_YUVNR_BINNING_Y_SHIFT) |
@@ -6709,7 +6718,7 @@ static int becore_sc_ratio(const struct becore_device *becore,
 		index = vertical ? BECORE_RGBP_SC_V_RATIO :
 				   BECORE_RGBP_SC_H_RATIO;
 		return becore_rgbp_input_value(becore_rgbp_input_profile(becore),
-					       index,
+					       &becore->chain, index,
 					       becore_rgbp_input_regs[index],
 					       ratio);
 	}
@@ -6867,9 +6876,9 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		case BECORE_GEN_MCSC_INPUT_SIZE:
 			if (reg == BECORE_MCSC_IN_WIDTH_REG)
-				result = becore_rgbp_out_width();
+				result = becore->chain.width;
 			else if (reg == BECORE_MCSC_IN_HEIGHT_REG)
-				result = becore_rgbp_out_height();
+				result = becore->chain.height;
 			else
 				return -EINVAL;
 			break;
@@ -6923,7 +6932,7 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		case BECORE_GEN_NR_GEOMETRY:
-			if (becore_yuvnr_geometry_value(input,
+			if (becore_yuvnr_geometry_value(input, &becore->chain,
 							reg - BECORE_YUVP_PHYS_BASE,
 							&result))
 				return -EINVAL;
@@ -6941,8 +6950,8 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		case BECORE_GEN_YUVP_CHAIN_SIZE:
-			result = becore_pack_size(becore_rgbp_out_width(),
-						  becore_rgbp_out_height());
+			result = becore_pack_size(becore->chain.width,
+						  becore->chain.height);
 			break;
 		/*
 		 * The block with nothing sent to it: bypassed, and its tuning
@@ -6962,7 +6971,8 @@ static int becore_generated_value(const struct becore_device *becore,
 			result = 0;
 			break;
 		case BECORE_GEN_SHARPEN_GEOMETRY:
-			if (becore_sharpen_geometry_value(input, reg, &result))
+			if (becore_sharpen_geometry_value(input, &becore->chain,
+							  reg, &result))
 				return -EINVAL;
 			break;
 		case BECORE_GEN_BAYER_PHASE: {
@@ -7034,7 +7044,8 @@ static int becore_generated_value(const struct becore_device *becore,
 				return -EINVAL;
 			break;
 		case BECORE_GEN_LTM:
-			if (becore_yuvp_ltm_value(reg - BECORE_YUVP_LTM_BASE,
+			if (becore_yuvp_ltm_value(&becore->chain,
+						  reg - BECORE_YUVP_LTM_BASE,
 						  &result))
 				return -EINVAL;
 			break;
@@ -7865,8 +7876,8 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 	    get_unaligned_le32(header + 20) != BECORE_GTNR_RECIPE_BYTES ||
 	    get_unaligned_le32(header + 24) || get_unaligned_le32(header + 28))
 		return -EINVAL;
-	if (becore->output.size < becore_gtnr_surface_size() ||
-	    becore->gtnr_output.size != becore_gtnr_surface_size())
+	if (becore->output.size < becore_gtnr_surface_size(&becore->chain) ||
+	    becore->gtnr_output.size != becore_gtnr_surface_size(&becore->chain))
 		return -EINVAL;
 
 	for (i = 0; i < BECORE_GTNR_HEADER_COUNT;
@@ -7918,7 +7929,7 @@ static int becore_gtnr_recipe_validate(struct becore_device *becore)
 				if (shape->mode != 0x00090000 || !(word & 1))
 					return -EINVAL;
 				reg = shape->pair_registers[word / 2];
-				if (becore_gtnr_dma_value(typed_count, reg, NULL))
+				if (becore_gtnr_dma_value(&becore->chain, typed_count, reg, NULL))
 					return -EINVAL;
 				typed_count++;
 			}
@@ -7996,7 +8007,7 @@ static int becore_encode_gtnr(struct becore_device *becore)
 
 			if (shape->typed_mask & BIT(word)) {
 				reg = shape->pair_registers[word / 2];
-				if (becore_gtnr_dma_value(typed_count, reg, &value))
+				if (becore_gtnr_dma_value(&becore->chain, typed_count, reg, &value))
 					return -EINVAL;
 				put_unaligned_le32(value, payload + word * 4);
 				typed_count++;
@@ -8169,7 +8180,7 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 	    get_unaligned_le32(header + 20) != BECORE_MCSC_RECIPE_BYTES ||
 	    get_unaligned_le32(header + 24) || get_unaligned_le32(header + 28))
 		return -EINVAL;
-	if (becore->output.size < becore_yuvp_output_size(input) ||
+	if (becore->output.size < becore_yuvp_output_size(input, &becore->chain) ||
 	    becore->mcsc_output.size != becore_mcsc_output_size())
 		return -EINVAL;
 
@@ -8222,7 +8233,8 @@ static int becore_mcsc_recipe_validate(struct becore_device *becore)
 				if (shape->mode != 0x00090000 || !(word & 1))
 					return -EINVAL;
 				reg = shape->pair_registers[word / 2];
-				if (becore_mcsc_dma_value(typed_count, reg,
+				if (becore_mcsc_dma_value(&becore->chain,
+							  typed_count, reg,
 							  BECORE_MCSC_INPUT_CAPTURED_VOTF,
 							  NULL, NULL))
 					return -EINVAL;
@@ -8305,7 +8317,9 @@ becore_encode_mcsc(struct becore_device *becore,
 
 			if (shape->typed_mask & BIT(word)) {
 				reg = shape->pair_registers[word / 2];
-				if (becore_mcsc_dma_value(typed_count, reg, transport,
+				if (becore_mcsc_dma_value(&becore->chain,
+							  typed_count, reg,
+							  transport,
 							  becore->votf_trs_token,
 							  &value))
 					return -EINVAL;
@@ -8853,17 +8867,16 @@ static void becore_c2serv_link_sample(struct becore_device *becore,
  * fabric at all.
  *
  * The line count is the plane's height, as in every captured link, and it is
- * taken from the profile this run resolved rather than from a constant, so
- * the fabric and the block cannot disagree about the frame.  That is why this
- * runs per frame from the run path and not once from the resume: a stream
- * holds one runtime-PM reference across all its frames, so a resume happens
- * before any run has chosen a profile.  Per frame is also where the vendor
- * programs a link.
+ * the chain raster's -- the same number the blocks either side are programmed
+ * with, so the fabric and they cannot disagree about the frame.  It runs per
+ * frame because that is where the vendor programs a link, and because the
+ * things it depends on are resolved per run.
+ *
+ * What it does *not* yet depend on is the token geometry beside it, which is
+ * a constant chosen for a 3120-line frame.  See becore_c2serv_tws_lines_in_token.
  */
 static void becore_c2serv_program_link(struct becore_device *becore)
 {
-	const struct becore_yuvp_output_profile *profile =
-		becore_yuvp_output_profile(becore);
 	struct becore_c2serv_state *producer =
 		&becore->c2serv_state[BECORE_C2SERV_YUVP];
 	struct becore_c2serv_state *consumer =
@@ -8883,8 +8896,8 @@ static void becore_c2serv_program_link(struct becore_device *becore)
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
 		void __iomem *tws = tws_base + BECORE_C2SERV_TWS(n);
 		void __iomem *trs = trs_base + BECORE_C2SERV_TRS(n);
-		u32 lines = n ? DIV_ROUND_UP(profile->height, 2) :
-				profile->height;
+		u32 lines = n ? DIV_ROUND_UP(becore->chain.height, 2) :
+				becore->chain.height;
 
 		u32 tws_token = becore_c2serv_token(becore->votf_tws_token,
 					becore_c2serv_tws_lines_in_token, n);
@@ -9342,7 +9355,7 @@ static int becore_alloc_cmdq_program(struct becore_device *becore,
 
 static int becore_alloc_diagnostic(struct becore_device *becore)
 {
-	size_t output_size = becore_yuvp_output_allocation_size();
+	size_t output_size = becore_yuvp_output_allocation_size(&becore->chain);
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
@@ -9410,7 +9423,7 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	if (ret)
 		return ret;
 	ret = becore_alloc_dma_buffer(becore, &becore->gtnr_output,
-				      becore_gtnr_surface_size(), "GTNR output");
+				      becore_gtnr_surface_size(&becore->chain), "GTNR output");
 	if (ret)
 		return ret;
 	ret = becore_alloc_dma_buffer(becore, &becore->mcsc_output,
@@ -13163,6 +13176,13 @@ static int becore_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	becore->dev = dev;
+	/*
+	 * The raster the chain runs at.  Compiled in as a default rather than
+	 * as six copies in as many profiles: nothing negotiates it yet, and
+	 * what changes when something does is this one assignment.
+	 */
+	becore->chain.width = BECORE_CHAIN_WIDTH;
+	becore->chain.height = BECORE_CHAIN_HEIGHT;
 	mutex_init(&becore->lock);
 	mutex_init(&becore->video_lock);
 	mutex_init(&becore->params_lock);

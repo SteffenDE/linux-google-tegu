@@ -237,8 +237,8 @@ static const struct becore_cmdq_shape becore_rgbp_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.generated_mask = 0x0200,
-		.fixed_mask = 0xa8aa,
+		.generated_mask = 0x0a00,
+		.fixed_mask = 0xa0aa,
 		.pair_registers = {
 			0x1c443184, 0x1c443188, 0x1c443194, 0x1c443198,
 			0x1c4431a4, 0x1c4431a8, 0x1c4431ac, 0x1c4431b0,
@@ -246,7 +246,7 @@ static const struct becore_cmdq_shape becore_rgbp_shape[] = {
 		.fixed_values = {
 			0x00000000, 0x00010002, 0x00000000, 0x0000001c,
 			0x00000000, 0x00020002, 0x00000000, 0x00000036,
-			0x00000000, 0x00000000, 0x00000000, 0x00000006,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000,
 			0x00000000, 0x00800107, 0x00000000, 0x00800107,
 		},
 	},

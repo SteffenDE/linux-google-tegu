@@ -2301,12 +2301,27 @@ static u32 becore_pack_size(u32 high, u32 low)
 	return (high << 16) | low;
 }
 
-static u32 becore_zoom_ratio(u32 in, u32 out)
+/*
+ * A ratio is a Q20 fraction in a u32, so it describes a downscale of just
+ * under 4096 and no further.  Past that the shifted numerator leaves 32 bits
+ * and the truncation lands somewhere small: an in/out of exactly 4096 reads
+ * back as **zero**, a scaler told to step nothing per output pixel, and 4097
+ * reads back as unity.  Either way becore_sc_coeff_set() then picks the x8/8
+ * filter for it, because both are at or below its first band.  Neither the
+ * register nor the filter is a failed write, so say so rather than write it.
+ */
+static int becore_zoom_ratio(u32 in, u32 out, u32 *ratio)
 {
-	if (!out)
-		return 0;
+	u64 scaled;
 
-	return (u32)div_u64((u64)in << BECORE_RATIO_SHIFT, out);
+	if (!out)
+		return -EINVAL;
+	scaled = div_u64((u64)in << BECORE_RATIO_SHIFT, out);
+	if (scaled > U32_MAX)
+		return -ERANGE;
+	*ratio = scaled;
+
+	return 0;
 }
 
 /*
@@ -2469,11 +2484,13 @@ static int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profi
 		else if (index == BECORE_RGBP_CROP_START)
 			result = becore_pack_size(crop.x, crop.y);
 		else if (index == BECORE_RGBP_SC_H_RATIO)
-			result = becore_zoom_ratio(crop.width,
-						   chain->width);
+			ret = becore_zoom_ratio(crop.width, chain->width,
+						&result);
 		else
-			result = becore_zoom_ratio(crop.height,
-						   chain->height);
+			ret = becore_zoom_ratio(crop.height, chain->height,
+						&result);
+		if (ret)
+			return ret;
 		break;
 	}
 	case BECORE_RGBP_INPUT_FORMAT:
@@ -3006,13 +3023,11 @@ becore_mcsc_dma_value(const struct becore_raster *chain,
 		*value = becore_pack_size(output->width, output->height);
 		break;
 	case BECORE_MCSC_DJAG_PS_H_RATIO:
-		*value = becore_zoom_ratio(becore_mcsc_djag_crop_width(chain),
-					   output->width);
-		break;
+		return becore_zoom_ratio(becore_mcsc_djag_crop_width(chain),
+					 output->width, value);
 	case BECORE_MCSC_DJAG_PS_V_RATIO:
-		*value = becore_zoom_ratio(becore_mcsc_djag_crop_height(chain),
-					   output->height);
-		break;
+		return becore_zoom_ratio(becore_mcsc_djag_crop_height(chain),
+					 output->height, value);
 	default:
 		return -EINVAL;
 	}
@@ -4962,6 +4977,15 @@ becore_yuvnr_geometry_value(const struct becore_raster *array,
 				      chain->width);
 		y = DIV_ROUND_CLOSEST(BECORE_YUVNR_BINNING_Q * crop.height,
 				      chain->height);
+		/*
+		 * Q10 in fourteen bits, so the crop may be up to 15.999 times
+		 * the chain and no more.  Masking a larger one keeps the low
+		 * bits: a crop 16.25 times the chain reads back as 0.25, a
+		 * fall-off running the wrong way over the frame.
+		 */
+		if (x > BECORE_YUVNR_BINNING_MASK ||
+		    y > BECORE_YUVNR_BINNING_MASK)
+			return -ERANGE;
 		*value = ((u32)x & BECORE_YUVNR_BINNING_MASK) |
 			 (((u32)y & BECORE_YUVNR_BINNING_MASK) <<
 			  BECORE_YUVNR_BINNING_Y_SHIFT) |
@@ -6630,12 +6654,12 @@ static int becore_rgbp_gtm_value(u32 offset, u32 *value)
  * take it from the matching one: a vertical register computed from a width
  * would be a real defect the moment the two differ.
  */
-static u32 becore_mcsc_chain_ratio(const struct becore_raster *output,
-				   bool vertical)
+static int becore_mcsc_chain_ratio(const struct becore_raster *output,
+				   bool vertical, u32 *ratio)
 {
 	u32 extent = vertical ? output->height : output->width;
 
-	return becore_zoom_ratio(extent, extent);
+	return becore_zoom_ratio(extent, extent, ratio);
 }
 
 /*
@@ -6846,9 +6870,7 @@ static int becore_sc_ratio(const struct becore_device *becore,
 	}
 	if (id != BECORE_MCSC)
 		return -EINVAL;
-	*ratio = becore_mcsc_chain_ratio(&becore->scaled, vertical);
-
-	return 0;
+	return becore_mcsc_chain_ratio(&becore->scaled, vertical, ratio);
 }
 
 static u32 becore_generated_word_count(enum becore_block_id id)
@@ -7215,8 +7237,11 @@ static int becore_generated_value(const struct becore_device *becore,
 		case BECORE_GEN_CHAIN_RATIO: {
 			bool vertical = reg == BECORE_MCSC_SC0_V_RATIO_REG ||
 					reg == BECORE_MCSC_PC0_V_RATIO_REG;
+			int err = becore_mcsc_chain_ratio(&becore->scaled,
+							  vertical, &result);
 
-			result = becore_mcsc_chain_ratio(&becore->scaled, vertical);
+			if (err)
+				return err;
 			break;
 		}
 		default:

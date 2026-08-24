@@ -49,7 +49,8 @@ void exynos_becore_input_unmap(struct exynos_becore_input *input);
 size_t exynos_becore_input_size(struct exynos_becore_input *input);
 
 /*
- * Put the back end's input on the producer's media graph.
+ * Put the back end on the producer's media graph -- its input pad, and its
+ * video nodes with it.
  *
  * The back end has to know the mosaic the front end is sending -- the demosaic
  * needs the CFA phase, which differs between this board's three cameras -- and
@@ -58,9 +59,20 @@ size_t exynos_becore_input_size(struct exynos_becore_input *input);
  * truth with no way to arbitrate, the back end registers a sink pad on the
  * producer's graph and reads the remote pad.
  *
+ * The back end has no media device of its own, so the producer's is the one
+ * media device the pipeline has, and the back end's nodes appear exactly while
+ * a producer is bound.
+ *
  * Call after the producer's own subdevice is registered and before its media
  * device is; the link is created enabled and immutable, because the two blocks
  * are wired to each other in silicon.
+ *
+ * On the way out two orderings matter, and neither is simply the reverse of
+ * the above.  Call exynos_becore_input_disconnect() before unregistering the
+ * graph, because taking the capture node down stops a stream and a stop calls
+ * back into the producer; and unregister the graph before the producer's own
+ * v4l2_device goes, because the two video nodes hold a reference to it that
+ * their release path walks.  The media device may go either side of it.
  */
 int exynos_becore_input_register_graph(struct exynos_becore_input *input,
 				       struct v4l2_device *v4l2_dev,

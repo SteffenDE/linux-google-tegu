@@ -1102,10 +1102,11 @@ static const u32 becore_rgbp_input_regs[] = {
 };
 
 /*
- * What the three rasters are set to while nothing negotiates them: the readout
- * the whole captured corpus came from, and the request it was serving.  They
- * are defaults assigned once at probe, not descriptions of anything --
- * becore->array, ->chain and ->scaled are what the driver reads.
+ * What the three rasters start at: the readout the whole captured corpus came
+ * from, and the request it was serving.  The array's is a starting value only,
+ * because a stream with a producer takes that raster from the producer's pad;
+ * nothing yet sets the other two.  None of the three is a description of
+ * anything -- becore->array, ->chain and ->scaled are what the driver reads.
  */
 #define BECORE_ARRAY_WIDTH		4208U
 #define BECORE_ARRAY_HEIGHT		3120U
@@ -11388,18 +11389,40 @@ static int becore_input_format(struct becore_device *becore,
 }
 
 /*
- * Take the producer's mosaic for this stream, or keep the compiled-in one if
- * there is no producer to ask -- which is the offline loop, where the staged
- * frame is the ultrawide's and so is the default.
+ * Take the producer's mosaic and the raster it sends them on, or keep what the
+ * driver already has if there is no producer to ask -- which is the offline
+ * loop, where the staged frame is the ultrawide's and so is the default.
+ *
+ * The two are not kept the same way, and the difference is which of them means
+ * anything without a producer. input_code is per-stream state whose only
+ * source is the remote pad, so with nothing there it returns to the
+ * compiled-in default; the array raster is device state that has to describe
+ * the slots whatever is or is not attached, so it is left as it stands.
  *
  * A code the table cannot place is refused rather than guessed. The phase
  * decides which of the four quads the demosaic reads as red, so a wrong one is
  * not a subtle error, and a refusal at STREAMON is a far better failure than a
  * picture with its colours swapped.
+ *
+ * A raster is refused on three counts, and only the first is about the number
+ * itself. It has to be one the register fields can carry; it has to lay a
+ * frame out in exactly the slot the producer was handed; and there has to be
+ * a crop of it that reaches the chain, which is the one derivation between the
+ * two rasters that can fail on its own. Everything else the raster feeds is
+ * range-checked where it is encoded.
+ *
+ * The middle one is an equality and not a bound, which looks stricter than it
+ * needs to be and is not. A slot the producer filled stages its whole
+ * allocation, and becore_recipe_validate() then requires the staged length to
+ * equal what the raster and the profile say the frame is -- so a raster that
+ * merely *fits* is accepted here and refuses every frame afterwards, which is
+ * a far worse failure than a refusal at STREAMON.
  */
-static int becore_latch_input_code(struct becore_device *becore)
+static int becore_latch_input_format(struct becore_device *becore)
 {
 	struct v4l2_mbus_framefmt format;
+	struct becore_raster array;
+	struct becore_rect crop;
 	int ret;
 
 	lockdep_assert_held(&becore->lock);
@@ -11416,7 +11439,36 @@ static int becore_latch_input_code(struct becore_device *becore)
 			format.code);
 		return -EINVAL;
 	}
+
+	array.width = format.width;
+	array.height = format.height;
+	ret = becore_raster_validate(becore->dev, "array", &array,
+				     BECORE_ARRAY_EXTENT_MAX);
+	if (ret)
+		return ret;
+	ret = becore_input_profiles_validate(becore->dev, &array);
+	if (ret)
+		return ret;
+	if (becore_input_allocation_size(&array) !=
+	    becore->inputs[0].buffer.size) {
+		dev_err(becore->dev,
+			"producer sends %ux%u, which lays out in %zu bytes a slot where the slots are %zu\n",
+			array.width, array.height,
+			becore_input_allocation_size(&array),
+			becore->inputs[0].buffer.size);
+		return -ENOSPC;
+	}
+	ret = becore_rgbp_crop(&array, &becore->chain, &crop);
+	if (ret) {
+		dev_err(becore->dev,
+			"no crop of %ux%u reaches the %ux%u chain\n",
+			array.width, array.height,
+			becore->chain.width, becore->chain.height);
+		return ret;
+	}
+
 	becore->input_code = format.code;
+	becore->array = array;
 
 	return 0;
 }
@@ -11424,12 +11476,13 @@ static int becore_latch_input_code(struct becore_device *becore)
 static int becore_sd_init_state(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *state)
 {
+	struct becore_device *becore = v4l2_get_subdevdata(sd);
 	struct v4l2_mbus_framefmt *sink =
 		v4l2_subdev_state_get_format(state, 0);
 
 	sink->code = BECORE_INPUT_DEFAULT_CODE;
-	sink->width = BECORE_ARRAY_WIDTH;
-	sink->height = BECORE_ARRAY_HEIGHT;
+	sink->width = becore->array.width;
+	sink->height = becore->array.height;
 	sink->field = V4L2_FIELD_NONE;
 	sink->colorspace = V4L2_COLORSPACE_RAW;
 	sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
@@ -11481,9 +11534,9 @@ static int becore_sd_get_fmt(struct v4l2_subdev *sd,
  * userspace had told the back end what the hardware was already doing.
  *
  * Nothing is refused here, and that is deliberate too. The back end cannot
- * place every mosaic, but the producer's raw path does not go through the back
- * end at all, so a code this driver cannot demosaic is no reason to stop a raw
- * capture. becore_latch_input_code() refuses it at the back end's own
+ * place every mosaic or work at every raster, but the producer's raw path does
+ * not go through the back end at all, so neither is a reason to stop a raw
+ * capture. becore_latch_input_format() refuses both at the back end's own
  * STREAMON, which is where it matters.
  */
 static int becore_sd_link_validate(struct v4l2_subdev *sd,
@@ -11797,9 +11850,13 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct becore_device *becore = vb2_get_drv_priv(q);
 	struct exynos_becore_input_stream_config stream_config;
 	struct exynos_becore_input *input;
+	struct becore_raster was_array;
+	u32 was_code;
 	int ret;
 
 	mutex_lock(&becore->lock);
+	was_array = becore->array;
+	was_code = becore->input_code;
 	if (becore->video_streaming || becore->running) {
 		ret = -EBUSY;
 		goto unlock;
@@ -11813,6 +11870,15 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EPERM;
 		goto unlock;
 	}
+	/*
+	 * Latch the producer's format first, because everything below is
+	 * checked against it: the record walk evaluates every word the array
+	 * raster derives, and doing that before the latch would prove it of
+	 * the previous stream's raster.
+	 */
+	ret = becore_latch_input_format(becore);
+	if (ret)
+		goto unlock;
 	ret = becore_recipe_records_validate(becore, false);
 	if (ret)
 		goto unlock;
@@ -11844,19 +11910,6 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	becore->completed_generation = 0;
 	becore->completed_output_size = 0;
 	becore_video_controls_snapshot(becore, &stream_config);
-	/*
-	 * Latch the mosaic here, with the rest of the per-stream state, rather
-	 * than reading it per frame: the demosaic's phase must not change under
-	 * a running stream, and a producer that is about to send frames has
-	 * already settled its format.
-	 */
-	ret = becore_latch_input_code(becore);
-	if (ret) {
-		becore->video_streaming = false;
-		becore_stream_power_put(becore);
-		becore_input_callback_put(input);
-		goto unlock;
-	}
 	becore->video_streaming = true;
 	mutex_unlock(&becore->lock);
 
@@ -11865,6 +11918,18 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		becore_input_callback_put(input);
 		mutex_lock(&becore->lock);
 		becore->video_streaming = false;
+		/*
+		 * The producer refused, so nothing it said about the frame it
+		 * sends was ever acted on -- and today refusing is what it does
+		 * for every raster but one, because the program that writes a
+		 * slot is a captured PDMA recipe selected by exactly matching
+		 * its source pad. Leaving what was latched behind would let the
+		 * offline loop, which has no producer to disagree with, encode
+		 * a geometry no frame was ever taken at, in a phase no sensor
+		 * read out.
+		 */
+		becore->array = was_array;
+		becore->input_code = was_code;
 		becore_stream_power_put(becore);
 		mutex_unlock(&becore->lock);
 		cancel_work_sync(&becore->video_work);
@@ -11879,6 +11944,9 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	    becore->video_streaming) {
 		becore->producer_streaming = true;
 	} else {
+		/* The producer went away under the dropped lock; same rule. */
+		becore->array = was_array;
+		becore->input_code = was_code;
 		ret = -ENODEV;
 	}
 	mutex_unlock(&becore->lock);
@@ -11905,6 +11973,15 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 
 unlock:
+	/*
+	 * Nothing was proven at what was latched, so none of it persists. The
+	 * mosaic matters here as much as the raster: its one reader is the
+	 * demosaic's phase, the offline loop never re-latches, and a phase left
+	 * behind by a stream that never started is a picture with its colours
+	 * swapped and nothing saying so.
+	 */
+	becore->array = was_array;
+	becore->input_code = was_code;
 	mutex_unlock(&becore->lock);
 	becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
 	return ret;

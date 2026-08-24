@@ -25,7 +25,8 @@ static const struct becore_cmdq_shape becore_gtnr_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0xaaa0,
+		.generated_mask = 0xaaa0,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1cc43288, 0x1cc43214, 0x1cc42200, 0x1cc42a00,
 			0x1cc42400, 0x1cc42c00, 0x1cc42600, 0x1cc42e00,
@@ -61,7 +62,8 @@ static const struct becore_cmdq_shape becore_gtnr_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0x8000,
+		.generated_mask = 0x8000,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1cc43244, 0x1cc43248, 0x1cc4324c, 0x1cc43254,
 			0x1cc43250, 0x1cc43204, 0x1cc43208, 0x1cc42800,
@@ -80,7 +82,8 @@ static const struct becore_cmdq_shape becore_gtnr_shape[] = {
 		.valid_words = 16,
 		.address_mask = 0x0028,
 		.typed_mask = 0xaa80,
-		.fixed_mask = 0x0002,
+		.generated_mask = 0x0002,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1cc42804, 0x1cc41e50, 0x1cc41e90, 0x1cc41e3c,
 			0x1cc41e10, 0x1cc41e18, 0x1cc41e04, 0x1cc41e20,
@@ -99,7 +102,8 @@ static const struct becore_cmdq_shape becore_gtnr_shape[] = {
 		.valid_words = 16,
 		.address_mask = 0x0000,
 		.typed_mask = 0x2aaa,
-		.fixed_mask = 0x8000,
+		.generated_mask = 0x8000,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1cc41e24, 0x1cc41e28, 0x1cc41e2c, 0x1cc41e4c,
 			0x1cc41e40, 0x1cc41e48, 0x1cc41e00, 0x1cc42000,
@@ -117,7 +121,8 @@ static const struct becore_cmdq_shape becore_gtnr_shape[] = {
 		.type_map = 0x55555555,
 		.valid_words = 16,
 		.address_mask = 0x0000,
-		.fixed_mask = 0x0aaa,
+		.generated_mask = 0x0aaa,
+		.fixed_mask = 0x0000,
 		.pair_registers = {
 			0x1cc42004, 0x1cc41a00, 0x1cc41a04, 0x1cc41c00,
 			0x1cc41c04, 0x1cc41800, 0x1cc43300, 0x1cc43308,

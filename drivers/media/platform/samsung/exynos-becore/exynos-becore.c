@@ -462,10 +462,13 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 /*
  * RGBP's BYR_DNS and YUVP's YUVNR carry the same object: an eight-knot
  * piecewise-linear curve of noise standard deviation against pixel level, one
- * curve for luma and one for chroma. The knots are genuine tuning and stay in
- * the recipe. What follows from them is the eight slopes, the shift they are
- * taken at, and -- because the chroma curve is measured on the same domain as
- * the luma one -- the chroma domain itself.
+ * curve for luma and one for chroma. The knots are genuine tuning, and the
+ * demosaicer's stay in the recipe; the noise reducer's are a parameters block
+ * away, so the driver generates those from the block or, with none in force,
+ * from the vendor's own default curve. What follows from the knots either way
+ * is the eight slopes, the shift they are taken at, and -- because the chroma
+ * curve is measured on the same domain as the luma one -- the chroma domain
+ * itself.
  *
  * A slope is (dY << 11) / dX, and the eighth field repeats the seventh because
  * there are eight fields for seven segments. The trap is the rounding: **DNS
@@ -527,14 +530,16 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
  * `luma_gain_x` is a tuning field like any other -- it lives in the shipped
  * `YuvNrStaticParam` and is not interpolated -- so what makes it stateable is
  * that it does not move, on three independent counts: it is bit-identical in
- * all thirty shipped tuning files, bit-identical in all 426 captured programs
- * on three cameras, and equal to the value `SetDefaultTuningCommon` compiles
- * in.
+ * all 34 shipped tuning files that carry this block, bit-identical in all 426
+ * captured programs on three cameras, and equal to the value
+ * `SetDefaultTuningCommon` compiles in.
  *
- * All three are needed. The compiled-in default alone proves nothing: the
- * field beside it in the same message, `std_lut_x`, is filled by that same
- * function and then overridden by most of the shipped tunings, which carry
- * five different noise-curve axes between them.
+ * All three are needed, and the field beside it in the same message says why:
+ * `std_lut_x` is filled by that same function and the shipped tunings carry
+ * *four* distinct noise-curve axes between them. Fourteen of the 34 do hold
+ * the compiled-in default, which is what makes it the wrong thing to argue
+ * from on its own -- a value being the vendor's default says nothing about
+ * whether a tuning file moves it.
  */
 #define BECORE_YUVP_NR_LUMA_GRID_FIRST	(BECORE_YUVP_NR_BASE + 0x524)
 #define BECORE_YUVP_NR_LUMA_GRID_LAST	(BECORE_YUVP_NR_BASE + 0x560)
@@ -1581,7 +1586,7 @@ enum becore_generated_kind {
 	BECORE_GEN_YUVP_DEGAMMA,	/* the inverse of RGBP's encode */
 	BECORE_GEN_SHARPEN_DEFAULT,	/* what GetDefaultYuvSharpEnhancer writes */
 	BECORE_GEN_NR_DEFAULT,	/* YUVNR's fixed output: GetDefaultYuvNr's */
-	BECORE_GEN_YUVNR,	/* the noise reducer bypassed, its tuning at zero */
+	BECORE_GEN_YUVNR,	/* the noise reducer bypassed, on its default */
 	BECORE_GEN_NR_LUMA_GRID,	/* its luma-gain curve's knot grid */
 	BECORE_GEN_NR_GEOMETRY,	/* its radial pair, from the crop and chain */
 	BECORE_GEN_GRID_DMA,	/* the LTM grid RDMA, from our own buffer */
@@ -1624,7 +1629,7 @@ struct becore_generated_range {
  * carrying one of them fails validation instead of programming the capture.
  */
 #define BECORE_RGBP_GENERATED_WORDS	291
-#define BECORE_YUVP_GENERATED_WORDS	1347
+#define BECORE_YUVP_GENERATED_WORDS	1359
 #define BECORE_MCSC_GENERATED_WORDS	99
 
 static const struct becore_generated_range becore_rgbp_generated[] = {
@@ -4119,9 +4124,9 @@ static int becore_yuvp_clut_1dlut_value(u32 offset, u32 *value)
  * Read one fixed word back out of the recipe by register address.
  *
  * Every other generated value is a function of the hardware description or of
- * a constant, and resolves from the register alone. A noise curve's slopes are
- * a function of its knots, which are tuning and stay in the recipe -- so
- * resolving one means finding a sibling register's value.
+ * a constant, and resolves from the register alone. The demosaicer's noise
+ * slopes are a function of its knots, which are tuning and stay in the recipe
+ * -- so resolving one means finding a sibling register's value.
  *
  * What makes that safe is not the order this runs in: it reads the
  * compiled-in table, so its answer does not depend on validation having run.
@@ -4178,6 +4183,27 @@ static int becore_recipe_fixed_value(enum becore_block_id id, u32 reg,
 
 	return found ? 0 : -EINVAL;
 }
+
+/*
+ * The tuning a stream with no parameters buffer runs on: nothing, bar the one
+ * value whose nothing is not a value.  Every other field is zero and the
+ * block's own inverted bypass turns that into the noise reducer off, as
+ * the sharpener's default does -- but the noise curve's domain is divided by,
+ * so eight zeros there would be a division by nothing rather than a flat
+ * curve, and becore_params_check_yuvnr() refuses the same eight from
+ * userspace.  BECORE_YUVNR_DEFAULT_CURVE is the vendor's own answer to that,
+ * read off SetDefaultTuningCommon rather than chosen here.
+ *
+ * Running the encode over this block rather than taking each entry's constant
+ * -- which is how the sharpener produces its default -- is not a stylistic
+ * difference.  This block has a field whose zero is *not* the constant's:
+ * `enable` inverts, so the default has to go through the same arithmetic a
+ * buffer does, and a default that read the constants would leave the noise
+ * reducer running with no tuning at all.
+ */
+static const struct exynos_becore_params_yuvnr becore_yuvnr_off = {
+	BECORE_YUVNR_DEFAULT_CURVE
+};
 
 /*
  * Each entry names the knots its slopes come from, so a chroma curve whose own
@@ -4285,12 +4311,64 @@ static int becore_noise_read_knot(enum becore_block_id id, u32 first,
 	return 0;
 }
 
+/* Every knot of a curve a parameters block carries, clamped as it is sent. */
+static void
+becore_noise_knots_from_params(const struct exynos_becore_params_yuvnr *params,
+			       const struct becore_noise_curve *curve,
+			       struct becore_noise_knots *knots)
+{
+	const __s32 *range = (const __s32 *)((const u8 *)params +
+					     curve->params_range);
+	u32 index;
+
+	for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
+		knots->x[index] = clamp(params->std_lut_x[index], 0,
+					BECORE_NOISE_KNOT_MAX);
+		knots->y[index] = clamp(range[index], 0, BECORE_NOISE_KNOT_MAX);
+	}
+}
+
+/* A curve whose knots the recipe still carries: the demosaicer's two. */
+static int becore_noise_knots_from_recipe(struct device *dev, size_t curve_index,
+					  struct becore_noise_knots *knots)
+{
+	const struct becore_noise_curve *curve =
+		&becore_noise_curves[curve_index];
+	u32 index;
+	int ret;
+
+	for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
+		ret = becore_noise_read_knot(curve->block, curve->x_first,
+					     index, &knots->x[index]);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "noise curve %zu has no knot domain\n",
+					     curve_index);
+		ret = becore_noise_read_knot(curve->block, curve->y_first,
+					     index, &knots->y[index]);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "noise curve %zu has no knot range\n",
+					     curve_index);
+	}
+
+	return 0;
+}
+
 /*
  * Resolve every curve's knots, and check each domain rises while we are here.
  * A curve that cannot be resolved is a wiring mistake in the table above --
  * most likely a chroma curve pointed at its own generated domain instead of
  * the luma copy it repeats -- and it is worth failing probe over rather than
  * discovering at the first STREAMON.
+ *
+ * The noise reducer's two curves do not come from the recipe at all: the
+ * driver generates their knot registers now, so the recipe no longer carries
+ * them, and what a stream with no parameters buffer writes there is
+ * becore_yuvnr_off's stated default. Resolving them out of the same block the
+ * field table encodes is what keeps the slopes describing the knots the
+ * hardware was given -- the same reason becore_noise_knots_for() takes a
+ * buffer's knots over these.
  */
 static int becore_noise_knots_resolve(struct device *dev)
 {
@@ -4301,21 +4379,14 @@ static int becore_noise_knots_resolve(struct device *dev)
 	for (i = 0; i < ARRAY_SIZE(becore_noise_curves); i++) {
 		const struct becore_noise_curve *curve = &becore_noise_curves[i];
 
-		for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
-			ret = becore_noise_read_knot(curve->block,
-						     curve->x_first, index,
-						     &becore_noise_knots[i].x[index]);
+		if (curve->params_range) {
+			becore_noise_knots_from_params(&becore_yuvnr_off, curve,
+						       &becore_noise_knots[i]);
+		} else {
+			ret = becore_noise_knots_from_recipe(dev, i,
+							     &becore_noise_knots[i]);
 			if (ret)
-				return dev_err_probe(dev, ret,
-						     "noise curve %zu has no knot domain\n",
-						     i);
-			ret = becore_noise_read_knot(curve->block,
-						     curve->y_first, index,
-						     &becore_noise_knots[i].y[index]);
-			if (ret)
-				return dev_err_probe(dev, ret,
-						     "noise curve %zu has no knot range\n",
-						     i);
+				return ret;
 		}
 		for (index = 1; index < BECORE_NOISE_KNOTS; index++) {
 			if (becore_noise_knots[i].x[index] <=
@@ -4350,20 +4421,11 @@ becore_noise_knots_for(const struct becore_device *becore, size_t curve_index,
 {
 	const struct becore_noise_curve *curve =
 		&becore_noise_curves[curve_index];
-	const struct exynos_becore_params_yuvnr *params = &becore->params.yuvnr;
-	const __s32 *range;
-	u32 index;
 
 	if (!curve->params_range || !becore->params.yuvnr_valid)
 		return &becore_noise_knots[curve_index];
 
-	range = (const __s32 *)((const u8 *)params + curve->params_range);
-	for (index = 0; index < BECORE_NOISE_KNOTS; index++) {
-		scratch->x[index] = clamp(params->std_lut_x[index], 0,
-					  BECORE_NOISE_KNOT_MAX);
-		scratch->y[index] = clamp(range[index], 0,
-					  BECORE_NOISE_KNOT_MAX);
-	}
+	becore_noise_knots_from_params(&becore->params.yuvnr, curve, scratch);
 
 	return scratch;
 }
@@ -5695,9 +5757,9 @@ static bool becore_yuvnr_gated(const struct exynos_becore_params_yuvnr *params,
  * that needed the driver to know which register that was would be a table with
  * a special case in the reader.
  *
- * `params` is what userspace most recently sent.  There is no NULL case here
- * and no default beside it: the words this block covers are still the recipe's
- * until a buffer arrives, and what a buffer does is win over them.
+ * `params` is what userspace most recently sent.  There is no NULL case: with
+ * no buffer in force the caller passes becore_yuvnr_off, so the default goes
+ * through this same arithmetic rather than through a second copy of it.
  */
 /*
  * The gain curve's last interval, which the hardware wants instead of its last
@@ -5926,20 +5988,6 @@ static int becore_yuvnr_value(const struct exynos_becore_params_yuvnr *params,
 
 	return 0;
 }
-
-/*
- * The tuning a stream with no parameters buffer runs on: nothing.  Every field
- * is zero, and the block's own inverted bypass turns that into the noise
- * reducer switched off, which is what the sharpener's default does too.
- *
- * Running the encode over a zeroed block rather than taking each entry's
- * constant -- which is how the sharpener produces its default -- is not a
- * stylistic difference.  This block has a field whose zero is *not* the
- * constant's: `enable` inverts, so the default has to go through the same
- * arithmetic a buffer does, and a default that read the constants would leave
- * the noise reducer running with no tuning at all.
- */
-static const struct exynos_becore_params_yuvnr becore_yuvnr_off;
 
 /*
  * What this block writes from outside the generated field table: bits ORed
@@ -7203,10 +7251,18 @@ static int becore_generated_value(const struct becore_device *becore,
 			break;
 		case BECORE_GEN_YUVNR:
 			/*
-			 * The same three the per-frame path uses, so the
-			 * default and a buffer of zeros cannot diverge: the
-			 * field table first, then the two derivations whose
-			 * registers the table does not hold.
+			 * The same three the per-frame path uses, in the same
+			 * order: the field table first, then the two
+			 * derivations whose registers the table does not hold.
+			 * So the default cannot diverge from what a buffer
+			 * holding the same values would produce.
+			 *
+			 * The noise reducer's default is not the sharpener's
+			 * all-zero parameter set, and cannot be: a domain of
+			 * eight zeros has no slopes, and
+			 * becore_params_check_yuvnr() refuses those same eight
+			 * from userspace. becore_yuvnr_off carries the
+			 * vendor's own curve there and zero everywhere else.
 			 */
 			if (becore_yuvnr_value(&becore_yuvnr_off, reg,
 					       &result) &&

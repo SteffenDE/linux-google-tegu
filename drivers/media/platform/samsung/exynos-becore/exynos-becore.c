@@ -2253,15 +2253,11 @@ static int becore_stream_crc_validate(struct device *dev)
 	return 0;
 }
 
+/* The array raster is becore_raster_validate()'s; this checks the profiles. */
 static int becore_input_profiles_validate(struct device *dev,
 					  const struct becore_raster *array)
 {
 	unsigned int i;
-
-	if (!array->width || !array->height || (array->width | array->height) & 1)
-		return dev_err_probe(dev, -EINVAL,
-				     "array raster %ux%u is not a whole number of Bayer quads\n",
-				     array->width, array->height);
 
 	for (i = 0; i < BECORE_RGBP_INPUT_PROFILE_COUNT; i++) {
 		const struct becore_rgbp_input_profile *profile =
@@ -2305,6 +2301,56 @@ static u32 becore_zoom_ratio(u32 in, u32 out)
 		return 0;
 
 	return (u32)div_u64((u64)in << BECORE_RATIO_SHIFT, out);
+}
+
+/*
+ * What a raster has to be before anything derives a register from it.  Every
+ * clause here is a silent failure rather than a loud one, which is why they
+ * are checked at all: none of them is reachable while the three rasters are
+ * probe-time constants, and all of them become reachable the moment something
+ * negotiates one.
+ *
+ * An extent has to fit the 16-bit half becore_pack_size() puts it in.  At
+ * 65536 the shift walks into the other half instead of overflowing: an array
+ * that wide encodes chain_src_img_size as 0x00000c30, a zero width, and no
+ * register write fails.
+ *
+ * An odd extent has no whole last pair of anything.  The array is read out in
+ * Bayer quads, the chain is the 4:2:0 surface YUVP writes and GTNR and MCSC
+ * read back, and the scaled output is NV21 -- all three side their chroma on a
+ * 2x2 grid the last row or column would fall off.
+ */
+#define BECORE_RASTER_EXTENT_MAX	U16_MAX
+
+/*
+ * The array's bound is tighter, and it comes from the two blocks that state a
+ * radial fall-off centre.  BYR_DNS writes -(array extent / 2) and YUVNR writes
+ * -(crop extent / 2), both into a 15-bit signed field, so the largest array
+ * either can describe is twice that field's negative span.  The crop is cut
+ * out of the array, so bounding the array bounds YUVNR's copy with it.
+ */
+#define BECORE_ARRAY_EXTENT_MAX		(BECORE_RGBP_DNS_CENTRE_MASK + 1)
+
+/* One bound, so the two fields it is the bound for have to be one width. */
+static_assert(BECORE_YUVNR_CENTRE_MASK == BECORE_RGBP_DNS_CENTRE_MASK);
+
+static int becore_raster_validate(struct device *dev, const char *name,
+				  const struct becore_raster *raster, u32 max)
+{
+	if (!raster->width || !raster->height)
+		return dev_err_probe(dev, -EINVAL,
+				     "%s raster %ux%u has a zero extent\n",
+				     name, raster->width, raster->height);
+	if ((raster->width | raster->height) & 1)
+		return dev_err_probe(dev, -EINVAL,
+				     "%s raster %ux%u has an odd extent\n",
+				     name, raster->width, raster->height);
+	if (raster->width > max || raster->height > max)
+		return dev_err_probe(dev, -EINVAL,
+				     "%s raster %ux%u exceeds %u\n",
+				     name, raster->width, raster->height, max);
+
+	return 0;
 }
 
 /*
@@ -4771,10 +4817,12 @@ static const u16 becore_yuvnr_radii[] = {
 };
 
 /*
- * The square is a u64 and the root comes from int_sqrt64() because the rasters
- * here are not this driver's to bound: they come from a profile table, and a
- * profile with a dimension past 46,341 would overflow a u32 square silently
- * and pick a bucket from a wrapped radius. The correction below is exact
+ * The square is a u64 and the root comes from int_sqrt64(). becore_raster_
+ * validate() now bounds the array to 32768 and the crop is cut out of it, so a
+ * u32 square would no longer wrap -- 46,341 is where it would -- but the width
+ * this takes is an argument rather than a raster, and a caller that reaches it
+ * with something wider should get a bucket rather than a wrapped radius. The
+ * correction below is exact
  * round-to-nearest -- `square - root * root > root` is `square >= root^2 +
  * root + 1`, which is `sqrt(square) >= root + 0.5` -- and a tie cannot happen,
  * since `(root + 0.5)^2` is never an integer.
@@ -9369,7 +9417,7 @@ static int becore_alloc_cmdq_program(struct becore_device *becore,
 
 static int becore_alloc_diagnostic(struct becore_device *becore)
 {
-	size_t output_size = becore_yuvp_output_allocation_size(&becore->chain);
+	size_t output_size;
 	int ret;
 
 	ret = becore_yuvnr_table_validate(becore->dev);
@@ -9391,9 +9439,23 @@ static int becore_alloc_diagnostic(struct becore_device *becore)
 	ret = becore_generated_tables_validate(becore->dev);
 	if (ret)
 		return ret;
+	ret = becore_raster_validate(becore->dev, "array", &becore->array,
+				     BECORE_ARRAY_EXTENT_MAX);
+	if (ret)
+		return ret;
+	ret = becore_raster_validate(becore->dev, "chain", &becore->chain,
+				     BECORE_RASTER_EXTENT_MAX);
+	if (ret)
+		return ret;
+	ret = becore_raster_validate(becore->dev, "scaled", &becore->scaled,
+				     BECORE_RASTER_EXTENT_MAX);
+	if (ret)
+		return ret;
 	ret = becore_input_profiles_validate(becore->dev, &becore->array);
 	if (ret)
 		return ret;
+	/* Every size below is derived, so none of them is taken any earlier. */
+	output_size = becore_yuvp_output_allocation_size(&becore->chain);
 	ret = becore_stream_crc_validate(becore->dev);
 	if (ret)
 		return ret;
@@ -13222,8 +13284,6 @@ static int becore_probe(struct platform_device *pdev)
 	becore->active_input_profile = BECORE_RGBP_INPUT_SBWC;
 	becore->active_output_profile = BECORE_YUVP_OUTPUT_SBWCL;
 	becore->votf = 1;
-	becore->active_output_size = becore_active_output_size(becore);
-	becore->active_capture_size = becore_mcsc_output_active_size(&becore->scaled);
 	becore->blocks[BECORE_RGBP] = (struct becore_block) {
 		.becore = becore,
 		.name = "RGBP",
@@ -13285,6 +13345,10 @@ static int becore_probe(struct platform_device *pdev)
 	ret = becore_alloc_diagnostic(becore);
 	if (ret)
 		return ret;
+	/* Derived from the three rasters, so after the check on them. */
+	becore->active_output_size = becore_active_output_size(becore);
+	becore->active_capture_size =
+		becore_mcsc_output_active_size(&becore->scaled);
 	becore->active_output_dma = becore->output.dma;
 
 	ret = devm_pm_runtime_enable(dev);

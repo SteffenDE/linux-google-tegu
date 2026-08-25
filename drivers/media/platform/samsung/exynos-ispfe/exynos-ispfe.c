@@ -23,6 +23,7 @@
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/media/samsung/exynos-ispfe-config.h>
+#include <media/v4l2-isp.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -1256,6 +1257,7 @@ struct ispfe_device {
 	/* The statistics metadata node, and the private areas that feed it. */
 	struct video_device stats_vdev;
 	struct media_pad stats_pad;
+	struct media_pad params_pad;
 	struct vb2_queue stats_queue;
 	/*
 	 * The statistics queue's own lock, because that queue can be started
@@ -1270,6 +1272,18 @@ struct ispfe_device {
 	struct list_head stats_free;
 	struct list_head stats_captured;
 	bool stats_streaming;
+
+	/*
+	 * The parameters node, which is one block type deep: LMP's white
+	 * balance gains.  A buffer is consumed by the next program encode
+	 * rather than by a frame, which is the same thing -- the front end
+	 * encodes one program per frame.
+	 */
+	struct video_device params_vdev;
+	struct mutex params_lock;
+	struct vb2_queue params_queue;
+	struct list_head params_pending;
+	bool params_streaming;
 	u32 stats_published;
 	u32 stats_empty;
 	u32 stats_dropped;
@@ -3156,6 +3170,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	return 0;
 }
 
+static void ispfe_params_consume(struct ispfe_device *ispfe);
+
 static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 {
 	for (;;) {
@@ -3231,6 +3247,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 		if (!ret) {
 			acquired = true;
 			stats = ispfe_stats_take(ispfe, program_slot);
+			ispfe_params_consume(ispfe);
 			ret = ispfe_pdma_encode(ispfe, program_slot,
 						ispfe->frame_dma,
 						buf->ticket.dma, stats);
@@ -5991,6 +6008,14 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 
 		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
 		stats = ispfe_stats_take(ispfe, slot);
+		/*
+		 * The raw recipes carry no white balance stage, so a parameters
+		 * buffer changes nothing here.  It is still consumed, because a
+		 * buffer that is never taken is a DQBUF that never returns --
+		 * and userspace has no way to know which program a stream
+		 * picked.
+		 */
+		ispfe_params_consume(ispfe);
 		ret = ispfe_pdma_encode(ispfe, slot, dma,
 					ispfe->backend_buffer.dma, stats);
 		if (ret) {
@@ -6686,6 +6711,421 @@ static const struct video_device ispfe_stats_template = {
 	.vfl_dir = VFL_DIR_RX,
 };
 
+/* ---- the parameters node ------------------------------------------------ */
+
+/*
+ * The front end's tuning is a captured vendor program, and this is the first
+ * piece of it that userspace states instead: LMP's white balance gains.
+ *
+ * They are the piece that has to move, because white balance is an estimate of
+ * the illuminant and nothing else in the system can make it.  They are also
+ * the cheapest, because the driver already states them rather than replaying
+ * them -- ispfe_pdma_apply_wbg() has written them into the program from
+ * ispfe->active_lmp_wbg since the encoder existed, and all this adds is a way
+ * for that value to come from outside.
+ *
+ * A buffer is taken by the next program encode, and the front end encodes one
+ * program per frame, so a gain set here reaches the frame after next.  That is
+ * the same latency the sensor's own controls have and for the same reason.
+ */
+
+struct ispfe_params_buffer {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+	/*
+	 * A driver-owned copy of the buffer, because the plane is userspace's
+	 * memory and it can rewrite it between the validator's read and the
+	 * walk's -- and between the walk's and any later one.  A size rewritten
+	 * to zero after validation makes the walk's `offset += header->size`
+	 * stand still, which is an unkillable loop inside QBUF holding the
+	 * queue's own lock.  Validate the copy, walk the copy.
+	 */
+	struct v4l2_isp_params_buffer *config;
+	/* What the walk resolved, which is what an encode will program. */
+	struct ispfe_lmp_wbg_profile wbg;
+	bool has_wbg;
+	bool restore_default;
+};
+
+static struct ispfe_params_buffer *
+to_ispfe_params_buffer(struct vb2_v4l2_buffer *vbuf)
+{
+	return container_of(vbuf, struct ispfe_params_buffer, vb);
+}
+
+static const struct v4l2_isp_params_block_type_info
+ispfe_params_block_info[] = {
+	[EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE] = {
+		.size = sizeof(struct exynos_ispfe_params_white_balance),
+	},
+};
+
+static_assert(ARRAY_SIZE(ispfe_params_block_info) ==
+	      EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL);
+
+#define ISPFE_PARAMS_BUFFER_SIZE \
+	v4l2_isp_params_buffer_size(EXYNOS_ISPFE_PARAMS_MAX_SIZE)
+
+/*
+ * A gain of zero is a channel switched off rather than balanced, and the upper
+ * bound is defect pixel correction's: it takes the red and blue gains rounded
+ * to Q7 into a ten-bit field, so a larger one cannot be described to it and
+ * ispfe_pdma_apply_dpc() would refuse the frame.  Refusing the buffer instead
+ * says which one was wrong.
+ */
+static int ispfe_params_check_wb(struct device *dev,
+				 const struct exynos_ispfe_params_white_balance *wb)
+{
+	unsigned int i;
+
+	for (i = 0; i < EXYNOS_ISPFE_WB_GAINS; i++) {
+		if (wb->gains[i] < 1 ||
+		    wb->gains[i] > EXYNOS_ISPFE_WB_GAIN_MAX) {
+			dev_dbg(dev,
+				"white balance gain %u is %u, outside 1..%u\n",
+				i, wb->gains[i], EXYNOS_ISPFE_WB_GAIN_MAX);
+			return -ERANGE;
+		}
+	}
+
+	return 0;
+}
+
+static int ispfe_params_walk(struct ispfe_device *ispfe,
+			     const struct v4l2_isp_params_buffer *config,
+			     struct ispfe_params_buffer *buf)
+{
+	size_t offset = 0;
+
+	while (offset < config->data_size) {
+		const struct v4l2_isp_params_block_header *header =
+			(const struct v4l2_isp_params_block_header *)
+			(config->data + offset);
+
+		switch (header->type) {
+		case EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE: {
+			const struct exynos_ispfe_params_white_balance *wb =
+				(const struct exynos_ispfe_params_white_balance *)header;
+			int ret;
+
+			/*
+			 * A disabled block asks for the driver's default back
+			 * rather than for white balance to stop, so it carries
+			 * no values and none are checked.  Which default that
+			 * is depends on the program a stream selects, and no
+			 * stream need have started when this runs -- ispfe->prog
+			 * is NULL until the first one -- so the block is
+			 * recorded as a request and resolved at the encode,
+			 * where a program exists by construction.
+			 */
+			if (header->flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) {
+				buf->restore_default = true;
+				break;
+			}
+
+			ret = ispfe_params_check_wb(ispfe->dev, wb);
+			if (ret)
+				return ret;
+
+			buf->wbg.red = wb->gains[EXYNOS_ISPFE_WB_RED];
+			buf->wbg.green_red = wb->gains[EXYNOS_ISPFE_WB_GREEN_RED];
+			buf->wbg.green_blue = wb->gains[EXYNOS_ISPFE_WB_GREEN_BLUE];
+			buf->wbg.blue = wb->gains[EXYNOS_ISPFE_WB_BLUE];
+			buf->has_wbg = true;
+			break;
+		}
+		default:
+			return -EINVAL;
+		}
+
+		offset += header->size;
+	}
+
+	return 0;
+}
+
+/*
+ * Take the earliest buffer waiting and make it the live state, if one is
+ * waiting.  Called from the encode paths, which run once per frame.
+ *
+ * The buffer is taken *and completed* inside one hold of ispfe->slock, gated
+ * on params_streaming, and that is the whole of the correctness argument:
+ * completing it after dropping the lock lets stop_streaming() run in between,
+ * find the list already empty and return, leaving a buffer active past it --
+ * which is the one thing vb2 forbids there.  vb2_buffer_done() takes only the
+ * queue's own done_lock and is IRQ-safe, so there is no inversion to avoid;
+ * ispfe_stats_return_all() completes under this same lock.
+ */
+static void ispfe_params_consume(struct ispfe_device *ispfe)
+{
+	struct ispfe_params_buffer *buf;
+
+	guard(spinlock_irqsave)(&ispfe->slock);
+
+	if (!ispfe->params_streaming)
+		return;
+
+	buf = list_first_entry_or_null(&ispfe->params_pending,
+				       struct ispfe_params_buffer, list);
+	if (!buf)
+		return;
+
+	list_del(&buf->list);
+
+	/*
+	 * Resolved here rather than at buf_prepare, because which default
+	 * applies is the running program's and no program need have existed
+	 * then.  A program without white balance at all -- the raw recipes --
+	 * has no default to restore and the request is dropped, which is the
+	 * same nothing the gains themselves would do there.
+	 */
+	if (buf->restore_default && ispfe->prog && ispfe->prog->lmp_wbg)
+		ispfe->active_lmp_wbg = *ispfe->prog->lmp_wbg;
+	else if (buf->has_wbg)
+		ispfe->active_lmp_wbg = buf->wbg;
+
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
+static void ispfe_params_return_all(struct ispfe_device *ispfe,
+				    enum vb2_buffer_state state)
+{
+	struct ispfe_params_buffer *buf;
+	struct ispfe_params_buffer *tmp;
+
+	guard(spinlock_irqsave)(&ispfe->slock);
+
+	list_for_each_entry_safe(buf, tmp, &ispfe->params_pending, list) {
+		list_del(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+}
+
+static int ispfe_params_buf_init(struct vb2_buffer *vb)
+{
+	struct ispfe_params_buffer *buf =
+		to_ispfe_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	buf->config = kvmalloc(ISPFE_PARAMS_BUFFER_SIZE, GFP_KERNEL);
+	if (!buf->config)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void ispfe_params_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct ispfe_params_buffer *buf =
+		to_ispfe_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	kvfree(buf->config);
+	buf->config = NULL;
+}
+
+static int ispfe_params_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
+				    unsigned int *nplanes, unsigned int sizes[],
+				    struct device *alloc_devs[])
+{
+	if (*nplanes) {
+		if (*nplanes != 1 || sizes[0] < ISPFE_PARAMS_BUFFER_SIZE)
+			return -EINVAL;
+		return 0;
+	}
+
+	*nplanes = 1;
+	sizes[0] = ISPFE_PARAMS_BUFFER_SIZE;
+
+	return 0;
+}
+
+static int ispfe_params_buf_prepare(struct vb2_buffer *vb)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(vb->vb2_queue);
+	struct ispfe_params_buffer *buf =
+		to_ispfe_params_buffer(to_vb2_v4l2_buffer(vb));
+	const struct v4l2_isp_params_buffer *config = buf->config;
+	int ret;
+
+	ret = v4l2_isp_params_validate_buffer_size(ispfe->dev, vb,
+						   ISPFE_PARAMS_BUFFER_SIZE);
+	if (ret)
+		return ret;
+
+	/* Validate what will be programmed, not what may change underneath. */
+	memcpy(buf->config, vb2_plane_vaddr(vb, 0), ISPFE_PARAMS_BUFFER_SIZE);
+
+	buf->has_wbg = false;
+	buf->restore_default = false;
+
+	/*
+	 * A buffer carrying no blocks changes nothing and has nothing in it to
+	 * check, which is what an all-zero buffer is -- what a queue's own
+	 * buffers hold before anyone fills them, and what v4l2-compliance
+	 * queues.
+	 */
+	if (config->version != V4L2_ISP_PARAMS_VERSION_V0 &&
+	    config->version != V4L2_ISP_PARAMS_VERSION_V1)
+		return -EINVAL;
+	if (!config->data_size)
+		return 0;
+
+	ret = v4l2_isp_params_validate_buffer(ispfe->dev, vb, config,
+					      ispfe_params_block_info,
+					      ARRAY_SIZE(ispfe_params_block_info));
+	if (ret)
+		return ret;
+
+	/*
+	 * Nothing is programmed here and the values are copied out rather than
+	 * read later, because the buffer is userspace's memory and can change
+	 * under the encode that would otherwise read it.
+	 */
+	return ispfe_params_walk(ispfe, config, buf);
+}
+
+static void ispfe_params_buf_queue(struct vb2_buffer *vb)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(vb->vb2_queue);
+	struct ispfe_params_buffer *buf =
+		to_ispfe_params_buffer(to_vb2_v4l2_buffer(vb));
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		list_add_tail(&buf->list, &ispfe->params_pending);
+}
+
+static int ispfe_params_start_streaming(struct vb2_queue *q,
+					unsigned int count)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		ispfe->params_streaming = true;
+
+	return 0;
+}
+
+static void ispfe_params_stop_streaming(struct vb2_queue *q)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		ispfe->params_streaming = false;
+
+	ispfe_params_return_all(ispfe, VB2_BUF_STATE_ERROR);
+}
+
+static const struct vb2_ops ispfe_params_vb2_ops = {
+	.queue_setup = ispfe_params_queue_setup,
+	.buf_init = ispfe_params_buf_init,
+	.buf_cleanup = ispfe_params_buf_cleanup,
+	.buf_prepare = ispfe_params_buf_prepare,
+	.buf_queue = ispfe_params_buf_queue,
+	.start_streaming = ispfe_params_start_streaming,
+	.stop_streaming = ispfe_params_stop_streaming,
+};
+
+static int ispfe_params_querycap(struct file *file, void *priv,
+				 struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, "exynos-ispfe", sizeof(cap->driver));
+	strscpy(cap->card, "zumapro ISPFE parameters", sizeof(cap->card));
+
+	return 0;
+}
+
+static int ispfe_params_g_fmt(struct file *file, void *priv,
+			      struct v4l2_format *f)
+{
+	memset(&f->fmt.meta, 0, sizeof(f->fmt.meta));
+	f->fmt.meta.dataformat = V4L2_META_FMT_ISPFE_PARAMS;
+	f->fmt.meta.buffersize = ISPFE_PARAMS_BUFFER_SIZE;
+
+	return 0;
+}
+
+static int ispfe_params_enum_fmt(struct file *file, void *priv,
+				 struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_META_FMT_ISPFE_PARAMS;
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops ispfe_params_ioctl_ops = {
+	.vidioc_querycap = ispfe_params_querycap,
+	.vidioc_enum_fmt_meta_out = ispfe_params_enum_fmt,
+	.vidioc_g_fmt_meta_out = ispfe_params_g_fmt,
+	.vidioc_s_fmt_meta_out = ispfe_params_g_fmt,
+	.vidioc_try_fmt_meta_out = ispfe_params_g_fmt,
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static const struct video_device ispfe_params_template = {
+	.name = "exynos-ispfe parameters",
+	.fops = &ispfe_fops,
+	.ioctl_ops = &ispfe_params_ioctl_ops,
+	.release = video_device_release_empty,
+	.device_caps = V4L2_CAP_META_OUTPUT | V4L2_CAP_STREAMING,
+	.vfl_dir = VFL_DIR_TX,
+};
+
+/* No link into the graph, for the reason the statistics node has none. */
+static int ispfe_params_register(struct ispfe_device *ispfe)
+{
+	struct vb2_queue *q = &ispfe->params_queue;
+	int ret;
+
+	INIT_LIST_HEAD(&ispfe->params_pending);
+
+	q->type = V4L2_BUF_TYPE_META_OUTPUT;
+	q->io_modes = VB2_MMAP;
+	q->drv_priv = ispfe;
+	q->ops = &ispfe_params_vb2_ops;
+	q->mem_ops = &vb2_vmalloc_memops;
+	q->buf_struct_size = sizeof(struct ispfe_params_buffer);
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->lock = &ispfe->params_lock;
+	q->dev = ispfe->dev;
+	q->min_queued_buffers = 0;
+
+	ret = vb2_queue_init(q);
+	if (ret)
+		return ret;
+
+	ispfe->params_vdev = ispfe_params_template;
+	ispfe->params_vdev.v4l2_dev = &ispfe->v4l2_dev;
+	ispfe->params_vdev.queue = q;
+	ispfe->params_vdev.lock = &ispfe->params_lock;
+	ispfe->params_vdev.entity.function = MEDIA_ENT_F_IO_V4L;
+	video_set_drvdata(&ispfe->params_vdev, ispfe);
+
+	ispfe->params_pad.flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&ispfe->params_vdev.entity, 1,
+				     &ispfe->params_pad);
+	if (ret)
+		return ret;
+
+	ret = video_register_device(&ispfe->params_vdev, VFL_TYPE_VIDEO, -1);
+	if (ret) {
+		media_entity_cleanup(&ispfe->params_vdev.entity);
+		return ret;
+	}
+
+	return 0;
+}
+
 /*
  * No link into the graph.  The pad the capture node hangs off carries Bayer to
  * that node, and a second enabled link from it would put this node into the
@@ -7178,6 +7618,10 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_vdev;
 
+	ret = ispfe_params_register(ispfe);
+	if (ret)
+		goto err_stats;
+
 	/*
 	 * The whole back end joins this graph -- its input off the same source
 	 * pad the raw node hangs from, since the side output and the raw output
@@ -7190,7 +7634,7 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 						 &ispfe->sd.entity,
 						 ISPFE_PAD_SOURCE);
 	if (ret)
-		goto err_stats;
+		goto err_params;
 
 	v4l2_async_nf_init(&ispfe->notifier, &ispfe->v4l2_dev);
 	asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
@@ -7214,6 +7658,9 @@ err_nf:
 	/* Sever the callbacks before the node whose teardown can raise one. */
 	exynos_becore_input_disconnect(ispfe->backend_input);
 	exynos_becore_input_unregister_graph(ispfe->backend_input);
+err_params:
+	vb2_video_unregister_device(&ispfe->params_vdev);
+	media_entity_cleanup(&ispfe->params_vdev.entity);
 err_stats:
 	/* Releases the queue too, which a bare unregister would not. */
 	vb2_video_unregister_device(&ispfe->stats_vdev);
@@ -7248,6 +7695,7 @@ static void ispfe_media_unregister(struct ispfe_device *ispfe)
 	 * is what releases the areas it is fed from.
 	 */
 	vb2_video_unregister_device(&ispfe->vdev);
+	vb2_video_unregister_device(&ispfe->params_vdev);
 	vb2_video_unregister_device(&ispfe->stats_vdev);
 	/* The capture teardown above can have scheduled it one last time. */
 	cancel_work_sync(&ispfe->stats_work);
@@ -7256,6 +7704,7 @@ static void ispfe_media_unregister(struct ispfe_device *ispfe)
 	/* Before the media device goes, since it holds the back end's three. */
 	exynos_becore_input_unregister_graph(ispfe->backend_input);
 	media_device_unregister(&ispfe->mdev);
+	media_entity_cleanup(&ispfe->params_vdev.entity);
 	media_entity_cleanup(&ispfe->stats_vdev.entity);
 	media_entity_cleanup(&ispfe->vdev.entity);
 	v4l2_device_unregister_subdev(&ispfe->sd);
@@ -7375,6 +7824,10 @@ static int ispfe_probe(struct platform_device *pdev)
 	ret = devm_mutex_init(dev, &ispfe->lock);
 	if (ret)
 		return ret;
+	ret = devm_mutex_init(dev, &ispfe->params_lock);
+	if (ret)
+		return ret;
+
 	ret = devm_mutex_init(dev, &ispfe->stats_lock);
 	if (ret)
 		return ret;

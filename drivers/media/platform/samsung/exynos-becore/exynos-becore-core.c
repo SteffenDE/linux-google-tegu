@@ -2228,6 +2228,13 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	 * them from DRAM, and no CPU mapping was read or written in between.
 	 */
 	slot->buffer.staged_bytes = slot->buffer.size;
+	/*
+	 * The producer's raster and not becore->array, which the offline loop
+	 * may have set to something else entirely.  A frame is at the raster
+	 * whoever wrote it wrote it at, and the run refuses to encode for any
+	 * other -- see becore_recipe_validate().
+	 */
+	slot->raster = becore->producer_array;
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
 	slot->state = BECORE_INPUT_READY;
@@ -2831,6 +2838,13 @@ static int becore_probe(struct platform_device *pdev)
 	 */
 	becore->array.width = BECORE_ARRAY_WIDTH;
 	becore->array.height = BECORE_ARRAY_HEIGHT;
+	/*
+	 * Until a stream reads the sink pad this is the only thing said about
+	 * what the producer sends, and it is more than a guess: the producer
+	 * checks the length of the slots it is handed against its own constant
+	 * at its probe, and that length is this raster's.
+	 */
+	becore->producer_array = becore->array;
 	becore->chain.width = BECORE_CHAIN_WIDTH;
 	becore->chain.height = BECORE_CHAIN_HEIGHT;
 	becore->scaled.width = BECORE_OUTPUT_WIDTH;

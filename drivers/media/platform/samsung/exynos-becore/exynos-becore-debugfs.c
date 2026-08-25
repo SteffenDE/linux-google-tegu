@@ -15,11 +15,14 @@
  * this back end's register arithmetic has been settled by comparing those
  * bytes against the vendor's own captured programs.
  *
- * Two of the files write rather than read.  becore_geometry_apply() takes the
- * chain and scaled rasters apart and puts them back, which is what turned a
- * failure at a second geometry from three unknowns into one echo each; the
- * override file substitutes a register's value into every record, which is how
- * a field's meaning gets swept when no capture distinguishes the candidates.
+ * Three of them change how a program is encoded rather than supplying one or
+ * reading one back.  becore_geometry_apply() takes the three rasters apart and
+ * puts them back, which is what turned a failure at a second geometry from
+ * three unknowns into one echo each; bayer_phase states the mosaic the staged
+ * frame was read out on, which is the one thing about it the loop cannot work
+ * out for itself; the override file substitutes a register's value into every
+ * record, which is how a field's meaning gets swept when no capture
+ * distinguishes the candidates.
  */
 
 #include <linux/array_size.h>
@@ -1266,6 +1269,113 @@ static const struct file_operations becore_geometry_fops = {
 	.release = single_release,
 };
 
+/*
+ * The mosaic's phase: which quad of the Bayer pattern is red.  Two registers
+ * take it, BYR_DNS's and BYR_DMSC's, and it decides what the demosaic reads as
+ * colour -- so a wrong one is not a subtle error.
+ *
+ * It belongs to the producer whenever a stream starts:
+ * becore_latch_input_format() takes it off the sink pad at STREAMON and puts
+ * it back if the stream does not start.  Where it differs from the array
+ * raster, which is latched by the same function, is what it does with no
+ * producer on the pad -- the raster stays as it is, because it has to describe
+ * the input slots whether anything is attached or not, and the mosaic returns
+ * to the compiled-in default, because a mosaic without a frame describes
+ * nothing.  So a phase written here holds until something latches, and a
+ * stream that ran leaves the producer's behind rather than this one.
+ *
+ * What this file is for is the offline loop, which has no producer to ask and
+ * until now had only that default -- the ultrawide's.  The captured corpus is
+ * three cameras reading out on three different phases, so replaying another
+ * camera's frame reproduced its whole program except this one word.
+ *
+ * The phase is written and the media-bus code is printed beside it, because
+ * the code is what the pad reports and the phase is what the register takes,
+ * and a file that showed only one of them would leave the other to be worked
+ * out by hand at exactly the moment the two are being compared.
+ *
+ * What this cannot check is whether the phase is the frame's.  A raster can be
+ * held against the staged frame's length; nothing in a Bayer frame says which
+ * quad it started on, so the only statement of that is the provenance of the
+ * file that was staged.  Whoever stages a frame states its phase, and the
+ * driver takes their word for it.
+ */
+static int becore_bayer_phase_show(struct seq_file *s, void *unused)
+{
+	struct becore_device *becore = s->private;
+
+	mutex_lock(&becore->lock);
+	seq_printf(s, "%d 0x%04x\n", becore_bayer_phase(becore->input_code),
+		   becore->input_code);
+	mutex_unlock(&becore->lock);
+
+	return 0;
+}
+
+static int becore_bayer_phase_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, becore_bayer_phase_show, inode->i_private);
+}
+
+static ssize_t becore_bayer_phase_write(struct file *file,
+					const char __user *buf, size_t count,
+					loff_t *ppos)
+{
+	struct becore_device *becore =
+		((struct seq_file *)file->private_data)->private;
+	char text[32];
+	char *line;
+	u32 phase;
+	u32 code;
+	int ret = 0;
+
+	if (count >= sizeof(text))
+		return -EFBIG;
+	if (copy_from_user(text, buf, count))
+		return -EFAULT;
+	text[count] = '\0';
+	line = strim(text);
+	/* As the geometry file: busybox writes the trailing newline on its own. */
+	if (!*line)
+		return count;
+	/*
+	 * kstrtou32() rather than the sscanf() the geometry file parses with,
+	 * and the difference matters here: sscanf("%u") drops the overflow and
+	 * hands back the wrapped value, so 4294967296 would arrive as a valid
+	 * phase 0 rather than as a refusal.  A wrapped raster is refused by the
+	 * bounds it then has to pass; a wrapped phase is one of the four.  Its
+	 * error code goes back as it stands, so a value too large to be a phase
+	 * is -ERANGE and a value that is not a number is -EINVAL.
+	 */
+	ret = kstrtou32(line, 10, &phase);
+	if (ret)
+		return ret;
+	code = becore_bayer_code(phase);
+	if (!code) {
+		dev_err(becore->dev,
+			"%u is not one of the four Bayer phases\n", phase);
+		return -EINVAL;
+	}
+
+	mutex_lock(&becore->lock);
+	if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else
+		becore->input_code = code;
+	mutex_unlock(&becore->lock);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations becore_bayer_phase_fops = {
+	.owner = THIS_MODULE,
+	.open = becore_bayer_phase_open,
+	.read = seq_read,
+	.write = becore_bayer_phase_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int becore_stream_crc_show(struct seq_file *s, void *unused)
 {
 	struct becore_device *becore = s->private;
@@ -1331,6 +1441,8 @@ int becore_debugfs_init(struct becore_device *becore)
 			    &becore_override_fops);
 	debugfs_create_file("geometry", 0600, dir, becore,
 			    &becore_geometry_fops);
+	debugfs_create_file("bayer_phase", 0600, dir, becore,
+			    &becore_bayer_phase_fops);
 	debugfs_create_u32("input_profile", 0644, dir,
 			   &becore->input_profile);
 	debugfs_create_u32("votf", 0644, dir, &becore->votf);

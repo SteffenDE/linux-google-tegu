@@ -73,22 +73,36 @@ distinct structs, or "blocks", which userspace appends to the data member of
 populate the type member with a value from
 :c:type:`exynos_ispfe_params_block_type`.
 
-One block type exists so far: the white balance gains the front end applies
-before it meters, which are therefore both what balances the picture and what
-the two grids above are measured through. Nothing about them is knowable to the
-kernel -- they are an estimate of the illuminant, which is what an AWB
-algorithm exists to make -- so until a buffer carries one the driver applies
-the gains its captured program was taken with.
+Two block types exist, and both carry what only an algorithm can decide.
+
+:c:type:`exynos_ispfe_params_white_balance` carries the gains the front end
+applies before it meters, which are therefore both what balances the picture
+and what the two grids above are measured through. Nothing about them is
+knowable to the kernel -- they are an estimate of the illuminant, which is what
+an AWB algorithm exists to make -- so until a buffer carries one the driver
+applies the gains its captured program was taken with.
+
+:c:type:`exynos_ispfe_params_metering` carries what the two grids *count*: the
+sample thresholds above and below which a sample is recorded as saturated or
+dark instead of being summed, and the luma window the white balance grid gates
+on. The grids exclude samples rather than clamping them, so these decide what
+the sums and counts in :c:type:`exynos_ispfe_stats_buffer` are a mean of, and
+an algorithm that cannot set them is metering through someone else's choice.
+What the block does *not* carry is the region geometry: the 64 x 48 regions and
+the cell size that tiles them over the sensor are derived from the format
+rather than chosen.
 
 A buffer is taken by the next program encode and the front end encodes one
-program per frame, so a gain reaches the frame after next: the same latency the
-sensor's own controls have, and for the same reason.
+program per frame, so a value reaches the frame after next: the same latency
+the sensor's own controls have, and for the same reason.
 
 The driver rejects a buffer at :c:func:`VIDIOC_QBUF` if a gain is outside
-``1 .. EXYNOS_ISPFE_WB_GAIN_MAX``, so a mistake is reported against the buffer
-that carried it. A block sent with ``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns
-the gains to the driver's default rather than switching white balance off; it
-carries no values, and none are checked.
+``1 .. EXYNOS_ISPFE_WB_GAIN_MAX``, if a metering dark threshold is above its
+own saturation threshold, or if the luma window is inverted -- so a mistake is
+reported against the buffer that carried it. A block sent with
+``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns that part of the configuration to
+the driver's default rather than switching the stage off; it carries no values,
+and none are checked.
 
 .. code-block:: c
 
@@ -115,6 +129,28 @@ carries no values, and none are checked.
 
 	data += sizeof(struct exynos_ispfe_params_white_balance);
 	params->data_size += sizeof(struct exynos_ispfe_params_white_balance);
+
+	struct exynos_ispfe_params_metering *met =
+		(struct exynos_ispfe_params_metering *)data;
+
+	met->header.type = EXYNOS_ISPFE_PARAM_BLOCK_METERING;
+	met->header.flags |= V4L2_ISP_PARAMS_FL_BLOCK_ENABLE;
+	met->header.size = sizeof(struct exynos_ispfe_params_metering);
+
+	/* Count everything the sensor can produce, on both grids. */
+	met->awb_saturation_threshold = EXYNOS_ISPFE_METERING_SAMPLE_MAX;
+	met->awb_dark_threshold = EXYNOS_ISPFE_METERING_EXCLUDE_NONE;
+	met->ae_saturation_threshold = EXYNOS_ISPFE_METERING_SAMPLE_MAX;
+	met->ae_dark_threshold = EXYNOS_ISPFE_METERING_EXCLUDE_NONE;
+
+	/* An unweighted luma, gated over its whole range. */
+	for (unsigned int i = 0; i < EXYNOS_ISPFE_WB_GAINS; i++)
+		met->awb_luma_coeff[i] = EXYNOS_ISPFE_METERING_LUMA_ONE / 4;
+	met->awb_luma_threshold_low = 0;
+	met->awb_luma_threshold_high = EXYNOS_ISPFE_METERING_LUMA_MAX;
+
+	data += sizeof(struct exynos_ispfe_params_metering);
+	params->data_size += sizeof(struct exynos_ispfe_params_metering);
 
 The ``bytesused`` field of the queued buffer must be the size of
 :c:type:`v4l2_isp_params_buffer` plus ``data_size``.

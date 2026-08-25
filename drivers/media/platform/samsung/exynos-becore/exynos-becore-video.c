@@ -186,6 +186,18 @@ static int becore_latch_input_format(struct becore_device *becore)
 
 	becore->input_code = format.code;
 	becore->array = array;
+	/*
+	 * And what a frame the producer hands over will be stamped with, which
+	 * is why this is unwound with the other two when a stream does not
+	 * start.  The check above is a length -- it is the only thing this
+	 * driver can hold a pad's raster to -- and a length does not
+	 * distinguish two array widths inside one 256-column bucket.  So the
+	 * pad *can* report a raster the producer then refuses to send, and
+	 * every path where that happens is a path that fails below.  Keeping
+	 * what was reported would leave the stamp naming a raster the producer
+	 * has just said it does not write.
+	 */
+	becore->producer_array = array;
 
 	return 0;
 }
@@ -568,11 +580,13 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct exynos_becore_input_stream_config stream_config;
 	struct exynos_becore_input *input;
 	struct becore_raster was_array;
+	struct becore_raster was_producer_array;
 	u32 was_code;
 	int ret;
 
 	mutex_lock(&becore->lock);
 	was_array = becore->array;
+	was_producer_array = becore->producer_array;
 	was_code = becore->input_code;
 	if (becore->video_streaming || becore->running) {
 		ret = -EBUSY;
@@ -646,6 +660,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		 * read out.
 		 */
 		becore->array = was_array;
+		becore->producer_array = was_producer_array;
 		becore->input_code = was_code;
 		becore_stream_power_put(becore);
 		mutex_unlock(&becore->lock);
@@ -663,6 +678,7 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	} else {
 		/* The producer went away under the dropped lock; same rule. */
 		becore->array = was_array;
+		becore->producer_array = was_producer_array;
 		becore->input_code = was_code;
 		ret = -ENODEV;
 	}
@@ -698,6 +714,7 @@ unlock:
 	 * swapped and nothing saying so.
 	 */
 	becore->array = was_array;
+	becore->producer_array = was_producer_array;
 	becore->input_code = was_code;
 	mutex_unlock(&becore->lock);
 	becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);

@@ -3477,7 +3477,17 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 				 struct ispfe_lmp_wbg_profile *wbg,
 				 const u8 **shading);
 
-static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
+/*
+ * Hand every finished frame to the back end.  This has no deadline of its own
+ * -- the frame is already written -- which is why it runs *after* the arm
+ * below rather than before it.  Doing it first cost a frame whenever it landed
+ * badly: producer_complete() hands the slot on, the back end queues its own
+ * work item for it, and that item takes the same mutex the next
+ * producer_acquire() needs and holds it across an encode.  Measured, the arm
+ * then waited 2.1 ms behind a lock it had itself caused to be taken, against a
+ * window of 1.3 ms.
+ */
+static void ispfe_backend_queue_drain(struct ispfe_device *ispfe)
 {
 	for (;;) {
 		struct ispfe_backend_buffer *buf;
@@ -3511,7 +3521,34 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 			ispfe->backend_completed++;
 		spin_unlock_irq(&ispfe->slock);
 	}
+}
 
+/*
+ * Encode a program into every slot the back end will take one for.  This is
+ * the deadline: a credit at the next frame start drops the frame unless one of
+ * these is on the ready list by then.
+ *
+ * It runs before the drain and does not need it to have run.  Two resources
+ * say so, and they are not the same argument.
+ *
+ * The local two are counted: a buffer is not idle for exactly as long as its
+ * back-end slot is a producer's, and PDMA_BUF_SLOTS is four against the back
+ * end's three input slots (BECORE_INPUT_SLOT_COUNT, its own private constant,
+ * so nothing here can assert it), leaving one program slot and one buffer
+ * always spare.
+ *
+ * The back-end slot is the one that matters and the counting says nothing
+ * about it.  producer_complete() moves a slot to *ready*, not free; only the
+ * back end's own run frees one.  So draining first never handed this an idle
+ * slot either -- what it handed it was the wait for that run, taken inside the
+ * 1.3 ms window.  Arming first spends the same dependency against a whole
+ * frame period instead: the run is ~17 ms of a 34 ms frame, so its result is
+ * ~31 ms old by the time this asks.  If it ever is not, producer_acquire()
+ * returns -EBUSY, this encodes nothing, and the credit that finds an empty
+ * ready list schedules the work again -- one frame, not a stall.
+ */
+static void ispfe_backend_queue_arm(struct ispfe_device *ispfe)
+{
 	for (;;) {
 		const struct ispfe_stats_area *stats = NULL;
 		struct ispfe_backend_buffer *buf = NULL;
@@ -3601,6 +3638,12 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 		list_add_tail(&buf->list, &ispfe->backend_ready);
 		spin_unlock_irq(&ispfe->slock);
 	}
+}
+
+static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
+{
+	ispfe_backend_queue_arm(ispfe);
+	ispfe_backend_queue_drain(ispfe);
 }
 
 /*

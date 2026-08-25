@@ -93,8 +93,20 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		ret = -EFBIG;
 		goto unlock;
 	}
-	if (*ppos == 0)
+	if (*ppos == 0) {
 		*staged_bytes = 0;
+		/*
+		 * A stage that starts at zero is what says which raster the
+		 * frame is at: whoever writes it writes it for the geometry
+		 * selected now.  Taken here rather than at the end so that a
+		 * geometry change part-way through a multi-write stage leaves
+		 * the raster the earlier bytes were written for, and the run
+		 * refuses rather than encoding for a raster half the frame is
+		 * not at.
+		 */
+		if (slot)
+			slot->raster = becore->array;
+	}
 	if (*ppos != *staged_bytes) {
 		ret = -ESPIPE;
 		goto unlock;
@@ -665,9 +677,20 @@ static int becore_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "mcsc_transport   %s\n",
 		   becore->mcsc_encoded_transport == BECORE_MCSC_INPUT_MEMORY ?
 		   "memory" : "captured-votf");
-	seq_printf(s, "input            %zu/%zu bytes, iova %pad\n",
+	/*
+	 * The raster with the length, because a run refuses on either and the
+	 * length alone cannot say which: a frame staged before a geometry set
+	 * is exactly as long as one staged after it whenever the two array
+	 * widths share a 256-column bucket.
+	 */
+	seq_printf(s, "input            %zu/%zu bytes",
 		   becore->inputs[0].buffer.staged_bytes,
-		   becore->inputs[0].buffer.size, &becore->inputs[0].buffer.dma);
+		   becore->inputs[0].buffer.size);
+	/* The raster describes a frame, so it says nothing without one. */
+	if (becore->inputs[0].buffer.staged_bytes)
+		seq_printf(s, " at %ux%u", becore->inputs[0].raster.width,
+			   becore->inputs[0].raster.height);
+	seq_printf(s, ", iova %pad\n", &becore->inputs[0].buffer.dma);
 	seq_printf(s, "input_state      %s\n",
 		   input_state_names[becore->inputs[0].state]);
 	seq_puts(s, "input_slots      ");
@@ -679,7 +702,8 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		if (slot->state == BECORE_INPUT_PRODUCER)
 			seq_printf(s, "#%llu", slot->producer_cookie);
 		else if (slot->state == BECORE_INPUT_READY)
-			seq_printf(s, "@%llu", slot->ready_sequence);
+			seq_printf(s, "@%llu:%ux%u", slot->ready_sequence,
+				   slot->raster.width, slot->raster.height);
 	}
 	seq_putc(s, '\n');
 	if (becore->input_producer) {
@@ -997,13 +1021,30 @@ static const struct file_operations becore_override_fops = {
 };
 
 /*
- * The chain and the scaled output, read and set as one.
+ * The three rasters, read and set as one.
  *
- * Everything from RGBP's crop down is derived from these two and from the
- * array, and they are only meaningful together: set one at a time, the driver
- * would spend the gap describing a geometry nobody asked for.  The array is
- * not settable here -- it is the producer's, taken from the sink pad at
- * STREAMON -- and it is printed so a reader sees all three at once.
+ * Everything from RGBP's crop down is derived from them, and they are only
+ * meaningful together: set one at a time, the driver would spend the gap
+ * describing a geometry nobody asked for.  So a write carries all three, in
+ * the order the read prints them -- six numbers, the array first.
+ *
+ * The array is still the producer's whenever a stream starts:
+ * becore_latch_input_format() takes it off the sink pad at STREAMON and puts
+ * it back again if the stream does not start.  What it is here is what the
+ * offline loop encodes for, and that is what makes it worth setting -- the
+ * captured corpus was taken at eight array rasters and only one of them could
+ * be replayed.
+ *
+ * It is bounded by the input slots rather than resizing them.  Freeing those
+ * would be a use-after-free while a producer holds clones of their
+ * scatterlists mapped in its own IOMMU domain, and a producer holds them for
+ * the lifetime of the device: ISPFE maps at its probe and unmaps only at its
+ * removal, and it is built in and suppresses unbind.  A knob that refused to
+ * resize while one was attached would therefore refuse on every boot there
+ * is.  Fitting the slot is enough for what this is for -- every array raster
+ * in the corpus lays out inside the allocation the live path already asks
+ * for, 4208x3120 compressed being the largest of them -- and one that does
+ * not fit is refused by name.
  *
  * This is what makes a second geometry something to try rather than something
  * to rebuild for.  Every derivation between the three rasters has been
@@ -1019,6 +1060,16 @@ static const struct file_operations becore_override_fops = {
  * bound.  A queue with buffers refuses too: MCSC writes a capture buffer
  * directly, so a scaled raster that grew past what REQBUFS allocated would
  * overrun it.
+ *
+ * A frame already staged is not discarded here and does not have to be: every
+ * slot carries the raster its frame was written at, and becore_recipe_
+ * validate() refuses to run one that is not the raster being encoded for.
+ * Which is the check that has to exist rather than a length comparison --
+ * becore_rgbp_input_size() reaches the width only through ALIGN(width, 256),
+ * so a frame written at 4208x3120 is exactly as long as one written at
+ * 4352x3120.  Leaving the frame alone also means a set that fails part-way
+ * costs nothing but the set, and that a frame comes back into use by putting
+ * the raster back rather than by re-uploading 27 MB of it.
  *
  * On a failure the previous geometry goes back and is allocated again.  If
  * even that fails the surfaces stay freed, and a run refuses rather than
@@ -1047,17 +1098,45 @@ static int becore_geometry_open(struct inode *inode, struct file *file)
 }
 
 static int becore_geometry_apply(struct becore_device *becore,
+				 const struct becore_raster *array,
 				 const struct becore_raster *chain,
 				 const struct becore_raster *scaled)
 {
+	struct becore_raster old_array = becore->array;
 	struct becore_raster old_chain = becore->chain;
 	struct becore_raster old_scaled = becore->scaled;
 	struct becore_rect crop;
+	size_t allocation;
 	u32 ratio;
 	int ret;
 
 	lockdep_assert_held(&becore->lock);
 
+	ret = becore_raster_validate(becore->dev, "array", array,
+				     BECORE_ARRAY_EXTENT_MAX);
+	if (ret)
+		return ret;
+	/*
+	 * Both input profiles have to lay a frame of this array out inside a
+	 * slot, which is the same pair of checks probe makes -- one that the
+	 * harness profile fits the live one, and one that the live one fits
+	 * the allocation.  The second is an inequality here where
+	 * becore_latch_input_format() makes it an equality, and deliberately:
+	 * a producer hands over a whole allocation, so a raster that merely
+	 * fits would refuse every frame it sent, where the offline loop stages
+	 * exactly the frame the raster describes.
+	 */
+	ret = becore_input_profiles_validate(becore->dev, array);
+	if (ret)
+		return ret;
+	allocation = becore_input_allocation_size(array);
+	if (allocation > becore->inputs[0].buffer.size) {
+		dev_err(becore->dev,
+			"a %ux%u array lays out in %zu bytes and an input slot is %zu\n",
+			array->width, array->height, allocation,
+			becore->inputs[0].buffer.size);
+		return -ENOSPC;
+	}
 	ret = becore_chain_validate(becore->dev, chain);
 	if (ret)
 		return ret;
@@ -1078,20 +1157,20 @@ static int becore_geometry_apply(struct becore_device *becore,
 	 * default array, any chain narrower than 260 passes the crop and the
 	 * ratio and then refuses every run afterwards with a bare -EINVAL.
 	 */
-	ret = becore_rgbp_crop(&becore->array, chain, &crop);
+	ret = becore_rgbp_crop(array, chain, &crop);
 	if (ret) {
 		dev_err(becore->dev, "no crop of %ux%u reaches a %ux%u chain\n",
-			becore->array.width, becore->array.height,
+			array->width, array->height,
 			chain->width, chain->height);
 		return ret;
 	}
-	ret = becore_yuvnr_geometry_value(&becore->array, chain,
+	ret = becore_yuvnr_geometry_value(array, chain,
 					  BECORE_YUVNR_BINNING, &ratio);
 	if (ret) {
 		dev_err(becore->dev,
 			"a %ux%u crop of %ux%u is too much for a %ux%u chain to bin\n",
 			crop.width, crop.height,
-			becore->array.width, becore->array.height,
+			array->width, array->height,
 			chain->width, chain->height);
 		return ret;
 	}
@@ -1106,6 +1185,7 @@ static int becore_geometry_apply(struct becore_device *becore,
 		return ret;
 	}
 
+	becore->array = *array;
 	becore->chain = *chain;
 	becore->scaled = *scaled;
 	becore_free_surfaces(becore);
@@ -1113,6 +1193,7 @@ static int becore_geometry_apply(struct becore_device *becore,
 	if (!ret)
 		return 0;
 
+	becore->array = old_array;
 	becore->chain = old_chain;
 	becore->scaled = old_scaled;
 	becore_free_surfaces(becore);
@@ -1135,6 +1216,7 @@ static ssize_t becore_geometry_write(struct file *file, const char __user *buf,
 {
 	struct becore_device *becore =
 		((struct seq_file *)file->private_data)->private;
+	struct becore_raster array;
 	struct becore_raster chain;
 	struct becore_raster scaled;
 	char text[64];
@@ -1154,9 +1236,10 @@ static ssize_t becore_geometry_write(struct file *file, const char __user *buf,
 	 */
 	if (!*line)
 		return count;
-	/* The %c matches only if something follows the four, and refuses it. */
-	if (sscanf(line, "%u %u %u %u %c", &chain.width, &chain.height,
-		   &scaled.width, &scaled.height, &tail) != 4)
+	/* The %c matches only if something follows the six, and refuses it. */
+	if (sscanf(line, "%u %u %u %u %u %u %c", &array.width, &array.height,
+		   &chain.width, &chain.height, &scaled.width, &scaled.height,
+		   &tail) != 6)
 		return -EINVAL;
 
 	mutex_lock(&becore->video_lock);
@@ -1167,7 +1250,7 @@ static ssize_t becore_geometry_write(struct file *file, const char __user *buf,
 		 vb2_is_busy(&becore->queue))
 		ret = -EBUSY;
 	else
-		ret = becore_geometry_apply(becore, &chain, &scaled);
+		ret = becore_geometry_apply(becore, &array, &chain, &scaled);
 	mutex_unlock(&becore->lock);
 	mutex_unlock(&becore->video_lock);
 

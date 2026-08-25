@@ -355,7 +355,35 @@ int becore_recipe_validate(struct becore_device *becore)
 	 * A slot the producer filled always holds a whole allocation, so it
 	 * only ever matches the live profile -- which is the second half of
 	 * refusing a producer frame under the linear profile.
+	 *
+	 * And the raster the frame was written at, which the length cannot
+	 * stand in for: becore_rgbp_input_size() reaches the width only
+	 * through ALIGN(width, 256), so every array width in one 256-column
+	 * bucket at one height lays out in the same number of bytes.  Without
+	 * this, a frame written at 4208x3120 runs at 4352x3120 -- the length
+	 * matches to the byte -- and 144 columns of compressed padding are
+	 * read as picture, in bounds, with nothing saying why the result is
+	 * wrong.  Which is reachable in exactly one direction: the array is a
+	 * debugfs write for the offline loop, and the frames a producer writes
+	 * are at a raster of its own.
 	 */
+	if (becore->run_input->raster.width != becore->array.width ||
+	    becore->run_input->raster.height != becore->array.height) {
+		/*
+		 * Named rather than left as a bare -EINVAL, because the frame
+		 * can have reached that slot from a different surface than the
+		 * one being used: a producer's frame outranks the staged one
+		 * in becore_next_input(), so an offline run at a second raster
+		 * refuses while one is waiting, and nothing else says so.
+		 * Running once at the raster named here consumes it.
+		 */
+		dev_err_ratelimited(becore->dev,
+				    "the frame in this slot is %ux%u and the geometry is %ux%u\n",
+				    becore->run_input->raster.width,
+				    becore->run_input->raster.height,
+				    becore->array.width, becore->array.height);
+		return -EINVAL;
+	}
 	if (wanted > input->size || input->staged_bytes != wanted ||
 	    becore->grid.staged_bytes != BECORE_GRID_SIZE)
 		return -EINVAL;

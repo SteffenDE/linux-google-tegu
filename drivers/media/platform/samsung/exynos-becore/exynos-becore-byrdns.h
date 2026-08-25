@@ -23,8 +23,10 @@
 
 /*
  * The value is a white-balance gain and a fixed point away from the register.
- * Green's gain is unity -- the AWB normalises it -- but the fixed point is not,
- * so all three take this path and only the gain differs.
+ * Red and blue take their own gain; green takes the mean of the two green
+ * gains, which is what the vendor's translator takes and is unity only while
+ * an AWB normalises green.  The fixed point is the same for all three, so they
+ * share one path and only the gain differs.
  */
 #define BECORE_BYR_DNS_FIELD_RED		BIT(1)
 #define BECORE_BYR_DNS_FIELD_GREEN		BIT(2)

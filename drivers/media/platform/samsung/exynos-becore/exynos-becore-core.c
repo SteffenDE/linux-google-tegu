@@ -2186,6 +2186,14 @@ int exynos_becore_input_producer_acquire(struct exynos_becore_input *input,
 	}
 	slot->buffer.staged_bytes = 0;
 	slot->ready_sequence = 0;
+	/*
+	 * The balance this frame will be taken through unless the producer
+	 * says otherwise, which is the one STREAMON handed it.  Seeding rather
+	 * than requiring means a producer with nothing to say about white
+	 * balance -- and every producer had nothing to say until one of them
+	 * grew a parameters node -- needs to do nothing at all.
+	 */
+	slot->gains = becore_stream_gains(becore);
 	cookie = ++becore->producer_sequence;
 	if (!cookie)
 		cookie = ++becore->producer_sequence;
@@ -2196,6 +2204,7 @@ int exynos_becore_input_producer_acquire(struct exynos_becore_input *input,
 		.size = slot->buffer.size,
 		.cookie = cookie,
 		.slot = i,
+		.gains = slot->gains,
 	};
 
 unlock:
@@ -2221,6 +2230,24 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 		ret = -EINVAL;
 		goto unlock;
 	}
+	if (!becore_gains_valid(&buffer->gains)) {
+		/*
+		 * Nothing can reach this today -- every gain the front end can
+		 * hold is already bounded by the same constant on its own side
+		 * -- which is exactly why it says so out loud.  The caller's
+		 * only recourse is to fail the stream, and a stream that stops
+		 * with a hung DQBUF and nothing in the log is worse than one
+		 * that is merely broken.
+		 */
+		dev_err_ratelimited(becore->dev,
+				    "producer frame carries gains %u/%u/%u/%u Q12, outside %u..%u\n",
+				    buffer->gains.red, buffer->gains.green_red,
+				    buffer->gains.green_blue, buffer->gains.blue,
+				    EXYNOS_BECORE_WBG_GAIN_MIN_Q12,
+				    EXYNOS_BECORE_WBG_GAIN_MAX_Q12);
+		ret = -ERANGE;
+		goto unlock;
+	}
 
 	/*
 	 * The caller has quiesced the producer at a completed-frame boundary.
@@ -2235,6 +2262,11 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	 * other -- see becore_recipe_validate().
 	 */
 	slot->raster = becore->producer_array;
+	/*
+	 * And the producer's gains, for the same reason the raster is the
+	 * producer's: a frame is at the balance whoever took it took it at.
+	 */
+	slot->gains = buffer->gains;
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
 	slot->state = BECORE_INPUT_READY;

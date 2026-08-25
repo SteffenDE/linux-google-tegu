@@ -324,6 +324,13 @@ enum becore_input_slot_state {
 struct becore_input_slot {
 	struct becore_dma_buffer buffer;
 	struct becore_raster raster;
+	/*
+	 * The white balance the frame in this slot was taken through, which is
+	 * the only thing the Bayer denoiser's noise factors may be scaled by.
+	 * Seeded from becore->stream_gains wherever a slot is handed out, and
+	 * replaced by whatever the producer states when it completes one.
+	 */
+	struct exynos_becore_input_gains gains;
 	enum becore_input_slot_state state;
 	bool cpu_dirty;
 	u64 producer_cookie;
@@ -565,20 +572,29 @@ struct becore_device {
 	 */
 	u32 input_code;
 	/*
-	 * The white balance the back end encodes against: the Bayer denoiser's
-	 * noise factors are its tuning times these gains.  Written by the
-	 * control op rather than copied at STREAMON, so that there is one
-	 * writer rather than a second source for a fact the controls already
-	 * hold.  Green is unity, which is what normalises the other two.
+	 * The white balance a *stream* starts at: what STREAMON hands the front
+	 * end, and what a frame carries until the front end says otherwise.
+	 * Written by the control op rather than copied at STREAMON, so that
+	 * there is one writer rather than a second source for a fact the
+	 * controls already hold.  The greens are unity, which is what
+	 * normalises the other two, and no control moves them.
 	 *
-	 * Both controls are grabbed for the length of a *stream*, so a video
+	 * This is not what the Bayer denoiser's noise factors are scaled by --
+	 * that is the balance the frame in hand was taken through, which the
+	 * producer states per frame and the slot carries.  These are what a
+	 * frame is seeded with, and a seed is what the back end asked for
+	 * rather than what the front end applied: the two part company as soon
+	 * as anything moves the gains per frame, and were never the same fact
+	 * about the greens at all, which is why a producer states its gains
+	 * rather than letting the seed stand.
+	 *
+	 * Both controls are grabbed for the length of a stream, so a video
 	 * frame cannot see one move.  The offline loop is the other way round
 	 * -- it runs precisely when nothing is streaming -- so these are read
 	 * and written once each, and the worst a concurrent ioctl can do is
-	 * give one offline frame a gain an ioctl old.
+	 * give one staged frame a gain an ioctl old.
 	 */
-	u32 encode_balance_red;
-	u32 encode_balance_blue;
+	struct exynos_becore_input_gains stream_gains;
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct vb2_queue queue;
@@ -973,6 +989,45 @@ extern const struct becore_c2serv_desc becore_c2serv[BECORE_NUM_C2SERV];
 struct exynos_becore_input *
 becore_input_callback_get(struct becore_device *becore);
 void becore_input_callback_put(struct exynos_becore_input *input);
+
+/*
+ * A gain of zero is a channel switched off rather than balanced, and the upper
+ * bound is what the front end's own parameters node holds its gains to -- the
+ * two interfaces describe the same four numbers and a frame may not arrive
+ * carrying one the node would have refused.
+ */
+static inline bool becore_gain_valid(u32 gain)
+{
+	return gain >= EXYNOS_BECORE_WBG_GAIN_MIN_Q12 &&
+	       gain <= EXYNOS_BECORE_WBG_GAIN_MAX_Q12;
+}
+
+static inline bool
+becore_gains_valid(const struct exynos_becore_input_gains *gains)
+{
+	return becore_gain_valid(gains->red) &&
+	       becore_gain_valid(gains->green_red) &&
+	       becore_gain_valid(gains->green_blue) &&
+	       becore_gain_valid(gains->blue);
+}
+
+/*
+ * The balance a frame handed out now is seeded with.  Read field by field
+ * because the control op writes the two that move without holding anything
+ * this side of the device takes: a seed an ioctl old is a frame at the gains
+ * the front end was started with, which is what it is for.
+ */
+static inline struct exynos_becore_input_gains
+becore_stream_gains(const struct becore_device *becore)
+{
+	return (struct exynos_becore_input_gains) {
+		.red = READ_ONCE(becore->stream_gains.red),
+		.green_red = READ_ONCE(becore->stream_gains.green_red),
+		.green_blue = READ_ONCE(becore->stream_gains.green_blue),
+		.blue = READ_ONCE(becore->stream_gains.blue),
+	};
+}
+
 int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		     u32 output_profile, bool ready_only,
 		     struct vb2_buffer *capture, bool packed_output,

@@ -13,16 +13,27 @@ struct exynos_becore_input;
 
 #define EXYNOS_BECORE_WBG_GAIN_MIN_Q12		1U
 #define EXYNOS_BECORE_WBG_GAIN_MAX_Q12		32751U
-/* What the green channels are held at, and so what normalises the other two. */
+/* A gain of 1.0, and what the greens are captured at rather than held at. */
 #define EXYNOS_BECORE_WBG_UNITY_Q12		4096U
 #define EXYNOS_BECORE_WBG_RED_DEFAULT_Q12	8473U
 #define EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12	6851U
 
 /* Stream-latched semantic policy passed to the attached front end. */
 struct exynos_becore_input_stream_config {
-	/* Unsigned Q12 gains; green channels remain normalized to unity. */
+	/*
+	 * Unsigned Q12, and the two the back end has: this configuration says
+	 * nothing about the greens, so a front end keeps its own.
+	 */
 	u32 red_balance;
 	u32 blue_balance;
+};
+
+/* Unsigned Q12 white balance gains, in the Bayer channel order R, Gr, Gb, B. */
+struct exynos_becore_input_gains {
+	u32 red;
+	u32 green_red;
+	u32 green_blue;
+	u32 blue;
 };
 
 struct exynos_becore_input_producer_ops {
@@ -31,12 +42,31 @@ struct exynos_becore_input_producer_ops {
 	void (*stop_streaming)(void *data);
 };
 
-/* One driver-owned input slot reserved for a front-end producer. */
+/*
+ * One driver-owned input slot reserved for a front-end producer.
+ *
+ * @gains is the white balance the frame in this buffer was taken through, and
+ * it travels with the frame rather than beside it because that is what its one
+ * consumer wants: the Bayer denoiser's noise factors are scaled by the gains
+ * applied in front of it -- photon noise scales with them -- so what it needs
+ * is the gains of *this* frame.  A "read whatever is newest" push would be
+ * right most of the time and wrong exactly while the gains are moving, which
+ * is when it matters.
+ *
+ * exynos_becore_input_producer_acquire() fills it with the balance the back end
+ * *asked* for -- its stream configuration, with the greens at unity because
+ * that is what the two gains it names are normalised against.  That is a seed
+ * and not a statement: a producer whose gains differ from the ones it was
+ * handed, for any reason including its own greens, has to overwrite this
+ * before completing the buffer.  Every gain has to be within
+ * EXYNOS_BECORE_WBG_GAIN_MIN_Q12 .. _MAX_Q12 or the buffer is refused.
+ */
 struct exynos_becore_input_buffer {
 	dma_addr_t dma;
 	size_t size;
 	u64 cookie;
 	unsigned int slot;
+	struct exynos_becore_input_gains gains;
 };
 
 struct exynos_becore_input *

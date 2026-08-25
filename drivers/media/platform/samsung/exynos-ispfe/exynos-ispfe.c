@@ -2701,6 +2701,23 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 	((ISPFE_LMP_LINEARIZATION_KNOTS + 1) * EXYNOS_ISPFE_WB_GAINS * 2)
 /* What the generated recipes declare the area to be, so an edit here says so. */
 static_assert(ISPFE_LMP_LINEARIZATION_LUT_BYTES == 0x410);
+/*
+ * The histogram's weight map, which is a *spatial* map over the picture: the
+ * block's own register printer names `csr_histogram_weights_cell_width` and
+ * `_cell_height` beside it.  Every captured program carries the same 1,024
+ * bytes and every one of them is 0x80, which is not tuning either --
+ * `lyric::LmpHistogram::Configure` memsets exactly this value when the tuning
+ * it is given carries no weight LUT of its own.  So it is the vendor's "no
+ * weighting" default, and stating it is a statement rather than a replay.
+ *
+ * How the map is laid out inside the table -- whether a row is packed to the
+ * cell count or to a fixed stride -- is not established, and does not need to
+ * be while every weight is equal.  It would need to be before this could
+ * become an interface, which is why it is not one.
+ */
+#define ISPFE_LMP_HISTOGRAM_LUT_REG	0x0006c8b8
+#define ISPFE_LMP_HISTOGRAM_WEIGHTS	0x400
+#define ISPFE_LMP_HISTOGRAM_WEIGHT_FLAT	0x80
 #define ISPFE_LMP_AWB_STATS_CONFIG_SIZE	0x34
 #define ISPFE_LMP_AE_STATS_CONFIG_SIZE	0x28
 #define ISPFE_LMP_STATS_SATURATION	0x10
@@ -3072,12 +3089,13 @@ static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
  *
  * The linearisation curve is that identity, on all four channels.  Its last
  * record is left at the zero the surrounding memset already wrote, because it
- * is padding rather than a knot.
+ * is padding rather than a knot.  The histogram's weight map is the uniform
+ * default, so nothing in the picture is weighted above anything else.
  *
- * A recipe that carries no such table is refused rather than left with a
- * zeroed one: every captured program writes this curve, so a recipe without
- * it is a recipe this code has not seen, and a zeroed curve would map every
- * input to black.
+ * A recipe that carries neither table is refused rather than left with a
+ * zeroed one: every captured program writes both, so a recipe without them is
+ * a recipe this code has not seen -- and a zeroed weight map would meter
+ * nothing at all.
  */
 static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 {
@@ -3104,6 +3122,18 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 					   area + 2 * (knot *
 						       EXYNOS_ISPFE_WB_GAINS +
 						       channel));
+
+	ret = ispfe_lut_area(ispfe, ISPFE_LMP_HISTOGRAM_LUT_REG,
+			     ISPFE_LMP_HISTOGRAM_WEIGHTS, &index, &area);
+	if (ret) {
+		dev_err(ispfe->dev,
+			"PDMA recipe carries no histogram weight map (%d)\n",
+			ret);
+		return -EINVAL;
+	}
+	__set_bit(index, &stated);
+	memset(area, ISPFE_LMP_HISTOGRAM_WEIGHT_FLAT,
+	       ISPFE_LMP_HISTOGRAM_WEIGHTS);
 
 	/*
 	 * And every empty input is one of those, so a recipe cannot declare a

@@ -782,6 +782,87 @@ extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
 #define BECORE_YUVP_GENERATED_WORDS	1365
 #define BECORE_MCSC_GENERATED_WORDS	116
 
+/*
+ * What a raster has to be before anything derives a register from it.  Every
+ * clause here is a silent failure rather than a loud one, which is why they
+ * are checked at all: none of them is reachable while the three rasters are
+ * probe-time constants, and all of them become reachable the moment something
+ * negotiates one.
+ *
+ * An extent has to fit the 16-bit half becore_pack_size() puts it in.  At
+ * 65536 the shift walks into the other half instead of overflowing: an array
+ * that wide encodes chain_src_img_size as 0x00000c30, a zero width, and no
+ * register write fails.
+ *
+ * An odd extent has no whole last pair of anything.  The array is read out in
+ * Bayer quads, the chain is the 4:2:0 surface YUVP writes and GTNR and MCSC
+ * read back, and the scaled output is NV21 -- all three side their chroma on a
+ * 2x2 grid the last row or column would fall off.
+ */
+#define BECORE_RASTER_EXTENT_MAX	U16_MAX
+
+/*
+ * The array's bound is tighter, and it comes from the two blocks that state a
+ * radial fall-off centre.  BYR_DNS writes -(array extent / 2) and YUVNR writes
+ * -(crop extent / 2), both into a 15-bit signed field, so the largest array
+ * either can describe is twice that field's negative span.  The crop is cut
+ * out of the array, so bounding the array bounds YUVNR's copy with it.
+ */
+#define BECORE_ARRAY_EXTENT_MAX		(BECORE_RGBP_DNS_CENTRE_MASK + 1)
+
+/* exynos-becore-geometry.c */
+size_t becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile,
+			      const struct becore_raster *array);
+size_t
+becore_rgbp_input_image_offset(const struct becore_rgbp_input_profile *profile,
+			       const struct becore_raster *array);
+size_t becore_input_allocation_size(const struct becore_raster *array);
+int becore_input_profiles_validate(struct device *dev,
+				   const struct becore_raster *array);
+int becore_output_profiles_validate(struct device *dev);
+u32 becore_pack_size(u32 high, u32 low);
+int becore_zoom_ratio(u32 in, u32 out, u32 *ratio);
+u32 becore_scaler_init_phase(u32 ratio);
+int becore_raster_validate(struct device *dev, const char *name,
+			   const struct becore_raster *raster, u32 max);
+int becore_chain_validate(struct device *dev,
+			  const struct becore_raster *chain);
+int becore_rgbp_crop(const struct becore_raster *array,
+		     const struct becore_raster *chain,
+		     struct becore_rect *crop);
+int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
+			    const struct becore_raster *array,
+			    const struct becore_raster *chain,
+			    u32 index, u32 reg, u32 *value);
+const struct becore_rgbp_input_profile *
+becore_rgbp_input_profile(const struct becore_device *becore);
+const struct becore_yuvp_output_profile *
+becore_yuvp_output_profile(const struct becore_device *becore);
+size_t becore_active_output_plane2_offset(const struct becore_device *becore);
+size_t becore_active_output_size(const struct becore_device *becore);
+size_t becore_yuvp_output_allocation_size(const struct becore_raster *chain);
+size_t becore_yuvp_output_size(const struct becore_yuvp_output_profile *profile,
+			       const struct becore_raster *chain);
+int becore_gtnr_dma_value(const struct becore_raster *chain, u32 index,
+			  u32 reg, u32 *value);
+size_t becore_gtnr_surface_size(const struct becore_raster *chain);
+u32 becore_mcsc_output_stride(const struct becore_raster *output);
+size_t becore_mcsc_output_active_size(const struct becore_raster *output);
+size_t becore_mcsc_output_size(const struct becore_raster *output);
+int becore_mcsc_dma_value(const struct becore_raster *chain,
+			  const struct becore_raster *output, u32 index, u32 reg,
+			  enum becore_mcsc_input_transport transport,
+			  const u32 *requested_token, u32 *value);
+dma_addr_t becore_gtnr_address_dma(struct becore_device *becore, u32 reg);
+dma_addr_t becore_mcsc_address_dma(struct becore_device *becore, u32 reg);
+u32 becore_typed_word_count(enum becore_block_id id);
+int becore_typed_value(struct becore_device *becore,
+		       enum becore_block_id id, u32 index, u32 reg,
+		       u32 *value);
+extern const u32 becore_rgbp_input_regs[BECORE_RGBP_INPUT_WORD_COUNT];
+extern const struct becore_yuvp_output_profile
+	becore_yuvp_outputs[BECORE_YUVP_OUTPUT_PROFILE_COUNT];
+
 /* exynos-becore-generated.c */
 int becore_generated_value(const struct becore_device *becore,
 			   enum becore_block_id id, u32 reg, u32 *value);
@@ -797,21 +878,9 @@ extern const struct becore_noise_curve becore_noise_curves[BECORE_NOISE_CURVES];
 
 /* exynos-becore-core.c */
 int becore_bayer_phase(u32 code);
-u32 becore_pack_size(u32 high, u32 low);
-int becore_rgbp_crop(const struct becore_raster *array,
-		     const struct becore_raster *chain,
-		     struct becore_rect *crop);
-const struct becore_rgbp_input_profile *
-becore_rgbp_input_profile(const struct becore_device *becore);
-int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
-			    const struct becore_raster *array,
-			    const struct becore_raster *chain,
-			    u32 index, u32 reg, u32 *value);
-u32 becore_scaler_init_phase(u32 ratio);
+u32 becore_mcsc_votf_enable(const u32 *requested_token);
 int becore_shape_register(const struct becore_cmdq_shape *shape,
 			  u32 word, u32 *reg);
-int becore_zoom_ratio(u32 in, u32 out, u32 *ratio);
-extern const u32 becore_rgbp_input_regs[BECORE_RGBP_INPUT_WORD_COUNT];
 extern const struct v4l2_file_operations becore_fops;
 
 #endif /* EXYNOS_BECORE_COMMON_H */

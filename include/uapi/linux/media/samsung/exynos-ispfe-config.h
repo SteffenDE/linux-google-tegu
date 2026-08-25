@@ -46,6 +46,8 @@ enum exynos_ispfe_stats_version {
  *	:c:type:`exynos_ispfe_params_white_balance`
  * @EXYNOS_ISPFE_PARAM_BLOCK_METERING: What the two statistics grids count,
  *	:c:type:`exynos_ispfe_params_metering`
+ * @EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING: The lens shading gain grid,
+ *	:c:type:`exynos_ispfe_params_lens_shading`
  * @EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * The front end applies white balance before it meters, so the gains are both
@@ -59,6 +61,7 @@ enum exynos_ispfe_stats_version {
 enum exynos_ispfe_params_block_type {
 	EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE = 0,
 	EXYNOS_ISPFE_PARAM_BLOCK_METERING,
+	EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING,
 	EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -222,6 +225,72 @@ struct exynos_ispfe_params_metering {
 	__u16 reserved;
 } __attribute__((aligned(8)));
 
+/*
+ * The shading grid: 33 columns by 25 rows of four gains, one per Bayer colour
+ * in the same R, Gr, Gb, B order everything else here uses, covering the whole
+ * picture with the outermost samples on its edges.
+ *
+ * The hardware reads them in a tiled layout, four rows of gains to a record,
+ * with the twenty-fifth row alone in a record whose other three rows are
+ * padding. That layout is the driver's business: what a block carries is the
+ * grid.
+ */
+#define EXYNOS_ISPFE_LSC_COLUMNS		33
+#define EXYNOS_ISPFE_LSC_ROWS			25
+
+/* Unsigned Q12, the same scale as the white balance gains: 4096 is 1.0. */
+#define EXYNOS_ISPFE_LSC_GAIN_ONE		4096
+
+/*
+ * The field is sixteen bits, so this is what can be described rather than a
+ * policy: a gain of 15.999756. The vendor's own tables run from exactly
+ * %EXYNOS_ISPFE_LSC_GAIN_ONE at their lowest point, near the centre, to about
+ * 5.2 at a corner, and none of the 54 captured ones has a single sample below
+ * unity.
+ */
+#define EXYNOS_ISPFE_LSC_GAIN_MAX		65535
+
+/**
+ * struct exynos_ispfe_params_lens_shading - The lens shading gain grid
+ *
+ * @header: The parameters block header
+ * @gains: %EXYNOS_ISPFE_LSC_ROWS rows of %EXYNOS_ISPFE_LSC_COLUMNS columns of
+ *	four unsigned Q12 gains, indexed by %EXYNOS_ISPFE_WB_RED and its
+ *	siblings
+ *
+ * The gain applied to a pixel is this grid interpolated at its position, so
+ * the grid describes the whole picture rather than a corner of it and its
+ * outermost samples sit on the edges. Each gain is at least one -- zero is a
+ * channel switched off rather than corrected -- and at most
+ * %EXYNOS_ISPFE_LSC_GAIN_MAX.
+ *
+ * This is the only place in the graph where shading can be corrected: the back
+ * end has no such stage. What it corrects is everything downstream of it,
+ * which is the processed image **and the exposure statistics** -- those are
+ * metered after this stage, and moving the grid moves them. What it does not
+ * reach is the raw output, which leaves the receiver before this stage runs:
+ * a grid sent while the raw path is streaming still changes
+ * :c:type:`exynos_ispfe_stats_ae` and still changes nothing in the raw
+ * buffers.
+ *
+ * A grid is per unit and per readout rather than per scene. Measured over 54
+ * captured vendor programs, a table is the same table across the frames of one
+ * capture to within 1.12% at its worst grid point, and differs by up to 30%
+ * between two sensor readouts of one camera and 42% between two cameras. So a
+ * consumer that has one calibration for this unit and this mode has what this
+ * block wants, and does not need to recompute it per frame.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the grid to
+ * the driver's default -- the calibration the running program was captured
+ * with -- rather than switching correction off. Unity everywhere is how to ask
+ * for no correction, and it is a grid like any other.
+ */
+struct exynos_ispfe_params_lens_shading {
+	struct v4l2_isp_params_block_header header;
+	__u16 gains[EXYNOS_ISPFE_LSC_ROWS][EXYNOS_ISPFE_LSC_COLUMNS]
+		   [EXYNOS_ISPFE_WB_GAINS];
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_ISPFE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -229,7 +298,8 @@ struct exynos_ispfe_params_metering {
  */
 #define EXYNOS_ISPFE_PARAMS_MAX_SIZE \
 	(sizeof(struct exynos_ispfe_params_white_balance) + \
-	 sizeof(struct exynos_ispfe_params_metering))
+	 sizeof(struct exynos_ispfe_params_metering) + \
+	 sizeof(struct exynos_ispfe_params_lens_shading))
 
 /*
  * Both grids are the same shape: LMP meters 64 x 48 rectangular regions over

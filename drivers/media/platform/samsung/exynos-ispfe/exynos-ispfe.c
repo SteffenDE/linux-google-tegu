@@ -487,6 +487,27 @@ struct ispfe_pdma_desc {
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 #define ISPFE_PDMA_MAX_BLOCKS_BYTES	ISPFE_PDMA_BACKEND_BLOCKS_BYTES
 
+/*
+ * The shading table as the hardware reads it: 33 x 25 x four unsigned Q12
+ * gains, four rows of gains to a 32-byte record.
+ */
+#define ISPFE_LSC_TILE_ROWS		4
+#define ISPFE_LSC_TILE_WORDS		(ISPFE_LSC_TILE_ROWS * \
+					 EXYNOS_ISPFE_WB_GAINS)
+#define ISPFE_LSC_LUT_BYTES		(DIV_ROUND_UP(EXYNOS_ISPFE_LSC_ROWS, \
+						      ISPFE_LSC_TILE_ROWS) * \
+					 EXYNOS_ISPFE_LSC_COLUMNS * \
+					 ISPFE_LSC_TILE_WORDS * 2)
+
+/*
+ * One copy per program slot, so that a table sent for one frame does not
+ * reach frames whose programs were already encoded.  A slot's program points
+ * at its own copy; the shared block area keeps the recipe's table for
+ * anything that does not.
+ */
+#define ISPFE_LSC_SLOT_STRIDE		ALIGN(ISPFE_LSC_LUT_BYTES, PAGE_SIZE)
+#define ISPFE_LSC_AREA_BYTES		(PDMA_SLOTS * ISPFE_LSC_SLOT_STRIDE)
+
 enum ispfe_backend_buffer_state {
 	ISPFE_BACKEND_BUFFER_IDLE,
 	ISPFE_BACKEND_BUFFER_PREPARING,
@@ -1206,6 +1227,19 @@ struct ispfe_device {
 	dma_addr_t programs_dma;
 	void *blocks;
 	dma_addr_t blocks_dma;
+	/*
+	 * PDMA_SLOTS copies of the shading table, one per program slot, and the
+	 * live one a slot's copy is taken from.  @shading is a whole tiled
+	 * table rather than a grid because tiling it is the expensive half and
+	 * a parameters buffer has already done it; it is swapped with the
+	 * buffer's own allocation under @slock, which keeps exactly one owner
+	 * per allocation and never leaves a live table in a buffer userspace is
+	 * about to get back.
+	 */
+	void *lsc;
+	dma_addr_t lsc_dma;
+	u8 *shading;
+	int lsc_input;
 	/*
 	 * Byte offsets within a program of the frame destination's two address
 	 * halves, so a destination can be retargeted without searching the
@@ -2497,7 +2531,8 @@ static int ispfe_stats_grid_of_output(unsigned int index)
  */
 static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 				    dma_addr_t bayer, dma_addr_t backend,
-				    const struct ispfe_stats_area *stats)
+				    const struct ispfe_stats_area *stats,
+				    dma_addr_t lsc)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
 	int grid;
@@ -2506,6 +2541,13 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 	case ISPFE_BUF_KIND_BAYER:
 		return bayer;
 	case ISPFE_BUF_KIND_INPUT:
+		/*
+		 * The shading table is the one input a frame can carry its own
+		 * copy of; @lsc is this slot's, or zero for the paths that
+		 * keep the shared area.
+		 */
+		if (lsc && (int)index == ispfe->lsc_input)
+			return lsc;
 		if (index < ispfe->prog->num_inputs)
 			return ispfe->blocks_dma +
 			       ispfe->prog->inputs[index].area_offset;
@@ -2574,6 +2616,15 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
  * refused their programs outright.
  */
 #define ISPFE_LMP_INSTANCE_STRIDE	0x1698
+/*
+ * The LUT target area is one instance apart too, and by a *different* stride:
+ * aligning the two recipes' register sets accounts for 55 of the 56 they use
+ * with three windows -- FC at 0x2000, the LMP core at the 0x1698 above, and
+ * the block the indirect bursts stream into at this one.  Reusing the core's
+ * stride here would silently miss the raw programs' shading table.
+ */
+#define ISPFE_LMP_LUT_INSTANCE_STRIDE	0x3ae8
+#define ISPFE_LMP_LSC_LUT_REG		0x0006a02c
 #define ISPFE_LMP_AWB_STATS_CONFIG_SIZE	0x34
 #define ISPFE_LMP_AE_STATS_CONFIG_SIZE	0x28
 #define ISPFE_LMP_STATS_SATURATION	0x10
@@ -2818,6 +2869,87 @@ static int ispfe_pdma_apply_ml0_profile(struct ispfe_device *ispfe,
 	}
 
 	return 0;
+}
+
+/*
+ * The shading grid the hardware reads is tiled: one 32-byte record holds four
+ * rows of one column's four gains, so the grid is stored four rows at a time
+ * and the twenty-fifth row is alone in a record whose other three rows are
+ * padding.  Reading it as a flat array correlates with nothing, which is what
+ * hid it during bring-up.
+ *
+ * A parameters block carries the grid; this is where it becomes the layout.
+ * The check that this is the layout is offline and exact: de-tiling the
+ * recipe's own captured table and re-tiling it reproduces its 7392 bytes.
+ */
+static unsigned int ispfe_lsc_word(unsigned int row, unsigned int column,
+				   unsigned int channel)
+{
+	return ((row / ISPFE_LSC_TILE_ROWS) * EXYNOS_ISPFE_LSC_COLUMNS +
+		column) * ISPFE_LSC_TILE_WORDS +
+	       (row % ISPFE_LSC_TILE_ROWS) * EXYNOS_ISPFE_WB_GAINS + channel;
+}
+
+static void ispfe_lsc_tile(u8 *tiled, const u16 *grid)
+{
+	unsigned int row, column, channel, point = 0;
+
+	memset(tiled, 0, ISPFE_LSC_LUT_BYTES);
+	for (row = 0; row < EXYNOS_ISPFE_LSC_ROWS; row++)
+		for (column = 0; column < EXYNOS_ISPFE_LSC_COLUMNS; column++)
+			for (channel = 0; channel < EXYNOS_ISPFE_WB_GAINS;
+			     channel++)
+				put_unaligned_le16(grid[point++],
+						   tiled + 2 *
+						   ispfe_lsc_word(row, column,
+								  channel));
+}
+
+/*
+ * Which of the running program's indirect inputs is the shading table, or a
+ * negative error if it has none.  Found by the register the burst targets
+ * rather than by an index, because the two LMP instances put it in different
+ * places and an index would quietly select a different table on the raw
+ * recipes.
+ */
+static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
+{
+	unsigned int i;
+
+	for (i = 0; i < prog->num_cmds; i++) {
+		const struct ispfe_pdma_cmd *cmd = &prog->cmds[i];
+
+		if (cmd->op != ISPFE_PDMA_INDIRECT_BURST ||
+		    (cmd->reg != ISPFE_LMP_LSC_LUT_REG &&
+		     cmd->reg != ISPFE_LMP_LSC_LUT_REG +
+				 ISPFE_LMP_LUT_INSTANCE_STRIDE))
+			continue;
+		if (cmd->len != ISPFE_LSC_LUT_BYTES ||
+		    ISPFE_BUF_TO_KIND(cmd->buffer) != ISPFE_BUF_KIND_INPUT ||
+		    ISPFE_BUF_TO_INDEX(cmd->buffer) >= prog->num_inputs)
+			return -EINVAL;
+		return ISPFE_BUF_TO_INDEX(cmd->buffer);
+	}
+
+	return -ENOENT;
+}
+
+/* One grid sample read back out of the tiled table, for the diagnostic. */
+static u16 ispfe_lsc_sample(const u8 *tiled, unsigned int row,
+			    unsigned int column, unsigned int channel)
+{
+	return get_unaligned_le16(tiled +
+				  2 * ispfe_lsc_word(row, column, channel));
+}
+
+/* The recipe's own captured table, which is what a disabled block asks for. */
+static const u8 *ispfe_lsc_default(const struct ispfe_pdma_program *prog)
+{
+	int input = ispfe_lsc_input(prog);
+
+	if (input < 0 || prog->inputs[input].size < ISPFE_LSC_LUT_BYTES)
+		return NULL;
+	return prog->inputs[input].data;
 }
 
 static int ispfe_pdma_prepare_ml0_lut(struct ispfe_device *ispfe)
@@ -3133,11 +3265,13 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
  */
 static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			     dma_addr_t bayer, dma_addr_t backend,
-			     const struct ispfe_stats_area *stats)
+			     const struct ispfe_stats_area *stats,
+			     const u8 *shading)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
 	const struct ispfe_pdma_reloc *last = prog->relocs + prog->num_relocs;
+	dma_addr_t lsc = 0;
 	u32 bayer_lo = 0, bayer_hi = 0;
 	u32 awb_lo = 0, awb_hi = 0;
 	u32 backend_image_lo = 0, backend_image_hi = 0;
@@ -3154,6 +3288,20 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		return -EINVAL;
 
 	program = ispfe->programs + slot * PDMA_SLOT_STRIDE;
+
+	/*
+	 * Give this slot its own copy of the shading table before anything
+	 * points at it, so that a table sent for this frame cannot reach a
+	 * frame whose program was encoded earlier.  A staged program keeps the
+	 * shared block area, because what it is for is running exactly the
+	 * bytes that were staged.
+	 */
+	if (shading && ispfe->lsc_input >= 0 &&
+	    !ispfe->active_pdma_program_override) {
+		lsc = ispfe->lsc_dma + slot * ISPFE_LSC_SLOT_STRIDE;
+		memcpy((u8 *)ispfe->lsc + slot * ISPFE_LSC_SLOT_STRIDE,
+		       shading, ISPFE_LSC_LUT_BYTES);
+	}
 
 	if (ispfe_pdma_recipe_bytes(prog) != prog->recipe_bytes ||
 	    prog->recipe_bytes > PDMA_SLOT_STRIDE) {
@@ -3174,7 +3322,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			continue;
 		case ISPFE_PDMA_INDIRECT_BURST:
 			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer,
-						backend, stats);
+						backend, stats, lsc);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			/*
@@ -3245,7 +3393,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			     reloc->hi + 4 > cmd->len))
 				return -EINVAL;
 			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer,
-						backend, stats);
+						backend, stats, lsc);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			put_unaligned_le32(lower_32_bits(dma),
@@ -3326,7 +3474,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 }
 
 static void ispfe_params_consume(struct ispfe_device *ispfe,
-				 struct ispfe_lmp_wbg_profile *wbg);
+				 struct ispfe_lmp_wbg_profile *wbg,
+				 const u8 **shading);
 
 static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 {
@@ -3367,6 +3516,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 		const struct ispfe_stats_area *stats = NULL;
 		struct ispfe_backend_buffer *buf = NULL;
 		struct ispfe_lmp_wbg_profile wbg;
+		const u8 *shading = NULL;
 		unsigned int program_slot;
 		unsigned int i;
 		bool acquired = false;
@@ -3412,7 +3562,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 			 * factors by them, and what it wants is the balance
 			 * *this* frame was taken through.
 			 */
-			ispfe_params_consume(ispfe, &wbg);
+			ispfe_params_consume(ispfe, &wbg, &shading);
 			buf->ticket.gains = (struct exynos_becore_input_gains) {
 				.red = wbg.red,
 				.green_red = wbg.green_red,
@@ -3421,7 +3571,8 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 			};
 			ret = ispfe_pdma_encode(ispfe, program_slot,
 						ispfe->frame_dma,
-						buf->ticket.dma, stats);
+						buf->ticket.dma, stats,
+						shading);
 			if (ret)
 				ispfe_stats_untake(ispfe, program_slot);
 		}
@@ -3473,6 +3624,7 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 	int ret;
 
 	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_MAX_BLOCKS_BYTES - 1) ||
+	    upper_32_bits(ispfe->lsc_dma + ISPFE_LSC_AREA_BYTES - 1) ||
 	    upper_32_bits(ispfe->programs_dma + PDMA_PROGRAMS_SIZE - 1) ||
 	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1) ||
 	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1) ||
@@ -3511,6 +3663,11 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 	 * whole of what the debugfs diagnostic and the dump slot ever use, so
 	 * both keep writing into the shared allocations the drained snapshot
 	 * reads.  A queue chooses an area when it encodes a slot for a buffer.
+	 *
+	 * The shading table is the stream's default here for the same reason a
+	 * slot's own copy exists at all: what a slot is encoded with is what
+	 * the frame it carries will be corrected by, and no frame has asked for
+	 * anything else yet.
 	 */
 	memset(ispfe->programs, 0, PDMA_PROGRAMS_SIZE);
 	for (i = 0; i < PDMA_SLOTS; i++) {
@@ -3518,7 +3675,7 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 					i == PDMA_DUMP_SLOT ?
 					ispfe->spare_frame_dma :
 					ispfe->frame_dma,
-					backend, NULL);
+					backend, NULL, ispfe->shading);
 		if (ret)
 			return ret;
 	}
@@ -4178,6 +4335,11 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 		ispfe->backend_header_lo = 0;
 		ispfe->backend_header_hi = 0;
 	}
+	if (ispfe->lsc) {
+		dma_free_coherent(ispfe->dev, ISPFE_LSC_AREA_BYTES,
+				  ispfe->lsc, ispfe->lsc_dma);
+		ispfe->lsc = NULL;
+	}
 	if (ispfe->blocks) {
 		dma_free_coherent(ispfe->dev, ISPFE_PDMA_MAX_BLOCKS_BYTES,
 				  ispfe->blocks, ispfe->blocks_dma);
@@ -4224,8 +4386,8 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 	unsigned int i;
 
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
-	    !ispfe->programs || !ispfe->blocks || !ispfe->awb_spare ||
-	    !ispfe->stats_areas[0].grid[0])
+	    !ispfe->programs || !ispfe->blocks || !ispfe->lsc ||
+	    !ispfe->awb_spare || !ispfe->stats_areas[0].grid[0])
 		return false;
 	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
 		return false;
@@ -4294,6 +4456,12 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	ispfe->programs = dma_alloc_coherent(ispfe->dev, PDMA_PROGRAMS_SIZE,
 					     &ispfe->programs_dma, GFP_KERNEL);
 	if (!ispfe->programs) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
+	ispfe->lsc = dma_alloc_coherent(ispfe->dev, ISPFE_LSC_AREA_BYTES,
+					&ispfe->lsc_dma, GFP_KERNEL);
+	if (!ispfe->lsc) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
@@ -4543,6 +4711,19 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	}
 	if (ispfe->prog->lmp_wbg)
 		lmp_wbg = *ispfe->prog->lmp_wbg;
+	/*
+	 * The shading grid *is* per-recipe, because it is a calibration of one
+	 * lens at one readout: measured over 54 captured vendor programs, two
+	 * readouts of one camera differ by up to 30% at a grid point.  So a
+	 * stream starts at the table its own recipe was captured with, and that
+	 * is what a disabled block asks for.
+	 */
+	ispfe->lsc_input = ispfe_lsc_input(ispfe->prog);
+	if (ispfe->lsc_input == -EINVAL)
+		return -EINVAL;
+	if (ispfe->lsc_input >= 0)
+		memcpy(ispfe->shading, ispfe_lsc_default(ispfe->prog),
+		       ISPFE_LSC_LUT_BYTES);
 	if (backend_consumer) {
 		/*
 		 * lmp_wbg with the rest: the back end is told the gains every
@@ -5573,6 +5754,29 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "              ae  sat/dark %d/%d\n",
 		   ispfe->active_lmp_metering.ae_saturation,
 		   ispfe->active_lmp_metering.ae_dark);
+	/*
+	 * Four samples of the 33 x 25 grid rather than the grid: the centre and
+	 * the two horizontal edges of the middle row say what a shading table
+	 * is doing, and the corner says how far it goes.  Green-red, because
+	 * the four channels move together and one of them is enough to see a
+	 * table change.
+	 */
+	seq_printf(s, "lmp_shading   %s, Gr edge/centre/edge %u/%u/%u, corner %u Q12\n",
+		   ispfe->lsc_input < 0 ? "not in this recipe" :
+		   ispfe->prog && !memcmp(ispfe->shading,
+					  ispfe_lsc_default(ispfe->prog),
+					  ISPFE_LSC_LUT_BYTES) ?
+		   "the recipe's own" : "from userspace",
+		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
+				    0, EXYNOS_ISPFE_WB_GREEN_RED),
+		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
+				    EXYNOS_ISPFE_LSC_COLUMNS / 2,
+				    EXYNOS_ISPFE_WB_GREEN_RED),
+		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
+				    EXYNOS_ISPFE_LSC_COLUMNS - 1,
+				    EXYNOS_ISPFE_WB_GREEN_RED),
+		   ispfe_lsc_sample(ispfe->shading, 0, 0,
+				    EXYNOS_ISPFE_WB_GREEN_RED));
 	seq_printf(s, "fc_axi_max_ost %#x requested, %#x active\n",
 		   ispfe->fc_axi_max_ost, ispfe->active_fc_axi_max_ost);
 	seq_printf(s, "backend_recipe %u requested, %u active\n",
@@ -5812,6 +6016,43 @@ static ssize_t ispfe_blocks_write(struct file *file, const char __user *buf,
 				      &ispfe->pdma_blocks_staged_bytes,
 				      &ispfe->pdma_blocks_staged_generation);
 }
+
+/*
+ * The live shading table, in the hardware's own tiled layout, readable while
+ * streaming -- which is the point: it is the only way to see that what a
+ * parameters buffer asked for is what a frame will be corrected by, and the
+ * tiling is exactly the part a test cannot check any other way.  Copied under
+ * the lock that swaps it, because a torn read of half of one table and half of
+ * another would be a diagnostic that lies.
+ */
+static ssize_t ispfe_lmp_shading_read(struct file *file, char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	struct ispfe_device *ispfe = file->private_data;
+	ssize_t ret;
+	u8 *copy;
+
+	if (ispfe->lsc_input < 0)
+		return -ENODATA;
+
+	copy = kmalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	scoped_guard(spinlock_irqsave, &ispfe->slock)
+		memcpy(copy, ispfe->shading, ISPFE_LSC_LUT_BYTES);
+	ret = simple_read_from_buffer(buf, count, ppos, copy,
+				      ISPFE_LSC_LUT_BYTES);
+	kfree(copy);
+
+	return ret;
+}
+
+static const struct file_operations ispfe_lmp_shading_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_lmp_shading_read,
+	.llseek = default_llseek,
+};
 
 static const struct file_operations ispfe_blocks_fops = {
 	.owner = THIS_MODULE,
@@ -6055,6 +6296,8 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
 	debugfs_create_file("blocks", 0644, d, ispfe, &ispfe_blocks_fops);
+	debugfs_create_file("lmp_shading", 0444, d, ispfe,
+			    &ispfe_lmp_shading_fops);
 	debugfs_create_file("program_override", 0644, d, ispfe,
 			    &ispfe_program_override_fops);
 	debugfs_create_file("lmp_awb_stats", 0444, d, ispfe,
@@ -6185,6 +6428,7 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 	for (;;) {
 		const struct ispfe_stats_area *stats;
 		struct ispfe_buffer *buf;
+		const u8 *shading = NULL;
 		unsigned int slot;
 		dma_addr_t dma;
 		int ret;
@@ -6206,15 +6450,17 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
 		stats = ispfe_stats_take(ispfe, slot);
 		/*
-		 * The raw recipes carry no white balance stage, so a parameters
-		 * buffer changes nothing here.  It is still consumed, because a
-		 * buffer that is never taken is a DQBUF that never returns --
-		 * and userspace has no way to know which program a stream
-		 * picked.
+		 * The raw recipes carry no white balance stage, so those gains
+		 * change nothing here; the shading table is theirs too, though
+		 * what it corrects is the LMP path rather than the Bayer this
+		 * queue writes.  A buffer is consumed either way, because one
+		 * that is never taken is a DQBUF that never returns -- and
+		 * userspace has no way to know which program a stream picked.
 		 */
-		ispfe_params_consume(ispfe, NULL);
+		ispfe_params_consume(ispfe, NULL, &shading);
 		ret = ispfe_pdma_encode(ispfe, slot, dma,
-					ispfe->backend_buffer.dma, stats);
+					ispfe->backend_buffer.dma, stats,
+					shading);
 		if (ret) {
 			scoped_guard(spinlock_irqsave, &ispfe->slock) {
 				ispfe_stats_untake_locked(ispfe, slot);
@@ -6941,10 +7187,20 @@ struct ispfe_params_buffer {
 	/* What the walk resolved, which is what an encode will program. */
 	struct ispfe_lmp_wbg_profile wbg;
 	struct ispfe_lmp_metering_profile metering;
+	/*
+	 * This buffer's shading table, already in the hardware's tiled layout,
+	 * because tiling is the expensive half and QBUF is the place to pay
+	 * for it.  Consuming the buffer swaps this pointer with the device's
+	 * live one rather than copying seven kilobytes under a spinlock, so
+	 * after a consume this holds whatever table the device had before.
+	 */
+	u8 *shading;
 	bool has_wbg;
 	bool has_metering;
+	bool has_shading;
 	bool restore_default;
 	bool restore_metering_default;
+	bool restore_shading_default;
 };
 
 static struct ispfe_params_buffer *
@@ -6960,6 +7216,9 @@ ispfe_params_block_info[] = {
 	},
 	[EXYNOS_ISPFE_PARAM_BLOCK_METERING] = {
 		.size = sizeof(struct exynos_ispfe_params_metering),
+	},
+	[EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING] = {
+		.size = sizeof(struct exynos_ispfe_params_lens_shading),
 	},
 };
 
@@ -7040,6 +7299,33 @@ static int ispfe_params_check_metering(struct device *dev,
 			m->ae_dark_threshold, m->ae_saturation_threshold);
 		return -ERANGE;
 	}
+
+	return 0;
+}
+
+/*
+ * A gain of zero is a colour switched off rather than corrected, which no
+ * shading table wants; the upper bound is the field's own width.  The grid is
+ * not required to be smooth, monotonic or centred on unity: those are
+ * properties of a lens, and a consumer correcting something else -- a filter,
+ * a cover glass -- is using the block rather than misusing it.
+ */
+static int
+ispfe_params_check_lens_shading(struct device *dev,
+				const struct exynos_ispfe_params_lens_shading *lsc)
+{
+	unsigned int row, column, channel;
+
+	for (row = 0; row < EXYNOS_ISPFE_LSC_ROWS; row++)
+		for (column = 0; column < EXYNOS_ISPFE_LSC_COLUMNS; column++)
+			for (channel = 0; channel < EXYNOS_ISPFE_WB_GAINS;
+			     channel++)
+				if (!lsc->gains[row][column][channel]) {
+					dev_dbg(dev,
+						"shading gain at row %u column %u channel %u is zero\n",
+						row, column, channel);
+					return -ERANGE;
+				}
 
 	return 0;
 }
@@ -7126,6 +7412,37 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
 			buf->has_metering = true;
 			break;
 		}
+		case EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING: {
+			const struct exynos_ispfe_params_lens_shading *lsc =
+				(const struct exynos_ispfe_params_lens_shading *)header;
+			int ret;
+
+			/*
+			 * As for the two above: a disabled block asks for the
+			 * driver's default back rather than for shading
+			 * correction to stop.  Which default that is depends on
+			 * the program a stream selects -- the table is a
+			 * calibration of one lens at one readout -- so it is
+			 * recorded and resolved at the encode.
+			 */
+			if (header->flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) {
+				buf->restore_shading_default = true;
+				break;
+			}
+
+			ret = ispfe_params_check_lens_shading(ispfe->dev, lsc);
+			if (ret)
+				return ret;
+
+			/*
+			 * Tiled here rather than at the encode, because this
+			 * runs once per buffer in process context where the
+			 * encode runs once per frame.
+			 */
+			ispfe_lsc_tile(buf->shading, &lsc->gains[0][0][0]);
+			buf->has_shading = true;
+			break;
+		}
 		default:
 			return -EINVAL;
 		}
@@ -7152,7 +7469,8 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
  * ispfe_stats_return_all() completes under this same lock.
  */
 static void ispfe_params_consume(struct ispfe_device *ispfe,
-				 struct ispfe_lmp_wbg_profile *wbg)
+				 struct ispfe_lmp_wbg_profile *wbg,
+				 const u8 **shading)
 {
 	struct ispfe_params_buffer *buf;
 
@@ -7183,12 +7501,31 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 		else if (buf->has_metering)
 			ispfe->active_lmp_metering = buf->metering;
 
+		/*
+		 * Swapped rather than copied: seven kilobytes under this lock
+		 * would be the largest thing it ever holds, and after the swap
+		 * the buffer owns the table the device had.  So every
+		 * allocation still has exactly one owner, and the one the
+		 * device is about to encode from is not in a buffer userspace
+		 * gets back on the next line.  Restoring the default writes
+		 * into the device's own table instead, which is a copy the
+		 * same size but only when a stream asks for it.
+		 */
+		if (buf->restore_shading_default && ispfe->lsc_input >= 0 &&
+		    ispfe->prog)
+			memcpy(ispfe->shading, ispfe_lsc_default(ispfe->prog),
+			       ISPFE_LSC_LUT_BYTES);
+		else if (buf->has_shading)
+			swap(ispfe->shading, buf->shading);
+
 		buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
 	if (wbg)
 		*wbg = ispfe->active_lmp_wbg;
+	if (shading)
+		*shading = ispfe->shading;
 }
 
 static void ispfe_params_return_all(struct ispfe_device *ispfe,
@@ -7211,8 +7548,14 @@ static int ispfe_params_buf_init(struct vb2_buffer *vb)
 		to_ispfe_params_buffer(to_vb2_v4l2_buffer(vb));
 
 	buf->config = kvmalloc(ISPFE_PARAMS_BUFFER_SIZE, GFP_KERNEL);
-	if (!buf->config)
+	buf->shading = kzalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
+	if (!buf->config || !buf->shading) {
+		kvfree(buf->config);
+		buf->config = NULL;
+		kfree(buf->shading);
+		buf->shading = NULL;
 		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -7224,6 +7567,8 @@ static void ispfe_params_buf_cleanup(struct vb2_buffer *vb)
 
 	kvfree(buf->config);
 	buf->config = NULL;
+	kfree(buf->shading);
+	buf->shading = NULL;
 }
 
 static int ispfe_params_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
@@ -7258,10 +7603,20 @@ static int ispfe_params_buf_prepare(struct vb2_buffer *vb)
 	/* Validate what will be programmed, not what may change underneath. */
 	memcpy(buf->config, vb2_plane_vaddr(vb, 0), ISPFE_PARAMS_BUFFER_SIZE);
 
+	/*
+	 * Every per-buffer verdict, because buffers are reused for the life of
+	 * a REQBUFS: a flag left set makes a buffer that once carried a block
+	 * carry it for ever, and for the shading table that is worse than
+	 * stale -- the consume *swaps* it, so a buffer re-queued without one
+	 * would trade the live table for its own on every frame and the
+	 * correction would alternate between two grids.
+	 */
 	buf->has_wbg = false;
 	buf->restore_default = false;
 	buf->has_metering = false;
 	buf->restore_metering_default = false;
+	buf->has_shading = false;
+	buf->restore_shading_default = false;
 
 	/*
 	 * A buffer carrying no blocks changes nothing and has nothing in it to
@@ -8092,6 +8447,22 @@ err_unmap:
 			     "invalid camera back-end input allocation\n");
 }
 
+/*
+ * The live shading table is plain kmalloc rather than devm, because consuming
+ * a parameters buffer swaps this pointer with that buffer's own allocation:
+ * every table then has exactly one owner, and no live one ever sits inside a
+ * buffer about to go back to userspace.  What the device holds at teardown is
+ * therefore some buffer's former allocation, which devm could not have known
+ * about, so the release is registered instead.
+ */
+static void ispfe_shading_release(void *data)
+{
+	struct ispfe_device *ispfe = data;
+
+	kfree(ispfe->shading);
+	ispfe->shading = NULL;
+}
+
 static int ispfe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -8106,8 +8477,16 @@ static int ispfe_probe(struct platform_device *pdev)
 		devm_kmalloc(dev, ISPFE_PDMA_RECIPE_BYTES, GFP_KERNEL);
 	ispfe->pdma_blocks_staged =
 		devm_kmalloc(dev, ISPFE_PDMA_BLOCKS_BYTES, GFP_KERNEL);
-	if (!ispfe->pdma_program_staged || !ispfe->pdma_blocks_staged)
+	ispfe->shading = kzalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
+	ispfe->lsc_input = -ENOENT;
+	if (!ispfe->pdma_program_staged || !ispfe->pdma_blocks_staged ||
+	    !ispfe->shading) {
+		kfree(ispfe->shading);
 		return -ENOMEM;
+	}
+	ret = devm_add_action_or_reset(dev, ispfe_shading_release, ispfe);
+	if (ret)
+		return ret;
 
 	ispfe->dev = dev;
 	ispfe->cam_clk = devm_clk_get(dev, "cam");

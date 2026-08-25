@@ -608,9 +608,26 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  * the drained snapshot uses, and is why a node can be stopped at any time
  * without proving anything about what the front end is doing.
  */
+/*
+ * Cacheable, and synced by hand at the two boundaries, because the copy out of
+ * here is the most expensive thing this driver does per frame.  These are DMA
+ * targets on a device with no `dma-coherent`, so dma_alloc_coherent() can only
+ * keep its promise by mapping them uncached -- and reading 576 KiB of uncached
+ * memory costs 9.5 ms at 62 MB/s, a quarter of a CPU at 29.44 fps.  The vendor
+ * does not pay that either: LWIS picks the cached dma-heap and exposes a
+ * ranged dma_buf_begin_cpu_access_partial() for the sync.
+ *
+ * dma_alloc_noncontiguous() rather than dma_alloc_noncoherent(), because the
+ * latter goes through dma_common_alloc_pages() under an IOMMU and would want
+ * an order-7 physically contiguous allocation for each of these ten -- a
+ * fragmentation failure waiting for uptime.  This asks for scattered pages and
+ * one contiguous IOVA, which is all the hardware needs: it is handed a single
+ * address, and @sgt->nents is 1.
+ */
 struct ispfe_stats_area {
 	struct list_head list;
 	void *grid[2];
+	struct sg_table *sgt[2];
 	dma_addr_t dma[2];
 	u64 timestamp;
 	u32 sequence;
@@ -2076,9 +2093,46 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		ispfe->stats_slot[slot] = area;
 	}
 
-	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++)
+	/*
+	 * The area is cacheable, so the cleared headers have to be written
+	 * back before the hardware is pointed at them: they are what says a
+	 * grid was *not* written this frame, and a copy left dirty in the
+	 * cache would be read back over whatever the hardware did write.
+	 * Cleaning also leaves the lines clean rather than dirty, which is
+	 * what makes the invalidate in ispfe_stats_publish() safe to discard.
+	 *
+	 * The header only, and not the allocation, because this runs on the
+	 * frame path: the encode behind it has to reach the ready list before
+	 * the next frame start credits a program.  Cleaning all 292 KiB to
+	 * publish 64 bytes of it is 4,672 cache lines a grid rather than one.
+	 * Measured, that made no difference to the frame rate -- it is not
+	 * where the margin goes -- so this is the cheap way to be right rather
+	 * than a fix for anything.  Nothing else here is ever dirty: the body
+	 * is written once, by the zeroing at allocation, and handed to the
+	 * device there; the only other CPU access to an area is the read in
+	 * ispfe_stats_publish(), and a read allocates clean lines.  So the
+	 * header is the whole of what a writeback has to cover.
+	 *
+	 * A ranged sync of one IOVA is only meaningful while it stays inside
+	 * a page, because the pages behind it are not contiguous.  Two
+	 * conjuncts, and only the first is asserted below: the offset has to
+	 * be zero as well, which it is because the grid's address *is* the
+	 * allocation's.
+	 *
+	 * The DMA API asks for the whole buffer to be handed back with
+	 * dma_sync_sgtable_for_device() and this deliberately does not.  What
+	 * makes that safe is that the device direction is only ever a clean on
+	 * this architecture, so the sole thing skipping it can cost is a lost
+	 * dirty line -- and the body is never dirty.
+	 */
+	BUILD_BUG_ON(sizeof(struct exynos_ispfe_stats_grid_header) > PAGE_SIZE);
+	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
 		memset(area->grid[grid], 0,
 		       sizeof(struct exynos_ispfe_stats_grid_header));
+		dma_sync_single_for_device(ispfe->dev, area->dma[grid],
+					   sizeof(struct exynos_ispfe_stats_grid_header),
+					   DMA_TO_DEVICE);
+	}
 
 	return area;
 }
@@ -2134,7 +2188,11 @@ static bool ispfe_stats_capture_locked(struct ispfe_device *ispfe,
 	if (!area)
 		return false;
 	ispfe->stats_slot[slot] = NULL;
-	/* Pairs with the writes the retired frame made into this area. */
+	/*
+	 * Ordering, not visibility: the area is cacheable, and what makes the
+	 * frame's writes readable through this mapping is the invalidate in
+	 * ispfe_stats_work_fn() rather than any barrier here.
+	 */
 	dma_rmb();
 	area->timestamp = timestamp;
 	area->sequence = sequence;
@@ -4304,12 +4362,23 @@ static void ispfe_stats_areas_free(struct ispfe_device *ispfe)
 		for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
 			unsigned int output = ispfe_stats_grids[grid].output;
 
-			if (!area->grid[grid])
-				continue;
-			dma_free_coherent(ispfe->dev,
-					  ispfe_pdma_outputs[output].size,
-					  area->grid[grid], area->dma[grid]);
-			area->grid[grid] = NULL;
+			/*
+			 * Separately, because an allocation that got its
+			 * pages and failed its mapping leaves one without the
+			 * other and this is the path that cleans it up.
+			 */
+			if (area->grid[grid]) {
+				dma_vunmap_noncontiguous(ispfe->dev,
+							 area->grid[grid]);
+				area->grid[grid] = NULL;
+			}
+			if (area->sgt[grid]) {
+				dma_free_noncontiguous(ispfe->dev,
+						       ispfe_pdma_outputs[output].size,
+						       area->sgt[grid],
+						       DMA_BIDIRECTIONAL);
+				area->sgt[grid] = NULL;
+			}
 		}
 		INIT_LIST_HEAD(&area->list);
 	}
@@ -4346,14 +4415,57 @@ static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
 
 			if (size < ISPFE_STATS_GRID_BYTES)
 				return -EINVAL;
+			/*
+			 * __GFP_ZERO, and it is not belt and braces:
+			 * dma_alloc_coherent() added it for us and
+			 * dma_alloc_noncontiguous() does not.  Only the 64-byte
+			 * header of a grid is ever written by this driver, so
+			 * without it every byte the hardware does not write is
+			 * page-allocator memory -- and it goes to userspace,
+			 * because a truncated grid still passes the header
+			 * check in ispfe_stats_publish().
+			 */
+			area->sgt[grid] =
+				dma_alloc_noncontiguous(ispfe->dev, size,
+							DMA_BIDIRECTIONAL,
+							GFP_KERNEL | __GFP_ZERO,
+							0);
+			if (!area->sgt[grid])
+				return -ENOMEM;
+			/*
+			 * One address for the hardware, because the allocation
+			 * is mapped into a single IOVA range however many
+			 * physical chunks are behind it.  @nents is 1 for the
+			 * same reason and is not worth testing -- the DMA core
+			 * assigns it unconditionally.
+			 *
+			 * @orig_nents is the one to be careful of: it really is
+			 * greater than one here, so the sync below has to stay
+			 * dma_sync_sgtable_*(), which walks it.  A
+			 * dma_sync_sg_*() over @nents would sync the first
+			 * physical chunk and silently skip the rest.
+			 */
+			area->dma[grid] = sg_dma_address(area->sgt[grid]->sgl);
 			area->grid[grid] =
-				dma_alloc_coherent(ispfe->dev, size,
-						   &area->dma[grid],
-						   GFP_KERNEL);
+				dma_vmap_noncontiguous(ispfe->dev, size,
+						       area->sgt[grid]);
 			if (!area->grid[grid])
 				return -ENOMEM;
 			if (upper_32_bits(area->dma[grid] + size - 1))
 				return -ERANGE;
+			/*
+			 * Hand the whole allocation to the device once, here,
+			 * so that everything after this point can rely on
+			 * "the body is never dirty" without asking which
+			 * allocator ran.  The zeroing above is a CPU write to
+			 * all of it, and only the IOMMU path happens to clean
+			 * afterwards; the direct fallback memsets through the
+			 * cacheable linear map and leaves it dirty.  This is
+			 * at probe, not on the frame path, so it is free.
+			 */
+			dma_sync_sgtable_for_device(ispfe->dev,
+						    area->sgt[grid],
+						    DMA_BIDIRECTIONAL);
 		}
 	}
 
@@ -6973,6 +7085,27 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		const struct exynos_ispfe_stats_grid_header *header =
 			area->grid[grid];
 
+		/*
+		 * Nothing here has been read since the hardware wrote it, so
+		 * every cached line of it is stale -- including the header the
+		 * test below reads.  Invalidating is what makes the copy read
+		 * the frame rather than the last one, and it is why the copy
+		 * can be a cached one at all: uncached, the same 288 KiB took
+		 * 4.8 ms a grid.
+		 *
+		 * Do not conclude from a test that this line is optional.
+		 * Removing it and running `camera-ispfe-stats --check` over
+		 * 200 buffers **passed**: five areas of two 292 KiB grids each
+		 * cycle 2.9 MiB through more cache than the core has, so by
+		 * the time an area comes round again its lines have usually
+		 * been evicted and the read reaches DRAM by accident.  It caught a torn grid
+		 * once in 220.  The argument for this line is the ownership
+		 * one -- the hardware wrote this memory and the CPU has no way
+		 * to know -- and not a measurement.
+		 */
+		dma_sync_sgtable_for_cpu(ispfe->dev, area->sgt[grid],
+					 DMA_BIDIRECTIONAL);
+
 		if (header->columns != EXYNOS_ISPFE_STATS_COLUMNS ||
 		    header->rows != EXYNOS_ISPFE_STATS_ROWS)
 			continue;
@@ -7010,14 +7143,16 @@ static bool ispfe_stats_producing(const struct ispfe_device *ispfe)
  * a buffer that comes back DONE inside the call that queued it is not what a
  * caller expects.
  *
- * On system_dfl_long_wq rather than the per-CPU one, because this copy is
- * long enough to be antisocial there.  Both grids are dma_alloc_coherent() and
- * so uncached, and reading 576 KiB of that takes 9.5 ms -- 62 MB/s, measured.
- * It never sleeps, so a per-CPU pool cannot run anything else behind it for
- * all of that, and what was behind it is ispfe_backend_fill_work(), which has
- * a frame deadline of about 1.3 ms.  That is the whole of why the front end
- * dropped one credit in three whenever this node was streaming.  An unbound
- * pool is not concurrency-managed, so a long item there blocks nothing.
+ * On system_dfl_long_wq rather than the per-CPU one, and it still belongs
+ * there now that the copy is cheap.  It was 9.5 ms while the grids were
+ * uncached -- 576 KiB at 62 MB/s, measured -- and it never sleeps, so a
+ * per-CPU pool could run nothing else behind it for all of that.  What was
+ * behind it is ispfe_backend_fill_work(), which has a frame deadline of about
+ * 1.3 ms, and that is the whole of why the front end dropped one credit in
+ * three whenever this node was streaming.  Cacheable grids took the copy to a
+ * measured 0.079 ms mean, so the old margin is back several times over; what
+ * has not changed is that this is a bulk copy with no deadline of its own,
+ * and an unbound pool is where one belongs.
  *
  * All six sites that queue this item name that one workqueue, and they have to:
  * a work_struct split across two of them can run on two CPUs at once, because

@@ -2509,6 +2509,22 @@ becore_sharpen_geometry_value(const struct becore_raster *array,
 		u32 vertical = DIV_ROUND_CLOSEST(BECORE_SHARPEN_STEP_Q *
 						 crop.height, chain_h);
 
+		/*
+		 * Q8 in sixteen bits, so the crop may be up to 255.996 times
+		 * the chain and no more.  Masking a larger one keeps the low
+		 * bits, exactly as YUVNR's binning would, and the result is a
+		 * spatial step running at a fraction of its real rate with
+		 * nothing saying so.
+		 *
+		 * Nothing can reach it today: binning is the same ratio at a
+		 * sixteenth of this bound, so a crop this much larger than the
+		 * chain is refused a few registers earlier in the same record
+		 * walk.  Which is the reason to state it here rather than
+		 * leave it to the order two unrelated words are evaluated in.
+		 */
+		if (horizontal > BECORE_SHARPEN_STEP_MASK ||
+		    vertical > BECORE_SHARPEN_STEP_MASK)
+			return -ERANGE;
 		*value = ((vertical & BECORE_SHARPEN_STEP_MASK) << 16) |
 			 (horizontal & BECORE_SHARPEN_STEP_MASK);
 		return 0;

@@ -827,6 +827,25 @@ extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
 /* What a queued capture's address must be aligned to; see becore_buf_prepare. */
 #define BECORE_CAPTURE_ALIGN		32
 
+struct becore_c2serv_desc {
+	const char *name;
+	u16 local_ip;
+	u8 producers;
+	u8 consumers;
+};
+
+struct becore_stream_crc {
+	u32 offset;
+	const char *name;
+};
+
+#define BECORE_STREAM_CRC_SEED_MASK	GENMASK_U32(7, 0)
+#define BECORE_STREAM_CRC_RESULT_MASK	GENMASK_U32(15, 8)
+#define BECORE_STREAM_CRC_RESULT_SHIFT	8
+
+/* exynos-becore-debugfs.c */
+int becore_debugfs_init(struct becore_device *becore);
+
 /* exynos-becore-video.c */
 int becore_bayer_phase(u32 code);
 void becore_video_return_all(struct becore_device *becore,
@@ -922,6 +941,11 @@ int becore_yuvp_gamma_curve_value(const struct becore_params_state *params,
 extern const struct becore_noise_curve becore_noise_curves[BECORE_NOISE_CURVES];
 
 /* exynos-becore-core.c */
+int becore_alloc_surfaces(struct becore_device *becore);
+void becore_free_surfaces(struct becore_device *becore);
+const struct becore_stream_crc *
+becore_stream_crc_table(enum becore_block_id id, size_t *count);
+extern const struct becore_c2serv_desc becore_c2serv[BECORE_NUM_C2SERV];
 struct exynos_becore_input *
 becore_input_callback_get(struct becore_device *becore);
 void becore_input_callback_put(struct exynos_becore_input *input);

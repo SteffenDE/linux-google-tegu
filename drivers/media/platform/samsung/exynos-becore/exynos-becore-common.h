@@ -810,6 +810,38 @@ extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
  */
 #define BECORE_ARRAY_EXTENT_MAX		(BECORE_RGBP_DNS_CENTRE_MASK + 1)
 
+/*
+ * The lattice, plus the pair that opens the port and the pair that closes it.
+ *
+ * These two expand against the captured recipe's own header, which this file
+ * deliberately does not include -- it carries two shape tables that would then
+ * be copied into every translation unit.  A file that uses either has to
+ * include exynos-becore-recipe.h itself, and both of the two that do already
+ * did before they were split apart.
+ */
+#define BECORE_YUVP_CLUT_BURST_HEADERS \
+	(DIV_ROUND_UP(BECORE_CLUT_LATTICE_WORDS, BECORE_CMDQ_PAYLOAD_WORDS) + 2)
+#define BECORE_YUVP_PROGRAM_HEADERS \
+	(BECORE_YUVP_HEADER_COUNT + BECORE_YUVP_CLUT_BURST_HEADERS)
+
+/* exynos-becore-recipe.c */
+size_t becore_cmdq_program_size(u32 header_count);
+size_t becore_cmdq_encoded_size(const struct becore_cmdq_program *program);
+int becore_shape_register(const struct becore_cmdq_shape *shape,
+			  u32 word, u32 *reg);
+int becore_recipe_validate(struct becore_device *becore);
+int becore_recipe_records_validate(struct becore_device *becore,
+				   bool validate_dma);
+int becore_recipe_generate(struct becore_device *becore);
+int becore_override_check(u32 reg);
+int becore_encode_programs(struct becore_device *becore);
+int becore_gtnr_recipe_validate(struct becore_device *becore);
+int becore_encode_gtnr(struct becore_device *becore);
+int becore_mcsc_recipe_generate(struct becore_device *becore);
+int becore_mcsc_recipe_validate(struct becore_device *becore);
+int becore_encode_mcsc(struct becore_device *becore,
+		       enum becore_mcsc_input_transport transport);
+
 /* exynos-becore-geometry.c */
 size_t becore_rgbp_input_size(const struct becore_rgbp_input_profile *profile,
 			      const struct becore_raster *array);
@@ -879,8 +911,6 @@ extern const struct becore_noise_curve becore_noise_curves[BECORE_NOISE_CURVES];
 /* exynos-becore-core.c */
 int becore_bayer_phase(u32 code);
 u32 becore_mcsc_votf_enable(const u32 *requested_token);
-int becore_shape_register(const struct becore_cmdq_shape *shape,
-			  u32 word, u32 *reg);
 extern const struct v4l2_file_operations becore_fops;
 
 #endif /* EXYNOS_BECORE_COMMON_H */

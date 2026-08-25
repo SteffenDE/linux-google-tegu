@@ -1112,11 +1112,16 @@ static_assert(EXYNOS_BECORE_CLUT_MAX == BECORE_CLUT_FIELD_MAX);
  *
  * Each of the first four registers packs two 16-bit halves with the width in
  * the high one, and the two ratios are the crop as a 20-bit fixed-point
- * fraction of the destination -- Samsung's own GET_ZOOM_RATIO(in, out), which
- * is ((in) << MCSC_PRECISION) / (out) with MCSC_PRECISION 20. This driver
- * crops the whole 4160 x 3120 raster into 4000 x 3000, which truncates to
- * 0x0010a3d7 on both axes; the vendor cropped 3536 x 2652 out of it and
- * carried 0x000e24dd, spending the difference on stabilisation.
+ * fraction of the destination. Samsung names that GET_ZOOM_RATIO(in, out) and
+ * writes it as ((in) << MCSC_PRECISION) / (out) with MCSC_PRECISION 20, an
+ * integer divide -- but this block's captured words are the *rounded*
+ * quotient, not the truncated one, at every window in the corpus that tells
+ * the two apart. RGBP's scaler is the truncation; see becore_zoom_ratio() and
+ * becore_mcsc_djag_ratio() for which readouts say so.
+ *
+ * This driver crops the whole 4160 x 3120 raster into 4000 x 3000, which
+ * gives 0x0010a3d7 on both axes either way; the vendor cropped 3536 x 2652
+ * out of it and carried 0x000e24dd, spending the difference on stabilisation.
  */
 #define BECORE_MCSC_DJAG_IMG_SIZE_REG	(BECORE_MCSC_PHYS_BASE + 0x4004)
 #define BECORE_MCSC_DJAG_PS_SRC_POS_REG	(BECORE_MCSC_PHYS_BASE + 0x4008)

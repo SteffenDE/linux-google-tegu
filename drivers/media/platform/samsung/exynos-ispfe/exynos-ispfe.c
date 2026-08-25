@@ -2683,6 +2683,24 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
  */
 #define ISPFE_LMP_LUT_INSTANCE_STRIDE	0x3ae8
 #define ISPFE_LMP_LSC_LUT_REG		0x0006a02c
+/*
+ * The linearisation curve LMP reads through that same area, and it is an
+ * exact identity: 129 knots of four unsigned Q15 channels in the R, Gr, Gb, B
+ * order everything else here uses, each holding `knot * 256`, so 32768 is one.
+ * Not 130 knots, which the 1,040 bytes invite -- the last record is zero on
+ * all four channels, which no ramp would be, so it is padding.
+ *
+ * Every one of the vendor's 54 captured programs writes exactly this table on
+ * all three cameras and all six sensor readouts, which is what says it is the
+ * hardware's pass-through rather than one phone's tuning.
+ */
+#define ISPFE_LMP_LINEARIZATION_LUT_REG	0x000695fc
+#define ISPFE_LMP_LINEARIZATION_KNOTS	129
+#define ISPFE_LMP_LINEARIZATION_STEP	256
+#define ISPFE_LMP_LINEARIZATION_LUT_BYTES \
+	((ISPFE_LMP_LINEARIZATION_KNOTS + 1) * EXYNOS_ISPFE_WB_GAINS * 2)
+/* What the generated recipes declare the area to be, so an edit here says so. */
+static_assert(ISPFE_LMP_LINEARIZATION_LUT_BYTES == 0x410);
 #define ISPFE_LMP_AWB_STATS_CONFIG_SIZE	0x34
 #define ISPFE_LMP_AE_STATS_CONFIG_SIZE	0x28
 #define ISPFE_LMP_STATS_SATURATION	0x10
@@ -2964,13 +2982,14 @@ static void ispfe_lsc_tile(u8 *tiled, const u16 *grid)
 }
 
 /*
- * Which of the running program's indirect inputs is the shading table, or a
+ * Which of the running program's indirect inputs a lookup table is, or a
  * negative error if it has none.  Found by the register the burst targets
- * rather than by an index, because the two LMP instances put it in different
- * places and an index would quietly select a different table on the raw
- * recipes.
+ * rather than by an index, because the two LMP instances put the LUT area in
+ * different places and an index would quietly select a different table on the
+ * raw recipes.
  */
-static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
+static int ispfe_lut_input(const struct ispfe_pdma_program *prog, u32 reg,
+			   u32 bytes)
 {
 	unsigned int i;
 
@@ -2978,11 +2997,10 @@ static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
 		const struct ispfe_pdma_cmd *cmd = &prog->cmds[i];
 
 		if (cmd->op != ISPFE_PDMA_INDIRECT_BURST ||
-		    (cmd->reg != ISPFE_LMP_LSC_LUT_REG &&
-		     cmd->reg != ISPFE_LMP_LSC_LUT_REG +
-				 ISPFE_LMP_LUT_INSTANCE_STRIDE))
+		    (cmd->reg != reg &&
+		     cmd->reg != reg + ISPFE_LMP_LUT_INSTANCE_STRIDE))
 			continue;
-		if (cmd->len != ISPFE_LSC_LUT_BYTES ||
+		if (cmd->len != bytes ||
 		    ISPFE_BUF_TO_KIND(cmd->buffer) != ISPFE_BUF_KIND_INPUT ||
 		    ISPFE_BUF_TO_INDEX(cmd->buffer) >= prog->num_inputs)
 			return -EINVAL;
@@ -2990,6 +3008,12 @@ static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
 	}
 
 	return -ENOENT;
+}
+
+static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
+{
+	return ispfe_lut_input(prog, ISPFE_LMP_LSC_LUT_REG,
+			       ISPFE_LSC_LUT_BYTES);
 }
 
 /* One grid sample read back out of the tiled table, for the diagnostic. */
@@ -3000,14 +3024,100 @@ static u16 ispfe_lsc_sample(const u8 *tiled, unsigned int row,
 				  2 * ispfe_lsc_word(row, column, channel));
 }
 
-/* The recipe's own captured table, which is what a disabled block asks for. */
+/*
+ * The recipe's own captured table, which is what a disabled block asks for.
+ * An input the driver states rather than replays carries no bytes at all, so
+ * that is a third way for a recipe to have no default here.
+ */
 static const u8 *ispfe_lsc_default(const struct ispfe_pdma_program *prog)
 {
 	int input = ispfe_lsc_input(prog);
 
-	if (input < 0 || prog->inputs[input].size < ISPFE_LSC_LUT_BYTES)
+	if (input < 0 || prog->inputs[input].size < ISPFE_LSC_LUT_BYTES ||
+	    !prog->inputs[input].data)
 		return NULL;
 	return prog->inputs[input].data;
+}
+
+/*
+ * Where one of the tables the driver states lives in the shared block area,
+ * checked against the area it has to fit in rather than trusted.
+ *
+ * The input it resolves to must be one the recipe declares stated -- carrying
+ * no bytes of its own.  A generated recipe where the register and the empty
+ * entry disagree would otherwise leave one table zeroed and overwrite another,
+ * which is a picture rather than an error.
+ */
+static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
+			  unsigned int *index, u8 **area)
+{
+	const struct ispfe_pdma_program *prog = ispfe->prog;
+	int input = ispfe_lut_input(prog, reg, bytes);
+
+	if (input < 0)
+		return input;
+	if (prog->inputs[input].size != bytes || prog->inputs[input].data ||
+	    size_add(prog->inputs[input].area_offset, bytes) >
+	    prog->blocks_bytes)
+		return -EINVAL;
+	*index = input;
+	*area = (u8 *)ispfe->blocks + prog->inputs[input].area_offset;
+	return 0;
+}
+
+/*
+ * The lookup tables the driver states rather than replays.  A captured table
+ * that is an identity or a uniform default is not tuning at all, and
+ * generating it says so where a thousand bytes of `const u8` cannot.
+ *
+ * The linearisation curve is that identity, on all four channels.  Its last
+ * record is left at the zero the surrounding memset already wrote, because it
+ * is padding rather than a knot.
+ *
+ * A recipe that carries no such table is refused rather than left with a
+ * zeroed one: every captured program writes this curve, so a recipe without
+ * it is a recipe this code has not seen, and a zeroed curve would map every
+ * input to black.
+ */
+static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
+{
+	const struct ispfe_pdma_program *prog = ispfe->prog;
+	unsigned int knot, channel, index, i;
+	unsigned long stated = 0;
+	u8 *area;
+	int ret;
+
+	if (prog->num_inputs > BITS_PER_LONG)
+		return -EINVAL;
+
+	ret = ispfe_lut_area(ispfe, ISPFE_LMP_LINEARIZATION_LUT_REG,
+			     ISPFE_LMP_LINEARIZATION_LUT_BYTES, &index, &area);
+	if (ret) {
+		dev_err(ispfe->dev,
+			"PDMA recipe carries no linearisation curve (%d)\n", ret);
+		return -EINVAL;
+	}
+	__set_bit(index, &stated);
+	for (knot = 0; knot < ISPFE_LMP_LINEARIZATION_KNOTS; knot++)
+		for (channel = 0; channel < EXYNOS_ISPFE_WB_GAINS; channel++)
+			put_unaligned_le16(knot * ISPFE_LMP_LINEARIZATION_STEP,
+					   area + 2 * (knot *
+						       EXYNOS_ISPFE_WB_GAINS +
+						       channel));
+
+	/*
+	 * And every empty input is one of those, so a recipe cannot declare a
+	 * table stated and get a zeroed area because nothing here fills it.
+	 */
+	for (i = 0; i < prog->num_inputs; i++)
+		if (!prog->inputs[i].data && !test_bit(i, &stated)) {
+			dev_err(ispfe->dev,
+				"PDMA recipe input %u carries no bytes and nothing states it\n",
+				i);
+			return -EINVAL;
+		}
+
+	return 0;
 }
 
 static int ispfe_pdma_prepare_ml0_lut(struct ispfe_device *ispfe)
@@ -3775,9 +3885,14 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 			if (input->area_offset + input->size >
 			    ispfe->prog->blocks_bytes)
 				return -EOVERFLOW;
+			if (!input->data)
+				continue;
 			memcpy((u8 *)ispfe->blocks + input->area_offset,
 			       input->data, input->size);
 		}
+		ret = ispfe_pdma_state_luts(ispfe);
+		if (ret)
+			return ret;
 		ret = ispfe_pdma_prepare_ml0_lut(ispfe);
 		if (ret)
 			return ret;
@@ -4900,9 +5015,18 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->lsc_input = ispfe_lsc_input(ispfe->prog);
 	if (ispfe->lsc_input == -EINVAL)
 		return -EINVAL;
-	if (ispfe->lsc_input >= 0)
-		memcpy(ispfe->shading, ispfe_lsc_default(ispfe->prog),
-		       ISPFE_LSC_LUT_BYTES);
+	if (ispfe->lsc_input >= 0) {
+		const u8 *table = ispfe_lsc_default(ispfe->prog);
+
+		/*
+		 * Refused here rather than later: a recipe that names a
+		 * shading table it does not carry has no default to restore,
+		 * and every path that restores one runs after this.
+		 */
+		if (!table)
+			return -EINVAL;
+		memcpy(ispfe->shading, table, ISPFE_LSC_LUT_BYTES);
+	}
 	if (backend_consumer) {
 		/*
 		 * lmp_wbg with the rest: the back end is told the gains every
@@ -5942,9 +6066,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	 */
 	seq_printf(s, "lmp_shading   %s, Gr edge/centre/edge %u/%u/%u, corner %u Q12\n",
 		   ispfe->lsc_input < 0 ? "not in this recipe" :
-		   ispfe->prog && !memcmp(ispfe->shading,
-					  ispfe_lsc_default(ispfe->prog),
-					  ISPFE_LSC_LUT_BYTES) ?
+		   ispfe->prog && ispfe_lsc_default(ispfe->prog) &&
+		   !memcmp(ispfe->shading,
+			   ispfe_lsc_default(ispfe->prog),
+			   ISPFE_LSC_LUT_BYTES) ?
 		   "the recipe's own" : "from userspace",
 		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
 				    0, EXYNOS_ISPFE_WB_GREEN_RED),

@@ -65,6 +65,19 @@ int becore_bayer_phase(u32 code)
 	return -EINVAL;
 }
 
+/*
+ * And back: the media-bus code a phase means, or 0 for a phase there is no
+ * code for. Zero is not a media-bus code, so a caller that ignores the range
+ * check cannot mistake the answer for one.
+ */
+u32 becore_bayer_code(u32 phase)
+{
+	if (phase >= ARRAY_SIZE(becore_input_codes))
+		return 0;
+
+	return becore_input_codes[phase];
+}
+
 /* ---- the input subdevice ------------------------------------------------ */
 
 /*

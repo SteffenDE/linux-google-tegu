@@ -740,6 +740,8 @@ struct becore_noise_curve {
  */
 #define BECORE_NOISE_CURVES		4
 
+struct becore_cmdq_shape;
+
 /* exynos-becore-params.c */
 int becore_params_init(struct becore_device *becore);
 void becore_params_work(struct work_struct *work);
@@ -771,10 +773,45 @@ int becore_dmsc_table_validate(struct device *dev);
 extern const struct exynos_becore_params_yuvnr becore_yuvnr_off;
 extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
 
-/* exynos-becore-core.c */
+/*
+ * How many words each block hands to becore_generated_value(). Held here
+ * rather than in the generated table so that a recipe which quietly stopped
+ * carrying one of them fails validation instead of programming the capture.
+ */
+#define BECORE_RGBP_GENERATED_WORDS	348
+#define BECORE_YUVP_GENERATED_WORDS	1365
+#define BECORE_MCSC_GENERATED_WORDS	116
+
+/* exynos-becore-generated.c */
+int becore_generated_value(const struct becore_device *becore,
+			   enum becore_block_id id, u32 reg, u32 *value);
+u32 becore_generated_word_count(enum becore_block_id id);
+int becore_generated_tables_validate(struct device *dev);
+int becore_noise_knots_resolve(struct device *dev);
+int becore_yuvnr_geometry_value(const struct becore_raster *array,
+				const struct becore_raster *chain,
+				u32 offset, u32 *value);
 int becore_yuvp_gamma_curve_value(const struct becore_params_state *params,
 				  u32 reg, u32 *value);
 extern const struct becore_noise_curve becore_noise_curves[BECORE_NOISE_CURVES];
+
+/* exynos-becore-core.c */
+int becore_bayer_phase(u32 code);
+u32 becore_pack_size(u32 high, u32 low);
+int becore_rgbp_crop(const struct becore_raster *array,
+		     const struct becore_raster *chain,
+		     struct becore_rect *crop);
+const struct becore_rgbp_input_profile *
+becore_rgbp_input_profile(const struct becore_device *becore);
+int becore_rgbp_input_value(const struct becore_rgbp_input_profile *profile,
+			    const struct becore_raster *array,
+			    const struct becore_raster *chain,
+			    u32 index, u32 reg, u32 *value);
+u32 becore_scaler_init_phase(u32 ratio);
+int becore_shape_register(const struct becore_cmdq_shape *shape,
+			  u32 word, u32 *reg);
+int becore_zoom_ratio(u32 in, u32 out, u32 *ratio);
+extern const u32 becore_rgbp_input_regs[BECORE_RGBP_INPUT_WORD_COUNT];
 extern const struct v4l2_file_operations becore_fops;
 
 #endif /* EXYNOS_BECORE_COMMON_H */

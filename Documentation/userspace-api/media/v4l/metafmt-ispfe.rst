@@ -73,7 +73,8 @@ distinct structs, or "blocks", which userspace appends to the data member of
 populate the type member with a value from
 :c:type:`exynos_ispfe_params_block_type`.
 
-Two block types exist, and both carry what only an algorithm can decide.
+Three block types exist, and each carries what only an algorithm or a
+calibration can decide.
 
 :c:type:`exynos_ispfe_params_white_balance` carries the gains the front end
 applies before it meters, which are therefore both what balances the picture
@@ -92,14 +93,25 @@ What the block does *not* carry is the region geometry: the 64 x 48 regions and
 the cell size that tiles them over the sensor are derived from the format
 rather than chosen.
 
+:c:type:`exynos_ispfe_params_lens_shading` carries the gain grid that corrects
+the lens's falloff: 33 x 25 points over the whole picture, four gains each, in
+the same R, Gr, Gb, B order as everything else here. It is the only stage in
+the graph that can correct shading. What it corrects is the processed image and
+the exposure statistics, which are metered after it; what it does not reach is
+the raw output, which leaves the receiver before it runs. A grid is a
+calibration of one lens at one sensor readout rather
+than a per-frame decision, so a consumer that has one for this unit and this
+mode has what the block wants; until a buffer carries one the driver applies
+the grid its captured program was taken with.
+
 A buffer is taken by the next program encode and the front end encodes one
 program per frame, so a value reaches the frame after next: the same latency
 the sensor's own controls have, and for the same reason.
 
 The driver rejects a buffer at :c:func:`VIDIOC_QBUF` if a gain is outside
 ``1 .. EXYNOS_ISPFE_WB_GAIN_MAX``, if a metering dark threshold is above its
-own saturation threshold, or if the luma window is inverted -- so a mistake is
-reported against the buffer that carried it. A block sent with
+own saturation threshold, if the luma window is inverted, or if any shading
+gain is zero -- so a mistake is reported against the buffer that carried it. A block sent with
 ``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns that part of the configuration to
 the driver's default rather than switching the stage off; it carries no values,
 and none are checked.
@@ -151,6 +163,22 @@ and none are checked.
 
 	data += sizeof(struct exynos_ispfe_params_metering);
 	params->data_size += sizeof(struct exynos_ispfe_params_metering);
+
+	struct exynos_ispfe_params_lens_shading *lsc =
+		(struct exynos_ispfe_params_lens_shading *)data;
+
+	lsc->header.type = EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING;
+	lsc->header.flags |= V4L2_ISP_PARAMS_FL_BLOCK_ENABLE;
+	lsc->header.size = sizeof(struct exynos_ispfe_params_lens_shading);
+
+	/* Unsigned Q12 again: a grid of unity gains corrects nothing. */
+	for (unsigned int row = 0; row < EXYNOS_ISPFE_LSC_ROWS; row++)
+		for (unsigned int col = 0; col < EXYNOS_ISPFE_LSC_COLUMNS; col++)
+			for (unsigned int c = 0; c < EXYNOS_ISPFE_WB_GAINS; c++)
+				lsc->gains[row][col][c] = calibration[row][col][c];
+
+	data += sizeof(struct exynos_ispfe_params_lens_shading);
+	params->data_size += sizeof(struct exynos_ispfe_params_lens_shading);
 
 The ``bytesused`` field of the queued buffer must be the size of
 :c:type:`v4l2_isp_params_buffer` plus ``data_size``.

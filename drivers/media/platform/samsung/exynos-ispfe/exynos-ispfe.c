@@ -3170,7 +3170,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	return 0;
 }
 
-static void ispfe_params_consume(struct ispfe_device *ispfe);
+static void ispfe_params_consume(struct ispfe_device *ispfe,
+				 struct ispfe_lmp_wbg_profile *wbg);
 
 static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 {
@@ -3210,6 +3211,7 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 	for (;;) {
 		const struct ispfe_stats_area *stats = NULL;
 		struct ispfe_backend_buffer *buf = NULL;
+		struct ispfe_lmp_wbg_profile wbg;
 		unsigned int program_slot;
 		unsigned int i;
 		bool acquired = false;
@@ -3247,7 +3249,21 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 		if (!ret) {
 			acquired = true;
 			stats = ispfe_stats_take(ispfe, program_slot);
-			ispfe_params_consume(ispfe);
+			/*
+			 * The gains this program is about to be encoded with,
+			 * taken under the same lock that may have just moved
+			 * them, and handed to the back end on the buffer the
+			 * program writes.  Its Bayer denoiser scales its noise
+			 * factors by them, and what it wants is the balance
+			 * *this* frame was taken through.
+			 */
+			ispfe_params_consume(ispfe, &wbg);
+			buf->ticket.gains = (struct exynos_becore_input_gains) {
+				.red = wbg.red,
+				.green_red = wbg.green_red,
+				.green_blue = wbg.green_blue,
+				.blue = wbg.blue,
+			};
 			ret = ispfe_pdma_encode(ispfe, program_slot,
 						ispfe->frame_dma,
 						buf->ticket.dma, stats);
@@ -4373,8 +4389,15 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	if (ispfe->prog->lmp_wbg)
 		lmp_wbg = *ispfe->prog->lmp_wbg;
 	if (backend_consumer) {
+		/*
+		 * lmp_wbg with the rest: the back end is told the gains every
+		 * frame was taken through, and a recipe with no white balance
+		 * stage has none to tell it.  Refusing here says so once,
+		 * where refusing at the first frame would only say -ERANGE.
+		 */
 		if (!ispfe->prog->backend_recipe ||
-		    !ispfe->prog->fixed_resources)
+		    !ispfe->prog->fixed_resources ||
+		    !ispfe->prog->lmp_wbg)
 			return -EINVAL;
 		source.loch = ispfe->prog->required_loch;
 		source.fcctx = ispfe->prog->required_fcctx;
@@ -6015,7 +6038,7 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		 * and userspace has no way to know which program a stream
 		 * picked.
 		 */
-		ispfe_params_consume(ispfe);
+		ispfe_params_consume(ispfe, NULL);
 		ret = ispfe_pdma_encode(ispfe, slot, dma,
 					ispfe->backend_buffer.dma, stats);
 		if (ret) {
@@ -6846,7 +6869,10 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
 
 /*
  * Take the earliest buffer waiting and make it the live state, if one is
- * waiting.  Called from the encode paths, which run once per frame.
+ * waiting.  Called from the encode paths, which run once per frame.  @wbg, if
+ * given, receives the gains the encode that follows will program -- read under
+ * the same lock hold that may have just moved them, so that what a caller
+ * reports about a frame is what that frame's program actually carries.
  *
  * The buffer is taken *and completed* inside one hold of ispfe->slock, gated
  * on params_streaming, and that is the whole of the correctness argument:
@@ -6856,36 +6882,39 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
  * queue's own done_lock and is IRQ-safe, so there is no inversion to avoid;
  * ispfe_stats_return_all() completes under this same lock.
  */
-static void ispfe_params_consume(struct ispfe_device *ispfe)
+static void ispfe_params_consume(struct ispfe_device *ispfe,
+				 struct ispfe_lmp_wbg_profile *wbg)
 {
 	struct ispfe_params_buffer *buf;
 
 	guard(spinlock_irqsave)(&ispfe->slock);
 
-	if (!ispfe->params_streaming)
-		return;
+	buf = ispfe->params_streaming ?
+		list_first_entry_or_null(&ispfe->params_pending,
+					 struct ispfe_params_buffer, list) :
+		NULL;
+	if (buf) {
+		list_del(&buf->list);
 
-	buf = list_first_entry_or_null(&ispfe->params_pending,
-				       struct ispfe_params_buffer, list);
-	if (!buf)
-		return;
+		/*
+		 * Resolved here rather than at buf_prepare, because which
+		 * default applies is the running program's and no program need
+		 * have existed then.  A program without white balance at all
+		 * -- the raw recipes -- has no default to restore and the
+		 * request is dropped, which is the same nothing the gains
+		 * themselves would do there.
+		 */
+		if (buf->restore_default && ispfe->prog && ispfe->prog->lmp_wbg)
+			ispfe->active_lmp_wbg = *ispfe->prog->lmp_wbg;
+		else if (buf->has_wbg)
+			ispfe->active_lmp_wbg = buf->wbg;
 
-	list_del(&buf->list);
+		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	}
 
-	/*
-	 * Resolved here rather than at buf_prepare, because which default
-	 * applies is the running program's and no program need have existed
-	 * then.  A program without white balance at all -- the raw recipes --
-	 * has no default to restore and the request is dropped, which is the
-	 * same nothing the gains themselves would do there.
-	 */
-	if (buf->restore_default && ispfe->prog && ispfe->prog->lmp_wbg)
-		ispfe->active_lmp_wbg = *ispfe->prog->lmp_wbg;
-	else if (buf->has_wbg)
-		ispfe->active_lmp_wbg = buf->wbg;
-
-	buf->vb.vb2_buf.timestamp = ktime_get_ns();
-	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	if (wbg)
+		*wbg = ispfe->active_lmp_wbg;
 }
 
 static void ispfe_params_return_all(struct ispfe_device *ispfe,

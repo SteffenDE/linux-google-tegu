@@ -1138,10 +1138,15 @@ struct exynos_becore_params_yuvnr {
  * **white balance**, which is physically what a denoiser wants: photon noise
  * scales with the per-channel gain applied in front of it. So @std_factor_r,
  * @std_factor_g and @std_factor_b are the tuning alone, and the driver
- * multiplies each by the gain the stream latched from %V4L2_CID_RED_BALANCE
- * and %V4L2_CID_BLUE_BALANCE before encoding it. Green takes unity. Sending
- * the product instead would put a live value in a tuning block and give the
- * driver two sources for one gain.
+ * multiplies each by the gain **that frame was taken through** before encoding
+ * it -- red by the red gain, blue by the blue one, and green by the mean of
+ * the two green gains. Sending the product instead would put a live value in a
+ * tuning block and give the driver two sources for one gain.
+ *
+ * Which gains those are is not this interface's to say: they are the front
+ * end's, they travel with the frame, and a caller must not pre-compensate for
+ * them here. In particular green's is unity only while an AWB normalises
+ * green.
  *
  * @biquad_scale_shift_subtracter is not a register either. The hardware takes
  * a resolution octave -- the block's own scale shift is the rung the input's

@@ -668,6 +668,40 @@ struct ispfe_lmp_wbg_profile {
 	u32 blue;
 };
 
+/*
+ * What the two metering grids exclude, which is the only part of their
+ * configuration that is not geometry.  Held in the units the hardware compares
+ * in -- signed for the sample thresholds, unsigned for the luma window -- so
+ * that nothing between here and the payload has to convert.
+ */
+struct ispfe_lmp_metering_profile {
+	s16 awb_saturation;
+	s16 awb_dark;
+	u16 awb_luma_coeff[4];
+	u16 awb_luma_low;
+	u16 awb_luma_high;
+	u16 awb_diff_coring;
+	s16 ae_saturation;
+	s16 ae_dark;
+};
+
+/*
+ * The vendor's, and identical in all five captured stats payloads across two
+ * sensor rasters -- which is what says they are tuning rather than geometry.
+ * As shipped the exposure grid counts every sample and the white balance grid
+ * discards only what sits at either end of its range.
+ */
+static const struct ispfe_lmp_metering_profile ispfe_lmp_metering_captured = {
+	.awb_saturation = 32256,
+	.awb_dark = 0,
+	.awb_luma_coeff = { 0, 0, 0, 256 },
+	.awb_luma_low = 0,
+	.awb_luma_high = 65535,
+	.awb_diff_coring = 0,
+	.ae_saturation = 32767,
+	.ae_dark = -32768,
+};
+
 /* The two LMP WBG stages use the same captured unsigned-Q12 gains. */
 static const struct ispfe_lmp_wbg_profile ispfe_lmp_wbg_backend = {
 	.red = 8473,
@@ -1102,6 +1136,7 @@ struct ispfe_device {
 	u32 lmp_ml0_profile;
 	u32 active_lmp_ml0_profile;
 	struct ispfe_lmp_wbg_profile active_lmp_wbg;
+	struct ispfe_lmp_metering_profile active_lmp_metering;
 	/* Select the captured ordinary back-end program for a debugfs run. */
 	u32 backend_recipe;
 	bool active_backend_recipe;
@@ -2514,6 +2549,43 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
 #define ISPFE_LMP_DPC_GAIN_MAX		GENMASK(9, 0)
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
+/*
+ * The two metering payloads, read rather than guessed.
+ * `AwbStatsConfigValue::Print` and `AeStatsConfigValue::Print` fetch every
+ * field at an explicit byte offset with an explicit mask, and
+ * `LmpAwbStats::Configure` and `LmpAeStats::Configure` deposit them at the
+ * same ones -- three vendor artefacts that agree.  The compiled-in payloads
+ * agree too: at these offsets the metering ROI comes out *exactly* centred in
+ * five of the six of them across two sensor rasters, `pic_width` is each
+ * sensor's own width, and the thresholds are byte-identical in all six.
+ *
+ * Only the thresholds are written here.  The six ROI words are the hardware's
+ * description of itself and stay replayed; the driver would have to derive
+ * them to state them, and nothing needs that yet.
+ */
+#define ISPFE_LMP_AWB_STATS_CONFIG_REG	0x000547e8
+#define ISPFE_LMP_AE_STATS_CONFIG_REG	0x00054870
+/*
+ * The back-end recipe and the two raw ones drive **different LMP instances**,
+ * and every block in them sits one fixed stride apart: dpc, mm_wbg, lsc_stats,
+ * histogram and both stats blocks are all 0x1698 higher in the raw programs
+ * than in the back-end one.  Matching only the back end's address would leave
+ * the raw recipes replaying their thresholds while the completeness check below
+ * refused their programs outright.
+ */
+#define ISPFE_LMP_INSTANCE_STRIDE	0x1698
+#define ISPFE_LMP_AWB_STATS_CONFIG_SIZE	0x34
+#define ISPFE_LMP_AE_STATS_CONFIG_SIZE	0x28
+#define ISPFE_LMP_STATS_SATURATION	0x10
+#define ISPFE_LMP_STATS_DARK		0x12
+#define ISPFE_LMP_AWB_STATS_LUMA_COEFF	0x14
+#define ISPFE_LMP_AWB_STATS_LUMA_LOW	0x1c
+#define ISPFE_LMP_AWB_STATS_LUMA_HIGH	0x1e
+#define ISPFE_LMP_AWB_STATS_DIFF_CORING	0x20
+#define ISPFE_LMP_AWB_STATS_CONFIG	BIT(0)
+#define ISPFE_LMP_AE_STATS_CONFIG	BIT(1)
+#define ISPFE_LMP_STATS_CONFIGS		(ISPFE_LMP_AWB_STATS_CONFIG | \
+					 ISPFE_LMP_AE_STATS_CONFIG)
 #define ISPFE_LMP_WBG_CONFIG		BIT(0)
 #define ISPFE_LMP_ALSC_WBG_CONFIG	BIT(1)
 #define ISPFE_LMP_WBG_CONFIGS		(ISPFE_LMP_WBG_CONFIG | \
@@ -2547,6 +2619,69 @@ static int ispfe_pdma_apply_wbg(struct ispfe_device *ispfe,
 	put_unaligned_le32(wbg->green_blue, payload + 0x0c);
 	put_unaligned_le32(wbg->blue, payload + 0x10);
 	*applied |= config;
+
+	return 0;
+}
+
+/* Either instance's copy of one LMP block. */
+static bool ispfe_lmp_block_is(u32 reg, u32 block)
+{
+	return reg == block || reg == block + ISPFE_LMP_INSTANCE_STRIDE;
+}
+
+/*
+ * Replace the captured threshold words in the two metering payloads.  The same
+ * shape as the white balance above and for the same reason: the driver already
+ * ships these values, and this is only a way for them to come from outside.
+ *
+ * A sample threshold is signed and reaches the payload as the sixteen bits it
+ * is; the luma window is unsigned and wider than the sample, because it gates a
+ * weighted sum of four of them.
+ *
+ * The four sample thresholds are the ones whose effect is observable: moving
+ * either grid's saturation or dark threshold moves that grid's counts and sums
+ * [HW 2026-08-25].  The luma weights, their window and the coring threshold are
+ * written just as faithfully and change nothing the statistics node reports,
+ * so they most likely feed the per-colour quantities the AWB region still
+ * carries as reserved.
+ */
+static int ispfe_pdma_apply_stats(struct ispfe_device *ispfe,
+				  const struct ispfe_pdma_cmd *cmd,
+				  u8 *payload, unsigned int *applied)
+{
+	const struct ispfe_lmp_metering_profile *m = &ispfe->active_lmp_metering;
+	unsigned int i;
+
+	if (ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_AWB_STATS_CONFIG_REG)) {
+		if (cmd->len != ISPFE_LMP_AWB_STATS_CONFIG_SIZE ||
+		    (*applied & ISPFE_LMP_AWB_STATS_CONFIG))
+			return -EINVAL;
+		put_unaligned_le16(m->awb_saturation,
+				   payload + ISPFE_LMP_STATS_SATURATION);
+		put_unaligned_le16(m->awb_dark, payload + ISPFE_LMP_STATS_DARK);
+		for (i = 0; i < ARRAY_SIZE(m->awb_luma_coeff); i++)
+			put_unaligned_le16(m->awb_luma_coeff[i], payload +
+					   ISPFE_LMP_AWB_STATS_LUMA_COEFF + i * 2);
+		put_unaligned_le16(m->awb_luma_low,
+				   payload + ISPFE_LMP_AWB_STATS_LUMA_LOW);
+		put_unaligned_le16(m->awb_luma_high,
+				   payload + ISPFE_LMP_AWB_STATS_LUMA_HIGH);
+		put_unaligned_le16(m->awb_diff_coring,
+				   payload + ISPFE_LMP_AWB_STATS_DIFF_CORING);
+		*applied |= ISPFE_LMP_AWB_STATS_CONFIG;
+		return 0;
+	}
+
+	if (ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_AE_STATS_CONFIG_REG)) {
+		if (cmd->len != ISPFE_LMP_AE_STATS_CONFIG_SIZE ||
+		    (*applied & ISPFE_LMP_AE_STATS_CONFIG))
+			return -EINVAL;
+		put_unaligned_le16(m->ae_saturation,
+				   payload + ISPFE_LMP_STATS_SATURATION);
+		put_unaligned_le16(m->ae_dark, payload + ISPFE_LMP_STATS_DARK);
+		*applied |= ISPFE_LMP_AE_STATS_CONFIG;
+		return 0;
+	}
 
 	return 0;
 }
@@ -3008,6 +3143,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	u32 backend_image_lo = 0, backend_image_hi = 0;
 	u32 backend_header_lo = 0, backend_header_hi = 0;
 	unsigned int lmp_wbg_configs = 0;
+	unsigned int lmp_stats_configs = 0;
 	bool lmp_dpc_applied = false;
 	unsigned int i;
 	u8 *program;
@@ -3085,6 +3221,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						   &lmp_dpc_applied);
 			if (ret)
 				return ret;
+			ret = ispfe_pdma_apply_stats(ispfe, cmd, program + at,
+						     &lmp_stats_configs);
+			if (ret)
+				return ret;
 			ret = ispfe_pdma_apply_ml0_profile(ispfe, cmd,
 						   program + at);
 			if (ret)
@@ -3142,6 +3282,21 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	    reloc != last || !awb_lo || !awb_hi ||
 	    (prog->raw_output && !bayer_lo)) {
 		dev_err(ispfe->dev, "PDMA recipe relocations do not match it\n");
+		return -EINVAL;
+	}
+	/*
+	 * Said separately because it asserts something about the *recipe* rather
+	 * than about this encode: every captured program carries both metering
+	 * blocks, on one LMP instance or the other.  A future one that does not
+	 * should say which block is missing rather than borrow the relocation
+	 * message above.
+	 */
+	if (!ispfe->active_pdma_program_override &&
+	    lmp_stats_configs != ISPFE_LMP_STATS_CONFIGS) {
+		dev_err(ispfe->dev,
+			"PDMA recipe is missing the %s metering block\n",
+			(lmp_stats_configs & ISPFE_LMP_AWB_STATS_CONFIG) ?
+			"exposure" : "white balance");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&
@@ -4464,6 +4619,12 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->active_fc_axi_max_ost = fc_axi_max_ost;
 	ispfe->active_lmp_ml0_profile = lmp_ml0_profile;
 	ispfe->active_lmp_wbg = lmp_wbg;
+	/*
+	 * Every captured program meters through the same thresholds, so unlike
+	 * the white balance there is no per-recipe profile to select -- what a
+	 * stream starts at is the vendor's, and a parameters buffer moves it.
+	 */
+	ispfe->active_lmp_metering = ispfe_lmp_metering_captured;
 	ispfe->active_backend_recipe = ispfe->prog->backend_recipe;
 	/*
 	 * A recipe that was captured with the LMP main-Bayer side output keeps
@@ -5399,6 +5560,19 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		   ispfe->active_lmp_wbg.green_red,
 		   ispfe->active_lmp_wbg.green_blue,
 		   ispfe->active_lmp_wbg.blue);
+	seq_printf(s, "lmp_metering  awb sat/dark %d/%d, luma %u/%u/%u/%u in %u..%u, coring %u\n",
+		   ispfe->active_lmp_metering.awb_saturation,
+		   ispfe->active_lmp_metering.awb_dark,
+		   ispfe->active_lmp_metering.awb_luma_coeff[0],
+		   ispfe->active_lmp_metering.awb_luma_coeff[1],
+		   ispfe->active_lmp_metering.awb_luma_coeff[2],
+		   ispfe->active_lmp_metering.awb_luma_coeff[3],
+		   ispfe->active_lmp_metering.awb_luma_low,
+		   ispfe->active_lmp_metering.awb_luma_high,
+		   ispfe->active_lmp_metering.awb_diff_coring);
+	seq_printf(s, "              ae  sat/dark %d/%d\n",
+		   ispfe->active_lmp_metering.ae_saturation,
+		   ispfe->active_lmp_metering.ae_dark);
 	seq_printf(s, "fc_axi_max_ost %#x requested, %#x active\n",
 		   ispfe->fc_axi_max_ost, ispfe->active_fc_axi_max_ost);
 	seq_printf(s, "backend_recipe %u requested, %u active\n",
@@ -6766,8 +6940,11 @@ struct ispfe_params_buffer {
 	struct v4l2_isp_params_buffer *config;
 	/* What the walk resolved, which is what an encode will program. */
 	struct ispfe_lmp_wbg_profile wbg;
+	struct ispfe_lmp_metering_profile metering;
 	bool has_wbg;
+	bool has_metering;
 	bool restore_default;
+	bool restore_metering_default;
 };
 
 static struct ispfe_params_buffer *
@@ -6780,6 +6957,9 @@ static const struct v4l2_isp_params_block_type_info
 ispfe_params_block_info[] = {
 	[EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE] = {
 		.size = sizeof(struct exynos_ispfe_params_white_balance),
+	},
+	[EXYNOS_ISPFE_PARAM_BLOCK_METERING] = {
+		.size = sizeof(struct exynos_ispfe_params_metering),
 	},
 };
 
@@ -6809,6 +6989,56 @@ static int ispfe_params_check_wb(struct device *dev,
 				i, wb->gains[i], EXYNOS_ISPFE_WB_GAIN_MAX);
 			return -ERANGE;
 		}
+	}
+
+	return 0;
+}
+
+/*
+ * A threshold outside the sample's own domain cannot describe a sample, and a
+ * dark threshold above its own saturation threshold excludes every sample in
+ * the frame -- which is a metering configuration that can only produce empty
+ * grids, so it is refused here rather than reported as three zero counts a
+ * frame later.  The luma window is unsigned and its own width, because it
+ * gates a weighted sum of four samples rather than one.
+ */
+static int ispfe_params_check_metering(struct device *dev,
+				       const struct exynos_ispfe_params_metering *m)
+{
+	unsigned int i;
+
+	if (m->reserved) {
+		dev_dbg(dev, "metering reserved word is %u, not zero\n",
+			m->reserved);
+		return -EINVAL;
+	}
+	/*
+	 * Nine bits, which is the field and not a policy: the vendor's own
+	 * accessor reads each coefficient as `& 0x1ff` and its encoder writes
+	 * them under the same mask.  A tenth bit would be dropped silently and
+	 * a weight of 512 would reach the hardware as zero, which turns the
+	 * luma into a constant and changes what the grid means with nothing
+	 * anywhere saying so.
+	 */
+	for (i = 0; i < EXYNOS_ISPFE_WB_GAINS; i++)
+		if (m->awb_luma_coeff[i] > EXYNOS_ISPFE_METERING_LUMA_COEFF_MAX) {
+			dev_dbg(dev, "metering luma weight %u is %u, above %u\n",
+				i, m->awb_luma_coeff[i],
+				EXYNOS_ISPFE_METERING_LUMA_COEFF_MAX);
+			return -ERANGE;
+		}
+	if (m->awb_luma_threshold_low > m->awb_luma_threshold_high) {
+		dev_dbg(dev, "metering luma window %u..%u is inverted\n",
+			m->awb_luma_threshold_low, m->awb_luma_threshold_high);
+		return -ERANGE;
+	}
+	if (m->awb_dark_threshold > m->awb_saturation_threshold ||
+	    m->ae_dark_threshold > m->ae_saturation_threshold) {
+		dev_dbg(dev,
+			"metering dark threshold above saturation: awb %d/%d, ae %d/%d\n",
+			m->awb_dark_threshold, m->awb_saturation_threshold,
+			m->ae_dark_threshold, m->ae_saturation_threshold);
+		return -ERANGE;
 	}
 
 	return 0;
@@ -6855,6 +7085,45 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
 			buf->wbg.green_blue = wb->gains[EXYNOS_ISPFE_WB_GREEN_BLUE];
 			buf->wbg.blue = wb->gains[EXYNOS_ISPFE_WB_BLUE];
 			buf->has_wbg = true;
+			break;
+		}
+		case EXYNOS_ISPFE_PARAM_BLOCK_METERING: {
+			const struct exynos_ispfe_params_metering *m =
+				(const struct exynos_ispfe_params_metering *)header;
+			unsigned int i;
+			int ret;
+
+			/*
+			 * As for white balance: a disabled block asks for the
+			 * driver's default back rather than for metering to
+			 * stop, so it carries no values and none are checked.
+			 * Unlike white balance the default needs no program to
+			 * resolve it -- every captured recipe meters through
+			 * the same thresholds -- but it is still recorded and
+			 * applied at the encode, so that the two blocks behave
+			 * the same way from outside.
+			 */
+			if (header->flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) {
+				buf->restore_metering_default = true;
+				break;
+			}
+
+			ret = ispfe_params_check_metering(ispfe->dev, m);
+			if (ret)
+				return ret;
+
+			buf->metering.awb_saturation = m->awb_saturation_threshold;
+			buf->metering.awb_dark = m->awb_dark_threshold;
+			for (i = 0; i < EXYNOS_ISPFE_WB_GAINS; i++)
+				buf->metering.awb_luma_coeff[i] =
+					m->awb_luma_coeff[i];
+			buf->metering.awb_luma_low = m->awb_luma_threshold_low;
+			buf->metering.awb_luma_high = m->awb_luma_threshold_high;
+			buf->metering.awb_diff_coring =
+				m->awb_diff_coring_threshold;
+			buf->metering.ae_saturation = m->ae_saturation_threshold;
+			buf->metering.ae_dark = m->ae_dark_threshold;
+			buf->has_metering = true;
 			break;
 		}
 		default:
@@ -6908,6 +7177,11 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 			ispfe->active_lmp_wbg = *ispfe->prog->lmp_wbg;
 		else if (buf->has_wbg)
 			ispfe->active_lmp_wbg = buf->wbg;
+
+		if (buf->restore_metering_default)
+			ispfe->active_lmp_metering = ispfe_lmp_metering_captured;
+		else if (buf->has_metering)
+			ispfe->active_lmp_metering = buf->metering;
 
 		buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
@@ -6986,6 +7260,8 @@ static int ispfe_params_buf_prepare(struct vb2_buffer *vb)
 
 	buf->has_wbg = false;
 	buf->restore_default = false;
+	buf->has_metering = false;
+	buf->restore_metering_default = false;
 
 	/*
 	 * A buffer carrying no blocks changes nothing and has nothing in it to

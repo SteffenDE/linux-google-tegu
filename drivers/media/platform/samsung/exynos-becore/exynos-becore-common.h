@@ -312,8 +312,18 @@ enum becore_input_slot_state {
  * dma_vmap_noncontiguous() returns.  cpu_dirty says a slot is in that state
  * and is the only reason a sync is issued.
  */
+/*
+ * The raster the frame in a slot was written at, which is not the same
+ * question as how long it is.  becore_rgbp_input_size() reaches a width only
+ * through ALIGN(width, 256), so every array width in one 256-column bucket at
+ * one height lays out in the same number of bytes -- a frame written at
+ * 4208x3120 is exactly as long as one written at 4352x3120, and running the
+ * first as the second reads 144 columns of compressed padding as picture.
+ * Only meaningful while buffer.staged_bytes is nonzero.
+ */
 struct becore_input_slot {
 	struct becore_dma_buffer buffer;
+	struct becore_raster raster;
 	enum becore_input_slot_state state;
 	bool cpu_dirty;
 	u64 producer_cookie;
@@ -595,6 +605,15 @@ struct becore_device {
 	struct becore_dma_buffer gtnr_output;
 	struct becore_dma_buffer mcsc_output;
 	struct exynos_becore_input *input_producer;
+	/*
+	 * What the producer says it sends, which is the array raster and not a
+	 * request: becore_latch_input_format() reads it off the sink pad, and
+	 * a stream that then fails to start does not un-say it.  It is what a
+	 * slot the producer fills is stamped with, so that a raster the
+	 * *driver* chose for the offline loop cannot be applied to a frame the
+	 * producer wrote.
+	 */
+	struct becore_raster producer_array;
 	u64 producer_sequence;
 	u64 input_sequence;
 	struct becore_cmdq_program program[BECORE_NUM_BLOCKS];

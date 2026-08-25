@@ -731,32 +731,58 @@ static const struct becore_byr_dns_reg *becore_byr_dns_lookup(u32 reg)
 }
 
 /*
+ * Which white balance a frame is encoded against.
+ *
+ * The frame's own, whenever there is a frame: a slot carries the gains it was
+ * taken through, so a moving AWB cannot scale one frame's noise by another
+ * frame's gains.  The stream's seed stands in for the one caller that holds no
+ * frame -- the record walk STREAMON runs to prove every word encodes -- where
+ * it decides nothing, because that walk only asks whether a value exists.
+ */
+static struct exynos_becore_input_gains
+becore_frame_gains(const struct becore_device *becore)
+{
+	if (becore->run_input)
+		return becore->run_input->gains;
+
+	return becore_stream_gains(becore);
+}
+
+/*
  * The three noise factors are the tuning times the white balance in front of
  * the block, which is the whole reason this block reads the AWB at all: photon
  * noise scales with the per-channel gain applied to it.  So the value that
  * travels in a parameters buffer is the tuning alone and this is where the
  * gain meets it -- Q12 against Q12, times the sixteen the field is expressed
- * at, rounded to nearest as `TranslateByrDns` does.  Green's gain is unity by
- * construction: the AWB normalises it, which the corpus confirms to the bit on
- * two of the three cameras.
+ * at, rounded to nearest as `TranslateByrDns` does.
+ *
+ * Green's gain is the mean of the two green gains and not unity, which is what
+ * the vendor's translator takes: `tuning * (wb[1] + wb[2]) * 0.5 * 16.0`
+ * against `tuning * wb[0] * 16.0` for red.  Unity is right only where the AWB
+ * normalises green -- true of every captured program, and not a property of
+ * the block.  The mean is folded into the same rounding step rather than taken
+ * first, so that the one rounding here is the one rounding the vendor has:
+ * @sum is twice the gain and the shift is one bit longer to match.
  */
-static s32 becore_byr_dns_balanced(const struct becore_device *becore,
+static s32 becore_byr_dns_balanced(const struct exynos_becore_input_gains *gains,
 				   const struct becore_byr_dns_field *field,
 				   s32 raw)
 {
-	u64 gain = EXYNOS_BECORE_WBG_UNITY_Q12;
+	u64 sum;
 	u64 product;
 
 	if (raw < 0)
 		return 0;
 	if (field->flags & BECORE_BYR_DNS_FIELD_RED)
-		gain = READ_ONCE(becore->encode_balance_red);
+		sum = 2ULL * gains->red;
 	else if (field->flags & BECORE_BYR_DNS_FIELD_BLUE)
-		gain = READ_ONCE(becore->encode_balance_blue);
+		sum = 2ULL * gains->blue;
+	else
+		sum = (u64)gains->green_red + gains->green_blue;
 
-	product = (u64)raw * gain * 16 + (1ULL << 23);
+	product = (u64)raw * sum * 16 + (1ULL << 24);
 
-	return (s32)min(product >> 24, (u64)S32_MAX);
+	return (s32)min(product >> 25, (u64)S32_MAX);
 }
 
 /*
@@ -783,12 +809,14 @@ int becore_byrdns_value(const struct becore_device *becore,
 			u32 reg, u32 *value)
 {
 	const struct becore_byr_dns_reg *entry = becore_byr_dns_lookup(reg);
+	struct exynos_becore_input_gains gains;
 	u32 word;
 	u32 i;
 
 	if (!entry)
 		return -ENOENT;
 
+	gains = becore_frame_gains(becore);
 	word = entry->constant;
 	for (i = 0; i < entry->count; i++) {
 		const struct becore_byr_dns_field *field =
@@ -801,7 +829,7 @@ int becore_byrdns_value(const struct becore_device *becore,
 		if (field->flags & (BECORE_BYR_DNS_FIELD_RED |
 				    BECORE_BYR_DNS_FIELD_GREEN |
 				    BECORE_BYR_DNS_FIELD_BLUE))
-			raw = becore_byr_dns_balanced(becore, field, raw);
+			raw = becore_byr_dns_balanced(&gains, field, raw);
 		if (field->flags & BECORE_BYR_DNS_FIELD_INVERT)
 			raw = raw ? 0 : 1;
 

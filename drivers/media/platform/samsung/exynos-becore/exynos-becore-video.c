@@ -349,10 +349,9 @@ void becore_video_return_all(struct becore_device *becore,
 }
 
 /*
- * The two gains the Bayer denoiser's noise factors are multiplied by, kept
- * where the encoder can reach them without taking the control handler's lock
- * under the device's.  Both controls are grabbed for the length of a stream,
- * so this cannot move under a frame.
+ * The balance a stream starts at, kept where a slot can be seeded from it
+ * without taking the control handler's lock under the device's.  Both controls
+ * are grabbed for the length of a stream, so this cannot move under a frame.
  */
 static int becore_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -361,10 +360,10 @@ static int becore_s_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_RED_BALANCE:
-		WRITE_ONCE(becore->encode_balance_red, ctrl->val);
+		WRITE_ONCE(becore->stream_gains.red, ctrl->val);
 		return 0;
 	case V4L2_CID_BLUE_BALANCE:
-		WRITE_ONCE(becore->encode_balance_blue, ctrl->val);
+		WRITE_ONCE(becore->stream_gains.blue, ctrl->val);
 		return 0;
 	}
 
@@ -911,10 +910,16 @@ int becore_video_init(struct becore_device *becore)
 	/*
 	 * The control op has not run yet, so seed these with the same defaults
 	 * the controls were created at.  The offline loop encodes without ever
-	 * setting one.
+	 * setting one.  The greens are here and no control writes them: nothing
+	 * this side of the interface can estimate an illuminant, and the two
+	 * gains a V4L2 control names are the two the vendor's own AWB moves.
 	 */
-	becore->encode_balance_red = EXYNOS_BECORE_WBG_RED_DEFAULT_Q12;
-	becore->encode_balance_blue = EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12;
+	becore->stream_gains = (struct exynos_becore_input_gains) {
+		.red = EXYNOS_BECORE_WBG_RED_DEFAULT_Q12,
+		.green_red = EXYNOS_BECORE_WBG_UNITY_Q12,
+		.green_blue = EXYNOS_BECORE_WBG_UNITY_Q12,
+		.blue = EXYNOS_BECORE_WBG_BLUE_DEFAULT_Q12,
+	};
 	if (handler->error) {
 		ret = handler->error;
 		goto err_ctrl;

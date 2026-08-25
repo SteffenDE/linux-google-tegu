@@ -107,8 +107,16 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 		 * refuses rather than encoding for a raster half the frame is
 		 * not at.
 		 */
-		if (slot)
+		if (slot) {
 			slot->raster = becore->array;
+			/*
+			 * And the balance, for the same reason and at the same
+			 * moment: a staged frame has no producer to state the
+			 * gains it was taken through, so what stands for them
+			 * is what the controls hold when the stage begins.
+			 */
+			slot->gains = becore_stream_gains(becore);
+		}
 	}
 	if (*ppos != *staged_bytes) {
 		ret = -ESPIPE;
@@ -632,6 +640,7 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		[BECORE_INPUT_QUARANTINED] = "quarantined",
 	};
 	struct becore_device *becore = s->private;
+	struct exynos_becore_input_gains stream_gains;
 	struct list_head *pos;
 	unsigned long flags;
 	unsigned int queued_outputs = 0;
@@ -709,6 +718,37 @@ static int becore_status_show(struct seq_file *s, void *unused)
 				   slot->raster.width, slot->raster.height);
 	}
 	seq_putc(s, '\n');
+	/*
+	 * The balance every slot holds, and not only the ones holding a frame:
+	 * nothing clears a slot's gains when a run gives it back, so a free
+	 * slot still says what the last frame through it was encoded against.
+	 * That is the whole of what makes the per-frame path checkable from a
+	 * shell -- run a capture with a moving AWB and these follow it.
+	 */
+	stream_gains = becore_stream_gains(becore);
+	seq_printf(s, "input_balance    stream %u/%u/%u/%u",
+		   stream_gains.red, stream_gains.green_red,
+		   stream_gains.green_blue, stream_gains.blue);
+	for (i = 0; i < BECORE_INPUT_SLOT_COUNT; i++) {
+		const struct exynos_becore_input_gains *gains =
+			&becore->inputs[i].gains;
+
+		seq_puts(s, i ? " " : ", slots ");
+		/*
+		 * A slot that has never been handed out carries the zeros it
+		 * was allocated with, and a gain of zero means a channel
+		 * switched off -- so say "no frame yet" rather than print four
+		 * of them into a field labelled Q12 gains.
+		 */
+		if (!gains->red && !gains->green_red && !gains->green_blue &&
+		    !gains->blue)
+			seq_puts(s, "--");
+		else
+			seq_printf(s, "%u/%u/%u/%u", gains->red,
+				   gains->green_red, gains->green_blue,
+				   gains->blue);
+	}
+	seq_puts(s, " Q12\n");
 	if (becore->input_producer) {
 		seq_printf(s, "input_producer   %s iovas",
 			   dev_name(becore->input_producer->producer));

@@ -2230,7 +2230,7 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
 	/* A slot is free now, so a pending buffer can be encoded into it. */
-	schedule_work(&ispfe->fill_work);
+	queue_work(system_highpri_wq, &ispfe->fill_work);
 }
 
 static void ispfe_backend_queue_credit(struct ispfe_device *ispfe)
@@ -2264,7 +2264,7 @@ static void ispfe_backend_queue_credit(struct ispfe_device *ispfe)
 		       PDMA_CTX(ispfe->active.loch) + PDMA_HEAD);
 
 	if (!buf)
-		schedule_work(&ispfe->backend_fill_work);
+		queue_work(system_highpri_wq, &ispfe->backend_fill_work);
 }
 
 static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
@@ -2301,7 +2301,7 @@ static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 	if (captured)
 		queue_work(system_dfl_long_wq, &ispfe->stats_work);
 	if (buf)
-		schedule_work(&ispfe->backend_fill_work);
+		queue_work(system_highpri_wq, &ispfe->backend_fill_work);
 }
 
 /*
@@ -3603,6 +3603,30 @@ static void ispfe_backend_queue_fill(struct ispfe_device *ispfe)
 	}
 }
 
+/*
+ * Both queue-fill work items -- this one and ispfe_fill_work() -- run on
+ * system_highpri_wq, and the reason is a deadline rather than importance.  A
+ * frame retires at LMP EOF and its replacement has to be encoded before the
+ * next frame start credits a program: about 1.3 ms later, measured.  The fill
+ * takes 30 us.  So what it cannot afford is being *scheduled behind* something
+ * bulky, and this driver's own statistics copy is exactly that: milliseconds
+ * of memcpy with no deadline of its own.  Putting that copy on an unbound pool
+ * stopped it holding the per-CPU worker, but an unbound worker woken by the
+ * same interrupt is placed on the same idle CPU and then keeps it for a full
+ * slice.  A highpri pool's workers are nice -20, so the fill preempts the copy
+ * rather than waiting a slice out behind it.
+ *
+ * Which is safe only because neither fill hogs what it preempts.  This one
+ * sleeps on the back end's mutex, which releases the pool; the raw one does
+ * not sleep at all but is bounded at four encodes, around 120 us.  The one
+ * exception is a producer_acquire() that finds a slot the offline diagnostic
+ * left dirty and syncs 27 MB of it, 2.3 ms -- reachable only if a debugfs run
+ * preceded the capture in the same boot.
+ *
+ * Neither is why the work exists rather than the interrupt.  For this one that
+ * is the back end's mutex, which producer_acquire() and producer_complete()
+ * take; for the raw one it is the size of the encode, said where it lives.
+ */
 static void ispfe_backend_fill_work(struct work_struct *work)
 {
 	struct ispfe_device *ispfe =
@@ -6422,6 +6446,10 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
  * Give queued buffers a program each.  Encoding is 6 KiB of work, so it happens
  * here in process context rather than in the frame-start interrupt, which then
  * only has to publish a sixteen-byte record.
+ *
+ * Its work item runs on system_highpri_wq for the frame deadline explained
+ * above ispfe_backend_fill_work(), which this path shares: it retires frames
+ * the same way and the same statistics node feeds off it.
  */
 static void ispfe_queue_fill(struct ispfe_device *ispfe)
 {

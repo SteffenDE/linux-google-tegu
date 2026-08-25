@@ -1095,9 +1095,10 @@ static int becore_geometry_apply(struct becore_device *becore,
 			chain->width, chain->height);
 		return ret;
 	}
-	ret = becore_zoom_ratio(chain->width, scaled->width, &ratio);
+	ret = becore_mcsc_djag_ratio(chain->width, scaled->width, &ratio);
 	if (!ret)
-		ret = becore_zoom_ratio(chain->height, scaled->height, &ratio);
+		ret = becore_mcsc_djag_ratio(chain->height, scaled->height,
+					     &ratio);
 	if (ret) {
 		dev_err(becore->dev, "no scaler ratio takes %ux%u to %ux%u\n",
 			chain->width, chain->height,

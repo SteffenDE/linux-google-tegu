@@ -44,6 +44,8 @@ enum exynos_ispfe_stats_version {
  *
  * @EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE: LMP's white balance gains,
  *	:c:type:`exynos_ispfe_params_white_balance`
+ * @EXYNOS_ISPFE_PARAM_BLOCK_METERING: What the two statistics grids count,
+ *	:c:type:`exynos_ispfe_params_metering`
  * @EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * The front end applies white balance before it meters, so the gains are both
@@ -56,6 +58,7 @@ enum exynos_ispfe_stats_version {
  */
 enum exynos_ispfe_params_block_type {
 	EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE = 0,
+	EXYNOS_ISPFE_PARAM_BLOCK_METERING,
 	EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -117,13 +120,116 @@ struct exynos_ispfe_params_white_balance {
 	__u32 gains[EXYNOS_ISPFE_WB_GAINS];
 } __attribute__((aligned(8)));
 
+/*
+ * Thresholds are compared against the sample as **signed** sixteen-bit, which
+ * the counts say rather than any document: the exposure grid ships with its
+ * dark threshold at 0x8000 and reports nothing dark, where an unsigned reading
+ * of 32768 would put every sample in the frame below it. The white balance
+ * grid ships with zero and reports four fifths of a dim room dark, which is
+ * the floor of the same domain.
+ *
+ * So %EXYNOS_ISPFE_METERING_EXCLUDE_NONE is the dark threshold that excludes
+ * nothing and %EXYNOS_ISPFE_METERING_SAMPLE_MAX the saturation threshold that
+ * does, and they are the two ends of one signed range.
+ */
+#define EXYNOS_ISPFE_METERING_SAMPLE_MAX	32767
+#define EXYNOS_ISPFE_METERING_EXCLUDE_NONE	(-32768)
+
+/*
+ * The luma weights are unsigned Q8 in a nine-bit field, so a weight of two is
+ * the most that can be described. The window they gate is a full unsigned
+ * sixteen bits, because it compares a weighted sum of four samples rather than
+ * one -- the two are different widths and the vendor's own accessors read them
+ * that way.
+ */
+#define EXYNOS_ISPFE_METERING_LUMA_ONE		256
+#define EXYNOS_ISPFE_METERING_LUMA_COEFF_MAX	511
+#define EXYNOS_ISPFE_METERING_LUMA_MAX		65535
+
+/**
+ * struct exynos_ispfe_params_metering - What the two statistics grids count
+ *
+ * @header: The parameters block header
+ * @awb_saturation_threshold: A white balance sample above this is counted
+ *	saturated instead of summed
+ * @awb_dark_threshold: A white balance sample below this -- or at it; the
+ *	measurement does not separate the two -- is counted dark instead of
+ *	summed. The vendor sets zero here and four fifths of a dim room's
+ *	samples still come back dark, which says the floor of the domain is at
+ *	or just above zero either way
+ * @awb_luma_coeff: Unsigned Q8 weights on R, Gr, Gb and B -- indexed by
+ *	%EXYNOS_ISPFE_WB_RED and its siblings -- forming the luma that
+ *	@awb_luma_threshold_low and @awb_luma_threshold_high gate on. Each is at
+ *	most %EXYNOS_ISPFE_METERING_LUMA_COEFF_MAX, which is the field's own
+ *	width; a set that describes an ordinary luma sums to
+ *	%EXYNOS_ISPFE_METERING_LUMA_ONE, and the driver does not require that,
+ *	because a deliberately weighted metering is a use rather than a mistake
+ * @awb_luma_threshold_low: The low end of the luma window
+ * @awb_luma_threshold_high: The high end of it
+ * @awb_diff_coring_threshold: A coring threshold on neighbour differences
+ * @ae_saturation_threshold: The exposure grid's own saturation threshold
+ * @ae_dark_threshold: The exposure grid's own dark threshold
+ * @reserved: Must be zero
+ *
+ * The two grids exclude samples rather than clamping them -- which is what
+ * makes a grey-world estimate over the white balance grid ignore both ends --
+ * so the four sample thresholds decide what the numbers in
+ * :c:type:`exynos_ispfe_stats_buffer` are a mean *of*. An algorithm that
+ * cannot set them is metering through someone else's choice.
+ *
+ * **Only the four sample thresholds are known to reach that buffer.** Moving
+ * either grid's saturation or dark threshold moves its counts and sums exactly
+ * as the names say, measured. Moving @awb_luma_coeff, the window it feeds, or
+ * @awb_diff_coring_threshold changes nothing this interface exposes -- with the
+ * window placed over the scene's luma, far below it, and with coring at its
+ * maximum, the white balance grid's counts and means do not move. They are real
+ * fields at read offsets and the driver programs them, so they most likely gate
+ * the per-colour quantities :c:type:`exynos_ispfe_stats_awb_region` still
+ * carries as reserved; until something decodes those, a consumer has no way to
+ * observe what they did, and this interface does not pretend otherwise.
+ *
+ * A dark threshold above its own saturation threshold would exclude every
+ * sample in the frame, and is refused rather than metered.
+ *
+ * The two grids take their own thresholds and are not two views of one
+ * setting: the exposure grid is metered after lens shading -- the hardware's
+ * own name for its tap says so -- so the two see the same scene at different
+ * levels.
+ *
+ * The vendor's own values are 32256 and 0 for the white balance grid and
+ * %EXYNOS_ISPFE_METERING_SAMPLE_MAX and %EXYNOS_ISPFE_METERING_EXCLUDE_NONE
+ * for the exposure grid, so as shipped the exposure grid counts every sample
+ * and the white balance grid excludes what sits at either end of its range.
+ * They are what a block sent with ``V4L2_ISP_PARAMS_FL_BLOCK_DISABLE`` returns
+ * to.
+ *
+ * What is **not** here is the region geometry. The grids' 64 x 48 regions and
+ * the cell size that tiles them over the sensor are derived from the format,
+ * not chosen: they are the hardware's description of itself, and a buffer that
+ * could disagree with the driver about them would give the two of them two
+ * sources for one fact.
+ */
+struct exynos_ispfe_params_metering {
+	struct v4l2_isp_params_block_header header;
+	__s16 awb_saturation_threshold;
+	__s16 awb_dark_threshold;
+	__u16 awb_luma_coeff[EXYNOS_ISPFE_WB_GAINS];
+	__u16 awb_luma_threshold_low;
+	__u16 awb_luma_threshold_high;
+	__u16 awb_diff_coring_threshold;
+	__s16 ae_saturation_threshold;
+	__s16 ae_dark_threshold;
+	__u16 reserved;
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_ISPFE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
  * The largest a buffer's block list can be, which is every block type once.
  */
 #define EXYNOS_ISPFE_PARAMS_MAX_SIZE \
-	sizeof(struct exynos_ispfe_params_white_balance)
+	(sizeof(struct exynos_ispfe_params_white_balance) + \
+	 sizeof(struct exynos_ispfe_params_metering))
 
 /*
  * Both grids are the same shape: LMP meters 64 x 48 rectangular regions over

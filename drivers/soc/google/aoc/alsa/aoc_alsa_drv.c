@@ -61,7 +61,24 @@ static const char *const audio_service_names[] = {
 static struct aoc_service_resource
 	service_lists[ARRAY_SIZE(audio_service_names) - 1];
 
-static spinlock_t service_lock;
+/*
+ * Statically initialised, because it is taken before this file's own init runs
+ * and not merely because it might be.  Built in, aoc_alsa_card.o links ahead
+ * of this one and both are device_initcall, so aoc_card_init() *always* runs
+ * first; its platform driver binds synchronously, and aoc_snd_card_probe()
+ * reaches alloc_aoc_audio_service() and this lock while aoc_alsa_init() is
+ * still queued behind it.  The lock was then taken with zeroed magic, which
+ * CONFIG_DEBUG_SPINLOCK reports as a bad-magic BUG at boot -- and because
+ * spin_bug() calls debug_locks_off(), that one report silently switches off
+ * every debug_locks-gated check for the rest of the session, lockdep included.
+ *
+ * The rest of what aoc_alsa_init() sets up is out of that window only by
+ * accident: alloc_aoc_audio_service() returns -EPROBE_DEFER on
+ * !aoc_audio_online before it reaches service_lists[i].name, which is NULL
+ * until then.  free_aoc_audio_service() has no such guard, and would
+ * dereference it -- nothing reaches that path first today.
+ */
+static DEFINE_SPINLOCK(service_lock);
 static int8_t n_services = 0;
 static bool drv_registered = false;
 static bool aoc_audio_online = false;
@@ -457,7 +474,6 @@ static int __init aoc_alsa_init(void)
 
 	aoc_audio_online = false;
 	drv_registered = false;
-	spin_lock_init(&service_lock);
 
 	init_waitqueue_head(&aoc_audio_state_wait_head);
 

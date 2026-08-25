@@ -824,6 +824,19 @@ extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
 #define BECORE_YUVP_PROGRAM_HEADERS \
 	(BECORE_YUVP_HEADER_COUNT + BECORE_YUVP_CLUT_BURST_HEADERS)
 
+/* What a queued capture's address must be aligned to; see becore_buf_prepare. */
+#define BECORE_CAPTURE_ALIGN		32
+
+/* exynos-becore-video.c */
+int becore_bayer_phase(u32 code);
+void becore_video_return_all(struct becore_device *becore,
+			     enum vb2_buffer_state state);
+void becore_video_controls_ungrab(struct becore_device *becore);
+void becore_params_drain_idle(struct becore_device *becore);
+void becore_video_work(struct work_struct *work);
+int becore_video_init(struct becore_device *becore);
+extern const struct v4l2_file_operations becore_fops;
+
 /* exynos-becore-recipe.c */
 size_t becore_cmdq_program_size(u32 header_count);
 size_t becore_cmdq_encoded_size(const struct becore_cmdq_program *program);
@@ -909,8 +922,15 @@ int becore_yuvp_gamma_curve_value(const struct becore_params_state *params,
 extern const struct becore_noise_curve becore_noise_curves[BECORE_NOISE_CURVES];
 
 /* exynos-becore-core.c */
-int becore_bayer_phase(u32 code);
+struct exynos_becore_input *
+becore_input_callback_get(struct becore_device *becore);
+void becore_input_callback_put(struct exynos_becore_input *input);
+int becore_run_frame(struct becore_device *becore, u32 input_profile,
+		     u32 output_profile, bool ready_only,
+		     struct vb2_buffer *capture, bool packed_output,
+		     bool run_mcsc);
+int becore_stream_power_get(struct becore_device *becore);
+void becore_stream_power_put(struct becore_device *becore);
 u32 becore_mcsc_votf_enable(const u32 *requested_token);
-extern const struct v4l2_file_operations becore_fops;
 
 #endif /* EXYNOS_BECORE_COMMON_H */

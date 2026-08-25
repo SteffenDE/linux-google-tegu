@@ -557,8 +557,11 @@ struct becore_device {
 	bool video_ready;
 	/*
 	 * The mosaic the producer says it is sending, latched when a stream
-	 * starts. Without a producer -- the offline loop -- it stays at the
-	 * ultrawide's, which is the camera every captured program came from.
+	 * starts and left there when it stops. So what the offline loop encodes
+	 * is the last thing latched, or whatever the bayer_phase debugfs file
+	 * was last written, and the ultrawide's until either happens -- that
+	 * being the camera every captured program the driver compiles in came
+	 * from.
 	 */
 	u32 input_code;
 	/*
@@ -867,6 +870,7 @@ int becore_debugfs_init(struct becore_device *becore);
 
 /* exynos-becore-video.c */
 int becore_bayer_phase(u32 code);
+u32 becore_bayer_code(u32 phase);
 void becore_video_return_all(struct becore_device *becore,
 			     enum vb2_buffer_state state);
 void becore_video_controls_ungrab(struct becore_device *becore);

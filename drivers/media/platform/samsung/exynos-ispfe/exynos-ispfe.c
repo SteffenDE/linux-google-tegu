@@ -2718,6 +2718,20 @@ static_assert(ISPFE_LMP_LINEARIZATION_LUT_BYTES == 0x410);
 #define ISPFE_LMP_HISTOGRAM_LUT_REG	0x0006c8b8
 #define ISPFE_LMP_HISTOGRAM_WEIGHTS	0x400
 #define ISPFE_LMP_HISTOGRAM_WEIGHT_FLAT	0x80
+/*
+ * How many cells that map is read as, which is a property of the raster and
+ * not of the scene.  `lyric::LmpHistogram::Configure` takes each axis of the
+ * sensor raster, divides by 128, adds one and clears the low bit, and deposits
+ * the two counts in one word of the histogram configuration block -- columns
+ * in bits 0..8, rows in bits 16..24.  The bits either side of them are zero in
+ * all 54 captured programs, so the word is the two counts and nothing else.
+ */
+#define ISPFE_LMP_HISTOGRAM_CONFIG_REG	0x0005481c
+#define ISPFE_LMP_HISTOGRAM_CONFIG_SIZE	0x54
+#define ISPFE_LMP_HISTOGRAM_CELLS	0x30
+#define ISPFE_LMP_HISTOGRAM_CELL_PITCH	128
+#define ISPFE_LMP_HISTOGRAM_CELL_ROWS_SHIFT	16
+#define ISPFE_LMP_HISTOGRAM_CELLS_MAX	511
 #define ISPFE_LMP_AWB_STATS_CONFIG_SIZE	0x34
 #define ISPFE_LMP_AE_STATS_CONFIG_SIZE	0x28
 #define ISPFE_LMP_STATS_SATURATION	0x10
@@ -2826,6 +2840,60 @@ static int ispfe_pdma_apply_stats(struct ispfe_device *ispfe,
 		*applied |= ISPFE_LMP_AE_STATS_CONFIG;
 		return 0;
 	}
+
+	return 0;
+}
+
+static u32 ispfe_lmp_histogram_cells(u32 raster)
+{
+	return (raster / ISPFE_LMP_HISTOGRAM_CELL_PITCH + 1) & ~1U;
+}
+
+/*
+ * The histogram's weight map covers the raster in cells, and how many is
+ * derivable from the raster rather than tuning -- which is what the corpus
+ * says: this is the one word of the block that tracks the sensor readout, and
+ * five distinct values appear across the eighteen captured ones.  Replaying
+ * the recipe's own would be right at that recipe's readout and wrong at every
+ * other, which is exactly the shape of thing ADR 0009 step 2 asks the driver
+ * to derive.
+ *
+ * A raster whose map would not fit the 1,024 weights the hardware reads is
+ * refused rather than metered through weights past the end of the table.  No
+ * captured readout comes close: the largest is 32 x 24.
+ */
+static int ispfe_pdma_apply_histogram(struct ispfe_device *ispfe,
+				      const struct ispfe_pdma_cmd *cmd,
+				      u8 *payload, bool *applied)
+{
+	u32 columns, rows;
+
+	if (!ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_HISTOGRAM_CONFIG_REG))
+		return 0;
+	if (cmd->len != ISPFE_LMP_HISTOGRAM_CONFIG_SIZE || *applied)
+		return -EINVAL;
+
+	columns = ispfe_lmp_histogram_cells(ispfe->prog->width);
+	rows = ispfe_lmp_histogram_cells(ispfe->prog->height);
+	/*
+	 * Each count against its own nine-bit field first, and only then the
+	 * two against the table.  The order is what makes both tests mean
+	 * something: 512 cells one way and two the other is 1,024 weights and
+	 * still a count that does not fit, so the product alone would let it
+	 * through with bit 9 set into a reserved field -- and a raster large
+	 * enough to overflow the product entirely would make that test read
+	 * zero and pass.  Bounded per axis first, the product cannot wrap.
+	 */
+	if (!columns || !rows ||
+	    columns > ISPFE_LMP_HISTOGRAM_CELLS_MAX ||
+	    rows > ISPFE_LMP_HISTOGRAM_CELLS_MAX ||
+	    columns * rows > ISPFE_LMP_HISTOGRAM_WEIGHTS)
+		return -EINVAL;
+
+	put_unaligned_le32(columns |
+			   rows << ISPFE_LMP_HISTOGRAM_CELL_ROWS_SHIFT,
+			   payload + ISPFE_LMP_HISTOGRAM_CELLS);
+	*applied = true;
 
 	return 0;
 }
@@ -3477,6 +3545,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	unsigned int lmp_wbg_configs = 0;
 	unsigned int lmp_stats_configs = 0;
 	bool lmp_dpc_applied = false;
+	bool lmp_histogram_applied = false;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -3571,6 +3640,11 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						     &lmp_stats_configs);
 			if (ret)
 				return ret;
+			ret = ispfe_pdma_apply_histogram(ispfe, cmd,
+						 program + at,
+						 &lmp_histogram_applied);
+			if (ret)
+				return ret;
 			ret = ispfe_pdma_apply_ml0_profile(ispfe, cmd,
 						   program + at);
 			if (ret)
@@ -3643,6 +3717,15 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			"PDMA recipe is missing the %s metering block\n",
 			(lmp_stats_configs & ISPFE_LMP_AWB_STATS_CONFIG) ?
 			"exposure" : "white balance");
+		return -EINVAL;
+	}
+	/*
+	 * And the same for the histogram, whose weight map the driver states:
+	 * a recipe without the block would leave the map's shape at whatever
+	 * the hardware came up in.
+	 */
+	if (!ispfe->active_pdma_program_override && !lmp_histogram_applied) {
+		dev_err(ispfe->dev, "PDMA recipe is missing the histogram block\n");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&

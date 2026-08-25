@@ -2204,7 +2204,7 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	spin_unlock(&ispfe->slock);
 
 	if (captured)
-		schedule_work(&ispfe->stats_work);
+		queue_work(system_dfl_long_wq, &ispfe->stats_work);
 
 	if (!buf)
 		return;
@@ -2299,7 +2299,7 @@ static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 	spin_unlock(&ispfe->slock);
 
 	if (captured)
-		schedule_work(&ispfe->stats_work);
+		queue_work(system_dfl_long_wq, &ispfe->stats_work);
 	if (buf)
 		schedule_work(&ispfe->backend_fill_work);
 }
@@ -4254,7 +4254,7 @@ static void ispfe_stats_areas_free(struct ispfe_device *ispfe)
 	 * back, so a buffer queued a moment ago is answered either way.
 	 */
 	if (READ_ONCE(ispfe->stats_streaming))
-		schedule_work(&ispfe->stats_work);
+		queue_work(system_dfl_long_wq, &ispfe->stats_work);
 }
 
 /*
@@ -5036,7 +5036,7 @@ static void ispfe_stop(struct ispfe_device *ispfe)
 	 */
 	scoped_guard(spinlock_irqsave, &ispfe->slock)
 		ispfe_stats_untake_all_locked(ispfe);
-	schedule_work(&ispfe->stats_work);
+	queue_work(system_dfl_long_wq, &ispfe->stats_work);
 	pm_runtime_put(ispfe->dev);
 }
 
@@ -6938,6 +6938,21 @@ static bool ispfe_stats_producing(const struct ispfe_device *ispfe)
  * hard interrupt handler should be doing -- and rather than from QBUF, because
  * a buffer that comes back DONE inside the call that queued it is not what a
  * caller expects.
+ *
+ * On system_dfl_long_wq rather than the per-CPU one, because this copy is
+ * long enough to be antisocial there.  Both grids are dma_alloc_coherent() and
+ * so uncached, and reading 576 KiB of that takes 9.5 ms -- 62 MB/s, measured.
+ * It never sleeps, so a per-CPU pool cannot run anything else behind it for
+ * all of that, and what was behind it is ispfe_backend_fill_work(), which has
+ * a frame deadline of about 1.3 ms.  That is the whole of why the front end
+ * dropped one credit in three whenever this node was streaming.  An unbound
+ * pool is not concurrency-managed, so a long item there blocks nothing.
+ *
+ * All six sites that queue this item name that one workqueue, and they have to:
+ * a work_struct split across two of them can run on two CPUs at once, because
+ * the non-reentrancy check compares the pool's workqueue against the queueing
+ * one.  ispfe_stats_publish() increments @stats_sequence outside @slock and is
+ * the one field here that relies on there being a single instance.
  */
 static void ispfe_stats_work_fn(struct work_struct *work)
 {
@@ -7046,7 +7061,7 @@ static void ispfe_stats_buf_queue(struct vb2_buffer *vb)
 	 * the front end's business and it can change under this call, so the
 	 * one place that answers it is the one place that acts on the answer.
 	 */
-	schedule_work(&ispfe->stats_work);
+	queue_work(system_dfl_long_wq, &ispfe->stats_work);
 }
 
 /*
@@ -7064,7 +7079,7 @@ static int ispfe_stats_start_streaming(struct vb2_queue *q, unsigned int count)
 		ispfe->stats_streaming = true;
 		ispfe->stats_sequence = 0;
 	}
-	schedule_work(&ispfe->stats_work);
+	queue_work(system_dfl_long_wq, &ispfe->stats_work);
 
 	return 0;
 }

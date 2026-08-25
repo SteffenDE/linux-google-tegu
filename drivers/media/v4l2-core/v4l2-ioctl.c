@@ -1473,6 +1473,7 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 	case V4L2_META_FMT_MALI_C55_STATS:	descr = "ARM Mali-C55 ISP 3A Statistics"; break;
 	case V4L2_META_FMT_BECORE_PARAMS:	descr = "zumapro BE-core ISP Parameters"; break;
 	case V4L2_META_FMT_ISPFE_STATS:		descr = "zumapro ISPFE Statistics"; break;
+	case V4L2_META_FMT_ISPFE_PARAMS:	descr = "zumapro ISPFE Parameters"; break;
 	case V4L2_PIX_FMT_NV12_8L128:	descr = "NV12 (8x128 Linear)"; break;
 	case V4L2_PIX_FMT_NV12M_8L128:	descr = "NV12M (8x128 Linear)"; break;
 	case V4L2_PIX_FMT_NV12_10BE_8L128:	descr = "10-bit NV12 (8x128 Linear, BE)"; break;

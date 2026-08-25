@@ -886,6 +886,7 @@ int becore_input_profiles_validate(struct device *dev,
 int becore_output_profiles_validate(struct device *dev);
 u32 becore_pack_size(u32 high, u32 low);
 int becore_zoom_ratio(u32 in, u32 out, u32 *ratio);
+int becore_mcsc_djag_ratio(u32 in, u32 out, u32 *ratio);
 u32 becore_scaler_init_phase(u32 ratio);
 int becore_raster_validate(struct device *dev, const char *name,
 			   const struct becore_raster *raster, u32 max);

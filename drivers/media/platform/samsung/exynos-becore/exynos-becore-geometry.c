@@ -382,6 +382,41 @@ int becore_zoom_ratio(u32 in, u32 out, u32 *ratio)
 }
 
 /*
+ * The same fraction for MCSC's pre-scaler, and not the same number.
+ *
+ * Samsung's GET_ZOOM_RATIO truncates, and RGBP's scaler does too: over the
+ * captured corpus its two ratio registers hold the truncated quotient at all
+ * fourteen windows, and eleven of those are windows where the rounded
+ * quotient would have been one larger.  DJAG is the other way round.  At three
+ * captured windows the vendor wrote the value *above* the truncation, and at
+ * seven more it wrote the value below with a fraction under a half -- 0.467
+ * among them, which is what rules out a ceiling and leaves round-to-nearest.
+ *
+ * So the two blocks do not share a rule, and the corpus is the only thing that
+ * says so: at the raster this driver ships, 4160 over 4000 and 3120 over 3000,
+ * the exact quotient's fraction is 0.04 and both rules give the same word.
+ *
+ * The error either way is one part in 2^20 of a step, which over a 4000-pixel
+ * line is four thousandths of a pixel.  Nothing would ever see it.  It is
+ * worth having right because a derivation that is nearly the vendor's is how
+ * the chain surface's stride survived: agreeing wherever the numbers make two
+ * formulas agree is not agreeing.
+ */
+int becore_mcsc_djag_ratio(u32 in, u32 out, u32 *ratio)
+{
+	u64 scaled;
+
+	if (!out)
+		return -EINVAL;
+	scaled = div_u64(((u64)in << BECORE_RATIO_SHIFT) + out / 2, out);
+	if (scaled > U32_MAX)
+		return -ERANGE;
+	*ratio = scaled;
+
+	return 0;
+}
+
+/*
  * Where MCSC's scaler starts, which is a function of its ratio rather than a
  * constant: half a source step when it stretches and nothing when it shrinks.
  * Ten captured POLY_SC0 programs say so -- the six that shrink write zero, and
@@ -1079,11 +1114,11 @@ becore_mcsc_dma_value(const struct becore_raster *chain,
 		*value = becore_pack_size(output->width, output->height);
 		break;
 	case BECORE_MCSC_DJAG_PS_H_RATIO:
-		return becore_zoom_ratio(becore_mcsc_djag_crop_width(chain),
-					 output->width, value);
+		return becore_mcsc_djag_ratio(becore_mcsc_djag_crop_width(chain),
+					      output->width, value);
 	case BECORE_MCSC_DJAG_PS_V_RATIO:
-		return becore_zoom_ratio(becore_mcsc_djag_crop_height(chain),
-					 output->height, value);
+		return becore_mcsc_djag_ratio(becore_mcsc_djag_crop_height(chain),
+					      output->height, value);
 	default:
 		return -EINVAL;
 	}

@@ -894,6 +894,7 @@ struct v4l2_pix_format {
 
 /* Vendor specific - used for the Google zumapro camera front end */
 #define V4L2_META_FMT_ISPFE_STATS	v4l2_fourcc('I', 'F', 'E', 'S') /* zumapro ISPFE Statistics */
+#define V4L2_META_FMT_ISPFE_PARAMS	v4l2_fourcc('I', 'F', 'E', 'P') /* zumapro ISPFE Parameters */
 
 #ifdef __KERNEL__
 /*

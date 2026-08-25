@@ -8,6 +8,7 @@
 #ifndef __UAPI_EXYNOS_ISPFE_CONFIG_H
 #define __UAPI_EXYNOS_ISPFE_CONFIG_H
 
+#include <linux/media/v4l2-isp.h>
 #include <linux/types.h>
 
 /**
@@ -37,6 +38,92 @@ enum exynos_ispfe_stats_version {
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
+
+/**
+ * enum exynos_ispfe_params_block_type - Parameters block type
+ *
+ * @EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE: LMP's white balance gains,
+ *	:c:type:`exynos_ispfe_params_white_balance`
+ * @EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
+ *
+ * The front end applies white balance before it meters, so the gains are both
+ * what balances the picture and what the exposure and white balance grids are
+ * measured through. Nothing about them is knowable to the kernel: they are an
+ * estimate of the illuminant, which is what an AWB algorithm exists to make.
+ *
+ * A block carries values in the units the block is specified in, never a
+ * register, an address or a command.
+ */
+enum exynos_ispfe_params_block_type {
+	EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE = 0,
+	EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL,
+};
+
+/* The four gains, in the order the statistics grids sum their channels. */
+#define EXYNOS_ISPFE_WB_RED			0
+#define EXYNOS_ISPFE_WB_GREEN_RED		1
+#define EXYNOS_ISPFE_WB_GREEN_BLUE		2
+#define EXYNOS_ISPFE_WB_BLUE			3
+#define EXYNOS_ISPFE_WB_GAINS			4
+
+/* Unsigned Q12: 4096 is 1.0, and is what the greens are captured at. */
+#define EXYNOS_ISPFE_WB_GAIN_ONE		4096
+
+/*
+ * The largest gain this interface accepts, and it is a **policy** rather than
+ * a hardware limit -- state it as the latter and the next person will believe
+ * the hardware stops here. The white balance field itself is twenty bits, so
+ * the hardware would take a gain of 255.99998, and the vendor's own translator
+ * clamps nothing.
+ *
+ * What this bound is, is the largest gain that can be described to *defect
+ * pixel correction* as well: it takes the red and blue gains in a ten-bit
+ * field, so 1023 * 32 + 15 is the last one that does not saturate there. The
+ * vendor is content to saturate it and go on; this refuses instead, because a
+ * white balance that silently stops correcting defects above a threshold
+ * nobody stated is worse than one that says no. The green gains are not in
+ * that path and are held to the same bound anyway, because a white balance
+ * whose greens leave the range its red and blue are held to is a mistake
+ * rather than a mode.
+ *
+ * The vendor derives its two quantisations independently from one float --
+ * round(gain * 4096) for white balance and round(gain * 128) for defect pixel
+ * correction -- where this derives the second from the first. The two can
+ * differ by one at a rounding boundary, which is exactly where this bound
+ * sits.
+ */
+#define EXYNOS_ISPFE_WB_GAIN_MAX		32751
+
+/**
+ * struct exynos_ispfe_params_white_balance - LMP's white balance gains
+ *
+ * @header: The parameters block header
+ * @gains: Four unsigned Q12 gains, indexed by %EXYNOS_ISPFE_WB_RED and its
+ *	siblings
+ *
+ * Each gain is at least one -- a gain of zero is a channel switched off rather
+ * than balanced, which no white balance wants -- and at most
+ * %EXYNOS_ISPFE_WB_GAIN_MAX.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the gains to
+ * the driver's default rather than switching white balance off. The stage does
+ * have an enable bit and this interface does not expose it: unity gains are
+ * the same picture, and a block whose disable means two different things --
+ * "put the default back" or "stop correcting" -- would need userspace to say
+ * which.
+ */
+struct exynos_ispfe_params_white_balance {
+	struct v4l2_isp_params_block_header header;
+	__u32 gains[EXYNOS_ISPFE_WB_GAINS];
+} __attribute__((aligned(8)));
+
+/**
+ * define EXYNOS_ISPFE_PARAMS_MAX_SIZE - Maximum parameters data size
+ *
+ * The largest a buffer's block list can be, which is every block type once.
+ */
+#define EXYNOS_ISPFE_PARAMS_MAX_SIZE \
+	sizeof(struct exynos_ispfe_params_white_balance)
 
 /*
  * Both grids are the same shape: LMP meters 64 x 48 rectangular regions over

@@ -396,11 +396,20 @@ struct exynos_ispfe_stats_awb_region {
  * per region. The difference sums are a sharpness measure over the region and
  * are signed; everything else is a count or a sum of samples.
  *
+ * **@sum is signed, and a dark region really does go below zero.** Samples
+ * reach this grid after black level subtraction, so a region darker than the
+ * pedestal sums negative -- 847 of a frame's 12,288 region sums at one line of
+ * exposure, none at 1500, on one scene. Read unsigned, each of those becomes
+ * about 4.29 billion and a mean over the grid comes out two to three orders of
+ * magnitude high: 456,378 units against the 11.8 the same buffer holds. The
+ * white balance grid's @sum was signed from the start and this one was not,
+ * which is the whole of the difference.
+ *
  * These statistics are metered after lens shading correction, so they describe
  * the corrected picture rather than the sensor's raw response.
  */
 struct exynos_ispfe_stats_ae_region {
-	__u32 sum[4];
+	__s32 sum[4];
 	__u16 usable_count[4];
 	__s32 y_diff_sum[4];
 	__u16 dark_count[4];

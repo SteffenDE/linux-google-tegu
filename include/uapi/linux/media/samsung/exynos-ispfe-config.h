@@ -16,6 +16,13 @@
  *
  * @EXYNOS_ISPFE_STATS_VERSION_V1: First version of the layout below
  *
+ * **A version's layout only ever grows at the end.** A member added to it does
+ * not bump the version, because everything before it keeps its offset and its
+ * meaning -- so take the buffer's extent from the format's ``buffersize`` and
+ * ``bytesused`` rather than from the size of a struct compiled against a newer
+ * header, and take its *content* from @exynos_ispfe_stats_buffer.stats_type.
+ * A member whose flag is clear was not written and may not be there at all.
+ *
  * The driver writes this into every buffer it completes. A consumer that does
  * not recognise the value must not interpret the rest of the buffer.
  */
@@ -35,6 +42,9 @@ enum exynos_ispfe_stats_version {
  *	The auto white balance grid, :c:type:`exynos_ispfe_stats_awb`
  * %EXYNOS_ISPFE_STATS_AE:
  *	The post-shading auto exposure grid, :c:type:`exynos_ispfe_stats_ae`
+ *
+ * %EXYNOS_ISPFE_STATS_HISTOGRAM:
+ *	The per-pixel RGBY histogram is present, in @histogram.
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
@@ -471,13 +481,15 @@ struct exynos_ispfe_stats_ae {
 #define EXYNOS_ISPFE_HISTOGRAM_LUMA		3
 #define EXYNOS_ISPFE_HISTOGRAM_PLANES		4
 #define EXYNOS_ISPFE_HISTOGRAM_BINS		512
+/* The bits of @exynos_ispfe_stats_histogram.bins_log2 that carry the count. */
+#define EXYNOS_ISPFE_HISTOGRAM_BINS_MASK	0x1f
 
 /**
  * struct exynos_ispfe_stats_histogram - The per-pixel RGBY histogram
  *
  * @reserved0: The hardware's own metadata area, undecoded
  * @bins_log2: How many bins the hardware was configured for, as a power of two
- *	in its low five bits
+ *	in its **low five bits**; mask before shifting
  * @reserved1: The rest of that metadata area, also undecoded
  * @bins: Per plane, how many samples fell in each bin
  * @total: Per plane, how many samples the histogram counted at all
@@ -498,14 +510,22 @@ struct exynos_ispfe_stats_ae {
  * divides by the length gets an answer wrong by exactly the ratio, and
  * `libipa`'s constraint arithmetic divides by the bin count.
  *
+ * The bins past that count read as zero because the allocation was zeroed, not
+ * because anything clears them per frame -- so on a torn buffer they can carry
+ * an older frame's counts.
+ *
  * It is the hardware's own report rather than a copy of the configuration --
  * `lyric::LmpRgbyHistogramStatsOutput::ValidateMetadata` checks its own
  * expectation against this same word -- so it says what the frame was actually
  * binned with.
  *
- * @total is what says a buffer holds a result: it counts samples rather than
- * values, so it is nonzero for any frame the hardware wrote, including a black
- * one, and the driver clears it before arming.
+ * **@bins_log2 is what says a buffer holds a result.** The driver clears it
+ * before arming and the hardware writes it, so it is zero for a frame nothing
+ * wrote. @total counts samples rather than values and would be the more
+ * natural test, and it cannot be used for one: it sits three pages into a
+ * non-contiguous allocation, too far for the driver to clear -- see the note on
+ * @reserved0 -- so it is **not** reset between frames and a torn buffer carries
+ * the previous occupant's totals rather than zeros.
  *
  * The first 64 bytes are the hardware's, in the same place the two grids keep
  * their own metadata area, and nothing has decoded them. They are not assumed
@@ -530,6 +550,8 @@ struct exynos_ispfe_stats_histogram {
  * @reserved: Undefined; zero
  * @awb: The white balance grid, valid when %EXYNOS_ISPFE_STATS_AWB is set
  * @ae: The exposure grid, valid when %EXYNOS_ISPFE_STATS_AE is set
+ * @histogram: The RGBY histogram, valid when %EXYNOS_ISPFE_STATS_HISTOGRAM is
+ *	set
  *
  * One buffer is one frame's statistics. Which frame is said twice, and neither
  * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
@@ -547,7 +569,7 @@ struct exynos_ispfe_stats_histogram {
  * A buffer with no measurement flags set carries no result. Which of the two
  * reasons applies is in @frame_sequence: zero means nothing was capturing when
  * the buffer was queued, and non-zero means that frame really happened and the
- * hardware wrote no grid for it. Check @stats_type before reading either grid
+ * hardware wrote no grid for it. Check @stats_type before reading any of them
  * either way.
  *
  * Nothing here is a register or an address: these are the values the hardware

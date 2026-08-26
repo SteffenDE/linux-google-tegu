@@ -12,10 +12,14 @@ V4L2_META_FMT_ISPFE_STATS ('IFES'), V4L2_META_FMT_ISPFE_PARAMS ('IFEP')
 
 The zumapro camera front end meters every frame it receives and writes the
 results to its statistics metadata capture video node, using the
-:c:type:`v4l2_meta_format` interface. One buffer holds one frame's results:
-the auto white balance grid and the post-shading auto exposure grid, both
-64 x 48 regions over the picture, described by
-:c:type:`exynos_ispfe_stats_buffer`.
+:c:type:`v4l2_meta_format` interface. One buffer holds one frame's results,
+described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid
+and the post-shading auto exposure grid, both 64 x 48 regions over the picture,
+and a per-pixel RGBY histogram of a region of it.
+
+The grids and the histogram are complementary rather than alternatives. A grid
+gives a mean per region and so can be weighted spatially; the histogram gives a
+distribution and so can answer a quantile. Neither is derivable from the other.
 
 Which frame a buffer describes is said by its timestamp, which is bit for bit
 the timestamp the same frame's image buffer carries, and by ``frame_sequence``,
@@ -29,7 +33,7 @@ with no statistics buffer queued produces none, which shows up as a jump in
 ``frame_sequence`` rather than as a stale result; and a buffer queued while
 nothing is capturing at all is returned immediately with ``stats_type`` zero,
 so a consumer is never left waiting on a frame nobody is going to run. Check
-``stats_type`` before reading either grid: a grid whose flag is clear was not
+``stats_type`` before reading any of them: a grid whose flag is clear was not
 written and holds no result. ``frame_sequence`` says which of the two reasons
 applies -- zero for a buffer that describes no frame, non-zero for a frame that
 happened and produced no grid.
@@ -43,7 +47,13 @@ happened and produced no grid.
 		return;
 
 	if (stats->stats_type & EXYNOS_ISPFE_STATS_AWB) {
-		__u64 sum[4] = {}, usable = 0;
+		/* The sums are signed: samples reach the grids after black
+		 * level subtraction, so a region darker than the pedestal
+		 * sums below zero. Reading them unsigned turns each such
+		 * region into about 4.29 billion.
+		 */
+		__s64 sum[4] = {};
+		__u64 usable = 0;
 
 		for (unsigned int i = 0; i < EXYNOS_ISPFE_STATS_REGIONS; i++) {
 			const struct exynos_ispfe_stats_awb_region *region =

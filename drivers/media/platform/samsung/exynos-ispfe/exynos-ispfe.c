@@ -692,19 +692,32 @@ static bool ispfe_stats_grid_written(const void *grid)
  * bin count the hardware reports into its metadata area -- nonzero for any
  * frame it wrote, and zero for the clear below.
  *
- * **The sample totals would be the more natural test and cannot be used.**
- * They sit at the far end of the structure, three pages into a
- * *non-contiguous* allocation, and clearing that far means both syncing beyond
- * what `dma_sync_single_for_device()` can describe here and leaving the body
- * dirty -- so a stale cache line can be written back over the frame the
- * hardware just wrote. That cost 18% of buffers, intermittently, until the
- * clear came back inside the first page.
+ * **The sample totals would be the stronger test and are not used.** They sit
+ * at the far end of the structure, three pages into a *non-contiguous*
+ * allocation, and clearing that far with the ranged
+ * `dma_sync_single_for_device()` the arm path uses both syncs physical memory
+ * that is not the allocation's and leaves the rest of it dirty over what the
+ * hardware wrote. That cost 18% of buffers, intermittently.
+ *
+ * `dma_sync_sgtable_for_device()` would describe the whole thing correctly, so
+ * this is a limit of how the arm path syncs rather than of the DMA API -- the
+ * door is closed, not locked. What is traded away by not opening it is
+ * completeness: the totals said "the hardware finished", where this says "the
+ * hardware started". A torn buffer therefore carries the previous frame's tail
+ * rather than zeros, which is why @total is documented as unusable for
+ * validity rather than merely unused.
  */
 static bool ispfe_stats_histogram_written(const void *grid)
 {
 	const struct exynos_ispfe_stats_histogram *histogram = grid;
 
-	return histogram->bins_log2 != 0;
+	/*
+	 * Masked, because that is what the field means and what a consumer
+	 * reads: a word with rubbish in its upper bits and nothing in its low
+	 * five would otherwise be published as a one-bin histogram rather than
+	 * rejected.
+	 */
+	return (histogram->bins_log2 & EXYNOS_ISPFE_HISTOGRAM_BINS_MASK) != 0;
 }
 
 static const struct ispfe_stats_grid {
@@ -2172,6 +2185,15 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 	BUILD_BUG_ON(sizeof(struct exynos_ispfe_stats_grid_header) > PAGE_SIZE);
 	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
 		size_t clear = ispfe_stats_grids[grid].clear;
+
+		/*
+		 * The BUILD_BUG_ON above asserts the size of a *type*, which is
+		 * not the value handed to the sync below -- so it did not catch
+		 * a descriptor whose clear ran past the first page, and would
+		 * not catch the next one. This is the quantity that matters.
+		 */
+		if (WARN_ON_ONCE(clear > PAGE_SIZE))
+			clear = PAGE_SIZE;
 
 		memset(area->grid[grid], 0, clear);
 		dma_sync_single_for_device(ispfe->dev, area->dma[grid], clear,
@@ -5099,7 +5121,8 @@ static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
 			unsigned int output = ispfe_stats_grids[grid].output;
 			size_t size = ispfe_pdma_outputs[output].size;
 
-			if (size < ispfe_stats_grids[grid].size)
+			if (size < ispfe_stats_grids[grid].size ||
+			    size < ispfe_stats_grids[grid].clear)
 				return -EINVAL;
 			/*
 			 * __GFP_ZERO, and it is not belt and braces:

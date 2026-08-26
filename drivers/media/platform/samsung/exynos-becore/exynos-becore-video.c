@@ -799,12 +799,100 @@ static int becore_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
+/*
+ * What the scaler can be asked for, given the chain raster it reads.
+ *
+ * Two extents rather than a list: MCSC's DJAG takes any ratio its Q20 register
+ * can hold, so the sizes between the bounds are as real as the bounds. The
+ * ceiling is the chain itself -- **not** because the register refuses to go
+ * above it, but because nothing has established that this scaler upscales:
+ * every one of the sixteen captured output rasters is a downscale of its
+ * chain, so offering more would be advertising something nobody has run.
+ *
+ * The floor is the ratio's own: past a 4096x downscale the Q20 value does not
+ * fit, which for a 4160-wide chain is a raster of two.
+ * %BECORE_SCALED_EXTENT_MIN is the larger of that and what an image with
+ * subsampled chroma needs, and it does not move with the chain because the
+ * chain cannot get near it.
+ *
+ * Both extents are even because the chroma plane is subsampled in both
+ * directions; the width needs no more alignment than that, since the stride
+ * pads to 64 on its own.
+ */
+static void becore_video_clamp(const struct becore_device *becore,
+			       struct becore_raster *scaled)
+{
+	scaled->width = clamp_t(u32, ALIGN_DOWN(scaled->width, 2),
+				BECORE_SCALED_EXTENT_MIN,
+				ALIGN_DOWN(becore->chain.width, 2));
+	scaled->height = clamp_t(u32, ALIGN_DOWN(scaled->height, 2),
+				 BECORE_SCALED_EXTENT_MIN,
+				 ALIGN_DOWN(becore->chain.height, 2));
+}
+
+static int becore_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct becore_device *becore = video_drvdata(file);
+	struct becore_raster scaled = {
+		.width = f->fmt.pix.width,
+		.height = f->fmt.pix.height,
+	};
+
+	becore_video_clamp(becore, &scaled);
+	becore_video_fill_pix(&scaled, &f->fmt.pix);
+
+	return 0;
+}
+
+/*
+ * The scaled raster is the one thing about this pipeline a consumer chooses.
+ *
+ * The array and the chain stay where they are: a 4160x3120 chain reaches every
+ * output the captured corpus uses, and moving it would change what RGBP crops
+ * and what the denoiser bins, which is a different negotiation from "what size
+ * do you want the picture".
+ *
+ * Reallocating the surfaces is the part that can fail, and
+ * becore_geometry_apply() is what puts the previous raster back if it does. A
+ * request the clamp already satisfied can still be refused there -- the DJAG
+ * ratio check is exact where the clamp is a bound -- so the return value
+ * matters and the format is only reported back once it has been applied.
+ */
 static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct becore_device *becore = video_drvdata(file);
+	struct becore_raster scaled = {
+		.width = f->fmt.pix.width,
+		.height = f->fmt.pix.height,
+	};
+	int ret;
 
 	if (vb2_is_busy(&becore->queue))
 		return -EBUSY;
+
+	becore_video_clamp(becore, &scaled);
+
+	/*
+	 * @video_lock is already held: it is the video device's own, so the
+	 * queue cannot start streaming underneath this.  What it does not cover
+	 * is the offline loop, which runs frames of its own through the same
+	 * surfaces -- so the same guards the debugfs geometry file uses apply
+	 * here, and for the same reason.
+	 */
+	mutex_lock(&becore->lock);
+	if (becore->reset_failed || becore->output_quarantined)
+		ret = -EIO;
+	else if (becore->running || becore->video_streaming)
+		ret = -EBUSY;
+	else if (scaled.width == becore->scaled.width &&
+		 scaled.height == becore->scaled.height)
+		ret = 0;
+	else
+		ret = becore_geometry_apply(becore, &becore->array,
+					    &becore->chain, &scaled);
+	mutex_unlock(&becore->lock);
+	if (ret)
+		return ret;
 
 	becore_video_fill_pix(&becore->scaled, &f->fmt.pix);
 
@@ -819,9 +907,13 @@ static int becore_enum_framesizes(struct file *file, void *priv,
 	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_NV21)
 		return -EINVAL;
 
-	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = becore->scaled.width;
-	fsize->discrete.height = becore->scaled.height;
+	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+	fsize->stepwise.min_width = BECORE_SCALED_EXTENT_MIN;
+	fsize->stepwise.max_width = ALIGN_DOWN(becore->chain.width, 2);
+	fsize->stepwise.step_width = 2;
+	fsize->stepwise.min_height = BECORE_SCALED_EXTENT_MIN;
+	fsize->stepwise.max_height = ALIGN_DOWN(becore->chain.height, 2);
+	fsize->stepwise.step_height = 2;
 
 	return 0;
 }
@@ -831,7 +923,7 @@ static const struct v4l2_ioctl_ops becore_ioctl_ops = {
 	.vidioc_enum_fmt_vid_cap = becore_enum_fmt,
 	.vidioc_g_fmt_vid_cap = becore_g_fmt,
 	.vidioc_s_fmt_vid_cap = becore_s_fmt,
-	.vidioc_try_fmt_vid_cap = becore_g_fmt,
+	.vidioc_try_fmt_vid_cap = becore_try_fmt,
 	.vidioc_enum_framesizes = becore_enum_framesizes,
 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
 	.vidioc_create_bufs = vb2_ioctl_create_bufs,

@@ -652,6 +652,14 @@ struct ispfe_stats_area {
 	dma_addr_t dma[2];
 	u64 timestamp;
 	u32 sequence;
+	/*
+	 * Which streaming session of the metadata node armed this area.  A
+	 * frame can retire after that session ended -- the front end is a
+	 * different queue and keeps going -- and its statistics belong to the
+	 * session that asked for them, not to whoever is streaming when they
+	 * land.
+	 */
+	u32 session;
 };
 
 /* Indices into ispfe_stats_area.grid, in the order the buffer carries them. */
@@ -1387,6 +1395,7 @@ struct ispfe_device {
 	struct list_head stats_free;
 	struct list_head stats_captured;
 	bool stats_streaming;
+	u32 stats_session;
 
 	/*
 	 * The parameters node, which is one block type deep: LMP's white
@@ -1402,6 +1411,19 @@ struct ispfe_device {
 	u32 stats_published;
 	u32 stats_empty;
 	u32 stats_dropped;
+	/*
+	 * Areas whose frame retired after the session that armed them ended,
+	 * which an earlier driver returned to the pool at STREAMOFF while the
+	 * front end was still writing into them.  A non-zero count is this
+	 * node having been stopped under a running capture, not a fault.
+	 *
+	 * It is a lower bound on that population rather than the whole of it:
+	 * an area that retires *during* the gap still matches the session, so
+	 * it goes back through the STREAMOFF splice without being counted.
+	 * Cycling the node back to back counts most of them; leaving it down
+	 * for longer than the retire depth counts none.
+	 */
+	u32 stats_stale;
 	/*
 	 * This node's own buffer counter, not the front end's frame counter.
 	 * A buffer that carries no frame still has to be numbered, and the
@@ -2119,6 +2141,7 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 			return NULL;
 		}
 		list_del_init(&area->list);
+		area->session = ispfe->stats_session;
 		ispfe->stats_slot[slot] = area;
 	}
 
@@ -2217,6 +2240,18 @@ static bool ispfe_stats_capture_locked(struct ispfe_device *ispfe,
 	if (!area)
 		return false;
 	ispfe->stats_slot[slot] = NULL;
+	/*
+	 * This is also the moment an area armed by a session that has since
+	 * ended becomes reclaimable, and the only one: until the frame retires
+	 * the front end may still be writing into it.  Reclaimed here rather
+	 * than published, because the buffers waiting now belong to somebody
+	 * who asked after that frame had already been metered.
+	 */
+	if (area->session != ispfe->stats_session) {
+		ispfe->stats_stale++;
+		ispfe_stats_area_put_locked(ispfe, area);
+		return false;
+	}
 	/*
 	 * Ordering, not visibility: the area is cacheable, and what makes the
 	 * frame's writes readable through this mapping is the invalidate in
@@ -6480,9 +6515,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "awb_reloc    %#x/%#x, spare %pad\n", ispfe->awb_lo,
 		   ispfe->awb_hi, &ispfe->awb_spare_dma);
 	seq_printf(s,
-		   "stats        streaming %u, published %u, empty %u, dropped %u\n",
+		   "stats        streaming %u, published %u, empty %u, dropped %u, stale %u\n",
 		   READ_ONCE(ispfe->stats_streaming), ispfe->stats_published,
-		   ispfe->stats_empty, ispfe->stats_dropped);
+		   ispfe->stats_empty, ispfe->stats_dropped,
+		   ispfe->stats_stale);
 	seq_printf(s,
 		   "backend      input %pad, spare %pad, size %zu, producing %u, handed_off %u\n",
 		   &backend_dma,
@@ -7764,7 +7800,16 @@ static int ispfe_stats_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
 
 	scoped_guard(spinlock_irqsave, &ispfe->slock) {
+		/*
+		 * Anything a previous session metered and did not get to hand
+		 * out is quiescent -- its frame retired to put it there -- so
+		 * this is where it goes back, rather than being published to
+		 * whoever is streaming now.
+		 */
+		list_splice_tail_init(&ispfe->stats_captured,
+				      &ispfe->stats_free);
 		ispfe->stats_streaming = true;
+		ispfe->stats_session++;
 		ispfe->stats_sequence = 0;
 	}
 	queue_work(system_dfl_long_wq, &ispfe->stats_work);
@@ -7785,7 +7830,19 @@ static void ispfe_stats_stop_streaming(struct vb2_queue *q)
 	 */
 	scoped_guard(spinlock_irqsave, &ispfe->slock) {
 		ispfe->stats_streaming = false;
-		ispfe_stats_untake_all_locked(ispfe);
+		/*
+		 * The armed areas are deliberately *not* returned here.  The
+		 * front end is a different queue and keeps streaming, and
+		 * every slot encoded before this still carries its area's
+		 * address in the program the hardware is running -- so putting
+		 * one back in the pool would let the next session hand it to a
+		 * second slot, and a grid would come back with its header from
+		 * one frame and its body from another.  Each is reclaimed
+		 * where it becomes quiescent instead, when its frame retires
+		 * in ispfe_stats_capture_locked().
+		 *
+		 * The captured ones have already retired, so they can go.
+		 */
 		list_splice_tail_init(&ispfe->stats_captured,
 				      &ispfe->stats_free);
 	}

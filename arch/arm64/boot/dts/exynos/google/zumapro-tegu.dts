@@ -2129,6 +2129,26 @@
 		/* Rear-facing. */
 		orientation = <1>;
 
+		/*
+		 * The die is mounted a quarter turn from the phone's upright
+		 * position: with the handset held screen-up, a captured frame
+		 * has to be turned 90 degrees *clockwise* to put the world the
+		 * right way up. This property is the correction expressed
+		 * counter-clockwise, which is the other way round, so 270.
+		 *
+		 * Measured rather than assumed [2026-08-26]: a frame of a desk
+		 * taken with the phone in its normal upright position reads
+		 * correctly only after a clockwise quarter turn.
+		 *
+		 * Nothing in this pipeline can apply it. A quarter turn is a
+		 * transpose, the sensor has no flip controls at all, and
+		 * neither the front end nor MCSC transposes -- so libcamera's
+		 * computeTransform() reports the native orientation back and
+		 * the consumer rotates. Stating it is still what lets a
+		 * consumer know which way round the frame is.
+		 */
+		rotation = <270>;
+
 		port {
 			cam_uw_out: endpoint {
 				remote-endpoint = <&ispfe_uw_in>;

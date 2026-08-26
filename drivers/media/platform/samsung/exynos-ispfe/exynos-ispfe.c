@@ -688,21 +688,23 @@ static bool ispfe_stats_grid_written(const void *grid)
 }
 
 /*
- * The histogram has no geometry to check, and its own first 64 bytes are not
- * decoded, so what says it was written is its sample totals: they count
- * samples rather than values, so any frame the hardware wrote has them nonzero
- * -- including a black one, where every bin but the first is empty.
+ * The histogram has no geometry to check, so what says it was written is the
+ * bin count the hardware reports into its metadata area -- nonzero for any
+ * frame it wrote, and zero for the clear below.
+ *
+ * **The sample totals would be the more natural test and cannot be used.**
+ * They sit at the far end of the structure, three pages into a
+ * *non-contiguous* allocation, and clearing that far means both syncing beyond
+ * what `dma_sync_single_for_device()` can describe here and leaving the body
+ * dirty -- so a stale cache line can be written back over the frame the
+ * hardware just wrote. That cost 18% of buffers, intermittently, until the
+ * clear came back inside the first page.
  */
 static bool ispfe_stats_histogram_written(const void *grid)
 {
 	const struct exynos_ispfe_stats_histogram *histogram = grid;
-	unsigned int plane;
 
-	for (plane = 0; plane < EXYNOS_ISPFE_HISTOGRAM_PLANES; plane++)
-		if (!histogram->total[plane])
-			return false;
-
-	return true;
+	return histogram->bins_log2 != 0;
 }
 
 static const struct ispfe_stats_grid {
@@ -737,14 +739,9 @@ static const struct ispfe_stats_grid {
 		.output = ISPFE_PDMA_OUTPUT_HISTOGRAM,
 		.offset = offsetof(struct exynos_ispfe_stats_buffer, histogram),
 		.size = sizeof(struct exynos_ispfe_stats_histogram),
-		/*
-		 * The whole of it, because the totals that say it was written
-		 * are at the far end.  Eight kilobytes against the grids' 292
-		 * each, so the cost is noise.
-		 */
-		.clear = sizeof(struct exynos_ispfe_stats_histogram),
 		.flag = EXYNOS_ISPFE_STATS_HISTOGRAM,
 		.written = ispfe_stats_histogram_written,
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 	},
 };
 

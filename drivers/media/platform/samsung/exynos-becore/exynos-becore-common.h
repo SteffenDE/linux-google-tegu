@@ -973,6 +973,10 @@ int becore_generated_value(const struct becore_device *becore,
 u32 becore_generated_word_count(enum becore_block_id id);
 int becore_generated_tables_validate(struct device *dev);
 int becore_noise_knots_resolve(struct device *dev);
+int becore_geometry_apply(struct becore_device *becore,
+			  const struct becore_raster *array,
+			  const struct becore_raster *chain,
+			  const struct becore_raster *scaled);
 int becore_yuvnr_geometry_value(const struct becore_raster *array,
 				const struct becore_raster *chain,
 				u32 offset, u32 *value);

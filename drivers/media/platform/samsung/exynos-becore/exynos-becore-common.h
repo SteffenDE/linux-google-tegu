@@ -840,6 +840,16 @@ extern const struct exynos_becore_params_dmsc becore_dmsc_neutral;
 #define BECORE_RASTER_EXTENT_MAX	U16_MAX
 
 /*
+ * The smallest scaled output this node offers.  DJAG's Q20 ratio stops fitting
+ * past a 4096x downscale, which for any chain this hardware can carry is a
+ * raster far below anything useful, so what this really encodes is that a
+ * picture with subsampled chroma wants more than a handful of samples.  It is
+ * a floor on the node rather than a hardware limit, and it is stated here
+ * because both the clamp and the size enumeration have to agree on it.
+ */
+#define BECORE_SCALED_EXTENT_MIN	32
+
+/*
  * The array's bound is tighter, and it comes from the two blocks that state a
  * radial fall-off centre.  BYR_DNS writes -(array extent / 2) and YUVNR writes
  * -(crop extent / 2), both into a 15-bit signed field, so the largest array

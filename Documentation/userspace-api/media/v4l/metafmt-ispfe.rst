@@ -15,11 +15,15 @@ results to its statistics metadata capture video node, using the
 :c:type:`v4l2_meta_format` interface. One buffer holds one frame's results,
 described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid
 and the post-shading auto exposure grid, both 64 x 48 regions over the picture,
-and a per-pixel RGBY histogram of a region of it.
+a per-pixel RGBY histogram of a region of it, and one sum per row of it.
 
-The grids and the histogram are complementary rather than alternatives. A grid
-gives a mean per region and so can be weighted spatially; the histogram gives a
-distribution and so can answer a quantile. Neither is derivable from the other.
+The four are complementary rather than alternatives, because each resolves the
+frame along a different axis and none is derivable from another. A grid gives a
+mean per region and so can be weighted spatially; the histogram gives a
+distribution and so can answer a quantile; the row sums resolve the frame in
+time, because a rolling shutter reads one row after another and a light
+modulated at twice the mains frequency therefore writes its waveform down the
+picture.
 
 Which frame a buffer describes is said by its timestamp, which is bit for bit
 the timestamp the same frame's image buffer carries, and by ``frame_sequence``,

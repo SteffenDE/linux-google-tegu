@@ -1212,6 +1212,13 @@ struct ispfe_device {
 	void *lsc;
 	dma_addr_t lsc_dma;
 	u8 *shading;
+	/*
+	 * Unity everywhere, in the hardware's tiled layout: what a stream
+	 * starts on, and what a disabled parameters block asks for.  Built once
+	 * because it is the same table for every recipe -- it is the *absence*
+	 * of a calibration rather than one.
+	 */
+	u8 *lsc_unity;
 	int lsc_input;
 	/*
 	 * Byte offsets within a program of the frame destination's two address
@@ -3331,6 +3338,28 @@ static unsigned int ispfe_lsc_word(unsigned int row, unsigned int column,
 	       (row % ISPFE_LSC_TILE_ROWS) * EXYNOS_ISPFE_WB_GAINS + channel;
 }
 
+/*
+ * Unity everywhere, in the tiled layout: a gain of one at every point on every
+ * channel, and zero in the padding rows the last record carries.  Built rather
+ * than memset, because %EXYNOS_ISPFE_LSC_GAIN_ONE is not a repeating byte and
+ * because the padding must stay zero -- the same index map every other reader
+ * of this table uses, so it cannot drift from them.
+ */
+static void ispfe_lsc_unity(u8 *tiled)
+{
+	unsigned int row, column, channel;
+
+	memset(tiled, 0, ISPFE_LSC_LUT_BYTES);
+	for (row = 0; row < EXYNOS_ISPFE_LSC_ROWS; row++)
+		for (column = 0; column < EXYNOS_ISPFE_LSC_COLUMNS; column++)
+			for (channel = 0; channel < EXYNOS_ISPFE_WB_GAINS;
+			     channel++)
+				put_unaligned_le16(EXYNOS_ISPFE_LSC_GAIN_ONE,
+						   tiled + 2 *
+						   ispfe_lsc_word(row, column,
+								  channel));
+}
+
 static void ispfe_lsc_tile(u8 *tiled, const u16 *grid)
 {
 	unsigned int row, column, channel, point = 0;
@@ -3390,17 +3419,32 @@ static u16 ispfe_lsc_sample(const u8 *tiled, unsigned int row,
 }
 
 /*
- * The recipe's own captured table, which is what a disabled block asks for.
- * An input the driver states rather than replays carries no bytes at all, so
- * that is a third way for a recipe to have no default here.
+ * The table a stream starts on, and what a disabled block asks for.
+ *
+ * Unity: shading correction switched off.  A recipe used to carry the vendor's
+ * own 7,392-byte grid here and the driver handed that back, which made the
+ * kernel ship a calibration of one lens at one readout -- ADR 0009 says no
+ * captured tuning ships, and that was the largest table left in the tree.
+ *
+ * The honest cost is that a consumer sending no grid gets visibly dark
+ * corners: this lens falls to about a sixth of its centre response there.
+ * That is the same trade the tone curve's identity default makes, and for the
+ * same reason -- a picture that says "nothing has calibrated this camera" is
+ * better than one silently carrying some other unit's numbers.  libcamera's
+ * IPA sends a real grid from the phone's own factory calibration.
+ *
+ * A recipe *may* still carry a table, and one that does is still honoured:
+ * `.data` is NULL only for the inputs the generator was told to neutralise.
  */
-static const u8 *ispfe_lsc_default(const struct ispfe_pdma_program *prog)
+static const u8 *ispfe_lsc_default(const struct ispfe_device *ispfe,
+				   const struct ispfe_pdma_program *prog)
 {
 	int input = ispfe_lsc_input(prog);
 
-	if (input < 0 || prog->inputs[input].size < ISPFE_LSC_LUT_BYTES ||
-	    !prog->inputs[input].data)
+	if (input < 0 || prog->inputs[input].size < ISPFE_LSC_LUT_BYTES)
 		return NULL;
+	if (!prog->inputs[input].data)
+		return ispfe->lsc_unity;
 	return prog->inputs[input].data;
 }
 
@@ -3451,6 +3495,7 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 	unsigned int knot, channel, index, i;
 	unsigned long stated = 0;
 	u8 *area;
+	int lsc;
 	int ret;
 
 	if (prog->num_inputs > BITS_PER_LONG)
@@ -3482,6 +3527,21 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 	__set_bit(index, &stated);
 	memset(area, ISPFE_LMP_HISTOGRAM_WEIGHT_FLAT,
 	       ISPFE_LMP_HISTOGRAM_WEIGHTS);
+
+	/*
+	 * The shading table is filled by every encode instead, from
+	 * @ispfe->shading -- the driver's own unity table until a parameters
+	 * block replaces it -- so a recipe carrying no bytes for it is not a
+	 * recipe with a hole.  Nothing is written here: the encode does it per
+	 * slot, and doing it twice would only add a copy that goes stale.
+	 *
+	 * A recipe that *does* carry a captured table still works; its bytes
+	 * are copied like any other input's and then overwritten by that same
+	 * encode.
+	 */
+	lsc = ispfe_lsc_input(prog);
+	if (lsc >= 0 && !prog->inputs[lsc].data)
+		__set_bit(lsc, &stated);
 
 	/*
 	 * And every empty input is one of those, so a recipe cannot declare a
@@ -5451,17 +5511,18 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	if (ispfe->prog->lmp_wbg)
 		lmp_wbg = *ispfe->prog->lmp_wbg;
 	/*
-	 * The shading grid *is* per-recipe, because it is a calibration of one
-	 * lens at one readout: measured over 54 captured vendor programs, two
-	 * readouts of one camera differ by up to 30% at a grid point.  So a
-	 * stream starts at the table its own recipe was captured with, and that
-	 * is what a disabled block asks for.
+	 * A stream starts on the driver's own default, which is unity: the grid
+	 * *is* per-recipe -- it is a calibration of one lens at one readout, and
+	 * two readouts of one camera differ by up to 30% at a grid point over
+	 * the 54 captured vendor programs -- and that is exactly why the kernel
+	 * has no business choosing one.  Correcting nothing is the only
+	 * position that is not somebody else's calibration.
 	 */
 	ispfe->lsc_input = ispfe_lsc_input(ispfe->prog);
 	if (ispfe->lsc_input == -EINVAL)
 		return -EINVAL;
 	if (ispfe->lsc_input >= 0) {
-		const u8 *table = ispfe_lsc_default(ispfe->prog);
+		const u8 *table = ispfe_lsc_default(ispfe, ispfe->prog);
 
 		/*
 		 * Refused here rather than later: a recipe that names a
@@ -6501,11 +6562,11 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	 */
 	seq_printf(s, "lmp_shading   %s, Gr edge/centre/edge %u/%u/%u, corner %u Q12\n",
 		   ispfe->lsc_input < 0 ? "not in this recipe" :
-		   ispfe->prog && ispfe_lsc_default(ispfe->prog) &&
+		   ispfe->prog && ispfe_lsc_default(ispfe, ispfe->prog) &&
 		   !memcmp(ispfe->shading,
-			   ispfe_lsc_default(ispfe->prog),
+			   ispfe_lsc_default(ispfe, ispfe->prog),
 			   ISPFE_LSC_LUT_BYTES) ?
-		   "the recipe's own" : "from userspace",
+		   "the driver's default" : "from userspace",
 		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
 				    0, EXYNOS_ISPFE_WB_GREEN_RED),
 		   ispfe_lsc_sample(ispfe->shading, EXYNOS_ISPFE_LSC_ROWS / 2,
@@ -8250,7 +8311,8 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 		 */
 		if (buf->restore_shading_default && ispfe->lsc_input >= 0 &&
 		    ispfe->prog)
-			memcpy(ispfe->shading, ispfe_lsc_default(ispfe->prog),
+			memcpy(ispfe->shading,
+			       ispfe_lsc_default(ispfe, ispfe->prog),
 			       ISPFE_LSC_LUT_BYTES);
 		else if (buf->has_shading)
 			swap(ispfe->shading, buf->shading);
@@ -9215,15 +9277,17 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->pdma_blocks_staged =
 		devm_kmalloc(dev, ISPFE_PDMA_BLOCKS_BYTES, GFP_KERNEL);
 	ispfe->shading = kzalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
+	ispfe->lsc_unity = devm_kmalloc(dev, ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
 	ispfe->lsc_input = -ENOENT;
 	if (!ispfe->pdma_program_staged || !ispfe->pdma_blocks_staged ||
-	    !ispfe->shading) {
+	    !ispfe->shading || !ispfe->lsc_unity) {
 		kfree(ispfe->shading);
 		return -ENOMEM;
 	}
 	ret = devm_add_action_or_reset(dev, ispfe_shading_release, ispfe);
 	if (ret)
 		return ret;
+	ispfe_lsc_unity(ispfe->lsc_unity);
 
 	ispfe->dev = dev;
 	ispfe->cam_clk = devm_clk_get(dev, "cam");

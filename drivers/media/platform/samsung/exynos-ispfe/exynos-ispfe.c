@@ -484,7 +484,14 @@ struct ispfe_pdma_desc {
 #define PDMA_SLOTS			(PDMA_BUF_SLOTS + 1)
 #define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_RECIPE_BYTES, PAGE_SIZE)
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
-#define ISPFE_PDMA_MAX_BLOCKS_BYTES	ISPFE_PDMA_BACKEND_BLOCKS_BYTES
+/*
+ * One allocation serves whichever recipe is selected, so it is sized for the
+ * largest.  The three stopped agreeing when the back-end recipe stopped
+ * carrying the scaler tables its cleared enables no longer ask for.
+ */
+#define ISPFE_PDMA_MAX_BLOCKS_BYTES					\
+	MAX(ISPFE_PDMA_BLOCKS_BYTES, MAX(ISPFE_PDMA_BINNED_BLOCKS_BYTES,	\
+					 ISPFE_PDMA_BACKEND_BLOCKS_BYTES))
 
 /*
  * The shading table as the hardware reads it: 33 x 25 x four unsigned Q12
@@ -823,14 +830,14 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 };
 
 /*
- * The program area and the shared block area are sized once for all recipes.
- * They happen to agree today; if a future capture does not, these say so at
- * build time rather than by overrunning an allocation.
+ * The program area is sized once for all recipes; the two raw ones happen to
+ * agree, and if a future capture does not these say so at build time rather
+ * than by overrunning an allocation.  The block area is the largest of the
+ * three by construction, so there is nothing to assert about it.
  */
 static_assert(ISPFE_PDMA_BINNED_RECIPE_BYTES == ISPFE_PDMA_RECIPE_BYTES);
 static_assert(ISPFE_PDMA_BINNED_BLOCKS_BYTES == ISPFE_PDMA_BLOCKS_BYTES);
 static_assert(ISPFE_PDMA_BACKEND_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
-static_assert(ISPFE_PDMA_BLOCKS_BYTES <= ISPFE_PDMA_MAX_BLOCKS_BYTES);
 
 /* The recipe for a geometry, or NULL if none was captured for it. */
 static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,
@@ -2780,6 +2787,40 @@ static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
 #define ISPFE_LMP_FRAME_CONFIG_REG0	0x0005467c
 #define ISPFE_LMP_ACTIVE_IFS_AT		0x10
 #define ISPFE_LMP_FRAME_CONFIG_MIN	(ISPFE_LMP_ACTIVE_IFS_AT + 8)
+/*
+ * The two scaler stages that feed those destinations, on the back-end recipe's
+ * instance, and the enable bits inside each one's first word.
+ *
+ * `LmpScaler::Configure` emits a `scaler_lut` for output i only when
+ * `sw_input_scale[i]` is set and `sw_yuv_scaler_bypass[i]` is not, and
+ * `LmpRgbScaler::Configure` emits `rgb_scaler_lut` only when
+ * `sw_input_scale_rgb` is set and `sw_rgb_scaler_bypass` is not.  So clearing
+ * an enable is how the vendor's own builder stops shipping a table -- and the
+ * corpus is unusually definite about it: across all 54 captured programs the
+ * table at 0x00069a0c, 0x00069b0c, 0x00069c0c is present exactly when
+ * `sw_input_scale[0]`, `[1]`, `[2]` is set, and the one at 0x00069d0c exactly
+ * when `sw_input_scale_rgb` is, with no exception either way.
+ */
+#define ISPFE_LMP_SCALER_CONFIG_REG0	(ISPFE_LMP_SCALER_CONFIG_REG - \
+					 ISPFE_LMP_INSTANCE_STRIDE)
+#define ISPFE_LMP_RGB_SCALER_CONFIG_REG0 (ISPFE_LMP_RGB_SCALER_CONFIG_REG - \
+					 ISPFE_LMP_INSTANCE_STRIDE)
+static_assert(ISPFE_LMP_SCALER_CONFIG_REG0 == 0x00054b90);
+static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
+#define ISPFE_LMP_SCALER_INPUT_SCALE	GENMASK(6, 4)
+#define ISPFE_LMP_RGB_SCALER_INPUT_SCALE	BIT(1)
+/*
+ * What the back-end recipe was captured with.  `lmp/scaler` takes only three
+ * values in the corpus -- 0x10, 0x50 and 0x70, one per enabled output -- and
+ * `lmp/rgb_scaler` two, 0x02 and 0x06, differing in `sw_binning_enable`.
+ */
+#define ISPFE_LMP_CAPTURED_SCALER	0x50
+#define ISPFE_LMP_CAPTURED_RGB_SCALER	0x06
+#define ISPFE_LMP_SCALER_APPLIED	BIT(0)
+#define ISPFE_LMP_RGB_SCALER_APPLIED	BIT(1)
+#define ISPFE_LMP_SCALERS_APPLIED	(ISPFE_LMP_SCALER_APPLIED | \
+					 ISPFE_LMP_RGB_SCALER_APPLIED)
+
 /* The interfaces of the three image destinations this driver does not run. */
 #define ISPFE_LMP_TAPOUT_IFS		(GENMASK_ULL(4, 2) | \
 					 GENMASK_ULL(8, 6) | \
@@ -3105,6 +3146,54 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		*header_hi = payload_at + 0x8c;
 		break;
 	}
+
+	return 0;
+}
+
+/*
+ * Turn off the scaler outputs whose destinations this driver does not run.
+ *
+ * Not the same move as the gate word and the interface mask beside it.  Those
+ * stop a destination being *written*; this stops the stage computing anything
+ * for it, which is how Lyric itself turns an output off -- and, because the
+ * builder emits a scaler's table only behind these bits, it is what lets the
+ * recipe stop carrying 768 bytes of scaler and RGB-scaler coefficients.
+ *
+ * The two have to move together.  A cleared enable whose table is still in the
+ * program is a shape no capture holds, and so is the reverse; the recipe drops
+ * exactly the tables whose bits are cleared here, and the encoder's own
+ * completeness check below is what says both commands were present to clear.
+ *
+ * Back-end recipe only.  The raw recipes still carry all three tables, and the
+ * pairing is per recipe rather than per driver.
+ */
+static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
+				    const struct ispfe_pdma_cmd *cmd,
+				    u8 *payload, unsigned int *applied)
+{
+	u32 word, mask, captured, flag;
+
+	if (!ispfe->prog->backend_recipe)
+		return 0;
+	if (cmd->reg == ISPFE_LMP_SCALER_CONFIG_REG0) {
+		mask = ISPFE_LMP_SCALER_INPUT_SCALE;
+		captured = ISPFE_LMP_CAPTURED_SCALER;
+		flag = ISPFE_LMP_SCALER_APPLIED;
+	} else if (cmd->reg == ISPFE_LMP_RGB_SCALER_CONFIG_REG0) {
+		mask = ISPFE_LMP_RGB_SCALER_INPUT_SCALE;
+		captured = ISPFE_LMP_CAPTURED_RGB_SCALER;
+		flag = ISPFE_LMP_RGB_SCALER_APPLIED;
+	} else {
+		return 0;
+	}
+	if (cmd->len < sizeof(u32) || (*applied & flag))
+		return -EINVAL;
+
+	word = get_unaligned_le32(payload);
+	if ((word & 0xff) != captured)
+		return -EINVAL;
+	put_unaligned_le32(word & ~mask, payload);
+	*applied |= flag;
 
 	return 0;
 }
@@ -3700,6 +3789,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	bool lmp_histogram_applied = false;
 	bool lmp_gates_applied = false;
 	bool lmp_active_ifs_applied = false;
+	unsigned int lmp_scalers_applied = 0;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -3827,6 +3917,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						  &lmp_active_ifs_applied);
 		if (ret)
 			return ret;
+		ret = ispfe_pdma_apply_scalers(ispfe, cmd, program + at,
+					       &lmp_scalers_applied);
+		if (ret)
+			return ret;
 
 		for (; reloc < last && reloc->cmd == i; reloc++) {
 			if (reloc->lo + 4 > cmd->len ||
@@ -3924,6 +4018,19 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	if (!lmp_active_ifs_applied) {
 		dev_err(ispfe->dev,
 			"PDMA recipe is missing the frame configuration\n");
+		return -EINVAL;
+	}
+	/*
+	 * And both scaler stages, whose enables have to be cleared for the
+	 * tables this recipe no longer carries.  A recipe that had lost one of
+	 * these commands would otherwise ship a scaler still asking for a
+	 * coefficient table that is not in the program.
+	 */
+	if (ispfe->prog->backend_recipe &&
+	    lmp_scalers_applied != ISPFE_LMP_SCALERS_APPLIED) {
+		dev_err(ispfe->dev, "PDMA recipe is missing the %s scaler\n",
+			(lmp_scalers_applied & ISPFE_LMP_SCALER_APPLIED) ?
+			"RGB" : "image");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&

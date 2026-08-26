@@ -394,6 +394,7 @@ struct becore_params_state {
 	s16 ccm[EXYNOS_BECORE_CCM_COEFFICIENTS];
 	s16 ccm_offsets[EXYNOS_BECORE_CCM_OFFSETS];
 	u16 ltm_curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
+	u16 ltm_tone_adjust[EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS];
 	u16 clut_u[EXYNOS_BECORE_CLUT_NODES];
 	u16 clut_v[EXYNOS_BECORE_CLUT_NODES];
 	u16 gamma[EXYNOS_BECORE_GAMMA_CHANNELS][EXYNOS_BECORE_GAMMA_POINTS];
@@ -403,6 +404,7 @@ struct becore_params_state {
 	struct exynos_becore_params_dmsc dmsc;
 	bool ccm_valid;
 	bool ltm_curve_valid;
+	bool ltm_tone_adjust_valid;
 	bool clut_valid;
 	bool gamma_valid;
 	bool sharpen_valid;

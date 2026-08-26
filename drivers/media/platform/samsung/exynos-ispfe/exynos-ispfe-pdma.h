@@ -78,6 +78,14 @@ enum ispfe_pdma_op {
  * select; @payload is the register/value pairs of a grouped write or the raw
  * bytes of an inline burst, and @len their size.  An indirect burst has no
  * inline payload: it streams @len bytes from @buffer instead.
+ *
+ * A NULL @payload on an inline burst is @len bytes of zero.  The front end
+ * will not run a program that skips a stage in the line-memory chain, so a
+ * stage whose output this driver does not read still has to be written -- but
+ * writing it one lens's captured tuning is worse than useless, and storing
+ * that tuning is what ADR 0009 forbids.  Such a command carries no bytes at
+ * all and the encoder blanks the span instead.  It is not valid on a grouped
+ * write, whose payload is register numbers as much as values.
  */
 struct ispfe_pdma_cmd {
 	u8 op;

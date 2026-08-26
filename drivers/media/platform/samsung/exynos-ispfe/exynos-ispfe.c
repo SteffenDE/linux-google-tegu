@@ -3715,7 +3715,7 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 			at += PDMA_CMD_INDIRECT_BURST_SIZE;
 			break;
 		case ISPFE_PDMA_GROUPED_WRITE:
-			if (cmd->len % 8 ||
+			if (cmd->len % 8 || !cmd->payload ||
 			    get_unaligned_le32(program + at) !=
 			    PDMA_CMD_GROUPED_WRITE(cmd->len))
 				return -EINVAL;
@@ -3897,7 +3897,10 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			memcpy(program + at,
 			       ispfe->pdma_program_staged + at, cmd->len);
 		else {
-			memcpy(program + at, cmd->payload, cmd->len);
+			if (cmd->payload)
+				memcpy(program + at, cmd->payload, cmd->len);
+			else
+				memset(program + at, 0, cmd->len);
 			ret = ispfe_pdma_apply_wbg(ispfe, cmd, program + at,
 						   &lmp_wbg_configs);
 			if (ret)

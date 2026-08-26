@@ -476,6 +476,9 @@ struct exynos_ispfe_stats_ae {
  * struct exynos_ispfe_stats_histogram - The per-pixel RGBY histogram
  *
  * @reserved0: The hardware's own metadata area, undecoded
+ * @bins_log2: How many bins the hardware was configured for, as a power of two
+ *	in its low five bits
+ * @reserved1: The rest of that metadata area, also undecoded
  * @bins: Per plane, how many samples fell in each bin
  * @total: Per plane, how many samples the histogram counted at all
  *
@@ -489,7 +492,16 @@ struct exynos_ispfe_stats_ae {
  * interface carries the first. The other two are allocated and written and
  * nothing reads them; what the three regions are is not decoded.
  *
- * Only the first 256 bins of each plane are written; see the note above.
+ * **Only the first ``1 << (@bins_log2 & 0x1f)`` bins of each plane are
+ * written**, and the recipes program 256 where the stride is 512. Take the
+ * count from @bins_log2 rather than from the array's length: a consumer that
+ * divides by the length gets an answer wrong by exactly the ratio, and
+ * `libipa`'s constraint arithmetic divides by the bin count.
+ *
+ * It is the hardware's own report rather than a copy of the configuration --
+ * `lyric::LmpRgbyHistogramStatsOutput::ValidateMetadata` checks its own
+ * expectation against this same word -- so it says what the frame was actually
+ * binned with.
  *
  * @total is what says a buffer holds a result: it counts samples rather than
  * values, so it is nonzero for any frame the hardware wrote, including a black
@@ -500,7 +512,9 @@ struct exynos_ispfe_stats_ae {
  * to have the grids' layout.
  */
 struct exynos_ispfe_stats_histogram {
-	__u32 reserved0[16];
+	__u32 reserved0[10];
+	__u32 bins_log2;
+	__u32 reserved1[5];
 	__u32 bins[EXYNOS_ISPFE_HISTOGRAM_PLANES][EXYNOS_ISPFE_HISTOGRAM_BINS];
 	__u32 total[EXYNOS_ISPFE_HISTOGRAM_PLANES];
 };

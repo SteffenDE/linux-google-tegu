@@ -2661,6 +2661,13 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
  * same list, with the two output headers taking the gate of the output they
  * belong to and the three histogram ROIs sharing one.
  *
+ * That does not divide evenly, so state the remainder rather than leave it to
+ * be recounted: eighteen flags, plus a slot each for the two output headers,
+ * plus two more for the extra histogram ROIs, is twenty-two -- against twenty
+ * slots.  The two flags with no slot of their own are sparse phase detection
+ * at bit 0 and the HDR statistics at bit 17, the first and last of the run.
+ * Every other bit was checked against both captured words, slot for slot.
+ *
  * The corpus is what makes that a reading rather than a guess.  Across the 54
  * captured programs the word takes six values, and every difference between
  * them is a destination whose address slot changed with it: bit 1 tracks the
@@ -2710,7 +2717,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_OUTPUT_GATES_AT	0x20
 #define ISPFE_LMP_BATCH_CONFIG_MIN	0xc8
 
-/* The three destinations that are only ever read through a debugfs file. */
+/* The three image destinations, which this driver has no reader for at all. */
 #define ISPFE_LMP_TAPOUT_GATES		(ISPFE_LMP_GATE_RGB_OUTPUT | \
 					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
 					 ISPFE_LMP_GATE_ML_OUTPUT2)
@@ -2783,8 +2790,20 @@ static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
  * `GetActiveDramInterfaces` declares only when `csr_alignmentformatter_enable`
  * is set, and that byte is `0xf1` in the back-end payload and `0xf0` in the
  * raw ones.
+ *
+ * The model accounts for every set bit in the low half -- 2, 3, 4 from the
+ * tapout being planar, 6 and 7 from formatter 0's two planes, 12 from
+ * formatter 2's one -- and for every clear one, with a single exception: bit
+ * 15 is set in both words and has no name here.  It sits immediately above
+ * formatter 2's run and is deliberately left alone, because withdrawing a bit
+ * whose owner is unknown is not a bounded change.  If it turns out to belong
+ * to one of these three destinations the withdrawal is incomplete rather than
+ * wrong.
  */
-#define ISPFE_LMP_FRAME_CONFIG_REG0	0x0005467c
+#define ISPFE_LMP_FRAME_CONFIG_REG	0x00055d14
+#define ISPFE_LMP_FRAME_CONFIG_REG0	(ISPFE_LMP_FRAME_CONFIG_REG - \
+					 ISPFE_LMP_INSTANCE_STRIDE)
+static_assert(ISPFE_LMP_FRAME_CONFIG_REG0 == 0x0005467c);
 #define ISPFE_LMP_ACTIVE_IFS_AT		0x10
 #define ISPFE_LMP_FRAME_CONFIG_MIN	(ISPFE_LMP_ACTIVE_IFS_AT + 8)
 /*
@@ -2795,11 +2814,18 @@ static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
  * `sw_input_scale[i]` is set and `sw_yuv_scaler_bypass[i]` is not, and
  * `LmpRgbScaler::Configure` emits `rgb_scaler_lut` only when
  * `sw_input_scale_rgb` is set and `sw_rgb_scaler_bypass` is not.  So clearing
- * an enable is how the vendor's own builder stops shipping a table -- and the
- * corpus is unusually definite about it: across all 54 captured programs the
- * table at 0x00069a0c, 0x00069b0c, 0x00069c0c is present exactly when
- * `sw_input_scale[0]`, `[1]`, `[2]` is set, and the one at 0x00069d0c exactly
- * when `sw_input_scale_rgb` is, with no exception either way.
+ * an enable is how the vendor's own builder stops shipping a table.
+ *
+ * The corpus agrees, and it is worth being exact about how far.  Across all 54
+ * captured programs the table at 0x00069a0c, 0x00069b0c, 0x00069c0c is present
+ * exactly when `sw_input_scale[0]`, `[1]`, `[2]` is set, and the one at
+ * 0x00069d0c exactly when `sw_input_scale_rgb` is -- which is what identifies
+ * which table belongs to which output, and that is the part this code needs.
+ * But only `[1]` and `[2]` are ever *observed* clear: `sw_input_scale[0]` is
+ * set in all 54 and `sw_input_scale_rgb` is set in all 54, so for those two
+ * only the set-implies-present half is witnessed.  Clearing them is the
+ * vendor's mechanism carried past the vendor's evidence, and it holds because
+ * it was measured on hardware, not because a capture shows it.
  */
 #define ISPFE_LMP_SCALER_CONFIG_REG0	(ISPFE_LMP_SCALER_CONFIG_REG - \
 					 ISPFE_LMP_INSTANCE_STRIDE)

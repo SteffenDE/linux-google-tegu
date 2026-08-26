@@ -56,7 +56,6 @@
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-program-binned.h"
 #include "exynos-ispfe-pdma-program-backend.h"
-#include "exynos-ispfe-pdma-seeds.h"
 
 /*
  * CSIS is licensed Samsung IP that mainline already drives as
@@ -532,14 +531,12 @@ struct ispfe_backend_buffer {
  */
 struct ispfe_pdma_output {
 	size_t size;
-	enum dma_data_direction direction;
-	const u8 *seed;
-	size_t seed_size;
 	/*
 	 * An LMP image destination rather than a completion or statistics
-	 * area: written by the hardware every frame and read by nothing on
-	 * the streaming path, so it is allocated and gated on only while the
-	 * diagnostic that reads it is asked for.
+	 * area.  The driver does not run these: the encoder clears the gate
+	 * and zeroes the address slot of every one of them, so they are named
+	 * only because the recipes' relocation tables name them, and they have
+	 * no size and no allocation.
 	 */
 	bool tapout;
 };
@@ -549,19 +546,8 @@ struct ispfe_awb_snapshot_file {
 	size_t size;
 };
 
-#define PDMA_OUTPUT(_size) { \
-	.size = (_size), .direction = DMA_FROM_DEVICE, \
-}
-#define PDMA_TAPOUT(_size, _seed) { \
-	.size = (_size), .direction = DMA_BIDIRECTIONAL, \
-	.seed = (_seed), .seed_size = sizeof(_seed), .tapout = true, \
-}
-
-/* Large enough for a 2048x1536 NV12 runtime geometry experiment. */
-#define ISPFE_LMP_ML0_MAX_SIZE		0x00480000
-/* The vendor's own allocation classes for the other two image tapouts. */
-#define ISPFE_LMP_RGB_TAPOUT_SIZE	299008
-#define ISPFE_LMP_ML2_TAPOUT_SIZE	311296
+#define PDMA_OUTPUT(_size)	{ .size = (_size) }
+#define PDMA_TAPOUT()		{ .tapout = true }
 
 /* Exact full-mode LMP main-Bayer allocation observed on the ultrawide. */
 #define ISPFE_BACKEND_INPUT_SIZE		0x01a17000
@@ -571,13 +557,12 @@ struct ispfe_awb_snapshot_file {
 
 /*
  * The working areas the front end writes back to, in the order the recipe's
- * ISPFE_BUF_OUTPUT() indices name them. Sizes and directions are the vendor
- * session's own allocation classes; the three bidirectional buffers are seeded
- * with its captured 0x2000-byte prefix and the rest of each starts at zero.
- * Outputs 0--9 are completion/statistics buffers. Outputs 10--12 are the LMP's
- * processed-image destinations: planar linear RGB, YUV420 ML output 0 and
- * interleaved RGB888 ML output 2 respectively -- tapouts, so they exist only
- * while `lmp_tapouts` asks for the diagnostic that reads them.
+ * ISPFE_BUF_OUTPUT() indices name them.  The sizes are the vendor session's
+ * own allocation classes.  Outputs 0--9 are completion/statistics buffers.
+ * Outputs 10--12 are the LMP's processed-image destinations --
+ * planar linear RGB, YUV420 ML output 0 and interleaved RGB888 ML output 2 --
+ * which nothing on this driver's path reads, so they are named without a size:
+ * the encoder gates all three off and writes a null address for each.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -590,26 +575,13 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(299008),
-	PDMA_TAPOUT(ISPFE_LMP_RGB_TAPOUT_SIZE, ispfe_pdma_seed_1cb80000),
-	PDMA_TAPOUT(ISPFE_LMP_ML0_MAX_SIZE, ispfe_pdma_seed_1cb00000),
-	PDMA_TAPOUT(ISPFE_LMP_ML2_TAPOUT_SIZE, ispfe_pdma_seed_1c980000),
+	PDMA_TAPOUT(),
+	PDMA_TAPOUT(),
+	PDMA_TAPOUT(),
 };
-
-/*
- * Each seed is a prefix of the buffer it initialises, which is what lets the
- * copy in ispfe_pdma_outputs_reset() take the seed's own length.  Asserted
- * rather than checked at run time: it is a property of two constant tables, so
- * getting it wrong should fail the build and not a stream on somebody's desk.
- */
-static_assert(sizeof(ispfe_pdma_seed_1cb80000) <= ISPFE_LMP_RGB_TAPOUT_SIZE);
-static_assert(sizeof(ispfe_pdma_seed_1cb00000) <= ISPFE_LMP_ML0_MAX_SIZE);
-static_assert(sizeof(ispfe_pdma_seed_1c980000) <= ISPFE_LMP_ML2_TAPOUT_SIZE);
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
-#define ISPFE_PDMA_OUTPUT_RGB		10
-#define ISPFE_PDMA_OUTPUT_ML0		11
-#define ISPFE_PDMA_OUTPUT_ML2		12
 
 /*
  * Where one frame's statistics land while the metadata node is streaming.
@@ -1279,14 +1251,6 @@ struct ispfe_device {
 	 */
 	bool backend_side_output;
 	bool active_backend_side_output;
-	/*
-	 * Whether the LMP image tapouts run.  They are read only through
-	 * `lmp_rgb`, `lmp_ml0` and `lmp_ml2`, so off by default: a stream that
-	 * nobody is going to look at through those does not allocate their
-	 * 5.1 MiB or ask the hardware to fill it (see ispfe_pdma_apply_gates()).
-	 */
-	bool lmp_tapouts;
-	bool active_lmp_tapouts;
 	u32 backend_image_lo;
 	u32 backend_image_hi;
 	u32 backend_header_lo;
@@ -2593,9 +2557,9 @@ static int ispfe_stats_grid_of_output(unsigned int index)
 }
 
 /*
- * Whether a recipe's destination is one this stream does not run, and so has
- * neither an allocation nor an enable.  Only the LMP image tapouts are ever
- * gated off; everything else a recipe names is always there.
+ * Whether a recipe's destination is one this driver does not run, and so has
+ * neither an allocation nor an enable.  Only the LMP image tapouts are gated
+ * off; everything else a recipe names is always there.
  */
 static bool ispfe_pdma_buffer_gated(const struct ispfe_device *ispfe, u8 buffer)
 {
@@ -2603,7 +2567,7 @@ static bool ispfe_pdma_buffer_gated(const struct ispfe_device *ispfe, u8 buffer)
 
 	return ISPFE_BUF_TO_KIND(buffer) == ISPFE_BUF_KIND_OUTPUT &&
 	       index < ARRAY_SIZE(ispfe_pdma_outputs) &&
-	       ispfe_pdma_outputs[index].tapout && !ispfe->active_lmp_tapouts;
+	       ispfe_pdma_outputs[index].tapout;
 }
 
 /*
@@ -3102,11 +3066,10 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
  * came with.
  *
  * Three of the destinations the vendor's programs enable are image tapouts --
- * a small linear RGB image and two machine-learning ones -- and nothing on
- * mainline's streaming path reads any of them.  Leaving them enabled costs
- * 5.1 MiB of coherent memory and about a megabyte of DMA writes per frame for
- * a picture only a debugfs file can look at, so they run when that diagnostic
- * is asked for and not otherwise.
+ * a small linear RGB image and two machine-learning ones -- and nothing this
+ * driver has reads any of them.  Leaving them enabled would cost 5.1 MiB of
+ * coherent memory and about a megabyte of DMA writes per frame for a picture
+ * with no consumer, so they never run.
  *
  * Only bits are cleared here, and only ones whose address slot the encoder
  * zeroes in the same pass: gate clear with a null address is the vendor's own
@@ -3138,8 +3101,7 @@ static int ispfe_pdma_apply_gates(struct ispfe_device *ispfe,
 	    ispfe->active_backend_side_output)
 		gates |= ISPFE_LMP_BACKEND_OUTPUT_GATE |
 			 ISPFE_LMP_TNR_OUTPUT_GATE;
-	if (!ispfe->active_lmp_tapouts)
-		gates &= ~ISPFE_LMP_TAPOUT_GATES;
+	gates &= ~ISPFE_LMP_TAPOUT_GATES;
 	put_unaligned_le32(gates, payload + ISPFE_LMP_OUTPUT_GATES_AT);
 	*applied = true;
 
@@ -3403,6 +3365,14 @@ static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
 }
 
 #define ISPFE_LMP_SCALER_FACTOR_MAX	GENMASK(23, 0)
+/*
+ * The largest ML output 0 a staged program may declare, from the vendor's own
+ * allocation class for that destination.  The driver does not run the LMP
+ * image tapouts, so nothing is allocated against this and no write can reach
+ * it; the bound stays because a staged program is a hand-written geometry and
+ * a self-consistent one is the only kind worth accepting.
+ */
+#define ISPFE_LMP_ML0_MAX_SIZE		0x00480000
 
 static u64 ispfe_pdma_scale_factor(u32 source, u32 destination)
 {
@@ -3462,7 +3432,7 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 	    total_size > ISPFE_LMP_ML0_MAX_SIZE)
 		return -EINVAL;
 
-	/* Output 2 stays enabled, so its factors must follow the new input too. */
+	/* Output 2 is scaled from the same input, so its factors follow it too. */
 	dest_width = output2 & U16_MAX;
 	dest_height = output2 >> 16;
 	if (!dest_width || !dest_height ||
@@ -3472,7 +3442,7 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 					     dest_height))
 		return -EINVAL;
 
-	/* The enabled linear-RGB branch has one automatic 2x pre-bin stage. */
+	/* The linear-RGB branch has one automatic 2x pre-bin stage. */
 	rgb_width = input_width;
 	rgb_height = input_height;
 	if (rgb_width > 1024 || rgb_height > 768) {
@@ -4902,34 +4872,25 @@ static void ispfe_pdma_outputs_reset(struct ispfe_device *ispfe)
 		if (!ispfe->pdma_output[i].cpu)
 			continue;
 		memset(ispfe->pdma_output[i].cpu, 0, output->size);
-		if (output->direction == DMA_BIDIRECTIONAL)
-			memcpy(ispfe->pdma_output[i].cpu, output->seed,
-			       output->seed_size);
 	}
 }
 
+/*
+ * The working-area allocations are not checked here, and do not need to be:
+ * ispfe_buffers_free() releases every allocation together and
+ * ispfe_buffers_alloc() calls it on any failure, so there is no state in which
+ * the pointers below are live and the outputs are not.  What used to be
+ * checked was whether the LMP image tapouts were allocated *and should not
+ * be*, which stopped being a question when the driver stopped running them.
+ */
 static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 {
-	unsigned int i;
-
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
 	    !ispfe->programs || !ispfe->blocks || !ispfe->lsc ||
 	    !ispfe->awb_spare || !ispfe->stats_areas[0].grid[0])
 		return false;
 	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
 		return false;
-	/*
-	 * Both directions: buffers held for tapouts this stream will not run
-	 * are as much a reason to reallocate as ones it needs and has not got.
-	 */
-	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
-		bool wanted = !ispfe_pdma_outputs[i].tapout ||
-			      ispfe->active_lmp_tapouts;
-
-		if (wanted != !!ispfe->pdma_output[i].cpu)
-			return false;
-	}
-
 	return true;
 }
 
@@ -5022,7 +4983,7 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		}
 	}
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
-		if (ispfe_pdma_outputs[i].tapout && !ispfe->active_lmp_tapouts)
+		if (ispfe_pdma_outputs[i].tapout)
 			continue;
 		ispfe->pdma_output[i].cpu = dma_alloc_coherent(
 			ispfe->dev, ispfe_pdma_outputs[i].size,
@@ -5206,7 +5167,6 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	const struct v4l2_mbus_framefmt *fmt;
 	u32 fc_axi_max_ost = ispfe->fc_axi_max_ost;
 	u32 backend_recipe = ispfe->backend_recipe;
-	bool lmp_tapouts = ispfe->lmp_tapouts;
 	bool pdma_program_override = ispfe->pdma_program_override;
 	struct ispfe_lmp_wbg_profile lmp_wbg = {};
 	int ret;
@@ -5236,12 +5196,6 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 		backend_recipe = 1;
 		pdma_program_override = false;
 	}
-	/*
-	 * @lmp_tapouts is deliberately not pinned with them.  It selects
-	 * destinations rather than the program's shape, and looking at what
-	 * LMP made of a frame is most useful precisely while the fixed
-	 * pipeline is the thing running.
-	 */
 
 	ispfe->prog = ispfe_program_for(source.width, source.height,
 					backend_recipe);
@@ -5360,7 +5314,6 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->active_backend_side_output = ispfe->prog->backend_output &&
 		(!ispfe->prog->patch_backend_output ||
 		 ispfe->backend_side_output);
-	ispfe->active_lmp_tapouts = lmp_tapouts;
 	ispfe->active_pdma_program_override = pdma_program_override;
 	ispfe->active_pdma_program_generation =
 		ispfe->active_pdma_program_override ?
@@ -6327,8 +6280,6 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "backend_side_output %u requested, %u active\n",
 		   ispfe->backend_side_output,
 		   ispfe->active_backend_side_output);
-	seq_printf(s, "lmp_tapouts  %u requested, %u active\n",
-		   ispfe->lmp_tapouts, ispfe->active_lmp_tapouts);
 	seq_printf(s, "pdma_override %u requested, %u active\n",
 		   ispfe->pdma_program_override,
 		   ispfe->active_pdma_program_override);
@@ -6656,47 +6607,6 @@ DEFINE_DEBUGFS_ATTRIBUTE(ispfe_program_override_fops,
 			 ispfe_program_override_get,
 			 ispfe_program_override_set, "%llu\n");
 
-/*
- * The captured program already enables memory-backed statistics and processed
- * outputs. Keep these diagnostics read-only and require the stream to be
- * stopped: unlike the per-frame Bayer queue, the allocations are shared and
- * hardware overwrites them continuously while streaming. AWB additionally
- * requires the two-EOF snapshot handoff that retargets its future writes.
- */
-static ssize_t ispfe_pdma_output_read(struct file *file, char __user *buf,
-				      size_t count, loff_t *ppos,
-				      unsigned int index)
-{
-	struct ispfe_device *ispfe = file->private_data;
-
-	guard(mutex)(&ispfe->lock);
-
-	if (index >= ARRAY_SIZE(ispfe_pdma_outputs))
-		return -EINVAL;
-	if (ispfe->streaming)
-		return -EBUSY;
-	if (!ispfe->pdma_output[index].cpu)
-		return -ENODATA;
-
-	return simple_read_from_buffer(buf, count, ppos,
-				       ispfe->pdma_output[index].cpu,
-				       ispfe_pdma_outputs[index].size);
-}
-
-static ssize_t ispfe_lmp_rgb_read(struct file *file, char __user *buf,
-				  size_t count, loff_t *ppos)
-{
-	return ispfe_pdma_output_read(file, buf, count, ppos,
-				      ISPFE_PDMA_OUTPUT_RGB);
-}
-
-static const struct file_operations ispfe_lmp_rgb_fops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.read = ispfe_lmp_rgb_read,
-	.llseek = default_llseek,
-};
-
 static int ispfe_lmp_awb_stats_open(struct inode *inode, struct file *file)
 {
 	struct ispfe_device *ispfe = inode->i_private;
@@ -6767,34 +6677,6 @@ static const struct file_operations ispfe_lmp_awb_stats_fops = {
 	.llseek = default_llseek,
 };
 
-static ssize_t ispfe_lmp_ml0_read(struct file *file, char __user *buf,
-				  size_t count, loff_t *ppos)
-{
-	return ispfe_pdma_output_read(file, buf, count, ppos,
-				      ISPFE_PDMA_OUTPUT_ML0);
-}
-
-static const struct file_operations ispfe_lmp_ml0_fops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.read = ispfe_lmp_ml0_read,
-	.llseek = default_llseek,
-};
-
-static ssize_t ispfe_lmp_ml2_read(struct file *file, char __user *buf,
-				  size_t count, loff_t *ppos)
-{
-	return ispfe_pdma_output_read(file, buf, count, ppos,
-				      ISPFE_PDMA_OUTPUT_ML2);
-}
-
-static const struct file_operations ispfe_lmp_ml2_fops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.read = ispfe_lmp_ml2_read,
-	.llseek = default_llseek,
-};
-
 DEFINE_SHOW_ATTRIBUTE(ispfe_status);
 
 static void ispfe_debugfs_init(struct ispfe_device *ispfe)
@@ -6825,7 +6707,6 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			   &ispfe->fc_axi_max_ost);
 	debugfs_create_u32("backend_recipe", 0644, d,
 			   &ispfe->backend_recipe);
-	debugfs_create_bool("lmp_tapouts", 0644, d, &ispfe->lmp_tapouts);
 	debugfs_create_bool("backend_side_output", 0644, d,
 			    &ispfe->backend_side_output);
 	debugfs_create_u32("credit_latency", 0644, d, &ispfe->credit_latency);
@@ -6855,9 +6736,6 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			    &ispfe_program_override_fops);
 	debugfs_create_file("lmp_awb_stats", 0444, d, ispfe,
 			    &ispfe_lmp_awb_stats_fops);
-	debugfs_create_file("lmp_rgb", 0444, d, ispfe, &ispfe_lmp_rgb_fops);
-	debugfs_create_file("lmp_ml0", 0444, d, ispfe, &ispfe_lmp_ml0_fops);
-	debugfs_create_file("lmp_ml2", 0444, d, ispfe, &ispfe_lmp_ml2_fops);
 }
 
 static void ispfe_report(struct ispfe_device *ispfe)

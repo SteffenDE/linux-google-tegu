@@ -58,60 +58,6 @@
 #define BECORE_LTM_TRANS_SLOPE_FRAC_BIT	14
 #define BECORE_LTM_TRANS_BIAS_BIT_ADJUST 0
 
-/*
- * The block's second curve: the tone adjustment the local map is applied
- * through, and the one register file here whose words the driver carries
- * rather than computes.
- *
- * It is the shipped apcamera.SCurve -- midpoint 0.1864, slope_midpoint 1.158,
- * relative_highlight_compression 1.0, relative_shadow_crushing 0.95 -- sampled
- * at x = i / 128 and quantised the way TranslateLtmToneAdjust does, as
- * clamp(round(y * 16384), 0, 16384).
- *
- * The evaluator those four numbers drive is three control points and a
- * spline. The midpoint is a fixed point, so the curve passes through (m, m)
- * at the tuning's slope, and both ends are pinned:
- *
- *	(0,	  0,	    (1 / slope_midpoint) * (1 - relative_shadow_crushing))
- *	(midpoint, midpoint, slope_midpoint)
- *	(1,	  1,	    1 + (white - 1) * relative_highlight_compression)
- *
- * where white is the slope that a logarithmic compression of the upper span,
- * ln(1 + k * x) / ln(1 + k), leaves at its end: that span's own chord slope
- * times k / ((k + 1) * ln(k + 1)), the chord being 1 here only because both
- * of its ends sit on y = x. Between two control points the interpolant is
- * Stineman's, which the vendor's own file name says -- with L the chord and
- * T0, T1 the endpoint tangents, A = T0 - L, B = T1 - L, and
- * y = L + A * B / (A + B).
- *
- * It stays a table for two reasons. The arithmetic is float32 throughout,
- * including a logf and a degree-5 polynomial for k whose error the shipped
- * curve carries; and there is no per-frame input to it -- the tuning is
- * byte-identical on all three cameras, and the 129 words are bit-identical in
- * all 426 captured programs and at every one of the eighteen captured
- * readouts, so this is one fixed vendor profile rather than a per-lens
- * calibration or a per-frame policy. tools/camera-ltm-scurve.py is the
- * evaluator, and its --check regenerates exactly this table.
- */
-static const u16 becore_ltm_toneadj[BECORE_LTM_TONEADJ_ENTRIES] = {
-	    0,    31,    98,   188,   291,   405,   526,   652,
-	  782,   916,  1052,  1190,  1330,  1471,  1613,  1757,
-	 1901,  2046,  2192,  2338,  2484,  2631,  2779,  2927,
-	 3075,  3223,  3370,  3517,  3664,  3810,  3956,  4102,
-	 4247,  4391,  4536,  4679,  4823,  4966,  5108,  5251,
-	 5392,  5534,  5675,  5815,  5955,  6095,  6235,  6374,
-	 6512,  6650,  6788,  6925,  7062,  7199,  7335,  7471,
-	 7606,  7741,  7876,  8010,  8144,  8278,  8411,  8543,
-	 8676,  8808,  8939,  9070,  9201,  9331,  9462,  9591,
-	 9720,  9849,  9978, 10106, 10234, 10361, 10488, 10615,
-	10741, 10867, 10993, 11118, 11243, 11367, 11491, 11615,
-	11738, 11861, 11984, 12106, 12228, 12350, 12471, 12592,
-	12712, 12832, 12952, 13072, 13191, 13309, 13428, 13546,
-	13663, 13781, 13898, 14014, 14131, 14246, 14362, 14477,
-	14592, 14707, 14821, 14935, 15048, 15161, 15274, 15387,
-	15499, 15611, 15722, 15833, 15944, 16055, 16165, 16275,
-	16384,
-};
 
 /*
  * RGBP's global tone map, named from Samsung RGBP v1.20. The block runs, but
@@ -845,6 +791,20 @@ static u32 becore_ltm_curve_identity(u32 index)
 				 EXYNOS_BECORE_LTM_CURVE_POINTS - 1);
 }
 
+/*
+ * And of the tone adjustment's. This one divides exactly -- 129 samples are
+ * 128 steps of 128 over a Q14 scale -- so the rounding is a no-op today. It
+ * is written the same way as the guide curve's anyway, for the reason that
+ * one's comment gives: the default has to stay bit-exact against what the
+ * parameters path packs, and a later change to either constant must not be
+ * able to reintroduce a truncation bias silently.
+ */
+static u32 becore_ltm_tone_adjust_identity(u32 index)
+{
+	return DIV_ROUND_CLOSEST(index * EXYNOS_BECORE_LTM_TONE_ADJUST_ONE,
+				 EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS - 1);
+}
+
 static int becore_yuvp_ltm_value(const struct becore_raster *chain, u32 offset,
 				 u32 *value)
 {
@@ -947,14 +907,23 @@ static int becore_yuvp_ltm_value(const struct becore_raster *chain, u32 offset,
 		 * The tone-adjust curve, two Q14 samples to a register with
 		 * the lower-numbered one in the low half. The odd sample count
 		 * leaves the last high half zero.
+		 *
+		 * An identity, so the local map is applied through no
+		 * adjustment at all: this curve is a *grade* -- one fixed
+		 * vendor profile, byte-identical on all three cameras and in
+		 * all 426 captured programs -- and under ADR 0009 a grade is
+		 * userspace's to send. The picture without one is a working
+		 * and visibly flatter picture, which is the honest default,
+		 * and `tools/camera-ltm-scurve.py` is where the vendor's own
+		 * curve now comes from.
 		 */
 		u32 index = (offset - (BECORE_YUVP_LTM_TONEADJ_FIRST -
 				       BECORE_YUVP_LTM_BASE)) / 4 *
 			    BECORE_LTM_TONEADJ_PER_REG;
 
-		*value = becore_ltm_toneadj[index];
-		if (index + 1 < BECORE_LTM_TONEADJ_ENTRIES)
-			*value |= (u32)becore_ltm_toneadj[index + 1] << 16;
+		*value = becore_ltm_tone_adjust_identity(index);
+		if (index + 1 < EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS)
+			*value |= becore_ltm_tone_adjust_identity(index + 1) << 16;
 		return 0;
 	}
 

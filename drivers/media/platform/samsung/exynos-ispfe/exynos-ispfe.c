@@ -535,6 +535,13 @@ struct ispfe_pdma_output {
 	enum dma_data_direction direction;
 	const u8 *seed;
 	size_t seed_size;
+	/*
+	 * An LMP image destination rather than a completion or statistics
+	 * area: written by the hardware every frame and read by nothing on
+	 * the streaming path, so it is allocated and gated on only while the
+	 * diagnostic that reads it is asked for.
+	 */
+	bool tapout;
 };
 
 struct ispfe_awb_snapshot_file {
@@ -545,13 +552,16 @@ struct ispfe_awb_snapshot_file {
 #define PDMA_OUTPUT(_size) { \
 	.size = (_size), .direction = DMA_FROM_DEVICE, \
 }
-#define PDMA_OUTPUT_RW(_size, _seed) { \
+#define PDMA_TAPOUT(_size, _seed) { \
 	.size = (_size), .direction = DMA_BIDIRECTIONAL, \
-	.seed = (_seed), .seed_size = sizeof(_seed), \
+	.seed = (_seed), .seed_size = sizeof(_seed), .tapout = true, \
 }
 
 /* Large enough for a 2048x1536 NV12 runtime geometry experiment. */
 #define ISPFE_LMP_ML0_MAX_SIZE		0x00480000
+/* The vendor's own allocation classes for the other two image tapouts. */
+#define ISPFE_LMP_RGB_TAPOUT_SIZE	299008
+#define ISPFE_LMP_ML2_TAPOUT_SIZE	311296
 
 /* Exact full-mode LMP main-Bayer allocation observed on the ultrawide. */
 #define ISPFE_BACKEND_INPUT_SIZE		0x01a17000
@@ -566,7 +576,8 @@ struct ispfe_awb_snapshot_file {
  * with its captured 0x2000-byte prefix and the rest of each starts at zero.
  * Outputs 0--9 are completion/statistics buffers. Outputs 10--12 are the LMP's
  * processed-image destinations: planar linear RGB, YUV420 ML output 0 and
- * interleaved RGB888 ML output 2 respectively.
+ * interleaved RGB888 ML output 2 respectively -- tapouts, so they exist only
+ * while `lmp_tapouts` asks for the diagnostic that reads them.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -579,10 +590,20 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(299008),
-	PDMA_OUTPUT_RW(299008, ispfe_pdma_seed_1cb80000),
-	PDMA_OUTPUT_RW(ISPFE_LMP_ML0_MAX_SIZE, ispfe_pdma_seed_1cb00000),
-	PDMA_OUTPUT_RW(311296, ispfe_pdma_seed_1c980000),
+	PDMA_TAPOUT(ISPFE_LMP_RGB_TAPOUT_SIZE, ispfe_pdma_seed_1cb80000),
+	PDMA_TAPOUT(ISPFE_LMP_ML0_MAX_SIZE, ispfe_pdma_seed_1cb00000),
+	PDMA_TAPOUT(ISPFE_LMP_ML2_TAPOUT_SIZE, ispfe_pdma_seed_1c980000),
 };
+
+/*
+ * Each seed is a prefix of the buffer it initialises, which is what lets the
+ * copy in ispfe_pdma_outputs_reset() take the seed's own length.  Asserted
+ * rather than checked at run time: it is a property of two constant tables, so
+ * getting it wrong should fail the build and not a stream on somebody's desk.
+ */
+static_assert(sizeof(ispfe_pdma_seed_1cb80000) <= ISPFE_LMP_RGB_TAPOUT_SIZE);
+static_assert(sizeof(ispfe_pdma_seed_1cb00000) <= ISPFE_LMP_ML0_MAX_SIZE);
+static_assert(sizeof(ispfe_pdma_seed_1c980000) <= ISPFE_LMP_ML2_TAPOUT_SIZE);
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
@@ -1302,6 +1323,14 @@ struct ispfe_device {
 	 */
 	bool backend_side_output;
 	bool active_backend_side_output;
+	/*
+	 * Whether the LMP image tapouts run.  They are read only through
+	 * `lmp_rgb`, `lmp_ml0` and `lmp_ml2`, so off by default: a stream that
+	 * nobody is going to look at through those does not allocate their
+	 * 5.1 MiB or ask the hardware to fill it (see ispfe_pdma_apply_gates()).
+	 */
+	bool lmp_tapouts;
+	bool active_lmp_tapouts;
 	u32 backend_image_lo;
 	u32 backend_image_hi;
 	u32 backend_header_lo;
@@ -2581,6 +2610,20 @@ static int ispfe_stats_grid_of_output(unsigned int index)
 }
 
 /*
+ * Whether a recipe's destination is one this stream does not run, and so has
+ * neither an allocation nor an enable.  Only the LMP image tapouts are ever
+ * gated off; everything else a recipe names is always there.
+ */
+static bool ispfe_pdma_buffer_gated(const struct ispfe_device *ispfe, u8 buffer)
+{
+	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
+
+	return ISPFE_BUF_TO_KIND(buffer) == ISPFE_BUF_KIND_OUTPUT &&
+	       index < ARRAY_SIZE(ispfe_pdma_outputs) &&
+	       ispfe_pdma_outputs[index].tapout && !ispfe->active_lmp_tapouts;
+}
+
+/*
  * What the recipe's buffer names resolve to for this driver's allocations.  The
  * frame destination is per program rather than per driver, because each program
  * aims one frame at one buffer.  So are the statistics, when a queue has given
@@ -2639,6 +2682,12 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_RGB_SCALER_CONFIG_REG	0x00056208
 #define ISPFE_LMP_SCALER_CONFIG_REG	0x00056228
 #define ISPFE_LMP_FORMATTER0_CONFIG_REG	0x0005626c
+/*
+ * Named on the raw recipes' LMP instance, which is the only one that reaches
+ * the three switches below.  The gate word is different -- both recipes carry
+ * it -- so it also gets the back-end recipe's address, and is matched through
+ * ispfe_lmp_block_is() rather than by either one alone.
+ */
 #define ISPFE_LMP_BACKEND_FORMATTER_REG	0x000565cc
 #define ISPFE_LMP_BACKEND_WDMA_CONFIG_REG 0x000565d8
 #define ISPFE_LMP_BATCH_CONFIG_REG	0x000567d8
@@ -2696,6 +2745,11 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_OUTPUT_GATES_AT	0x20
 #define ISPFE_LMP_BATCH_CONFIG_MIN	0xc8
 
+/* The three destinations that are only ever read through a debugfs file. */
+#define ISPFE_LMP_TAPOUT_GATES		(ISPFE_LMP_GATE_RGB_OUTPUT | \
+					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
+					 ISPFE_LMP_GATE_ML_OUTPUT2)
+
 /*
  * What both raw recipes were captured with: the six statistics the front end
  * emits, plus the three image destinations.  The back-end recipe's own word is
@@ -2707,9 +2761,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 					 ISPFE_LMP_GATE_HISTOGRAM | \
 					 ISPFE_LMP_GATE_POST_LSC_AE | \
 					 ISPFE_LMP_GATE_MOTION_METERING | \
-					 ISPFE_LMP_GATE_RGB_OUTPUT | \
-					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
-					 ISPFE_LMP_GATE_ML_OUTPUT2)
+					 ISPFE_LMP_TAPOUT_GATES)
 static_assert(ISPFE_LMP_CAPTURED_OUTPUT_GATES == 0x0000b1f8);
 #define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
 #define ISPFE_LMP_DPC_GAIN_MAX		GENMASK(9, 0)
@@ -2739,6 +2791,16 @@ static_assert(ISPFE_LMP_CAPTURED_OUTPUT_GATES == 0x0000b1f8);
  * refused their programs outright.
  */
 #define ISPFE_LMP_INSTANCE_STRIDE	0x1698
+/*
+ * The batch record on the back-end recipe's instance.  Named here rather than
+ * beside the other batch constants because it is built from the stride above,
+ * and the assertion below has to be able to evaluate it: it pins the address
+ * the back-end recipe actually uses, so a future stride change fails the build
+ * instead of quietly matching nothing at STREAMON.
+ */
+#define ISPFE_LMP_BATCH_CONFIG_REG0	(ISPFE_LMP_BATCH_CONFIG_REG - \
+					 ISPFE_LMP_INSTANCE_STRIDE)
+static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
 /*
  * The LUT target area is one instance apart too, and by a *different* stride:
  * aligning the two recipes' register sets accounts for 55 of the 56 they use
@@ -3019,18 +3081,17 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		put_unaligned_le32(0x00000001, payload + 0x20);
 		break;
 	case ISPFE_LMP_BATCH_CONFIG_REG:
-		if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN ||
-		    get_unaligned_le32(payload + ISPFE_LMP_OUTPUT_GATES_AT) !=
-		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
+		/*
+		 * The gate word is not written here: ispfe_pdma_apply_gates()
+		 * owns it for both recipes, so that two functions cannot
+		 * disagree about one word.
+		 */
+		if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN)
 			return -EINVAL;
 		if (upper_32_bits(dma) ||
 		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET) ||
 		    upper_32_bits(ispfe->tnr_pyramid_dma))
 			return -ERANGE;
-		put_unaligned_le32(ISPFE_LMP_CAPTURED_OUTPUT_GATES |
-				     ISPFE_LMP_BACKEND_OUTPUT_GATE |
-				     ISPFE_LMP_TNR_OUTPUT_GATE,
-				     payload + ISPFE_LMP_OUTPUT_GATES_AT);
 		put_unaligned_le32(lower_32_bits(dma +
 						 ISPFE_BACKEND_IMAGE_OFFSET),
 				     payload + 0x80);
@@ -3049,6 +3110,55 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		*header_hi = payload_at + 0x8c;
 		break;
 	}
+
+	return 0;
+}
+
+/*
+ * State which LMP destinations run, rather than replaying the word a capture
+ * came with.
+ *
+ * Three of the destinations the vendor's programs enable are image tapouts --
+ * a small linear RGB image and two machine-learning ones -- and nothing on
+ * mainline's streaming path reads any of them.  Leaving them enabled costs
+ * 5.1 MiB of coherent memory and about a megabyte of DMA writes per frame for
+ * a picture only a debugfs file can look at, so they run when that diagnostic
+ * is asked for and not otherwise.
+ *
+ * Only bits are cleared here, and only ones whose address slot the encoder
+ * zeroes in the same pass: gate clear with a null address is the vendor's own
+ * way of not writing a destination, and the corpus shows it on five of them.
+ *
+ * The word is checked against the two shapes the captured recipes carry before
+ * anything is changed, so a future capture whose gates differ is refused rather
+ * than re-gated on an assumption about the rest of the word.
+ */
+static int ispfe_pdma_apply_gates(struct ispfe_device *ispfe,
+				  const struct ispfe_pdma_cmd *cmd,
+				  u8 *payload, bool *applied)
+{
+	u32 gates;
+
+	if (!ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_BATCH_CONFIG_REG0))
+		return 0;
+	if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN || *applied)
+		return -EINVAL;
+
+	gates = get_unaligned_le32(payload + ISPFE_LMP_OUTPUT_GATES_AT);
+	if (gates != ISPFE_LMP_CAPTURED_OUTPUT_GATES &&
+	    gates != (ISPFE_LMP_CAPTURED_OUTPUT_GATES |
+		      ISPFE_LMP_BACKEND_OUTPUT_GATE |
+		      ISPFE_LMP_TNR_OUTPUT_GATE))
+		return -EINVAL;
+
+	if (ispfe->prog->patch_backend_output &&
+	    ispfe->active_backend_side_output)
+		gates |= ISPFE_LMP_BACKEND_OUTPUT_GATE |
+			 ISPFE_LMP_TNR_OUTPUT_GATE;
+	if (!ispfe->active_lmp_tapouts)
+		gates &= ~ISPFE_LMP_TAPOUT_GATES;
+	put_unaligned_le32(gates, payload + ISPFE_LMP_OUTPUT_GATES_AT);
+	*applied = true;
 
 	return 0;
 }
@@ -3611,6 +3721,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	unsigned int lmp_stats_configs = 0;
 	bool lmp_dpc_applied = false;
 	bool lmp_histogram_applied = false;
+	bool lmp_gates_applied = false;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -3723,16 +3834,38 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						      &backend_header_hi);
 		if (ret)
 			return ret;
+		/*
+		 * Applied to a staged program too, because it is what decides
+		 * whether a destination the driver has not allocated is
+		 * enabled.  A staged program cannot have moved the word:
+		 * ispfe_pdma_staged_validate() already holds every byte of it
+		 * that is neither a relocation nor scaler geometry.
+		 */
+		ret = ispfe_pdma_apply_gates(ispfe, cmd, program + at,
+					     &lmp_gates_applied);
+		if (ret)
+			return ret;
 
 		for (; reloc < last && reloc->cmd == i; reloc++) {
 			if (reloc->lo + 4 > cmd->len ||
 			    (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH &&
 			     reloc->hi + 4 > cmd->len))
 				return -EINVAL;
-			dma = ispfe_pdma_buffer(ispfe, reloc->buffer, bayer,
-						backend, stats, lsc);
-			if (dma == DMA_MAPPING_ERROR)
-				return -EINVAL;
+			/*
+			 * A destination this stream is not running gets the
+			 * null address that goes with its cleared gate, which
+			 * is how every captured program leaves the five it
+			 * does not write.
+			 */
+			if (ispfe_pdma_buffer_gated(ispfe, reloc->buffer)) {
+				dma = 0;
+			} else {
+				dma = ispfe_pdma_buffer(ispfe, reloc->buffer,
+							bayer, backend, stats,
+							lsc);
+				if (dma == DMA_MAPPING_ERROR)
+					return -EINVAL;
+			}
 			put_unaligned_le32(lower_32_bits(dma),
 					   program + at + reloc->lo);
 			if (reloc->hi != ISPFE_PDMA_RELOC_NO_HIGH)
@@ -3791,6 +3924,15 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 */
 	if (!ispfe->active_pdma_program_override && !lmp_histogram_applied) {
 		dev_err(ispfe->dev, "PDMA recipe is missing the histogram block\n");
+		return -EINVAL;
+	}
+	/*
+	 * And for the batch record, whose gate word says which destinations
+	 * run: a recipe without it would leave three of them enabled against
+	 * memory this driver has not allocated.
+	 */
+	if (!lmp_gates_applied) {
+		dev_err(ispfe->dev, "PDMA recipe is missing the batch record\n");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&
@@ -4046,7 +4188,8 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 		return -ERANGE;
 
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
-		if (upper_32_bits(ispfe->pdma_output[i].dma +
+		if (ispfe->pdma_output[i].cpu &&
+		    upper_32_bits(ispfe->pdma_output[i].dma +
 				  ispfe_pdma_outputs[i].size - 1))
 			return -ERANGE;
 
@@ -4793,6 +4936,7 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 				  ispfe->pdma_output[i].cpu,
 				  ispfe->pdma_output[i].dma);
 		ispfe->pdma_output[i].cpu = NULL;
+		ispfe->pdma_output[i].dma = 0;
 	}
 	if (ispfe->programs) {
 		dma_free_coherent(ispfe->dev, PDMA_PROGRAMS_SIZE,
@@ -4844,12 +4988,12 @@ static void ispfe_pdma_outputs_reset(struct ispfe_device *ispfe)
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
 		const struct ispfe_pdma_output *output = &ispfe_pdma_outputs[i];
 
+		if (!ispfe->pdma_output[i].cpu)
+			continue;
 		memset(ispfe->pdma_output[i].cpu, 0, output->size);
-		if (output->direction == DMA_BIDIRECTIONAL) {
-			WARN_ON_ONCE(output->seed_size > output->size);
+		if (output->direction == DMA_BIDIRECTIONAL)
 			memcpy(ispfe->pdma_output[i].cpu, output->seed,
-			       min(output->seed_size, output->size));
-		}
+			       output->seed_size);
 	}
 }
 
@@ -4863,9 +5007,17 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 		return false;
 	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
 		return false;
-	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
-		if (!ispfe->pdma_output[i].cpu)
+	/*
+	 * Both directions: buffers held for tapouts this stream will not run
+	 * are as much a reason to reallocate as ones it needs and has not got.
+	 */
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		bool wanted = !ispfe_pdma_outputs[i].tapout ||
+			      ispfe->active_lmp_tapouts;
+
+		if (wanted != !!ispfe->pdma_output[i].cpu)
 			return false;
+	}
 
 	return true;
 }
@@ -4959,6 +5111,8 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 		}
 	}
 	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		if (ispfe_pdma_outputs[i].tapout && !ispfe->active_lmp_tapouts)
+			continue;
 		ispfe->pdma_output[i].cpu = dma_alloc_coherent(
 			ispfe->dev, ispfe_pdma_outputs[i].size,
 			&ispfe->pdma_output[i].dma, GFP_KERNEL);
@@ -5142,6 +5296,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	u32 fc_axi_max_ost = ispfe->fc_axi_max_ost;
 	u32 lmp_ml0_profile = ispfe->lmp_ml0_profile;
 	u32 backend_recipe = ispfe->backend_recipe;
+	bool lmp_tapouts = ispfe->lmp_tapouts;
 	bool pdma_program_override = ispfe->pdma_program_override;
 	struct ispfe_lmp_wbg_profile lmp_wbg = {};
 	int ret;
@@ -5172,6 +5327,12 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 		lmp_ml0_profile = ISPFE_LMP_ML0_PROFILE_CAPTURED;
 		pdma_program_override = false;
 	}
+	/*
+	 * @lmp_tapouts is deliberately not pinned with them.  It selects
+	 * destinations rather than the program's shape, and looking at what
+	 * LMP made of a frame is most useful precisely while the fixed
+	 * pipeline is the thing running.
+	 */
 
 	ispfe->prog = ispfe_program_for(source.width, source.height,
 					backend_recipe);
@@ -5262,6 +5423,12 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	if (ispfe->prog->backend_recipe &&
 	    lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED)
 		return -EINVAL;
+	/* Reshaping an ML output the stream is not running means nothing. */
+	if (!lmp_tapouts && lmp_ml0_profile != ISPFE_LMP_ML0_PROFILE_CAPTURED) {
+		dev_err(ispfe->dev,
+			"lmp_ml0_profile needs lmp_tapouts, which is off\n");
+		return -EINVAL;
+	}
 	if (pdma_program_override) {
 		if (ispfe->prog->backend_recipe)
 			return -EINVAL;
@@ -5298,6 +5465,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->active_backend_side_output = ispfe->prog->backend_output &&
 		(!ispfe->prog->patch_backend_output ||
 		 ispfe->backend_side_output);
+	ispfe->active_lmp_tapouts = lmp_tapouts;
 	ispfe->active_pdma_program_override = pdma_program_override;
 	ispfe->active_pdma_program_generation =
 		ispfe->active_pdma_program_override ?
@@ -6266,6 +6434,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "backend_side_output %u requested, %u active\n",
 		   ispfe->backend_side_output,
 		   ispfe->active_backend_side_output);
+	seq_printf(s, "lmp_tapouts  %u requested, %u active\n",
+		   ispfe->lmp_tapouts, ispfe->active_lmp_tapouts);
 	seq_printf(s, "pdma_override %u requested, %u active\n",
 		   ispfe->pdma_program_override,
 		   ispfe->active_pdma_program_override);
@@ -6324,10 +6494,18 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tnr_iova     %pad  size %u\n",
 		   &ispfe->tnr_pyramid_dma, ISPFE_TNR_PYRAMID_SIZE);
 	seq_printf(s, "ring_iova    %pad\n", &ispfe->ring_dma);
-	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++)
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_outputs); i++) {
+		if (!ispfe->pdma_output[i].cpu) {
+			seq_printf(s, "aux%02u_iova  %-18s  size %zu\n", i,
+				   ispfe_pdma_outputs[i].tapout ?
+				   "gated" : "unallocated",
+				   ispfe_pdma_outputs[i].size);
+			continue;
+		}
 		seq_printf(s, "aux%02u_iova  %pad  size %zu\n", i,
 			   &ispfe->pdma_output[i].dma,
 			   ispfe_pdma_outputs[i].size);
+	}
 	seq_printf(s, "ring_head    %#x\n", ispfe->head);
 
 	if (ispfe->streaming) {
@@ -6755,6 +6933,7 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			   &ispfe->lmp_ml0_profile);
 	debugfs_create_u32("backend_recipe", 0644, d,
 			   &ispfe->backend_recipe);
+	debugfs_create_bool("lmp_tapouts", 0644, d, &ispfe->lmp_tapouts);
 	debugfs_create_bool("backend_side_output", 0644, d,
 			    &ispfe->backend_side_output);
 	debugfs_create_u32("credit_latency", 0644, d, &ispfe->credit_latency);

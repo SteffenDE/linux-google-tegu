@@ -45,10 +45,13 @@ enum exynos_ispfe_stats_version {
  *
  * %EXYNOS_ISPFE_STATS_HISTOGRAM:
  *	The per-pixel RGBY histogram is present, in @histogram.
+ * %EXYNOS_ISPFE_STATS_FLICKER:
+ *	The per-row sums are present, in @flicker.
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM		(1U << 2)
+#define EXYNOS_ISPFE_STATS_FLICKER		(1U << 3)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -539,6 +542,81 @@ struct exynos_ispfe_stats_histogram {
 	__u32 total[EXYNOS_ISPFE_HISTOGRAM_PLANES];
 };
 
+/*
+ * The most rows the flicker block will sum. It is the hardware's own bound --
+ * `lyric::LmpFlickerStatsOutput::Make` refuses a larger count and refuses a
+ * buffer smaller than the 0x46c0 bytes this many rows need -- rather than a
+ * picture height, and it is comfortably above the 3120 rows this sensor's full
+ * readout has. Take the rows in use from @exynos_ispfe_stats_flicker.rows.
+ */
+#define EXYNOS_ISPFE_FLICKER_ROWS		4512
+
+/**
+ * struct exynos_ispfe_stats_flicker - One sum per row of the picture
+ *
+ * @reserved0: The hardware's own metadata area, undecoded
+ * @rows: How many entries of @row_sum the hardware wrote
+ * @reserved1: The rest of that metadata area, also undecoded
+ * @row_sum: Per entry, the sum of its samples
+ *
+ * **An entry is a pair of picture rows, not one.** The block reports 1560
+ * entries for the 4208x3120 readout, and summing a raw frame's rows in pairs
+ * reproduces them to an R-squared of 0.999973 where the first 1560 rows alone
+ * give 0.77 [HW 2026-08-26]. So an entry spans two line times, which is what
+ * converts a period in entries to one in seconds, and @rows is half the
+ * picture height rather than the whole of it.
+ *
+ * The samples are the ones the two grids meter -- after black level
+ * subtraction and with the gains applied -- rather than the sensor's. The same
+ * fit puts the slope at 34.06 and the intercept at 64.1 counts a sample, which
+ * is the black level, and the mean per sample agrees with the white balance
+ * grid's own mean over the same frame to 1%.
+ *
+ * Where the two grids and the histogram resolve the picture in space and in
+ * intensity, this resolves it in **time**: a rolling shutter reads one row
+ * after another, so a light that is modulated at twice the mains frequency
+ * writes its own waveform down the frame, and a sum along each row is the
+ * cheapest thing that recovers it. That is the whole of what this measurement
+ * is for -- the sums say nothing about the picture that the exposure grid does
+ * not say better, and everything about the *illuminant*.
+ *
+ * There is nothing to configure and so nothing here describes a configuration.
+ * The block's register printer has exactly three fields -- an enable, a frame
+ * id and this buffer's address -- so unlike the two grids there is no region of
+ * interest, no channel selection and no weighting: a row is a row of the
+ * picture the front end is processing, and the sum is over all of it.
+ *
+ * **@rows is what says a buffer holds a result.** The driver clears it before
+ * the frame is armed and the hardware writes it, so it is zero for a frame
+ * nothing wrote; it is also the hardware's own report rather than a copy of a
+ * configuration, which is how the vendor's own reader validates the buffer it
+ * allocated. Entries past @rows are not written and hold whatever they last
+ * did.
+ *
+ * The sums are **signed because the vendor reads them signed** --
+ * `ZumaAeInputParser::ExtractFlickerData` copies them into a ``vector<int>`` --
+ * and not because they go negative. **They do not**: the block floors at zero.
+ * On a black frame at one line of exposure and unit gain, all 1560 entries are
+ * exactly zero while the exposure grid metered from the same frames sums to
+ * about -12 million per colour, which is what a signed grid does below the
+ * black level pedestal [HW 2026-08-26]. So the two are not alike, and a
+ * consumer should not carry the exposure grid's expectations here.
+ *
+ * Nothing reachable distinguishes the two readings in any case: a full row
+ * pair sums to a few tens of millions in the metering domain, so the sign bit
+ * is never in use.
+ *
+ * The first 64 bytes are the hardware's, in the same place the two grids keep
+ * their own metadata area, and only @rows is decoded. They are not assumed to
+ * have the grids' layout.
+ */
+struct exynos_ispfe_stats_flicker {
+	__u32 reserved0[9];
+	__u32 rows;
+	__u32 reserved1[6];
+	__s32 row_sum[EXYNOS_ISPFE_FLICKER_ROWS];
+};
+
 /**
  * struct exynos_ispfe_stats_buffer - ISPFE per-frame statistics
  *
@@ -552,6 +630,7 @@ struct exynos_ispfe_stats_histogram {
  * @ae: The exposure grid, valid when %EXYNOS_ISPFE_STATS_AE is set
  * @histogram: The RGBY histogram, valid when %EXYNOS_ISPFE_STATS_HISTOGRAM is
  *	set
+ * @flicker: The per-row sums, valid when %EXYNOS_ISPFE_STATS_FLICKER is set
  *
  * One buffer is one frame's statistics. Which frame is said twice, and neither
  * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
@@ -583,6 +662,7 @@ struct exynos_ispfe_stats_buffer {
 	struct exynos_ispfe_stats_awb awb;
 	struct exynos_ispfe_stats_ae ae;
 	struct exynos_ispfe_stats_histogram histogram;
+	struct exynos_ispfe_stats_flicker flicker;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

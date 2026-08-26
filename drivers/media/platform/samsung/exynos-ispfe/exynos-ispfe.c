@@ -589,6 +589,11 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
+/*
+ * The histogram block writes three regions of interest through one gate, and
+ * the recipes relocate all three.  This is the first; nothing reads the others.
+ */
+#define ISPFE_PDMA_OUTPUT_HISTOGRAM	6
 
 /*
  * Where one frame's statistics land while the metadata node is streaming.
@@ -624,11 +629,17 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  * one contiguous IOVA, which is all the hardware needs: it is handed a single
  * address, and @sgt->nents is 1.
  */
+/* Indices into ispfe_stats_area.grid, in the order the buffer carries them. */
+#define ISPFE_STATS_GRID_AWB		0
+#define ISPFE_STATS_GRID_AE		1
+#define ISPFE_STATS_GRID_HISTOGRAM	2
+#define ISPFE_STATS_GRIDS		3
+
 struct ispfe_stats_area {
 	struct list_head list;
-	void *grid[2];
-	struct sg_table *sgt[2];
-	dma_addr_t dma[2];
+	void *grid[ISPFE_STATS_GRIDS];
+	struct sg_table *sgt[ISPFE_STATS_GRIDS];
+	dma_addr_t dma[ISPFE_STATS_GRIDS];
 	u64 timestamp;
 	u32 sequence;
 	/*
@@ -640,11 +651,6 @@ struct ispfe_stats_area {
 	 */
 	u32 session;
 };
-
-/* Indices into ispfe_stats_area.grid, in the order the buffer carries them. */
-#define ISPFE_STATS_GRID_AWB		0
-#define ISPFE_STATS_GRID_AE		1
-#define ISPFE_STATS_GRIDS		2
 
 /*
  * One per slot a queue can arm, and one more so that a frame retiring while
@@ -668,25 +674,88 @@ struct ispfe_stats_area {
  * because the copy length is the interface's and the destination is the
  * hardware's.
  */
+/*
+ * A grid holds one complete frame when its header reports the geometry this
+ * hardware meters.  The header is the first thing the hardware writes and the
+ * driver clears it before arming, so a stale or unwritten area fails this.
+ */
+static bool ispfe_stats_grid_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_grid_header *header = grid;
+
+	return header->columns == EXYNOS_ISPFE_STATS_COLUMNS &&
+	       header->rows == EXYNOS_ISPFE_STATS_ROWS;
+}
+
+/*
+ * The histogram has no geometry to check, and its own first 64 bytes are not
+ * decoded, so what says it was written is its sample totals: they count
+ * samples rather than values, so any frame the hardware wrote has them nonzero
+ * -- including a black one, where every bin but the first is empty.
+ */
+static bool ispfe_stats_histogram_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_histogram *histogram = grid;
+	unsigned int plane;
+
+	for (plane = 0; plane < EXYNOS_ISPFE_HISTOGRAM_PLANES; plane++)
+		if (!histogram->total[plane])
+			return false;
+
+	return true;
+}
+
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
+	size_t size;
+	/*
+	 * How much of the area the driver clears before the frame is armed,
+	 * which has to cover whatever @written reads.
+	 */
+	size_t clear;
 	u32 flag;
+	bool (*written)(const void *grid);
 } ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
 	[ISPFE_STATS_GRID_AWB] = {
 		.output = ISPFE_PDMA_OUTPUT_AWB,
 		.offset = offsetof(struct exynos_ispfe_stats_buffer, awb),
+		.size = sizeof(struct exynos_ispfe_stats_awb),
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 		.flag = EXYNOS_ISPFE_STATS_AWB,
+		.written = ispfe_stats_grid_written,
 	},
 	[ISPFE_STATS_GRID_AE] = {
 		.output = ISPFE_PDMA_OUTPUT_AE,
 		.offset = offsetof(struct exynos_ispfe_stats_buffer, ae),
+		.size = sizeof(struct exynos_ispfe_stats_ae),
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 		.flag = EXYNOS_ISPFE_STATS_AE,
+		.written = ispfe_stats_grid_written,
+	},
+	[ISPFE_STATS_GRID_HISTOGRAM] = {
+		.output = ISPFE_PDMA_OUTPUT_HISTOGRAM,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, histogram),
+		.size = sizeof(struct exynos_ispfe_stats_histogram),
+		/*
+		 * The whole of it, because the totals that say it was written
+		 * are at the far end.  Eight kilobytes against the grids' 292
+		 * each, so the cost is noise.
+		 */
+		.clear = sizeof(struct exynos_ispfe_stats_histogram),
+		.flag = EXYNOS_ISPFE_STATS_HISTOGRAM,
+		.written = ispfe_stats_histogram_written,
 	},
 };
 
 static_assert(sizeof(struct exynos_ispfe_stats_awb) == ISPFE_STATS_GRID_BYTES);
 static_assert(sizeof(struct exynos_ispfe_stats_ae) == ISPFE_STATS_GRID_BYTES);
+/*
+ * The layout closes against the vendor's own bound: `LmpRgbyHistogramStatsOutput`
+ * refuses a buffer of 258 32-byte units or fewer, and this is the smallest that
+ * holds four 512-bin planes and their totals behind the hardware's metadata.
+ */
+static_assert(sizeof(struct exynos_ispfe_stats_histogram) == 0x2050);
 
 struct ispfe_lmp_wbg_profile {
 	u32 red;
@@ -2105,10 +2174,10 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 	 */
 	BUILD_BUG_ON(sizeof(struct exynos_ispfe_stats_grid_header) > PAGE_SIZE);
 	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
-		memset(area->grid[grid], 0,
-		       sizeof(struct exynos_ispfe_stats_grid_header));
-		dma_sync_single_for_device(ispfe->dev, area->dma[grid],
-					   sizeof(struct exynos_ispfe_stats_grid_header),
+		size_t clear = ispfe_stats_grids[grid].clear;
+
+		memset(area->grid[grid], 0, clear);
+		dma_sync_single_for_device(ispfe->dev, area->dma[grid], clear,
 					   DMA_TO_DEVICE);
 	}
 
@@ -5033,7 +5102,7 @@ static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
 			unsigned int output = ispfe_stats_grids[grid].output;
 			size_t size = ispfe_pdma_outputs[output].size;
 
-			if (size < ISPFE_STATS_GRID_BYTES)
+			if (size < ispfe_stats_grids[grid].size)
 				return -EINVAL;
 			/*
 			 * __GFP_ZERO, and it is not belt and braces:
@@ -7638,8 +7707,6 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 
 	for (grid = 0; area && grid < ISPFE_STATS_GRIDS; grid++) {
 		const struct ispfe_stats_grid *desc = &ispfe_stats_grids[grid];
-		const struct exynos_ispfe_stats_grid_header *header =
-			area->grid[grid];
 
 		/*
 		 * Nothing here has been read since the hardware wrote it, so
@@ -7662,14 +7729,12 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		dma_sync_sgtable_for_cpu(ispfe->dev, area->sgt[grid],
 					 DMA_BIDIRECTIONAL);
 
-		if (header->columns != EXYNOS_ISPFE_STATS_COLUMNS ||
-		    header->rows != EXYNOS_ISPFE_STATS_ROWS)
+		if (!desc->written(area->grid[grid]))
 			continue;
 
-		memcpy((u8 *)out + desc->offset, area->grid[grid],
-		       ISPFE_STATS_GRID_BYTES);
+		memcpy((u8 *)out + desc->offset, area->grid[grid], desc->size);
 		out->stats_type |= desc->flag;
-		used = max(used, desc->offset + ISPFE_STATS_GRID_BYTES);
+		used = max(used, desc->offset + desc->size);
 	}
 
 	buf->vb.vb2_buf.timestamp = area ? area->timestamp : ktime_get_ns();

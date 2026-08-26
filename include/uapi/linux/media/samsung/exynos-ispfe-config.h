@@ -281,9 +281,16 @@ struct exynos_ispfe_params_metering {
  * block wants, and does not need to recompute it per frame.
  *
  * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the grid to
- * the driver's default -- the calibration the running program was captured
- * with -- rather than switching correction off. Unity everywhere is how to ask
- * for no correction, and it is a grid like any other.
+ * the driver's default, which is unity everywhere -- so for this block, and
+ * unlike the two above, disabling really does switch correction off. The
+ * kernel ships no calibration: a grid belongs to one unit at one readout, and
+ * two readouts of one camera differ by up to 30% at a grid point, so there is
+ * no table it could carry that would be right for the next stream.
+ *
+ * The cost is visible and is meant to be. With no grid sent, a corner of this
+ * lens reads about a sixth of its centre, and a picture that looks
+ * uncalibrated is a better answer than one silently corrected by some other
+ * unit's numbers.
  */
 struct exynos_ispfe_params_lens_shading {
 	struct v4l2_isp_params_block_header header;

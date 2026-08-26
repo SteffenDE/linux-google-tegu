@@ -1216,6 +1216,21 @@ int becore_params_value(const struct becore_device *becore,
 			 ((u32)params->ltm_curve[index + 1] << 16);
 		return 0;
 	}
+	if (params->ltm_tone_adjust_valid &&
+	    reg >= BECORE_YUVP_LTM_TONEADJ_FIRST &&
+	    reg <= BECORE_YUVP_LTM_TONEADJ_LAST) {
+		index = (reg - BECORE_YUVP_LTM_TONEADJ_FIRST) / 4 *
+			BECORE_LTM_TONEADJ_PER_REG;
+		/*
+		 * An odd sample count, so the last register's high half has no
+		 * sample to carry and stays zero -- as the driver's own default
+		 * leaves it.
+		 */
+		*value = params->ltm_tone_adjust[index];
+		if (index + 1 < EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS)
+			*value |= (u32)params->ltm_tone_adjust[index + 1] << 16;
+		return 0;
+	}
 	/*
 	 * No range test in front of this one: the table it walks is the only
 	 * statement of where those registers are, and a second copy of their
@@ -1328,6 +1343,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_DMSC] = {
 		.size = sizeof(struct exynos_becore_params_dmsc),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST] = {
+		.size = sizeof(struct exynos_becore_params_ltm_tone_adjust),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -1381,6 +1399,33 @@ becore_params_check_ltm_curve(struct device *dev,
 		}
 		if (i && ltm->curve[i] < ltm->curve[i - 1]) {
 			dev_dbg(dev, "tone curve decreases at point %u\n", i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * The same rule, in units the block's other curve does not share: this one is
+ * Q14 where the guide curve is Q15, and both are 16-bit fields, so a curve
+ * sent in the wrong one would fit and be twice as steep.
+ */
+static int
+becore_params_check_ltm_tone_adjust(struct device *dev,
+				    const struct exynos_becore_params_ltm_tone_adjust *ltm)
+{
+	unsigned int i;
+
+	for (i = 0; i < EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS; i++) {
+		if (ltm->curve[i] > EXYNOS_BECORE_LTM_TONE_ADJUST_ONE) {
+			dev_dbg(dev, "tone adjustment point %u exceeds unity\n",
+				i);
+			return -EINVAL;
+		}
+		if (i && ltm->curve[i] < ltm->curve[i - 1]) {
+			dev_dbg(dev, "tone adjustment decreases at point %u\n",
+				i);
 			return -EINVAL;
 		}
 	}
@@ -1588,6 +1633,26 @@ static int becore_params_walk(struct becore_device *becore,
 			memcpy(becore->params.ltm_curve, ltm->curve,
 			       sizeof(becore->params.ltm_curve));
 			becore->params.ltm_curve_valid = true;
+			break;
+		}
+		case EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST: {
+			const struct exynos_becore_params_ltm_tone_adjust *ltm =
+				(const void *)header;
+
+			if (disable) {
+				if (apply)
+					becore->params.ltm_tone_adjust_valid = false;
+				break;
+			}
+			ret = becore_params_check_ltm_tone_adjust(becore->dev,
+								  ltm);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			memcpy(becore->params.ltm_tone_adjust, ltm->curve,
+			       sizeof(becore->params.ltm_tone_adjust));
+			becore->params.ltm_tone_adjust_valid = true;
 			break;
 		}
 		case EXYNOS_BECORE_PARAM_BLOCK_CLUT: {

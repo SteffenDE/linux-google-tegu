@@ -731,8 +731,7 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
 #define BECORE_YUVP_LTM_TRANS_LAST	(BECORE_YUVP_LTM_BASE + 0x1d0)
 #define BECORE_YUVP_LTM_TONEADJ_FIRST	(BECORE_YUVP_LTM_BASE + 0x1d4)
 #define BECORE_YUVP_LTM_TONEADJ_LAST	(BECORE_YUVP_LTM_BASE + 0x2d4)
-/* 129 entries two to a register, which is the LUT's own shape. */
-#define BECORE_LTM_TONEADJ_ENTRIES	129
+/* Two entries to a register, which is the LUT's own shape. */
 #define BECORE_LTM_TONEADJ_PER_REG	2
 /*
  * 129 samples over 65 registers, so the last register's high half is padding
@@ -741,7 +740,7 @@ static_assert((BECORE_YUVP_ROI_REGION_LAST - BECORE_YUVP_ROI_REGION_FIRST) /
  */
 static_assert((BECORE_YUVP_LTM_TONEADJ_LAST -
 	       BECORE_YUVP_LTM_TONEADJ_FIRST) / 4 + 1 ==
-	      DIV_ROUND_UP(BECORE_LTM_TONEADJ_ENTRIES,
+	      DIV_ROUND_UP(EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS,
 			   BECORE_LTM_TONEADJ_PER_REG));
 
 #define BECORE_YUVP_LTM_LUMA_THRES_REG	(BECORE_YUVP_LTM_BASE + 0x2d8)

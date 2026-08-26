@@ -769,8 +769,9 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->active_capture_size);
 	seq_printf(s, "overrides        %u\n", becore->override_count);
 	seq_printf(s,
-		   "params           ccm %u, ltm curve %u, colour LUT %u, gamma %u, sharpener %u, noise reducer %u\n",
+		   "params           ccm %u, ltm curve %u, ltm tone adjust %u, colour LUT %u, gamma %u, sharpener %u, noise reducer %u\n",
 		   becore->params.ccm_valid, becore->params.ltm_curve_valid,
+		   becore->params.ltm_tone_adjust_valid,
 		   becore->params.clut_valid, becore->params.gamma_valid,
 		   becore->params.sharpen_valid, becore->params.yuvnr_valid);
 	seq_printf(s, "input_profile    %u requested, %u active, %zu bytes\n",

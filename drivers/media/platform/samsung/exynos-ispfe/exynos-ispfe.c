@@ -2191,7 +2191,7 @@ static bool ispfe_stats_capture_locked(struct ispfe_device *ispfe,
 	/*
 	 * Ordering, not visibility: the area is cacheable, and what makes the
 	 * frame's writes readable through this mapping is the invalidate in
-	 * ispfe_stats_work_fn() rather than any barrier here.
+	 * ispfe_stats_publish() rather than any barrier here.
 	 */
 	dma_rmb();
 	area->timestamp = timestamp;
@@ -2643,9 +2643,74 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_BACKEND_WDMA_CONFIG_REG 0x000565d8
 #define ISPFE_LMP_BATCH_CONFIG_REG	0x000567d8
 
-#define ISPFE_LMP_CAPTURED_OUTPUT_GATES	0x0000b1f8
+/*
+ * The batch record is sixteen 0xa8-byte entries after a 0x20-byte header of
+ * plane offsets, and each entry opens with an enable word, an interrupt word
+ * and twenty 64-bit destination addresses.  The driver programs entry 0; the
+ * other fifteen are zero, because every captured program has a batch size of
+ * one.
+ *
+ * The enable word is one bit per destination, in the order
+ * `LmpBayerPipeline::ConfigureBatchEnabled` writes its per-output boolean
+ * flags -- *not* the order of the `bitset` it also maintains, which is the
+ * interrupt word and has a different assignment.  A flag is set exactly when
+ * its destination has an address, and the entry's address slots follow the
+ * same list, with the two output headers taking the gate of the output they
+ * belong to and the three histogram ROIs sharing one.
+ *
+ * The corpus is what makes that a reading rather than a guess.  Across the 54
+ * captured programs the word takes six values, and every difference between
+ * them is a destination whose address slot changed with it: bit 1 tracks the
+ * CDAF address, bit 14 the second ML output's and bit 15 the third's.  The two
+ * bits the driver already had names for -- the LMP main output it hands the
+ * back end, and the TNR pyramid -- land where this list puts them, on 10 and
+ * 16.  One bit per destination reproduces all 54 words; shifting the run by
+ * one, or giving either header or each histogram ROI its own bit, reproduces
+ * none of them.  The eight destinations between the anchored bits fill the
+ * eight positions between them exactly, so no unnamed gate can hide inside
+ * the run.
+ */
+#define ISPFE_LMP_GATE_SPARSE_PD	BIT(0)
+#define ISPFE_LMP_GATE_CDAF		BIT(1)
+#define ISPFE_LMP_GATE_PRE_LSC_AE	BIT(2)
+#define ISPFE_LMP_GATE_AWB_STATS	BIT(3)
+#define ISPFE_LMP_GATE_LSC_STATS	BIT(4)
+#define ISPFE_LMP_GATE_FLICKER_STATS	BIT(5)
+#define ISPFE_LMP_GATE_HISTOGRAM	BIT(6)
+#define ISPFE_LMP_GATE_POST_LSC_AE	BIT(7)
+#define ISPFE_LMP_GATE_MOTION_METERING	BIT(8)
+#define ISPFE_LMP_GATE_BILATERAL_GRID	BIT(9)
 #define ISPFE_LMP_BACKEND_OUTPUT_GATE	BIT(10)
+#define ISPFE_LMP_GATE_SECONDARY_OUTPUT	BIT(11)
+#define ISPFE_LMP_GATE_RGB_OUTPUT	BIT(12)
+#define ISPFE_LMP_GATE_ML_OUTPUT0	BIT(13)
+#define ISPFE_LMP_GATE_ML_OUTPUT1	BIT(14)
+#define ISPFE_LMP_GATE_ML_OUTPUT2	BIT(15)
 #define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
+
+/*
+ * Where the enable word sits, and the end of the entry that carries it: the
+ * driver reaches no further into the record than batch entry 0, and 0xc8 is
+ * exactly 0x20 + 0xa8.
+ */
+#define ISPFE_LMP_OUTPUT_GATES_AT	0x20
+#define ISPFE_LMP_BATCH_CONFIG_MIN	0xc8
+
+/*
+ * What both raw recipes were captured with: the six statistics the front end
+ * emits, plus the three image destinations.  The back-end recipe's own word is
+ * this and the two the back-end producer needs.
+ */
+#define ISPFE_LMP_CAPTURED_OUTPUT_GATES	(ISPFE_LMP_GATE_AWB_STATS | \
+					 ISPFE_LMP_GATE_LSC_STATS | \
+					 ISPFE_LMP_GATE_FLICKER_STATS | \
+					 ISPFE_LMP_GATE_HISTOGRAM | \
+					 ISPFE_LMP_GATE_POST_LSC_AE | \
+					 ISPFE_LMP_GATE_MOTION_METERING | \
+					 ISPFE_LMP_GATE_RGB_OUTPUT | \
+					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
+					 ISPFE_LMP_GATE_ML_OUTPUT2)
+static_assert(ISPFE_LMP_CAPTURED_OUTPUT_GATES == 0x0000b1f8);
 #define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
 #define ISPFE_LMP_DPC_GAIN_MAX		GENMASK(9, 0)
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
@@ -2954,8 +3019,8 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		put_unaligned_le32(0x00000001, payload + 0x20);
 		break;
 	case ISPFE_LMP_BATCH_CONFIG_REG:
-		if (cmd->len < 0xc8 ||
-		    get_unaligned_le32(payload + 0x20) !=
+		if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN ||
+		    get_unaligned_le32(payload + ISPFE_LMP_OUTPUT_GATES_AT) !=
 		    ISPFE_LMP_CAPTURED_OUTPUT_GATES)
 			return -EINVAL;
 		if (upper_32_bits(dma) ||
@@ -2965,7 +3030,7 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		put_unaligned_le32(ISPFE_LMP_CAPTURED_OUTPUT_GATES |
 				     ISPFE_LMP_BACKEND_OUTPUT_GATE |
 				     ISPFE_LMP_TNR_OUTPUT_GATE,
-				     payload + 0x20);
+				     payload + ISPFE_LMP_OUTPUT_GATES_AT);
 		put_unaligned_le32(lower_32_bits(dma +
 						 ISPFE_BACKEND_IMAGE_OFFSET),
 				     payload + 0x80);

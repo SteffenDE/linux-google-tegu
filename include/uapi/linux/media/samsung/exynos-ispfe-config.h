@@ -38,6 +38,7 @@ enum exynos_ispfe_stats_version {
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
+#define EXYNOS_ISPFE_STATS_HISTOGRAM		(1U << 2)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -446,6 +447,50 @@ struct exynos_ispfe_stats_ae {
 	struct exynos_ispfe_stats_ae_region regions[EXYNOS_ISPFE_STATS_REGIONS];
 };
 
+/*
+ * The histogram's four planes, in the order it carries them, and how many bins
+ * each has. The bin count is the block's own maximum rather than a choice:
+ * `lyric::LmpRgbyHistogramStatsOutput::Make` refuses anything above it, and the
+ * planes sit exactly that far apart.
+ */
+#define EXYNOS_ISPFE_HISTOGRAM_RED		0
+#define EXYNOS_ISPFE_HISTOGRAM_GREEN		1
+#define EXYNOS_ISPFE_HISTOGRAM_BLUE		2
+#define EXYNOS_ISPFE_HISTOGRAM_LUMA		3
+#define EXYNOS_ISPFE_HISTOGRAM_PLANES		4
+#define EXYNOS_ISPFE_HISTOGRAM_BINS		512
+
+/**
+ * struct exynos_ispfe_stats_histogram - The per-pixel RGBY histogram
+ *
+ * @reserved0: The hardware's own metadata area, undecoded
+ * @bins: Per plane, how many samples fell in each bin
+ * @total: Per plane, how many samples the histogram counted at all
+ *
+ * Unlike the two grids this has no spatial resolution: it is one distribution
+ * over a region of the frame, where they are means over 64 x 48 regions. The
+ * two are complementary rather than ordered -- a quantile is not derivable from
+ * a mean, and a weighted metering is not derivable from a distribution -- and
+ * an exposure algorithm that wants constraint modes needs this one.
+ *
+ * The block writes **three** of these, one per region of interest, and this
+ * interface carries the first. The other two are allocated and written and
+ * nothing reads them; what the three regions are is not decoded.
+ *
+ * @total is what says a buffer holds a result: it counts samples rather than
+ * values, so it is nonzero for any frame the hardware wrote, including a black
+ * one, and the driver clears it before arming.
+ *
+ * The first 64 bytes are the hardware's, in the same place the two grids keep
+ * their own metadata area, and nothing has decoded them. They are not assumed
+ * to have the grids' layout.
+ */
+struct exynos_ispfe_stats_histogram {
+	__u32 reserved0[16];
+	__u32 bins[EXYNOS_ISPFE_HISTOGRAM_PLANES][EXYNOS_ISPFE_HISTOGRAM_BINS];
+	__u32 total[EXYNOS_ISPFE_HISTOGRAM_PLANES];
+};
+
 /**
  * struct exynos_ispfe_stats_buffer - ISPFE per-frame statistics
  *
@@ -487,6 +532,7 @@ struct exynos_ispfe_stats_buffer {
 	__u32 reserved;
 	struct exynos_ispfe_stats_awb awb;
 	struct exynos_ispfe_stats_ae ae;
+	struct exynos_ispfe_stats_histogram histogram;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

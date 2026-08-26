@@ -30,13 +30,16 @@
  *	:c:type:`exynos_becore_params_byr_dns`
  * @EXYNOS_BECORE_PARAM_BLOCK_DMSC: The demosaic's tuning,
  *	:c:type:`exynos_becore_params_dmsc`
+ * @EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST: The local tone mapper's tone
+ *	adjustment curve, :c:type:`exynos_becore_params_ltm_tone_adjust`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
  * balance's own output, the guide curve is the exposure estimate's, the
  * lattice comes from a tuning tree indexed by the illuminant estimate, the
- * tone curve is the grade a calibration ships, and the sharpener's and noise
- * reducer's tuning come from trees indexed by analog gain and exposure ratio.
+ * tone curve is the grade a calibration ships, the tone adjustment is a curve
+ * from the same tuning, and the sharpener's and noise reducer's tuning come
+ * from trees indexed by analog gain and exposure ratio.
  * What none of them carries is a register address or a program: userspace
  * supplies values in the units the block is specified in, and the driver
  * encodes them.
@@ -50,6 +53,7 @@ enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_YUVNR,
 	EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS,
 	EXYNOS_BECORE_PARAM_BLOCK_DMSC,
+	EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -109,6 +113,45 @@ struct exynos_becore_params_ccm {
 struct exynos_becore_params_ltm_curve {
 	struct v4l2_isp_params_block_header header;
 	__u16 curve[EXYNOS_BECORE_LTM_CURVE_POINTS];
+} __attribute__((aligned(8)));
+
+/*
+ * 129 samples rather than 128, because both ends are sampled: the curve is
+ * evaluated at x = i / 128 for i in 0..128.
+ */
+#define EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS	129
+
+/* Q14 over the unit interval; the hardware field is 16 bits. */
+#define EXYNOS_BECORE_LTM_TONE_ADJUST_ONE	16384
+
+/**
+ * struct exynos_becore_params_ltm_tone_adjust - Local tone mapper's tone
+ *	adjustment curve
+ *
+ * @header: The parameters block header
+ * @curve: 129 evenly spaced Q14 samples of the curve, ascending
+ *
+ * The curve the local map is applied through, and the block's second: where
+ * :c:type:`exynos_becore_params_ltm_curve` is the guide the tone mapper
+ * derives from a frame, this one is a fixed grade that does not move with the
+ * scene.
+ *
+ * The curve must be non-decreasing and no sample may exceed
+ * %EXYNOS_BECORE_LTM_TONE_ADJUST_ONE, for the same reason the guide curve
+ * must: a tone curve that goes backwards inverts contrast over that interval,
+ * which is what a sign or ordering error in userspace looks like.
+ *
+ * The driver's own default is an identity ramp, so a stream that sends no
+ * block gets the local map applied through no adjustment at all -- a working
+ * picture, and a visibly flatter one than the vendor's grade.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the curve
+ * to that default rather than switching tone mapping off: like the guide
+ * curve, it has no bypass that leaves a usable picture behind it.
+ */
+struct exynos_becore_params_ltm_tone_adjust {
+	struct v4l2_isp_params_block_header header;
+	__u16 curve[EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS];
 } __attribute__((aligned(8)));
 
 /* 17 nodes per axis, indexed by RGB, each holding one (U, V) chroma pair. */
@@ -1337,6 +1380,7 @@ struct exynos_becore_params_dmsc {
 	 sizeof(struct exynos_becore_params_sharpen) + \
 	 sizeof(struct exynos_becore_params_yuvnr) + \
 	 sizeof(struct exynos_becore_params_byr_dns) + \
-	 sizeof(struct exynos_becore_params_dmsc))
+	 sizeof(struct exynos_becore_params_dmsc) + \
+	 sizeof(struct exynos_becore_params_ltm_tone_adjust))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

@@ -2665,6 +2665,10 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
  * none of them.  The eight destinations between the anchored bits fill the
  * eight positions between them exactly, so no unnamed gate can hide inside
  * the run.
+ *
+ * The run does not end at the TNR pyramid, though: the printer has one more
+ * field after it.  The corpus could not have found that, because nothing in
+ * it ever sets the bit.
  */
 #define ISPFE_LMP_GATE_SPARSE_PD	BIT(0)
 #define ISPFE_LMP_GATE_CDAF		BIT(1)
@@ -2683,6 +2687,13 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_GATE_ML_OUTPUT1	BIT(14)
 #define ISPFE_LMP_GATE_ML_OUTPUT2	BIT(15)
 #define ISPFE_LMP_TNR_OUTPUT_GATE	BIT(16)
+/*
+ * `BatchPdpOutputEnableValue::Print` has an eighteenth field after the TNR
+ * pyramid, `sw_hdr_stats_en`.  Named for completeness only: no captured
+ * program sets it, so the corpus cannot place it -- what places it is that it
+ * is last in the printer, behind a bit the two recipes anchor.
+ */
+#define ISPFE_LMP_GATE_HDR_STATS	BIT(17)
 
 /*
  * Where the enable word sits, and the end of the entry that carries it: the

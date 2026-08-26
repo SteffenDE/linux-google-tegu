@@ -2749,6 +2749,43 @@ static_assert(ISPFE_LMP_CAPTURED_OUTPUT_GATES == 0x0000b1f8);
 					 ISPFE_LMP_INSTANCE_STRIDE)
 static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
 /*
+ * `lmp/frame_config` on the same instance, and the 53-bit DRAM write-interface
+ * mask inside it.  `LmpInput::GetActiveDramInterfaces` derives this word by
+ * walking the whole CSR image, so it is the one place a destination's *plane
+ * count* reaches the hardware; the batch record's gate word says only whether
+ * the destination runs.  A destination whose interfaces stay declared here is
+ * one the line-memory processor still keeps buffers for.
+ *
+ * Three interfaces per image output, in output order after the ten reserved
+ * for the Bayer path and the statistics: the linear-RGB tapout at 2..4 (three
+ * planes when `sw_rgb_tapout_format` is planar, one otherwise), then output
+ * formatters 0, 1 and 2 at 6..8, 9..11 and 12..14.  The captured programs read
+ * back exactly that -- the back-end recipe's word is `0x3920003e90dc` and the
+ * raw recipes' `0x2120003e90dc`, differing only in bits 43 and 44, which
+ * `GetActiveDramInterfaces` declares only when `csr_alignmentformatter_enable`
+ * is set, and that byte is `0xf1` in the back-end payload and `0xf0` in the
+ * raw ones.
+ */
+#define ISPFE_LMP_FRAME_CONFIG_REG0	0x0005467c
+#define ISPFE_LMP_ACTIVE_IFS_AT		0x10
+#define ISPFE_LMP_FRAME_CONFIG_MIN	(ISPFE_LMP_ACTIVE_IFS_AT + 8)
+/* The interfaces of the three image destinations this driver does not run. */
+#define ISPFE_LMP_TAPOUT_IFS		(GENMASK_ULL(4, 2) | \
+					 GENMASK_ULL(8, 6) | \
+					 GENMASK_ULL(14, 12))
+/*
+ * What both raw recipes were captured with, and the back-end recipe's own word
+ * is this plus the alignment formatter's two.  Held as literals because this
+ * driver reads the word rather than deriving it: 44 of its bits belong to
+ * blocks nothing here interprets, and asserting the whole word is what makes
+ * clearing three destinations' worth of it a bounded change.
+ */
+#define ISPFE_LMP_CAPTURED_ACTIVE_IFS	0x00002120003e90dcULL
+#define ISPFE_LMP_ALIGNMENT_FORMATTER_IFS	(BIT_ULL(43) | BIT_ULL(44))
+static_assert((ISPFE_LMP_CAPTURED_ACTIVE_IFS |
+	       ISPFE_LMP_ALIGNMENT_FORMATTER_IFS) == 0x00003920003e90dcULL);
+
+/*
  * The LUT target area is one instance apart too, and by a *different* stride:
  * aligning the two recipes' register sets accounts for 55 of the 56 they use
  * with three windows -- FC at 0x2000, the LMP core at the 0x1698 above, and
@@ -3057,6 +3094,47 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		*header_hi = payload_at + 0x8c;
 		break;
 	}
+
+	return 0;
+}
+
+/*
+ * State which DRAM write interfaces are live, rather than replaying the word a
+ * capture came with.
+ *
+ * Clearing a destination's gate stops the write; it does not withdraw the
+ * interface the line-memory processor reserved for it.  Lyric never leaves the
+ * two disagreeing -- `GetActiveDramInterfaces` rebuilds this word from the same
+ * per-block enables that decide the gates -- so a program whose gate word says
+ * a destination is off while this word still claims its interfaces is a shape
+ * no capture contains.
+ *
+ * Only bits are cleared, and only ones belonging to the three image
+ * destinations whose gates the encoder clears in the same pass.  The word is
+ * checked against the two shapes the captured recipes carry first, so a future
+ * capture whose interfaces differ is refused rather than re-derived on an
+ * assumption about the other 44 bits.
+ */
+static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
+				       const struct ispfe_pdma_cmd *cmd,
+				       u8 *payload, bool *applied)
+{
+	u64 ifs;
+
+	if (!ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_FRAME_CONFIG_REG0))
+		return 0;
+	if (cmd->len < ISPFE_LMP_FRAME_CONFIG_MIN || *applied)
+		return -EINVAL;
+
+	ifs = get_unaligned_le64(payload + ISPFE_LMP_ACTIVE_IFS_AT);
+	if (ifs != ISPFE_LMP_CAPTURED_ACTIVE_IFS &&
+	    ifs != (ISPFE_LMP_CAPTURED_ACTIVE_IFS |
+		    ISPFE_LMP_ALIGNMENT_FORMATTER_IFS))
+		return -EINVAL;
+
+	ifs &= ~ISPFE_LMP_TAPOUT_IFS;
+	put_unaligned_le64(ifs, payload + ISPFE_LMP_ACTIVE_IFS_AT);
+	*applied = true;
 
 	return 0;
 }
@@ -3610,6 +3688,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	bool lmp_dpc_applied = false;
 	bool lmp_histogram_applied = false;
 	bool lmp_gates_applied = false;
+	bool lmp_active_ifs_applied = false;
 	unsigned int i;
 	u8 *program;
 	size_t at = 0;
@@ -3729,6 +3808,14 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 					     &lmp_gates_applied);
 		if (ret)
 			return ret;
+		/*
+		 * Applied to a staged program for the same reason as the gates:
+		 * it is the other half of saying a destination does not run.
+		 */
+		ret = ispfe_pdma_apply_active_ifs(ispfe, cmd, program + at,
+						  &lmp_active_ifs_applied);
+		if (ret)
+			return ret;
 
 		for (; reloc < last && reloc->cmd == i; reloc++) {
 			if (reloc->lo + 4 > cmd->len ||
@@ -3817,6 +3904,15 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	 */
 	if (!lmp_gates_applied) {
 		dev_err(ispfe->dev, "PDMA recipe is missing the batch record\n");
+		return -EINVAL;
+	}
+	/*
+	 * And the frame configuration, which carries the interface mask that
+	 * has to agree with those gates.
+	 */
+	if (!lmp_active_ifs_applied) {
+		dev_err(ispfe->dev,
+			"PDMA recipe is missing the frame configuration\n");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&

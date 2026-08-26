@@ -594,6 +594,12 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  * the recipes relocate all three.  This is the first; nothing reads the others.
  */
 #define ISPFE_PDMA_OUTPUT_HISTOGRAM	6
+/*
+ * The flicker block's destination is named twice by the recipe -- once in its
+ * own CSR and once in the batch record -- and the relocation is by buffer
+ * name, so both follow this area without anything here saying so.
+ */
+#define ISPFE_PDMA_OUTPUT_FLICKER	1
 
 /*
  * Where one frame's statistics land while the metadata node is streaming.
@@ -633,7 +639,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_AWB		0
 #define ISPFE_STATS_GRID_AE		1
 #define ISPFE_STATS_GRID_HISTOGRAM	2
-#define ISPFE_STATS_GRIDS		3
+#define ISPFE_STATS_GRID_FLICKER	3
+#define ISPFE_STATS_GRIDS		4
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -678,6 +685,9 @@ struct ispfe_stats_area {
  * A grid holds one complete frame when its header reports the geometry this
  * hardware meters.  The header is the first thing the hardware writes and the
  * driver clears it before arming, so a stale or unwritten area fails this.
+ *
+ * These run on the *copy* rather than on the area -- see ispfe_stats_publish()
+ * -- so what one of them approves is what the caller will read.
  */
 static bool ispfe_stats_grid_written(const void *grid)
 {
@@ -720,6 +730,27 @@ static bool ispfe_stats_histogram_written(const void *grid)
 	return (histogram->bins_log2 & EXYNOS_ISPFE_HISTOGRAM_BINS_MASK) != 0;
 }
 
+/*
+ * The flicker block reports how many rows it summed, into the same metadata
+ * area the grids keep their geometry in, and that is what says it wrote this
+ * frame: the driver clears it before arming, so an area the hardware did not
+ * reach reads zero.
+ *
+ * The upper bound is not paranoia about the hardware.  A consumer indexes
+ * @row_sum with this count, and a torn or unwritten word here would send it
+ * past the end of the array -- so the interface only ever publishes a count
+ * the array can hold.  Which is why this has to run on the copy: approving a
+ * count in the area and then copying out whatever is there now would be a
+ * bound that does not bind.
+ */
+static bool ispfe_stats_flicker_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_flicker *flicker = grid;
+
+	return flicker->rows != 0 &&
+	       flicker->rows <= EXYNOS_ISPFE_FLICKER_ROWS;
+}
+
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
@@ -756,6 +787,23 @@ static const struct ispfe_stats_grid {
 		.written = ispfe_stats_histogram_written,
 		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 	},
+	[ISPFE_STATS_GRID_FLICKER] = {
+		.output = ISPFE_PDMA_OUTPUT_FLICKER,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, flicker),
+		.size = sizeof(struct exynos_ispfe_stats_flicker),
+		.flag = EXYNOS_ISPFE_STATS_FLICKER,
+		.written = ispfe_stats_flicker_written,
+		/*
+		 * Named in this structure's own terms and not the grid
+		 * header's: the metadata area is in the same place and is the
+		 * same size, and that is all the two have in common -- the
+		 * kernel-doc says explicitly that this does not have the
+		 * grids' layout, so borrowing their type here would be a claim
+		 * the interface refuses to make.
+		 */
+		.clear = offsetofend(struct exynos_ispfe_stats_flicker,
+				     reserved1),
+	},
 };
 
 static_assert(sizeof(struct exynos_ispfe_stats_awb) == ISPFE_STATS_GRID_BYTES);
@@ -766,6 +814,19 @@ static_assert(sizeof(struct exynos_ispfe_stats_ae) == ISPFE_STATS_GRID_BYTES);
  * holds four 512-bin planes and their totals behind the hardware's metadata.
  */
 static_assert(sizeof(struct exynos_ispfe_stats_histogram) == 0x2050);
+/*
+ * The same bound from the other side: `LmpFlickerStatsOutput::Make` refuses a
+ * buffer of fewer than 0x46c0 bytes whatever row count it is asked for, which
+ * is exactly the metadata area plus %EXYNOS_ISPFE_FLICKER_ROWS sums.
+ */
+static_assert(sizeof(struct exynos_ispfe_stats_flicker) == 0x46c0);
+/*
+ * And the two offsets inside it, because the size alone does not pin them:
+ * moving a word from @reserved1 to @reserved0 keeps the structure exactly
+ * 0x46c0 bytes and silently publishes a reserved word as the row count.
+ */
+static_assert(offsetof(struct exynos_ispfe_stats_flicker, rows) == 0x24);
+static_assert(offsetof(struct exynos_ispfe_stats_flicker, row_sum) == 0x40);
 
 struct ispfe_lmp_wbg_profile {
 	u32 red;
@@ -7749,10 +7810,31 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		dma_sync_sgtable_for_cpu(ispfe->dev, area->sgt[grid],
 					 DMA_BIDIRECTIONAL);
 
-		if (!desc->written(area->grid[grid]))
+		/*
+		 * Copied first and tested afterwards, so that the test is of
+		 * the bytes the caller will read rather than of the bytes that
+		 * were in the area a moment earlier.  The two are the same
+		 * memory and the second load is not the first: the hardware
+		 * owns the source and a predicate that read it directly would
+		 * be approving one value and publishing another.
+		 *
+		 * That matters because a predicate does not only say yes or
+		 * no.  The flicker result's says how many sums are in it, and
+		 * a consumer indexes the array with the count it is handed --
+		 * so approving a count of 3120 and then copying out a torn
+		 * 0xffffffff would send it past the end of an 18 KiB buffer
+		 * with the flag set to say it may.
+		 *
+		 * The cost is a copy for a grid that turns out not to hold a
+		 * result, which happens only when the hardware wrote nothing
+		 * at all -- and a buffer with no frame behind it never reaches
+		 * this loop.
+		 */
+		memcpy((u8 *)out + desc->offset, area->grid[grid], desc->size);
+
+		if (!desc->written((u8 *)out + desc->offset))
 			continue;
 
-		memcpy((u8 *)out + desc->offset, area->grid[grid], desc->size);
 		out->stats_type |= desc->flag;
 		used = max(used, desc->offset + desc->size);
 	}

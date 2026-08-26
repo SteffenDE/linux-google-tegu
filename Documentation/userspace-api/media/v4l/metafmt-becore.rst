@@ -31,8 +31,11 @@ The driver rejects a buffer at :c:func:`VIDIOC_QBUF` if a block is
 inconsistent, so a mistake is reported against the buffer that carried it:
 every row of the colour matrix must sum to
 ``EXYNOS_BECORE_CCM_ONE``, which is what makes the matrix preserve neutrals;
-the tone curve must not decrease; and the colour LUT's samples must fit
-``EXYNOS_BECORE_CLUT_MAX`` with both ends of its grey axis neutral.
+neither of the tone mapper's two curves may decrease, nor exceed the unity
+each is scaled against -- they are Q15 and Q14 in fields of the same width,
+so a curve sent in the wrong one fits and is twice as steep; and the colour
+LUT's samples must fit ``EXYNOS_BECORE_CLUT_MAX`` with both ends of its grey
+axis neutral.
 
 The sharpener is the exception and is deliberately not checked that way. Its
 values are fixed-point numbers in the hardware's own fields, and a value past

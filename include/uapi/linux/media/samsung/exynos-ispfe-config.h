@@ -448,10 +448,22 @@ struct exynos_ispfe_stats_ae {
 };
 
 /*
- * The histogram's four planes, in the order it carries them, and how many bins
- * each has. The bin count is the block's own maximum rather than a choice:
- * `lyric::LmpRgbyHistogramStatsOutput::Make` refuses anything above it, and the
- * planes sit exactly that far apart.
+ * The histogram's four planes, in the order it carries them, and how far apart
+ * they sit.
+ *
+ * %EXYNOS_ISPFE_HISTOGRAM_BINS is the **buffer's** stride and the block's
+ * maximum, not how many bins are in use. The block takes a bin count as a
+ * power of two and the recipes program 256, while the planes stay 512 apart
+ * regardless -- so the upper half of every plane is never written and reads
+ * back as the zeros the driver left. A consumer that walks all 512 gets the
+ * right answer for a distribution; one that divides by the array length does
+ * not.
+ *
+ * That is a configuration and not a limit: Lyric's own default is 512, and the
+ * count travels with a `block_size` word the hardware requires to equal
+ * `16 << log2(bins)` -- four planes of four bytes a bin. Nothing here can raise
+ * it, because the count lives in the front end's replayed program rather than
+ * in this interface, and no captured program has ever used 512.
  */
 #define EXYNOS_ISPFE_HISTOGRAM_RED		0
 #define EXYNOS_ISPFE_HISTOGRAM_GREEN		1
@@ -476,6 +488,8 @@ struct exynos_ispfe_stats_ae {
  * The block writes **three** of these, one per region of interest, and this
  * interface carries the first. The other two are allocated and written and
  * nothing reads them; what the three regions are is not decoded.
+ *
+ * Only the first 256 bins of each plane are written; see the note above.
  *
  * @total is what says a buffer holds a result: it counts samples rather than
  * values, so it is nonzero for any frame the hardware wrote, including a black

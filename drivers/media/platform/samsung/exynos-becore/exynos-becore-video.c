@@ -893,6 +893,119 @@ static void becore_video_negotiate(const struct becore_device *becore,
 	scaled->height = becore_video_clamp(scaled->height, chain->height);
 }
 
+/*
+ * The whole geometry, said in the units the selection API says it in.
+ *
+ * Three rectangles, and what each one means here:
+ *
+ * %V4L2_SEL_TGT_CROP_BOUNDS and %V4L2_SEL_TGT_CROP_DEFAULT are both the array
+ * -- "what the driver writer considers the complete picture", which for a
+ * Bayer array with no optical-black region is all of it.  They are equal on
+ * purpose: the API's own way of asking "is this device cropping?" is to
+ * compare the active rectangle against the default, and a default that moved
+ * with the format would answer no however much was being cropped.
+ *
+ * %V4L2_SEL_TGT_CROP is what becore_rgbp_crop() derives from the chain in
+ * force, so it moves with the requested aspect ratio: a 4:3 output leaves the
+ * array's full height, and a 16:9 one comes back 4208x2368 at (0, 376), which
+ * is the vendor's own 16:9 readout.  That difference from the default *is* the
+ * policy this driver picks on the consumer's behalf, and saying it here is the
+ * whole point of implementing this ioctl.
+ *
+ * The compose targets are the buffer's, all four the whole of it, because
+ * nothing here letterboxes and nothing writes outside the picture.  They are
+ * worth reporting rather than refusing: the API's way of asking "is this
+ * device scaling, and by how much?" is to compare the crop against the
+ * compose, and without them an application has to guess from the format.
+ *
+ * %V4L2_SEL_TGT_COMPOSE_PADDED is among them, and it is the one target here
+ * that states something about the *hardware* rather than about a choice this
+ * driver made: it is "the active area and all padding pixels that are inserted
+ * or modified by hardware", and the scaler's output stride is the width
+ * rounded up to 64, so most formats have padding columns beyond the picture.
+ * Reporting it equal to the compose rectangle asserts the write-DMA never
+ * writes them, which is measured rather than assumed -- poisoning every buffer
+ * before queueing it and reading back what survives leaves the padding
+ * untouched at four geometries with 8, 20, 32 and 48 padding columns, over
+ * 2.1 million padding bytes, while the picture columns carry a live scene.
+ *
+ * **Read-only.**  Nothing here can set a rectangle, and the specification's
+ * "if cropping (composing) is not supported then the active rectangle is not
+ * mutable and it is always equal to the bounds rectangle" does not fit that.
+ * It fits the compose side, where the two *are* equal; the crop side deviates,
+ * because this hardware genuinely crops and it is just not the application's
+ * choice yet.  Reporting the bounds instead
+ * would be a lie about where the picture comes from, and a no-op
+ * %VIDIOC_S_SELECTION that quietly ignored a rectangle would be a worse one --
+ * a consumer asking for digital zoom would get none and no error.  Making it
+ * settable is the change that separates the aspect ratio from the field of
+ * view, and libcamera's own scaler-crop control maps onto exactly this
+ * rectangle.
+ *
+ * Implementing this also makes %VIDIOC_CROPCAP and %VIDIOC_G_CROP valid on
+ * this node, which the V4L2 core answers out of the targets above.
+ */
+static int becore_g_selection(struct file *file, void *priv,
+			      struct v4l2_selection *sel)
+{
+	struct becore_device *becore = video_drvdata(file);
+	struct becore_rect crop;
+	int ret = 0;
+
+	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	/*
+	 * @video_lock, which the core holds here, would be enough on its own --
+	 * both writers of these three take it.  @lock is taken because it is
+	 * what every reader outside this node uses for them, so that a future
+	 * writer that does not go through the video device stays covered.
+	 */
+	mutex_lock(&becore->lock);
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = becore->array.width;
+		sel->r.height = becore->array.height;
+		break;
+	case V4L2_SEL_TGT_CROP:
+		/*
+		 * Cannot fail for a pair this driver installed: every path
+		 * that sets one runs becore_rgbp_crop() first, and the
+		 * compiled-in pair probe starts from yields a valid crop too.
+		 * So the error is defensive, and %EINVAL rather than what
+		 * becore_rgbp_crop() returns, because %ERANGE is a set-side
+		 * answer about @flags.
+		 */
+		if (becore_rgbp_crop(&becore->array, &becore->chain, &crop)) {
+			ret = -EINVAL;
+			break;
+		}
+		sel->r.left = crop.x;
+		sel->r.top = crop.y;
+		sel->r.width = crop.width;
+		sel->r.height = crop.height;
+		break;
+	case V4L2_SEL_TGT_COMPOSE:
+	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+	case V4L2_SEL_TGT_COMPOSE_PADDED:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = becore->scaled.width;
+		sel->r.height = becore->scaled.height;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+	mutex_unlock(&becore->lock);
+
+	return ret;
+}
+
 static int becore_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct becore_device *becore = video_drvdata(file);
@@ -1006,6 +1119,7 @@ static const struct v4l2_ioctl_ops becore_ioctl_ops = {
 	.vidioc_s_fmt_vid_cap = becore_s_fmt,
 	.vidioc_try_fmt_vid_cap = becore_try_fmt,
 	.vidioc_enum_framesizes = becore_enum_framesizes,
+	.vidioc_g_selection = becore_g_selection,
 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
 	.vidioc_create_bufs = vb2_ioctl_create_bufs,
 	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,

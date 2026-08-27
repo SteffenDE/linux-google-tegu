@@ -32,6 +32,7 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/log2.h>
 #include <linux/media/samsung/exynos-becore-config.h>
 #include <linux/math.h>
@@ -161,6 +162,14 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 #define BECORE_C2SERV_LIMIT		1
 
 #define BECORE_RESET_TIMEOUT_US		1000
+
+/*
+ * How long a reset is given once it has missed the bound above.  Two frame
+ * times at this sensor's rate, which is far longer than any reset observed to
+ * complete and short enough that a genuinely stuck one is still an error
+ * rather than a hang.
+ */
+#define BECORE_RESET_LATE_US		50000
 
 #define BECORE_YUVP_STAGE_BLOCKS	(BIT(BECORE_RGBP) | BIT(BECORE_YUVP))
 
@@ -421,18 +430,52 @@ static void becore_issue_reset(struct becore_block *block)
 	writel_relaxed(0, block->base + BECORE_SET_CTRL);
 }
 
-static int becore_wait_reset(struct becore_block *block)
+/*
+ * Wait for one software reset to clear, and tell a late one from a refusing
+ * one.
+ *
+ * The two want different fixes and the millisecond bound this used to have
+ * could not distinguish them: a processor that clears at three milliseconds
+ * and one that never clears both read back 1 when the poll gives up, and
+ * reading 1 was taken to mean the block was refusing.  So a reset that misses
+ * the expected bound is polled to a far more generous one and the outcome is
+ * named -- a warning with how long it actually took, or an error saying it
+ * never cleared at all.
+ *
+ * Waiting the extra time is not merely diagnostic.  A reset that completes is
+ * a reset that completed, and giving up on one that was about to finish is
+ * what turns a slow teardown into a device quarantined until reboot.
+ */
+static int becore_poll_reset(struct device *dev, void __iomem *reg,
+			     const char *name)
 {
+	ktime_t start = ktime_get();
 	u32 value;
 	int ret;
 
-	ret = readl_poll_timeout(block->base + BECORE_SW_RESET, value, !value,
-				  1, BECORE_RESET_TIMEOUT_US);
-	if (ret)
-		dev_err(block->becore->dev, "%s reset timed out (0x%08x)\n",
-			block->name, value);
+	ret = readl_poll_timeout(reg, value, !value, 1,
+				 BECORE_RESET_TIMEOUT_US);
+	if (!ret)
+		return 0;
+
+	ret = readl_poll_timeout(reg, value, !value, 10,
+				 BECORE_RESET_LATE_US);
+	if (!ret) {
+		dev_warn(dev, "%s reset cleared late, after %lld us\n",
+			 name, ktime_us_delta(ktime_get(), start));
+		return 0;
+	}
+
+	dev_err(dev, "%s reset never cleared in %u us (0x%08x)\n",
+		name, BECORE_RESET_LATE_US, value);
 
 	return ret;
+}
+
+static int becore_wait_reset(struct becore_block *block)
+{
+	return becore_poll_reset(block->becore->dev,
+				 block->base + BECORE_SW_RESET, block->name);
 }
 
 static int becore_reset_all(struct becore_device *becore)
@@ -787,17 +830,11 @@ static int becore_c2serv_reset(struct becore_device *becore,
 			       enum becore_c2serv_id id)
 {
 	void __iomem *base = becore->c2serv[id];
-	u32 value;
-	int ret;
 
 	writel_relaxed(1, base + BECORE_C2SERV_SW_RESET);
-	ret = readl_poll_timeout(base + BECORE_C2SERV_SW_RESET, value, !value,
-				 1, BECORE_RESET_TIMEOUT_US);
-	if (ret)
-		dev_err(becore->dev, "%s reset timed out (%#010x)\n",
-			becore_c2serv[id].name, value);
 
-	return ret;
+	return becore_poll_reset(becore->dev, base + BECORE_C2SERV_SW_RESET,
+				 becore_c2serv[id].name);
 }
 
 /*

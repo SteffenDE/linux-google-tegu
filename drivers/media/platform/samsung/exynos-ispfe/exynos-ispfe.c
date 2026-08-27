@@ -1285,9 +1285,15 @@ struct ispfe_source {
  * that stream is on is the device tree's statement rather than a choice
  * userspace makes.
  */
+/*
+ * Sink pads come first, one per camera the device tree describes, in ascending
+ * bank order; the source pad follows them.  So the source's index depends on
+ * how many cameras there are and cannot be a constant -- it is
+ * ispfe->source_pad, and with one camera the layout is the one this driver has
+ * always had, sink 0 and source 1.
+ */
 #define ISPFE_PAD_SINK			0
-#define ISPFE_PAD_SOURCE		1
-#define ISPFE_NUM_PADS			2
+#define ISPFE_MAX_PADS			(CSIS_NUM_LINKS + 1)
 
 /*
  * The receive path does not convert: what the sensor puts on the link is what
@@ -1557,7 +1563,8 @@ struct ispfe_device {
 	struct media_device mdev;
 	struct v4l2_device v4l2_dev;
 	struct v4l2_subdev sd;
-	struct media_pad pads[ISPFE_NUM_PADS];
+	struct media_pad pads[ISPFE_MAX_PADS];
+	u16 source_pad;
 	struct v4l2_async_notifier notifier;
 	/*
 	 * The sensor, and which of its pads the link comes from.  Written by
@@ -5872,7 +5879,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	 * it under a running stream.
 	 */
 	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
-	fmt = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+	fmt = v4l2_subdev_state_get_format(state, ispfe->source_pad);
 	source.width = fmt->width;
 	source.height = fmt->height;
 	v4l2_subdev_unlock_state(state);
@@ -6323,7 +6330,7 @@ static int ispfe_capture_set(void *data, u64 val)
 		if (ret)
 			goto err_power;
 		ret = v4l2_subdev_enable_streams(&ispfe->sd,
-						 ISPFE_PAD_SOURCE, BIT_ULL(0));
+						 ispfe->source_pad, BIT_ULL(0));
 		if (ret)
 			goto err_stop;
 		ispfe->sensor_streaming = true;
@@ -6331,7 +6338,7 @@ static int ispfe_capture_set(void *data, u64 val)
 	}
 
 	ispfe_stop(ispfe);
-	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ispfe->source_pad,
 					  BIT_ULL(0));
 	if (ret)
 		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
@@ -6450,7 +6457,7 @@ static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
 		goto err_stop;
 	}
 
-	ret = v4l2_subdev_enable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+	ret = v4l2_subdev_enable_streams(&ispfe->sd, ispfe->source_pad,
 					 BIT_ULL(0));
 	if (ret)
 		goto err_stop;
@@ -6485,7 +6492,7 @@ static void ispfe_backend_queue_stop(struct ispfe_device *ispfe)
 	cancel_work_sync(&ispfe->backend_fill_work);
 	ispfe_stop(ispfe);
 	cancel_work_sync(&ispfe->backend_fill_work);
-	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ispfe->source_pad,
 					  BIT_ULL(0));
 	if (ret)
 		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
@@ -7532,7 +7539,7 @@ static void ispfe_active_pix(struct ispfe_device *ispfe,
 	struct v4l2_subdev_state *state;
 
 	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
-	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE),
+	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ispfe->source_pad),
 		       pix);
 	v4l2_subdev_unlock_state(state);
 }
@@ -7801,7 +7808,7 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * the first frames and can leave the link's error bits set, which reads
 	 * like a PHY fault and is not one.
 	 */
-	ret = v4l2_subdev_enable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+	ret = v4l2_subdev_enable_streams(&ispfe->sd, ispfe->source_pad,
 					 BIT_ULL(0));
 	if (ret)
 		goto err_stop;
@@ -7851,7 +7858,7 @@ static void ispfe_stop_streaming(struct vb2_queue *q)
 	 * completing by the time the lists are emptied.
 	 */
 	ispfe_stop(ispfe);
-	ret = v4l2_subdev_disable_streams(&ispfe->sd, ISPFE_PAD_SOURCE,
+	ret = v4l2_subdev_disable_streams(&ispfe->sd, ispfe->source_pad,
 					  BIT_ULL(0));
 	if (ret)
 		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
@@ -7898,8 +7905,8 @@ static int ispfe_enum_fmt(struct file *file, void *priv,
 		return -EINVAL;
 
 	state = v4l2_subdev_lock_and_get_active_state(&ispfe->sd);
-	code = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE)->code;
-	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE),
+	code = v4l2_subdev_state_get_format(state, ispfe->source_pad)->code;
+	ispfe_fill_pix(v4l2_subdev_state_get_format(state, ispfe->source_pad),
 		       &pix);
 	v4l2_subdev_unlock_state(state);
 
@@ -9119,10 +9126,11 @@ static struct ispfe_device *sd_to_ispfe(struct v4l2_subdev *sd)
 static int ispfe_sd_init_state(struct v4l2_subdev *sd,
 			       struct v4l2_subdev_state *state)
 {
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
 	struct v4l2_mbus_framefmt *sink =
 		v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
 	struct v4l2_mbus_framefmt *source =
-		v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+		v4l2_subdev_state_get_format(state, ispfe->source_pad);
 
 	sink->code = ISPFE_DEFAULT_CODE;
 	sink->width = ISPFE_DEFAULT_WIDTH;
@@ -9141,8 +9149,10 @@ static int ispfe_sd_enum_mbus_code(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_state *state,
 				   struct v4l2_subdev_mbus_code_enum *code)
 {
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+
 	/* Nothing converts, so the source offers exactly what the sink took. */
-	if (code->pad == ISPFE_PAD_SOURCE) {
+	if (code->pad == ispfe->source_pad) {
 		if (code->index)
 			return -EINVAL;
 		code->code = v4l2_subdev_state_get_format(state,
@@ -9162,10 +9172,12 @@ static int ispfe_sd_enum_frame_size(struct v4l2_subdev *sd,
 				    struct v4l2_subdev_state *state,
 				    struct v4l2_subdev_frame_size_enum *fse)
 {
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+
 	if (fse->index)
 		return -EINVAL;
 
-	if (fse->pad == ISPFE_PAD_SOURCE) {
+	if (fse->pad == ispfe->source_pad) {
 		const struct v4l2_mbus_framefmt *sink =
 			v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
 
@@ -9204,7 +9216,7 @@ static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
 	struct ispfe_device *ispfe = sd_to_ispfe(sd);
 	struct v4l2_mbus_framefmt *sink, *source;
 
-	if (format->pad == ISPFE_PAD_SOURCE)
+	if (format->pad == ispfe->source_pad)
 		return v4l2_subdev_get_fmt(sd, state, format);
 
 	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
@@ -9225,7 +9237,7 @@ static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
 	format->format.xfer_func = V4L2_XFER_FUNC_NONE;
 
 	sink = v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
-	source = v4l2_subdev_state_get_format(state, ISPFE_PAD_SOURCE);
+	source = v4l2_subdev_state_get_format(state, ispfe->source_pad);
 	*sink = format->format;
 	*source = *sink;
 
@@ -9538,6 +9550,9 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 
 	ispfe_link_to_src(ispfe, ispfe_only_link(ispfe));
 
+	/* Sink pads first, one per camera, then the source. */
+	ispfe->source_pad = ispfe->num_links;
+
 	/*
 	 * The first endpoint, for the notifier to bind against -- which is that
 	 * one link's, because there is exactly one endpoint in total.  When a
@@ -9565,8 +9580,13 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	ispfe->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
 	ispfe->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
 	ispfe->sd.entity.ops = &ispfe_subdev_entity_ops;
-	snprintf(ispfe->sd.name, sizeof(ispfe->sd.name), "exynos-ispfe csis%u",
-		 ispfe->src.link);
+	/*
+	 * Not the bank number any more.  One receiver serves all twelve link
+	 * banks, so naming the entity after whichever one a sensor happened to
+	 * arrive on was a statement about the board that stopped being true of
+	 * the entity the moment it could carry more than one.
+	 */
+	strscpy(ispfe->sd.name, "exynos-ispfe csis", sizeof(ispfe->sd.name));
 	v4l2_set_subdevdata(&ispfe->sd, ispfe);
 
 	/*
@@ -9575,8 +9595,8 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	 */
 	ispfe->pads[ISPFE_PAD_SINK].flags = MEDIA_PAD_FL_SINK |
 					    MEDIA_PAD_FL_MUST_CONNECT;
-	ispfe->pads[ISPFE_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
-	ret = media_entity_pads_init(&ispfe->sd.entity, ISPFE_NUM_PADS,
+	ispfe->pads[ispfe->source_pad].flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&ispfe->sd.entity, ispfe->source_pad + 1,
 				     ispfe->pads);
 	if (ret)
 		goto err_v4l2;
@@ -9626,7 +9646,7 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_vdev_entity;
 
-	ret = media_create_pad_link(&ispfe->sd.entity, ISPFE_PAD_SOURCE,
+	ret = media_create_pad_link(&ispfe->sd.entity, ispfe->source_pad,
 				    &ispfe->vdev.entity, 0,
 				    MEDIA_LNK_FL_ENABLED |
 				    MEDIA_LNK_FL_IMMUTABLE);
@@ -9651,7 +9671,7 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	ret = exynos_becore_input_register_graph(ispfe->backend_input,
 						 &ispfe->v4l2_dev,
 						 &ispfe->sd.entity,
-						 ISPFE_PAD_SOURCE);
+						 ispfe->source_pad);
 	if (ret)
 		goto err_params;
 
@@ -10016,7 +10036,7 @@ static void ispfe_remove(struct platform_device *pdev)
 			if (ispfe->sensor_streaming) {
 				ispfe_stop(ispfe);
 				v4l2_subdev_disable_streams(&ispfe->sd,
-							    ISPFE_PAD_SOURCE,
+							    ispfe->source_pad,
 							    BIT_ULL(0));
 				ispfe_sensor_power(ispfe, false);
 				ispfe->sensor_streaming = false;
@@ -10033,7 +10053,7 @@ static void ispfe_remove(struct platform_device *pdev)
 		if (ispfe->sensor_streaming) {
 			ispfe_stop(ispfe);
 			v4l2_subdev_disable_streams(&ispfe->sd,
-						    ISPFE_PAD_SOURCE, BIT_ULL(0));
+						    ispfe->source_pad, BIT_ULL(0));
 			ispfe_sensor_power(ispfe, false);
 			ispfe->sensor_streaming = false;
 			ispfe->owner = ISPFE_OWNER_NONE;

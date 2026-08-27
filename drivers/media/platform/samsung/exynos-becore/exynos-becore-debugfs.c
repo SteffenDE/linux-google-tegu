@@ -1085,6 +1085,16 @@ static int becore_geometry_open(struct inode *inode, struct file *file)
 	return single_open(file, becore_geometry_show, inode->i_private);
 }
 
+/*
+ * All three rasters at once, which is what the offline loop needs and what no
+ * other interface offers.
+ *
+ * **The chain it sets does not survive a `VIDIOC_S_FMT`.** That call derives
+ * the chain from the format's aspect ratio, so the video node and this file
+ * are two ways to set the same thing and the last one wins.  For the loop that
+ * is not a conflict -- it stages frames rather than streaming the node -- but
+ * a chain hand-set here and then followed by an `S_FMT` is gone.
+ */
 static ssize_t becore_geometry_write(struct file *file, const char __user *buf,
 				     size_t count, loff_t *ppos)
 {

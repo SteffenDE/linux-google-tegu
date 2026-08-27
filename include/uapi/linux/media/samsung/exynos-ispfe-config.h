@@ -467,6 +467,19 @@ struct exynos_ispfe_stats_rggb_region {
  * the corrected picture rather than the sensor's raw response -- measured, not
  * taken from the tap's name; see :c:type:`exynos_ispfe_stats_lsc`, which is
  * the grid on the other side of that stage.
+ *
+ * **A sample at the sensor's own maximum reads 32727 here** [HW 2026-08-27],
+ * so that is where this domain ends and %EXYNOS_ISPFE_METERING_SAMPLE_MAX is
+ * forty counts above anything the grid can contain. Two ways, agreeing to
+ * 0.12%: a region where all 1024 samples of a colour sit at the ten-bit
+ * sensor's 1023 reports exactly 32727, and the affine fit of this grid against
+ * a raw frame of the same scene -- 34.09 counts per raw count with the black
+ * level at 64.1 -- predicts 34.09 * (1023 - 64.1) = 32689 for that sample.
+ *
+ * It is worth stating because it is the number a consumer normalises by, and
+ * because the range is *not* the fourteen bits a mean over a normal scene
+ * suggests: a metering domain whose top is assumed at 16383 calls a ninth of
+ * an ordinary frame clipped, and an exposure loop built on that under-exposes.
  */
 struct exynos_ispfe_stats_ae_region {
 	__s32 sum[4];

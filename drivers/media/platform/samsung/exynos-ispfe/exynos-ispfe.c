@@ -1597,13 +1597,21 @@ struct ispfe_device {
 	 */
 	u32 stats_stale;
 	/*
-	 * This node's own buffer counter, not the front end's frame counter.
-	 * A buffer that carries no frame still has to be numbered, and the
-	 * raw node's start_streaming resets the frame counter -- so numbering
-	 * buffers with it would step backwards both at the start of a session
-	 * and whenever a raw capture is restarted under a consumer that kept
-	 * streaming.  Which frame a buffer describes is said by its timestamp
-	 * and by frame_sequence in the buffer itself.
+	 * The last frame number published on this node, which is what a
+	 * buffer's `sequence` carries -- V4L2's sequence is the frame number,
+	 * and a consumer pairing a frame with the settings it was taken at has
+	 * nothing else it can read without mapping the payload.
+	 *
+	 * Held here rather than taken from ispfe->sequence at publish time
+	 * because a buffer that carries no frame still has to be numbered, and
+	 * it repeats this instead of inventing one.
+	 *
+	 * It restarts when the *front end's* stream does, which is a real
+	 * discontinuity for a consumer that keeps this node streaming across
+	 * two captures: the frame counter is per stream, so a second capture
+	 * numbers from zero again.  That is the same discontinuity
+	 * frame_sequence in the payload has always had, and the buffer's
+	 * timestamp is the pairing key that survives it.
 	 */
 	u32 stats_sequence;
 	/*
@@ -8018,8 +8026,25 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		used = max(used, desc->offset + desc->size);
 	}
 
+	/*
+	 * V4L2's `sequence` is the frame number, so that is what this carries:
+	 * a consumer pairing a frame with the sensor settings it was taken at
+	 * has nothing else to go on, and it cannot read the payload -- on a
+	 * split pipeline the half that owns the sensor is not the half that
+	 * maps statistics.
+	 *
+	 * A buffer with no frame behind it repeats the last frame's number
+	 * rather than inventing one.  That keeps the sequence non-decreasing,
+	 * which is the one thing a queue may not break, and it costs nothing to
+	 * read: such a buffer is published only when no statistics are coming at
+	 * all, never during a capture, and it says so itself with no
+	 * measurement flags set and @frame_sequence zero.
+	 */
+	if (area)
+		ispfe->stats_sequence = area->sequence;
+
 	buf->vb.vb2_buf.timestamp = area ? area->timestamp : ktime_get_ns();
-	buf->vb.sequence = ispfe->stats_sequence++;
+	buf->vb.sequence = ispfe->stats_sequence;
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, used);
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 }
@@ -8059,7 +8084,7 @@ static bool ispfe_stats_producing(const struct ispfe_device *ispfe)
  * All six sites that queue this item name that one workqueue, and they have to:
  * a work_struct split across two of them can run on two CPUs at once, because
  * the non-reentrancy check compares the pool's workqueue against the queueing
- * one.  ispfe_stats_publish() increments @stats_sequence outside @slock and is
+ * one.  ispfe_stats_publish() updates @stats_sequence outside @slock and is
  * the one field here that relies on there being a single instance.
  */
 static void ispfe_stats_work_fn(struct work_struct *work)

@@ -7784,6 +7784,19 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 
 err_stop:
 	ispfe_stop(ispfe);
+	/*
+	 * This is the only label a fill can have run under -- the others are
+	 * reached before ispfe_queue_fill() is called, and so is this one's
+	 * geometry check, which makes the wait a no-op there rather than
+	 * wrong.  It is needed because the work item holds a buffer off all
+	 * three lists for the length of an encode, so a copy running now would
+	 * still be holding one when they are emptied below, and vb2 would take
+	 * that buffer back from under it.  ispfe_stop() has freed the
+	 * interrupts, so nothing queues the work again once this returns.
+	 * ispfe_stop_streaming() waits at the same point and for the same
+	 * reason.
+	 */
+	cancel_work_sync(&ispfe->fill_work);
 err_power:
 	ispfe_sensor_power(ispfe, false);
 err_pipeline:

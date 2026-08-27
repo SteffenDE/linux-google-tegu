@@ -540,8 +540,8 @@ struct ispfe_pdma_output {
 	size_t size;
 	/*
 	 * An LMP image destination rather than a completion or statistics
-	 * area.  The driver does not run these: the encoder clears the gate
-	 * and zeroes the address slot of every one of them, so they are named
+	 * area.  The driver does not run these: it states no gate for any of
+	 * them and the encoder zeroes their address slots, so they are named
 	 * only because the recipes' relocation tables name them, and they have
 	 * no size and no allocation.
 	 */
@@ -569,7 +569,8 @@ struct ispfe_awb_snapshot_file {
  * Outputs 10--12 are the LMP's processed-image destinations --
  * planar linear RGB, YUV420 ML output 0 and interleaved RGB888 ML output 2 --
  * which nothing on this driver's path reads, so they are named without a size:
- * the encoder gates all three off and writes a null address for each.
+ * no gate is stated for any of the three and the encoder writes a null address
+ * for each.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -2971,31 +2972,54 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_GATE_HDR_STATS	BIT(17)
 
 /*
- * Where the enable word sits, and the end of the entry that carries it: the
- * driver reaches no further into the record than batch entry 0, and 0xc8 is
- * exactly 0x20 + 0xa8.
+ * The two words of batch entry 0 the driver states, and the end of the entry
+ * that carries them: it reaches no further into the record than entry 0, and
+ * 0xc8 is exactly 0x20 + 0xa8.
  */
 #define ISPFE_LMP_OUTPUT_GATES_AT	0x20
+#define ISPFE_LMP_BATCH_IRQS_AT		0x24
 #define ISPFE_LMP_BATCH_CONFIG_MIN	0xc8
 
-/* The three image destinations, which this driver has no reader for at all. */
-#define ISPFE_LMP_TAPOUT_GATES		(ISPFE_LMP_GATE_RGB_OUTPUT | \
-					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
-					 ISPFE_LMP_GATE_ML_OUTPUT2)
-
 /*
- * What both raw recipes were captured with: the six statistics the front end
- * emits, plus the three image destinations.  The back-end recipe's own word is
- * this and the two the back-end producer needs.
+ * What this driver runs: the six statistics taps the front end publishes.  The
+ * back-end producer's two are added per stream below.
  */
-#define ISPFE_LMP_CAPTURED_OUTPUT_GATES	(ISPFE_LMP_GATE_AWB_STATS | \
+#define ISPFE_LMP_STATISTICS_GATES	(ISPFE_LMP_GATE_AWB_STATS | \
 					 ISPFE_LMP_GATE_LSC_STATS | \
 					 ISPFE_LMP_GATE_FLICKER_STATS | \
 					 ISPFE_LMP_GATE_HISTOGRAM | \
 					 ISPFE_LMP_GATE_POST_LSC_AE | \
-					 ISPFE_LMP_GATE_MOTION_METERING | \
-					 ISPFE_LMP_TAPOUT_GATES)
-static_assert(ISPFE_LMP_CAPTURED_OUTPUT_GATES == 0x0000b1f8);
+					 ISPFE_LMP_GATE_MOTION_METERING)
+static_assert(ISPFE_LMP_STATISTICS_GATES == 0x000001f8);
+
+/*
+ * And what it does not: the three image destinations the vendor's own programs
+ * enable -- a small linear RGB frame and two machine-learning ones -- which
+ * nothing here reads.  Named rather than merely omitted, because the same
+ * three have to stay absent from three separate places: this word, the DRAM
+ * write-interface mask further down, and the encoder's own output table.
+ *
+ * There is no relation between the first two to assert -- they are different
+ * bit spaces, three interfaces to one destination -- so both are pinned to a
+ * literal instead, which makes a change to either a deliberate edit rather
+ * than a drift.  The disjointness below is the one mistake that *is*
+ * expressible: a tapout bit finding its way into the word the driver builds.
+ */
+#define ISPFE_LMP_TAPOUT_GATES		(ISPFE_LMP_GATE_RGB_OUTPUT | \
+					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
+					 ISPFE_LMP_GATE_ML_OUTPUT2)
+static_assert(ISPFE_LMP_TAPOUT_GATES == 0x0000b000);
+static_assert(!(ISPFE_LMP_STATISTICS_GATES & ISPFE_LMP_TAPOUT_GATES));
+
+/*
+ * The interrupt word's own bits, in the field order
+ * `BatchPdpInterruptEnableValue::Print` walks.  Register-update and
+ * end-of-frame are the pair the front end's ISR services.  The only other
+ * value in the corpus adds bit 4, the CDAF window interrupt, on the one camera
+ * whose programs run CDAF at all.
+ */
+#define ISPFE_LMP_BATCH_IRQ_REG_UPDATE	BIT(0)
+#define ISPFE_LMP_BATCH_IRQ_EOF		BIT(1)
 #define ISPFE_LMP_DPC_CONFIG_SIZE	0x5c
 #define ISPFE_LMP_DPC_GAIN_MAX		GENMASK(9, 0)
 #define ISPFE_LMP_WBG_CONFIG_SIZE	0x18
@@ -3108,10 +3132,17 @@ static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
 #define ISPFE_LMP_SCALERS_APPLIED	(ISPFE_LMP_SCALER_APPLIED | \
 					 ISPFE_LMP_RGB_SCALER_APPLIED)
 
-/* The interfaces of the three image destinations this driver does not run. */
+/*
+ * The interfaces of the same three image destinations %ISPFE_LMP_TAPOUT_GATES
+ * names -- the RGB tapout and output formatters 0 and 2, three interfaces
+ * each.  Pinned to a literal for the reason given there: nothing can assert
+ * that these are the same three destinations, so the pair of literals is what
+ * makes dropping one of them from either list a deliberate edit.
+ */
 #define ISPFE_LMP_TAPOUT_IFS		(GENMASK_ULL(4, 2) | \
 					 GENMASK_ULL(8, 6) | \
 					 GENMASK_ULL(14, 12))
+static_assert(ISPFE_LMP_TAPOUT_IFS == 0x00000000000071dcULL);
 /*
  * What both raw recipes were captured with, and the back-end recipe's own word
  * is this plus the alignment formatter's two.  Held as literals because this
@@ -3405,9 +3436,9 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		break;
 	case ISPFE_LMP_BATCH_CONFIG_REG:
 		/*
-		 * The gate word is not written here: ispfe_pdma_apply_gates()
-		 * owns it for both recipes, so that two functions cannot
-		 * disagree about one word.
+		 * The gate and interrupt words are not written here:
+		 * ispfe_pdma_apply_batch() owns them for both recipes, so that
+		 * two functions cannot disagree about one word.
 		 */
 		if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN)
 			return -EINVAL;
@@ -3489,18 +3520,19 @@ static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
  * State which DRAM write interfaces are live, rather than replaying the word a
  * capture came with.
  *
- * Clearing a destination's gate stops the write; it does not withdraw the
+ * A destination with no gate is not written; that does not withdraw the
  * interface the line-memory processor reserved for it.  Lyric never leaves the
  * two disagreeing -- `GetActiveDramInterfaces` rebuilds this word from the same
  * per-block enables that decide the gates -- so a program whose gate word says
  * a destination is off while this word still claims its interfaces is a shape
  * no capture contains.
  *
- * Only bits are cleared, and only ones belonging to the three image
- * destinations whose gates the encoder clears in the same pass.  The word is
- * checked against the two shapes the captured recipes carry first, so a future
- * capture whose interfaces differ is refused rather than re-derived on an
- * assumption about the other 44 bits.
+ * Only bits are cleared, and only ones belonging to the same three image
+ * destinations %ISPFE_LMP_TAPOUT_GATES names: the batch record's enable word
+ * is built without those three, and this is the other half of saying so.  The
+ * word is checked against the two shapes the captured recipes carry first, so a
+ * future capture whose interfaces differ is refused rather than re-derived on
+ * an assumption about the other 44 bits.
  */
 static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 				       const struct ispfe_pdma_cmd *cmd,
@@ -3527,47 +3559,61 @@ static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 }
 
 /*
- * State which LMP destinations run, rather than replaying the word a capture
- * came with.
+ * Build the batch record, rather than editing a captured one.
  *
- * Three of the destinations the vendor's programs enable are image tapouts --
- * a small linear RGB image and two machine-learning ones -- and nothing this
- * driver has reads any of them.  Leaving them enabled would cost 5.1 MiB of
- * coherent memory and about a megabyte of DMA writes per frame for a picture
- * with no consumer, so they never run.
+ * It is a structure and not a tuning: a 0x20-byte header of plane offsets and
+ * sixteen 0xa8-byte entries, each an enable word, an interrupt word and twenty
+ * 64-bit destination addresses.  Every captured program has a batch size of
+ * one, so entry 0 is the whole of it and the other fifteen are zero.  The
+ * addresses are relocations, and the plane offsets belong to the linear RGB
+ * frame and the three machine-learning outputs -- destinations this driver
+ * does not run, whose base addresses the encoder nulls in the same pass, so an
+ * offset from one of them describes nothing and is left at zero too.
  *
- * Only bits are cleared here, and only ones whose address slot the encoder
- * zeroes in the same pass: gate clear with a null address is the vendor's own
- * way of not writing a destination, and the corpus shows it on five of them.
+ * That leaves two words for this function, and the recipe therefore carries no
+ * bytes at all for the record: the encoder blanks the whole 0xaa0, and what
+ * reaches the hardware is these two words and the relocated addresses.
  *
- * The word is checked against the two shapes the captured recipes carry before
- * anything is changed, so a future capture whose gates differ is refused rather
- * than re-gated on an assumption about the rest of the word.
+ * The enable word is one bit per destination.  Three of the ones the vendor's
+ * programs set are the image tapouts above; leaving them on would cost 5.1 MiB
+ * of coherent memory and about a megabyte of DMA writes per frame for a
+ * picture with no consumer, so they are simply not in the word.
+ *
+ * Stating the word rather than masking a replayed one moves a check earlier
+ * rather than losing it.  The recipe generator lists every non-zero word of
+ * the captured record that no relocation covers, so a capture whose enable or
+ * interrupt word differs from these changes the generated header -- and the
+ * rule that regenerating the recipes must leave the tree clean is what catches
+ * it, at generation time instead of at STREAMON.
  */
-static int ispfe_pdma_apply_gates(struct ispfe_device *ispfe,
+static int ispfe_pdma_apply_batch(struct ispfe_device *ispfe,
 				  const struct ispfe_pdma_cmd *cmd,
 				  u8 *payload, bool *applied)
 {
-	u32 gates;
+	u32 gates = ISPFE_LMP_STATISTICS_GATES;
 
 	if (!ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_BATCH_CONFIG_REG0))
 		return 0;
 	if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN || *applied)
 		return -EINVAL;
 
-	gates = get_unaligned_le32(payload + ISPFE_LMP_OUTPUT_GATES_AT);
-	if (gates != ISPFE_LMP_CAPTURED_OUTPUT_GATES &&
-	    gates != (ISPFE_LMP_CAPTURED_OUTPUT_GATES |
-		      ISPFE_LMP_BACKEND_OUTPUT_GATE |
-		      ISPFE_LMP_TNR_OUTPUT_GATE))
-		return -EINVAL;
-
-	if (ispfe->prog->patch_backend_output &&
-	    ispfe->active_backend_side_output)
+	/*
+	 * The producer's two follow the one flag that already decides whether
+	 * this stream feeds it -- unconditional on the back-end recipe, which
+	 * exists for it, and a switch on the full-readout raw one, which can
+	 * carry it as a side output.  Asking the same question a second way
+	 * here would let the gate and the address disagree: a gate set for a
+	 * stream this flag calls off would leave the encoder writing no address
+	 * beside it.
+	 */
+	if (ispfe->active_backend_side_output)
 		gates |= ISPFE_LMP_BACKEND_OUTPUT_GATE |
 			 ISPFE_LMP_TNR_OUTPUT_GATE;
-	gates &= ~ISPFE_LMP_TAPOUT_GATES;
+
 	put_unaligned_le32(gates, payload + ISPFE_LMP_OUTPUT_GATES_AT);
+	put_unaligned_le32(ISPFE_LMP_BATCH_IRQ_REG_UPDATE |
+			   ISPFE_LMP_BATCH_IRQ_EOF,
+			   payload + ISPFE_LMP_BATCH_IRQS_AT);
 	*applied = true;
 
 	return 0;
@@ -4051,10 +4097,18 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 				return -EINVAL;
 			at += PDMA_CMD_INLINE_BURST_HEAD;
 			payload = program + at;
+			/*
+			 * A command with no payload is @len bytes of zero, so
+			 * that is what a staged program has to carry there:
+			 * the recipe holds no captured bytes to compare
+			 * against, and the encoder's apply functions write
+			 * whatever the driver states on top afterwards.
+			 */
 			for (j = 0; j < cmd->len; j++)
 				if (!ispfe_pdma_reloc_byte(prog, i, j) &&
 				    !ispfe_pdma_geometry_byte(cmd, j) &&
-				    payload[j] != cmd->payload[j])
+				    payload[j] != (cmd->payload ?
+						   cmd->payload[j] : 0))
 					return -EINVAL;
 			switch (cmd->reg) {
 			case ISPFE_LMP_DDS_CONFIG_REG:
@@ -4066,7 +4120,8 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 				 * DDS is therefore part of the captured hardware
 				 * envelope, not editable output geometry.
 				 */
-				if (get_unaligned_le32(payload) !=
+				if (!cmd->payload ||
+				    get_unaligned_le32(payload) !=
 				    get_unaligned_le32(cmd->payload))
 					return -EINVAL;
 				break;
@@ -4127,7 +4182,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	unsigned int lmp_stats_configs = 0;
 	bool lmp_dpc_applied = false;
 	bool lmp_histogram_applied = false;
-	bool lmp_gates_applied = false;
+	bool lmp_batch_applied = false;
 	bool lmp_active_ifs_applied = false;
 	unsigned int lmp_scalers_applied = 0;
 	unsigned int i;
@@ -4244,12 +4299,12 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		/*
 		 * Applied to a staged program too, because it is what decides
 		 * whether a destination the driver has not allocated is
-		 * enabled.  A staged program cannot have moved the word:
+		 * enabled.  A staged program cannot have moved either word:
 		 * ispfe_pdma_staged_validate() already holds every byte of it
 		 * that is neither a relocation nor scaler geometry.
 		 */
-		ret = ispfe_pdma_apply_gates(ispfe, cmd, program + at,
-					     &lmp_gates_applied);
+		ret = ispfe_pdma_apply_batch(ispfe, cmd, program + at,
+					     &lmp_batch_applied);
 		if (ret)
 			return ret;
 		/*
@@ -4272,9 +4327,9 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 				return -EINVAL;
 			/*
 			 * A destination this stream is not running gets the
-			 * null address that goes with its cleared gate, which
-			 * is how every captured program leaves the five it
-			 * does not write.
+			 * null address that goes with having no gate, which is
+			 * how every captured program leaves the five it does
+			 * not write.
 			 */
 			if (ispfe_pdma_buffer_gated(ispfe, reloc->buffer)) {
 				dma = 0;
@@ -4346,11 +4401,12 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		return -EINVAL;
 	}
 	/*
-	 * And for the batch record, whose gate word says which destinations
-	 * run: a recipe without it would leave three of them enabled against
-	 * memory this driver has not allocated.
+	 * And for the batch record, which the driver builds entirely: a recipe
+	 * without it would leave every destination gated off and no frame
+	 * interrupt enabled, since the words that say otherwise are written
+	 * here and nowhere else.
 	 */
-	if (!lmp_gates_applied) {
+	if (!lmp_batch_applied) {
 		dev_err(ispfe->dev, "PDMA recipe is missing the batch record\n");
 		return -EINVAL;
 	}

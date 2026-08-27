@@ -5787,6 +5787,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 
 	/* A new attempt invalidates every result published by an older session. */
 	WRITE_ONCE(ispfe->snapshot_state, ISPFE_SNAPSHOT_IDLE);
+
 	if (backend_consumer != !!stream_config)
 		return -EINVAL;
 
@@ -5961,6 +5962,23 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	if (ret)
 		goto err_backend_early;
 
+	/*
+	 * The frame counter belongs to the stream, so it restarts with the
+	 * others rather than on the one path that used to do it.  Only
+	 * ispfe_start_streaming() reset it, which made it a boot-lifetime
+	 * counter for every other owner: two back-to-back back-end streams
+	 * reported the hardware's own frame_id as 93 both times -- it does
+	 * restart -- while this counter went 1397 and then 1548, growing by 151
+	 * against the 150 frames streamed in between.  A number that does not
+	 * restart with the thing it counts cannot be paired with anything, and
+	 * V4L2's `sequence` is the frame number.
+	 *
+	 * Here and not earlier in this function because ispfe_frame_sync()
+	 * states as a property that this and frame_start reset together, and a
+	 * start refused by one of the validation returns above would otherwise
+	 * zero one and not the other.
+	 */
+	ispfe->sequence = 0;
 	atomic_set(&ispfe->frame_start, 0);
 	atomic_set(&ispfe->frame_end, 0);
 	atomic_set(&ispfe->fc_events, 0);
@@ -7648,7 +7666,6 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto err_return;
 
-	ispfe->sequence = 0;
 	ispfe->owner = ISPFE_OWNER_V4L2;
 
 	ret = ispfe_sensor_power(ispfe, true);

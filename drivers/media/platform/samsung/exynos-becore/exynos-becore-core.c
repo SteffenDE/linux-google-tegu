@@ -163,6 +163,9 @@ static u32 becore_c2serv_token(const u32 *requested, const u32 *captured,
 
 #define BECORE_RESET_TIMEOUT_US		1000
 
+/* What Lyric gives its own reset polls, and most of a frame at this rate. */
+#define BECORE_C2SERV_FLUSH_US		20000
+
 /*
  * How long a reset is given once it has missed the bound above.  Two frame
  * times at this sensor's rate, which is far longer than any reset observed to
@@ -1097,6 +1100,26 @@ static void becore_c2serv_link_start(struct becore_device *becore)
 	becore_c2serv_link_sample(becore, &becore->c2serv_armed);
 }
 
+/*
+ * Wait for one VOTF endpoint to stop being busy after a flush.
+ *
+ * The bound is Lyric's own for a reset poll -- 20 ms, most of a frame -- and a
+ * timeout is a warning rather than an error: the teardown continues either
+ * way, and an endpoint that will not go idle produces a failed reset
+ * downstream that says so on its own.
+ */
+static void becore_c2serv_wait_idle(struct becore_device *becore,
+				    void __iomem *busy, const char *window,
+				    const char *what, unsigned int plane)
+{
+	u32 value;
+
+	if (readl_poll_timeout(busy, value, !value, 1, BECORE_C2SERV_FLUSH_US))
+		dev_warn(becore->dev,
+			 "%s %s plane %u still busy %#x after its flush\n",
+			 window, what, plane, value);
+}
+
 static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
 {
 	void __iomem *tws_base = becore->c2serv[BECORE_C2SERV_YUVP];
@@ -1116,6 +1139,33 @@ static void becore_c2serv_link_stop(struct becore_device *becore, bool failed)
 				  BECORE_C2SERV_TRS_FLUSH);
 		writel_relaxed(1, tws_base + BECORE_C2SERV_TWS(n) +
 				  BECORE_C2SERV_TWS_FLUSH);
+	}
+
+	/*
+	 * A flush is a request, not an act, and this waits for it.
+	 *
+	 * Every endpoint carries a `busy` bit, and after a stream killed
+	 * mid-frame both ends of this link report it set with the ring empty --
+	 * a producer holding an unfinished token and a consumer waiting for one
+	 * that will never come.  Writing flush and moving straight on to take
+	 * the enables and the ring away left them there, and neither the
+	 * windows nor the two processors whose FIFOs feed them would then
+	 * complete a software reset: the device was quarantined until reboot.
+	 *
+	 * So the endpoints are given the same bound Lyric gives its own resets
+	 * to go idle before anything else is touched.  One that does not is
+	 * reported rather than waited on forever, because the teardown has to
+	 * finish either way.
+	 */
+	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {
+		becore_c2serv_wait_idle(becore, tws_base + BECORE_C2SERV_TWS(n) +
+					BECORE_C2SERV_TWS_BUSY,
+					becore_c2serv[BECORE_C2SERV_YUVP].name,
+					"tws", n);
+		becore_c2serv_wait_idle(becore, trs_base + BECORE_C2SERV_TRS(n) +
+					BECORE_C2SERV_TRS_BUSY,
+					becore_c2serv[BECORE_C2SERV_MCSC].name,
+					"trs", n);
 	}
 
 	for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++) {

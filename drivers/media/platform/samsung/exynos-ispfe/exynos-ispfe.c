@@ -590,6 +590,12 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
 /*
+ * The same grid a second time, from the tap the shading estimate is computed
+ * from.  Lyric allocates this one and the white balance one from a single
+ * call, so the two are one writer's output twice over.
+ */
+#define ISPFE_PDMA_OUTPUT_LSC		5
+/*
  * The histogram block writes three regions of interest through one gate, and
  * the recipes relocate all three.  This is the first; nothing reads the others.
  */
@@ -640,7 +646,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_AE		1
 #define ISPFE_STATS_GRID_HISTOGRAM	2
 #define ISPFE_STATS_GRID_FLICKER	3
-#define ISPFE_STATS_GRIDS		4
+#define ISPFE_STATS_GRID_LSC		4
+#define ISPFE_STATS_GRIDS		5
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -804,10 +811,19 @@ static const struct ispfe_stats_grid {
 		.clear = offsetofend(struct exynos_ispfe_stats_flicker,
 				     reserved1),
 	},
+	[ISPFE_STATS_GRID_LSC] = {
+		.output = ISPFE_PDMA_OUTPUT_LSC,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, lsc),
+		.size = sizeof(struct exynos_ispfe_stats_lsc),
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
+		.flag = EXYNOS_ISPFE_STATS_LSC,
+		.written = ispfe_stats_grid_written,
+	},
 };
 
 static_assert(sizeof(struct exynos_ispfe_stats_awb) == ISPFE_STATS_GRID_BYTES);
 static_assert(sizeof(struct exynos_ispfe_stats_ae) == ISPFE_STATS_GRID_BYTES);
+static_assert(sizeof(struct exynos_ispfe_stats_lsc) == ISPFE_STATS_GRID_BYTES);
 /*
  * The layout closes against the vendor's own bound: `LmpRgbyHistogramStatsOutput`
  * refuses a buffer of 258 32-byte units or fewer, and this is the smallest that

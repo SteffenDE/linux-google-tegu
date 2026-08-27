@@ -44,13 +44,18 @@ enum exynos_ispfe_stats_version {
  *	The post-shading auto exposure grid, :c:type:`exynos_ispfe_stats_ae`
  *
  * %EXYNOS_ISPFE_STATS_HISTOGRAM:
- *	The per-pixel RGBY histogram is present, in @histogram.
+ *	The per-pixel RGBY histogram of the first region of interest is
+ *	present, in @histogram.
  * %EXYNOS_ISPFE_STATS_FLICKER:
  *	The per-row sums are present, in @flicker.
  * %EXYNOS_ISPFE_STATS_LSC:
  *	The lens shading grid, :c:type:`exynos_ispfe_stats_lsc`
  * %EXYNOS_ISPFE_STATS_MOTION:
  *	The motion metering map, :c:type:`exynos_ispfe_stats_motion`
+ * %EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1:
+ *	The histogram of the second region of interest, in @histogram_roi1
+ * %EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2:
+ *	The histogram of the third, in @histogram_roi2
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
@@ -58,6 +63,8 @@ enum exynos_ispfe_stats_version {
 #define EXYNOS_ISPFE_STATS_FLICKER		(1U << 3)
 #define EXYNOS_ISPFE_STATS_LSC			(1U << 4)
 #define EXYNOS_ISPFE_STATS_MOTION		(1U << 5)
+#define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1	(1U << 6)
+#define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2	(1U << 7)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -557,6 +564,8 @@ struct exynos_ispfe_stats_lsc {
 #define EXYNOS_ISPFE_HISTOGRAM_LUMA		3
 #define EXYNOS_ISPFE_HISTOGRAM_PLANES		4
 #define EXYNOS_ISPFE_HISTOGRAM_BINS		512
+/* How many regions of interest the block meters, each into its own result. */
+#define EXYNOS_ISPFE_HISTOGRAM_ROIS		3
 /* The bits of @exynos_ispfe_stats_histogram.bins_log2 that carry the count. */
 #define EXYNOS_ISPFE_HISTOGRAM_BINS_MASK	0x1f
 
@@ -577,8 +586,19 @@ struct exynos_ispfe_stats_lsc {
  * an exposure algorithm that wants constraint modes needs this one.
  *
  * The block writes **three** of these, one per region of interest, and this
- * interface carries the first. The other two are allocated and written and
- * nothing reads them; what the three regions are is not decoded.
+ * interface carries all three: this structure is the first, and
+ * @exynos_ispfe_stats_buffer.histogram_roi1 and
+ * @exynos_ispfe_stats_buffer.histogram_roi2 are the other two. They are three
+ * independent windows on one frame, so what separates them is the region each
+ * was given -- and **every recipe gives all three the same region**, so as
+ * shipped the three results describe the same pixels. That makes them a
+ * measurement of the path rather than of the picture: three writes by one
+ * block into three allocations, which have to agree bin for bin, and a
+ * disagreement is a torn copy rather than a scene.
+ *
+ * %EXYNOS_ISPFE_HISTOGRAM_ROIS is the count. Their geometry is not in this
+ * interface -- like the grids' regions it comes from the format -- and nothing
+ * lets a consumer choose it yet.
  *
  * **Only the first ``1 << (@bins_log2 & 0x1f)`` bins of each plane are
  * written**, and the recipes program 256 where the stride is 512. Take the
@@ -794,6 +814,10 @@ struct exynos_ispfe_stats_motion {
  * @lsc: The lens shading grid, valid when %EXYNOS_ISPFE_STATS_LSC is set
  * @motion: The motion metering map, valid when %EXYNOS_ISPFE_STATS_MOTION is
  *	set
+ * @histogram_roi1: The histogram of the second region of interest, valid when
+ *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1 is set
+ * @histogram_roi2: The histogram of the third, valid when
+ *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2 is set
  *
  * One buffer is one frame's statistics. Which frame is said twice, and neither
  * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
@@ -828,6 +852,13 @@ struct exynos_ispfe_stats_buffer {
 	struct exynos_ispfe_stats_flicker flicker;
 	struct exynos_ispfe_stats_lsc lsc;
 	struct exynos_ispfe_stats_motion motion;
+	/*
+	 * The three regions of interest are not an array, because @histogram
+	 * is where it has always been and a version's layout only ever grows
+	 * at the end.  They are one block's three results all the same.
+	 */
+	struct exynos_ispfe_stats_histogram histogram_roi1;
+	struct exynos_ispfe_stats_histogram histogram_roi2;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

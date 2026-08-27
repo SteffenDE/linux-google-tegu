@@ -15,8 +15,8 @@ results to its statistics metadata capture video node, using the
 :c:type:`v4l2_meta_format` interface. One buffer holds one frame's results,
 described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid,
 the lens shading grid and the post-shading auto exposure grid, each 64 x 48
-regions over the picture, a per-pixel RGBY histogram of a region of it, a
-motion metering map and one sum per row of it.
+regions over the picture, three per-pixel RGBY histograms of three regions of
+it, a motion metering map and one sum per row of it.
 
 They are complementary rather than alternatives, because each resolves the
 frame along a different axis and none is derivable from another. A grid gives a
@@ -29,6 +29,13 @@ picture.
 Two of the grids carry the same record because one hardware writer produces
 both, and what separates them is where each is metered and what each was told
 to exclude.
+
+The three histograms are one block's three regions of interest, and the
+driver's programs give all three the same region -- so as shipped they describe
+the same pixels three times, through three separate writes. Until something can
+place them, that is what they are worth: three results that have to agree bin
+for bin, and a disagreement that says a copy crossed a frame boundary, without
+knowing anything about the scene.
 
 The motion metering map is the one result that is a picture: a small greyscale
 image of the frame -- 128 x 96 as the driver's programs ask for it -- with one

@@ -597,9 +597,11 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_PDMA_OUTPUT_LSC		5
 /*
  * The histogram block writes three regions of interest through one gate, and
- * the recipes relocate all three.  This is the first; nothing reads the others.
+ * the recipes relocate all three.  They are consecutive.
  */
 #define ISPFE_PDMA_OUTPUT_HISTOGRAM	6
+#define ISPFE_PDMA_OUTPUT_HISTOGRAM_ROI1	7
+#define ISPFE_PDMA_OUTPUT_HISTOGRAM_ROI2	8
 /*
  * The flicker block's destination is named twice by the recipe -- once in its
  * own CSR and once in the batch record -- and the relocation is by buffer
@@ -652,7 +654,9 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_FLICKER	3
 #define ISPFE_STATS_GRID_LSC		4
 #define ISPFE_STATS_GRID_MOTION		5
-#define ISPFE_STATS_GRIDS		6
+#define ISPFE_STATS_GRID_HISTOGRAM_ROI1	6
+#define ISPFE_STATS_GRID_HISTOGRAM_ROI2	7
+#define ISPFE_STATS_GRIDS		8
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -874,6 +878,24 @@ static const struct ispfe_stats_grid {
 		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 		.flag = EXYNOS_ISPFE_STATS_LSC,
 		.written = ispfe_stats_grid_written,
+	},
+	[ISPFE_STATS_GRID_HISTOGRAM_ROI1] = {
+		.output = ISPFE_PDMA_OUTPUT_HISTOGRAM_ROI1,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer,
+				   histogram_roi1),
+		.size = sizeof(struct exynos_ispfe_stats_histogram),
+		.flag = EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1,
+		.written = ispfe_stats_histogram_written,
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
+	},
+	[ISPFE_STATS_GRID_HISTOGRAM_ROI2] = {
+		.output = ISPFE_PDMA_OUTPUT_HISTOGRAM_ROI2,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer,
+				   histogram_roi2),
+		.size = sizeof(struct exynos_ispfe_stats_histogram),
+		.flag = EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2,
+		.written = ispfe_stats_histogram_written,
+		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
 	},
 };
 

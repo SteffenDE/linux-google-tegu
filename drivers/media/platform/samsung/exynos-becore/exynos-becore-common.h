@@ -335,6 +335,15 @@ struct becore_input_slot {
 	bool cpu_dirty;
 	u64 producer_cookie;
 	u64 ready_sequence;
+	/*
+	 * Which frame the producer says is in this slot, and when it ended.
+	 * Carried to the processed buffer made from it, because that buffer is
+	 * that frame -- it is what pairs a picture with the statistics metered
+	 * from it and with the sensor settings it was taken at.  Zero for a
+	 * slot nobody produced, which is a staged one.
+	 */
+	u32 producer_frame;
+	u64 producer_timestamp;
 };
 
 /*

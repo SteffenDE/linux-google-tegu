@@ -67,6 +67,26 @@ struct exynos_becore_input_buffer {
 	u64 cookie;
 	unsigned int slot;
 	struct exynos_becore_input_gains gains;
+	/*
+	 * Which frame this is, and when it ended, in the producer's own
+	 * numbering.  Set by the producer when it completes a buffer and
+	 * ignored on acquire.
+	 *
+	 * The consumer carries both to the frame it makes from this one,
+	 * because a processed frame is that frame: it is what lets anything
+	 * downstream pair the picture with the statistics metered from it and
+	 * with the sensor settings it was taken at, neither of which the
+	 * consumer has or should have.
+	 *
+	 * Optional.  producer_acquire() clears them, so a producer that has no
+	 * frame numbering to offer -- or a path that hands a buffer on without
+	 * one, which the ISPFE snapshot handoff does -- leaves them zero and
+	 * the consumer numbers the frame itself.  Note that zero is not the
+	 * signal for that: the consumer knows a producer filled the slot
+	 * because it completed it, not because the number is set.
+	 */
+	u32 sequence;
+	u64 timestamp;
 };
 
 struct exynos_becore_input *

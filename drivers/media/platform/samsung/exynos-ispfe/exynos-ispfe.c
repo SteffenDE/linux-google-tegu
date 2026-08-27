@@ -2594,6 +2594,14 @@ static void ispfe_backend_queue_complete(struct ispfe_device *ispfe)
 			buf->state = ISPFE_BACKEND_BUFFER_DONE;
 			ispfe->backend_flight_count--;
 			/*
+			 * Which frame this is, for the consumer to carry to
+			 * the frame it makes from it.  The same number and the
+			 * same timestamp the statistics for this frame get,
+			 * taken here because this is the moment both are known.
+			 */
+			buf->ticket.sequence = ispfe->sequence;
+			buf->ticket.timestamp = timestamp;
+			/*
 			 * The program slot is not released until the fill work
 			 * has handed the frame on, so nothing re-encodes it in
 			 * between and its statistics stay where they were

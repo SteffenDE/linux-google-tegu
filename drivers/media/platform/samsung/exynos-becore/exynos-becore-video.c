@@ -499,10 +499,10 @@ void becore_video_work(struct work_struct *work)
 			return;
 		}
 
-		buf->vb.vb2_buf.timestamp = ktime_get_ns();
-		mutex_lock(&becore->lock);
-		buf->vb.sequence = becore->video_sequence++;
-		mutex_unlock(&becore->lock);
+		/*
+		 * The sequence and the timestamp were set by the run, from the
+		 * input slot that made this frame and while it still held it.
+		 */
 		buf->vb.field = V4L2_FIELD_NONE;
 		vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
 				      becore->active_capture_size);

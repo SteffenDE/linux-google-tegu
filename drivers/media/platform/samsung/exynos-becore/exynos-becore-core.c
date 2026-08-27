@@ -1920,7 +1920,6 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 	streaming = becore->video_streaming;
 	becore->video_streaming = false;
 	becore->producer_streaming = false;
-	becore_stream_power_put(becore);
 	spin_lock_irqsave(&becore->run_lock, flags);
 	if (becore->running) {
 		becore->abort_run = true;
@@ -1932,6 +1931,18 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 	mutex_unlock(&becore->lock);
 
 	cancel_work_sync(&becore->video_work);
+
+	/*
+	 * Powered down only once the run in flight has been abandoned and the
+	 * worker has joined, which is the order becore_stop_streaming() uses.
+	 * A suspend resets all four processors and both C2SERV instances, and
+	 * asking a chain that is still mid-frame to reset is not a thing to do
+	 * on purpose.
+	 */
+	mutex_lock(&becore->lock);
+	becore_stream_power_put(becore);
+	mutex_unlock(&becore->lock);
+
 	if (streaming) {
 		becore_video_controls_ungrab(becore);
 		vb2_queue_error(&becore->queue);

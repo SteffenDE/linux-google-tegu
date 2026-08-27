@@ -7683,12 +7683,13 @@ static void ispfe_buf_queue(struct vb2_buffer *vb)
 		list_add_tail(&buf->list, &ispfe->pending);
 
 	/*
-	 * Not vb2_is_streaming(): with a min_queued_buffers of two, STREAMON
-	 * with one buffer queued succeeds and defers the actual start to the
-	 * next QBUF -- which enqueues every buffer into the driver *before*
-	 * calling start_streaming.  So the queue can be streaming while there
-	 * is still no program area to encode into.  Gate on the driver's own
-	 * state instead; ispfe_start_streaming() drains what accumulated.
+	 * Not vb2_is_streaming(): with any non-zero min_queued_buffers, a
+	 * STREAMON with nothing queued succeeds -- the check there is on
+	 * buffers *allocated* -- and defers the actual start to the next QBUF,
+	 * which enqueues every buffer into the driver *before* calling
+	 * start_streaming.  So the queue can be streaming while there is still
+	 * no program area to encode into.  Gate on the driver's own state
+	 * instead; ispfe_start_streaming() drains what accumulated.
 	 */
 	if (ispfe->owner == ISPFE_OWNER_V4L2)
 		ispfe_queue_fill(ispfe);
@@ -9493,10 +9494,13 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	q->buf_struct_size = sizeof(struct ispfe_buffer);
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	/*
-	 * A frame lands in the buffer credited a frame earlier, so the queue
-	 * has to hold at least two before the first one can be completed.
+	 * A frame lands in the buffer credited a frame earlier, so completing
+	 * the first one takes a second credit -- but not a second *buffer*.
+	 * Dump credits age what is in flight, so a lone buffer is credited at
+	 * one frame start, filled during the next, and retired at that frame's
+	 * end against the dump credit in between.
 	 */
-	q->min_queued_buffers = 2;
+	q->min_queued_buffers = 1;
 	q->lock = &ispfe->lock;
 	ret = vb2_queue_init(q);
 	if (ret)

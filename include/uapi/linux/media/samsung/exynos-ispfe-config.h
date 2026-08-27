@@ -77,10 +77,11 @@ enum exynos_ispfe_stats_version {
  *	:c:type:`exynos_ispfe_params_lens_shading`
  * @EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
- * The front end applies white balance before it meters, so the gains are both
- * what balances the picture and what the exposure and white balance grids are
- * measured through. Nothing about them is knowable to the kernel: they are an
- * estimate of the illuminant, which is what an AWB algorithm exists to make.
+ * The white balance gains are the one thing here that nothing about is knowable
+ * to the kernel: they are an estimate of the illuminant, which is what an AWB
+ * algorithm exists to make. What they do **not** change is what the metering
+ * grids report, which are metered above that stage -- see
+ * :c:type:`exynos_ispfe_params_white_balance`.
  *
  * A block carries values in the units the block is specified in, never a
  * register, an address or a command.
@@ -133,6 +134,20 @@ enum exynos_ispfe_params_block_type {
  * @header: The parameters block header
  * @gains: Four unsigned Q12 gains, indexed by %EXYNOS_ISPFE_WB_RED and its
  *	siblings
+ *
+ * **The statistics grids are metered before this stage** [HW 2026-08-27], so
+ * a gain sent here changes the picture and does not change what the next
+ * buffer of :c:type:`exynos_ispfe_stats_buffer` reports. An algorithm's
+ * estimate off those grids is therefore an absolute one -- the gain to ask for
+ * next, not a correction to the gain in force.
+ *
+ * Two measurements say so. On the raw path, where the driver replays the
+ * recipe's own gains of 1.6633 and 2.1101 on red and blue, all four colours of
+ * all three grids fit a raw frame of the same scene with the *same* slope to
+ * 0.03%; and on the back-end path, with an auto white balance loop settled at
+ * 1.9663x red and 1.7234x blue, the illuminant the same grids report is still
+ * 1.9664 and 1.7234. A grid metered through the gains would have reported
+ * unity there.
  *
  * Each gain is at least one -- a gain of zero is a channel switched off rather
  * than balanced, which no white balance wants -- and at most
@@ -660,10 +675,10 @@ struct exynos_ispfe_stats_histogram {
  * picture height rather than the whole of it.
  *
  * The samples are the ones the metering grids see -- after black level
- * subtraction and with the gains applied -- rather than the sensor's. The same
- * fit puts the slope at 34.06 and the intercept at 64.1 counts a sample, which
- * is the black level, and the mean per sample agrees with the white balance
- * grid's own mean over the same frame to 1%.
+ * subtraction, and *not* through the white balance gains -- rather than the
+ * sensor's. The same fit puts the slope at 34.06 and the intercept at 64.1
+ * counts a sample, which is the black level, and the mean per sample agrees
+ * with the white balance grid's own mean over the same frame to 1%.
  *
  * Where the grids and the histograms resolve the picture in space and in
  * intensity, this resolves it in **time**: a rolling shutter reads one row

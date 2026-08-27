@@ -112,11 +112,18 @@ Three block types exist, and each carries what only an algorithm or a
 calibration can decide.
 
 :c:type:`exynos_ispfe_params_white_balance` carries the gains the front end
-applies before it meters, which are therefore both what balances the picture
-and what the two grids above are measured through. Nothing about them is
-knowable to the kernel -- they are an estimate of the illuminant, which is what
-an AWB algorithm exists to make -- so until a buffer carries one the driver
-applies the gains its captured program was taken with.
+applies to the picture. Nothing about them is knowable to the kernel -- they
+are an estimate of the illuminant, which is what an AWB algorithm exists to
+make -- so until a buffer carries one the driver applies the gains its captured
+program was taken with.
+
+**The statistics above are metered before these gains, not through them.** An
+algorithm that reads the grids therefore sees the sensor's own colour whatever
+it last asked for, and its estimate is a direct one rather than a correction to
+what it already applied: the ratio it computes is the illuminant, and the gain
+it should ask for next is that ratio, not that ratio times the gain in force.
+Getting this the wrong way round gives a loop that converges on unity gains and
+a picture with the illuminant left in it.
 
 :c:type:`exynos_ispfe_params_metering` carries what the two grids *count*: the
 sample thresholds above and below which a sample is recorded as saturated or

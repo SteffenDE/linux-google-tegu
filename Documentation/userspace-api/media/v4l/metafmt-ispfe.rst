@@ -15,8 +15,8 @@ results to its statistics metadata capture video node, using the
 :c:type:`v4l2_meta_format` interface. One buffer holds one frame's results,
 described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid,
 the lens shading grid and the post-shading auto exposure grid, each 64 x 48
-regions over the picture, a per-pixel RGBY histogram of a region of it, and one
-sum per row of it.
+regions over the picture, a per-pixel RGBY histogram of a region of it, a
+motion metering map and one sum per row of it.
 
 They are complementary rather than alternatives, because each resolves the
 frame along a different axis and none is derivable from another. A grid gives a
@@ -29,6 +29,15 @@ picture.
 Two of the grids carry the same record because one hardware writer produces
 both, and what separates them is where each is metered and what each was told
 to exclude.
+
+The motion metering map is the one result that is a picture: a small greyscale
+image of the frame -- 128 x 96 as the driver's programs ask for it -- with one
+value per cell and nothing excluded. It is the cheapest thing here to compare
+against the frame itself, or against its own value on the previous frame, which
+is what its name describes. **Index it with the stride it reports** rather than
+with the array's declared width: unlike the grids, whose rows are always the
+hardware's 64 regions apart, this block packs its rows to the map it was
+configured for.
 
 Which frame a buffer describes is said by its timestamp, which is bit for bit
 the timestamp the same frame's image buffer carries, and by ``frame_sequence``,

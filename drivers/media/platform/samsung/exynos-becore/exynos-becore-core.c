@@ -2450,6 +2450,9 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	 * producer's: a frame is at the balance whoever took it took it at.
 	 */
 	slot->gains = buffer->gains;
+	/* And which frame it is, for the buffer this slot ends up as. */
+	slot->producer_frame = buffer->sequence;
+	slot->producer_timestamp = buffer->timestamp;
 	slot->producer_cookie = 0;
 	slot->ready_sequence = ++becore->input_sequence;
 	slot->state = BECORE_INPUT_READY;
@@ -2969,7 +2972,45 @@ int becore_run_frame(struct becore_device *becore, u32 input_profile,
 		becore->completed_output_size = 0;
 		becore->mcsc_completed_generation = 0;
 		becore->mcsc_completed_output_size = 0;
-	} else {
+	}
+
+	/*
+	 * Number the frame here, where the slot that made it is still in hand.
+	 *
+	 * A processed frame *is* the frame the producer made, so it carries
+	 * that frame's number and that frame's end -- not a count of this
+	 * node's buffers and not the moment the chain finished.  Both are what
+	 * pair a picture with the statistics metered from it and with the
+	 * sensor settings it was taken at.
+	 *
+	 * The test is `ready_sequence` and not the frame number being non-zero,
+	 * which is a different question with a coincidental answer: a producer
+	 * that never fills the field leaves it zero, and one in-tree caller
+	 * does exactly that.  `ready_sequence` is what producer_complete() sets
+	 * and the free path clears, so it is the one that means "a producer
+	 * filled this slot".  It has to be read before the slot is released,
+	 * which is why this is here and not in the caller.
+	 *
+	 * A run with no producer behind it -- the offline loop's staged input,
+	 * taken from BECORE_INPUT_FREE and possibly a producer's slot before
+	 * that -- is no frame of anybody's and gets this node's own counter and
+	 * its own completion time.
+	 */
+	if (!ret && capture) {
+		struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(capture);
+
+		if (becore->run_input->ready_sequence) {
+			vbuf->sequence = becore->run_input->producer_frame;
+			capture->timestamp =
+				becore->run_input->producer_timestamp;
+		} else {
+			vbuf->sequence = becore->video_sequence;
+			capture->timestamp = ktime_get_ns();
+		}
+		becore->video_sequence++;
+	}
+
+	if (quiesced) {
 		becore->run_input->state = BECORE_INPUT_FREE;
 		becore->run_input->ready_sequence = 0;
 	}

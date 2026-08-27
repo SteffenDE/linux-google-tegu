@@ -47,11 +47,14 @@ enum exynos_ispfe_stats_version {
  *	The per-pixel RGBY histogram is present, in @histogram.
  * %EXYNOS_ISPFE_STATS_FLICKER:
  *	The per-row sums are present, in @flicker.
+ * %EXYNOS_ISPFE_STATS_LSC:
+ *	The lens shading grid, :c:type:`exynos_ispfe_stats_lsc`
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM		(1U << 2)
 #define EXYNOS_ISPFE_STATS_FLICKER		(1U << 3)
+#define EXYNOS_ISPFE_STATS_LSC			(1U << 4)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -201,7 +204,7 @@ struct exynos_ispfe_params_white_balance {
  * window placed over the scene's luma, far below it, and with coring at its
  * maximum, the white balance grid's counts and means do not move. They are real
  * fields at read offsets and the driver programs them, so they most likely gate
- * the per-colour quantities :c:type:`exynos_ispfe_stats_awb_region` still
+ * the per-colour quantities :c:type:`exynos_ispfe_stats_rggb_region` still
  * carries as reserved; until something decodes those, a consumer has no way to
  * observe what they did, and this interface does not pretend otherwise.
  *
@@ -209,9 +212,11 @@ struct exynos_ispfe_params_white_balance {
  * sample in the frame, and is refused rather than metered.
  *
  * The two grids take their own thresholds and are not two views of one
- * setting: the exposure grid is metered after lens shading -- the hardware's
- * own name for its tap says so -- so the two see the same scene at different
- * levels.
+ * setting. What they are *not* is two points in the chain: both are metered
+ * after lens shading correction, and with the unity table the driver ships
+ * they return bit-identical sums wherever neither excludes a sample
+ * [HW 2026-08-27]. The grid metered before that stage is
+ * :c:type:`exynos_ispfe_stats_lsc`, and nothing here configures it.
  *
  * The vendor's own values are 32256 and 0 for the white balance grid and
  * %EXYNOS_ISPFE_METERING_SAMPLE_MAX and %EXYNOS_ISPFE_METERING_EXCLUDE_NONE
@@ -280,12 +285,16 @@ struct exynos_ispfe_params_metering {
  *
  * This is the only place in the graph where shading can be corrected: the back
  * end has no such stage. What it corrects is everything downstream of it,
- * which is the processed image **and the exposure statistics** -- those are
- * metered after this stage, and moving the grid moves them. What it does not
- * reach is the raw output, which leaves the receiver before this stage runs:
- * a grid sent while the raw path is streaming still changes
- * :c:type:`exynos_ispfe_stats_ae` and still changes nothing in the raw
- * buffers.
+ * which is the processed image and **two of the three metering grids** --
+ * :c:type:`exynos_ispfe_stats_ae` and :c:type:`exynos_ispfe_stats_awb` are
+ * metered after this stage, and moving the grid moves both.
+ *
+ * What it does **not** reach is the raw output, which leaves the receiver
+ * before this stage runs, and :c:type:`exynos_ispfe_stats_lsc`, which is
+ * metered above it. So a grid sent while the raw path is streaming changes the
+ * exposure and white balance grids, and changes neither the raw buffers nor
+ * the lens shading grid -- which is what makes that grid an estimate of the
+ * falloff rather than a view of the correction.
  *
  * A grid is per unit and per readout rather than per scene. Measured over 54
  * captured vendor programs, a table is the same table across the frames of one
@@ -366,7 +375,7 @@ struct exynos_ispfe_stats_grid_header {
 };
 
 /**
- * struct exynos_ispfe_stats_awb_region - One region of the white balance grid
+ * struct exynos_ispfe_stats_rggb_region - One region of an RGGB metering grid
  *
  * @sum: Sums of the accepted samples, in R, Gr, Gb and B order
  * @reserved0: Two further retained per-colour quantities, meaning unknown
@@ -383,8 +392,18 @@ struct exynos_ispfe_stats_grid_header {
  * counts add up to the number of samples the region's cell contains, and that
  * identity over the whole grid is the cheapest check that a buffer holds one
  * complete frame rather than a torn one.
+ *
+ * **Two grids carry this record**, :c:type:`exynos_ispfe_stats_awb` and
+ * :c:type:`exynos_ispfe_stats_lsc`, and they are two instances of one hardware
+ * writer rather than a resemblance: Lyric reads both through a single
+ * `lyric::LmpAwbLscStatsOutput`, whose ``GetRggbRegionStatsV2`` is where the
+ * field names below come from, and its allocator builds one for
+ * ``outputs.awb_stats`` and one for ``outputs.lsc_stats`` from the same call.
+ * The two blocks' register layouts are the same too -- what differs between
+ * them is the thresholds and the luma weights each is programmed with, not
+ * what it writes.
  */
-struct exynos_ispfe_stats_awb_region {
+struct exynos_ispfe_stats_rggb_region {
 	__s32 sum[4];
 	__s32 reserved0[8];
 	__u16 usable_count;
@@ -420,7 +439,9 @@ struct exynos_ispfe_stats_awb_region {
  * which is the whole of the difference.
  *
  * These statistics are metered after lens shading correction, so they describe
- * the corrected picture rather than the sensor's raw response.
+ * the corrected picture rather than the sensor's raw response -- measured, not
+ * taken from the tap's name; see :c:type:`exynos_ispfe_stats_lsc`, which is
+ * the grid on the other side of that stage.
  */
 struct exynos_ispfe_stats_ae_region {
 	__s32 sum[4];
@@ -445,7 +466,7 @@ struct exynos_ispfe_stats_ae_region {
  */
 struct exynos_ispfe_stats_awb {
 	struct exynos_ispfe_stats_grid_header header;
-	struct exynos_ispfe_stats_awb_region regions[EXYNOS_ISPFE_STATS_REGIONS];
+	struct exynos_ispfe_stats_rggb_region regions[EXYNOS_ISPFE_STATS_REGIONS];
 };
 
 /**
@@ -458,6 +479,55 @@ struct exynos_ispfe_stats_awb {
 struct exynos_ispfe_stats_ae {
 	struct exynos_ispfe_stats_grid_header header;
 	struct exynos_ispfe_stats_ae_region regions[EXYNOS_ISPFE_STATS_REGIONS];
+};
+
+/**
+ * struct exynos_ispfe_stats_lsc - The lens shading grid
+ *
+ * @header: What the hardware recorded about this grid
+ * @regions: The metered regions, indexed as for
+ *	:c:type:`exynos_ispfe_stats_awb`
+ *
+ * The third of the front end's rectangular metering grids, and the second to
+ * carry :c:type:`exynos_ispfe_stats_rggb_region` -- see that type for why the
+ * record is shared rather than merely alike. Its name is the hardware's own:
+ * the recipe's tap is ``lmp/lsc_stats`` and Lyric's allocator calls its buffer
+ * ``outputs.lsc_stats``.
+ *
+ * **This is the one grid metered before lens shading correction**, and the
+ * other two are metered after it [HW 2026-08-27]. Which is what the tap is
+ * for: an estimate of the falloff has to see the falloff. It was measured by
+ * sending :c:type:`exynos_ispfe_params_lens_shading` a table with twice the
+ * gain at the corners as at the centre and fitting all three grids against a
+ * raw frame of the same scene -- the raw output leaves the receiver before any
+ * of this runs, so a grid upstream of the correction stays an affine function
+ * of it with constant coefficients and one downstream does not. This grid held
+ * at an R-squared of 0.99997 with a radial residual correlation of +0.09; the
+ * exposure grid fell to 0.948 at +0.72, and the two grids' per-colour ratio
+ * ran from 1.04 at the centre of the field to 1.80 at its corners.
+ *
+ * **With the table the driver ships, that costs one part in 4096 and nothing
+ * else** [HW 2026-08-27]. Its default shading grid is unity, so the stage it
+ * straddles is a unit gain: the exposure and white balance grids come back
+ * *bit-identical* to each other in every region where neither excludes a
+ * sample, and this one reads about one Q12 step above them, which is the
+ * rounding of that multiply. So a consumer must not expect a difference here
+ * until something sends a real calibration -- and must not assume there is
+ * none once something does.
+ *
+ * The one thing the vendor's own allocator does say is that this grid's
+ * geometry is not negotiable where the white balance grid's is: it builds this
+ * one at a hardcoded 64 x 48 and that one from the request's fields.
+ *
+ * The thresholds and luma weights it is programmed with are its own and are
+ * not the white balance grid's -- the vendor ships -30000 and 31500 here
+ * against 0 and 32256 there -- so what its counts exclude is a different set
+ * of samples. :c:type:`exynos_ispfe_params_metering` does not reach this block
+ * yet.
+ */
+struct exynos_ispfe_stats_lsc {
+	struct exynos_ispfe_stats_grid_header header;
+	struct exynos_ispfe_stats_rggb_region regions[EXYNOS_ISPFE_STATS_REGIONS];
 };
 
 /*
@@ -497,7 +567,7 @@ struct exynos_ispfe_stats_ae {
  * @bins: Per plane, how many samples fell in each bin
  * @total: Per plane, how many samples the histogram counted at all
  *
- * Unlike the two grids this has no spatial resolution: it is one distribution
+ * Unlike the grids this has no spatial resolution: it is one distribution
  * over a region of the frame, where they are means over 64 x 48 regions. The
  * two are complementary rather than ordered -- a quantile is not derivable from
  * a mean, and a weighted metering is not derivable from a distribution -- and
@@ -530,7 +600,7 @@ struct exynos_ispfe_stats_ae {
  * @reserved0 -- so it is **not** reset between frames and a torn buffer carries
  * the previous occupant's totals rather than zeros.
  *
- * The first 64 bytes are the hardware's, in the same place the two grids keep
+ * The first 64 bytes are the hardware's, in the same place the grids keep
  * their own metadata area, and nothing has decoded them. They are not assumed
  * to have the grids' layout.
  */
@@ -566,13 +636,13 @@ struct exynos_ispfe_stats_histogram {
  * converts a period in entries to one in seconds, and @rows is half the
  * picture height rather than the whole of it.
  *
- * The samples are the ones the two grids meter -- after black level
+ * The samples are the ones the metering grids see -- after black level
  * subtraction and with the gains applied -- rather than the sensor's. The same
  * fit puts the slope at 34.06 and the intercept at 64.1 counts a sample, which
  * is the black level, and the mean per sample agrees with the white balance
  * grid's own mean over the same frame to 1%.
  *
- * Where the two grids and the histogram resolve the picture in space and in
+ * Where the grids and the histograms resolve the picture in space and in
  * intensity, this resolves it in **time**: a rolling shutter reads one row
  * after another, so a light that is modulated at twice the mains frequency
  * writes its own waveform down the frame, and a sum along each row is the
@@ -582,7 +652,7 @@ struct exynos_ispfe_stats_histogram {
  *
  * There is nothing to configure and so nothing here describes a configuration.
  * The block's register printer has exactly three fields -- an enable, a frame
- * id and this buffer's address -- so unlike the two grids there is no region of
+ * id and this buffer's address -- so unlike the grids there is no region of
  * interest, no channel selection and no weighting: a row is a row of the
  * picture the front end is processing, and the sum is over all of it.
  *
@@ -606,7 +676,7 @@ struct exynos_ispfe_stats_histogram {
  * pair sums to a few tens of millions in the metering domain, so the sign bit
  * is never in use.
  *
- * The first 64 bytes are the hardware's, in the same place the two grids keep
+ * The first 64 bytes are the hardware's, in the same place the grids keep
  * their own metadata area, and only @rows is decoded. They are not assumed to
  * have the grids' layout.
  */
@@ -631,6 +701,7 @@ struct exynos_ispfe_stats_flicker {
  * @histogram: The RGBY histogram, valid when %EXYNOS_ISPFE_STATS_HISTOGRAM is
  *	set
  * @flicker: The per-row sums, valid when %EXYNOS_ISPFE_STATS_FLICKER is set
+ * @lsc: The lens shading grid, valid when %EXYNOS_ISPFE_STATS_LSC is set
  *
  * One buffer is one frame's statistics. Which frame is said twice, and neither
  * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
@@ -663,6 +734,7 @@ struct exynos_ispfe_stats_buffer {
 	struct exynos_ispfe_stats_ae ae;
 	struct exynos_ispfe_stats_histogram histogram;
 	struct exynos_ispfe_stats_flicker flicker;
+	struct exynos_ispfe_stats_lsc lsc;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

@@ -13,17 +13,22 @@ V4L2_META_FMT_ISPFE_STATS ('IFES'), V4L2_META_FMT_ISPFE_PARAMS ('IFEP')
 The zumapro camera front end meters every frame it receives and writes the
 results to its statistics metadata capture video node, using the
 :c:type:`v4l2_meta_format` interface. One buffer holds one frame's results,
-described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid
-and the post-shading auto exposure grid, both 64 x 48 regions over the picture,
-a per-pixel RGBY histogram of a region of it, and one sum per row of it.
+described by :c:type:`exynos_ispfe_stats_buffer`: the auto white balance grid,
+the lens shading grid and the post-shading auto exposure grid, each 64 x 48
+regions over the picture, a per-pixel RGBY histogram of a region of it, and one
+sum per row of it.
 
-The four are complementary rather than alternatives, because each resolves the
+They are complementary rather than alternatives, because each resolves the
 frame along a different axis and none is derivable from another. A grid gives a
 mean per region and so can be weighted spatially; the histogram gives a
 distribution and so can answer a quantile; the row sums resolve the frame in
 time, because a rolling shutter reads one row after another and a light
 modulated at twice the mains frequency therefore writes its waveform down the
 picture.
+
+Two of the grids carry the same record because one hardware writer produces
+both, and what separates them is where each is metered and what each was told
+to exclude.
 
 Which frame a buffer describes is said by its timestamp, which is bit for bit
 the timestamp the same frame's image buffer carries, and by ``frame_sequence``,
@@ -60,7 +65,7 @@ happened and produced no grid.
 		__u64 usable = 0;
 
 		for (unsigned int i = 0; i < EXYNOS_ISPFE_STATS_REGIONS; i++) {
-			const struct exynos_ispfe_stats_awb_region *region =
+			const struct exynos_ispfe_stats_rggb_region *region =
 				&stats->awb.regions[i];
 
 			for (unsigned int c = 0; c < 4; c++)
@@ -111,8 +116,11 @@ rather than chosen.
 the lens's falloff: 33 x 25 points over the whole picture, four gains each, in
 the same R, Gr, Gb, B order as everything else here. It is the only stage in
 the graph that can correct shading. What it corrects is the processed image and
-the exposure statistics, which are metered after it; what it does not reach is
-the raw output, which leaves the receiver before it runs. A grid is a
+two of the three metering grids -- the exposure and white balance ones, which
+are metered after it. What it does not reach is the raw output, which leaves
+the receiver before it runs, or the lens shading grid, which is metered above
+it and is therefore an estimate of the falloff rather than a view of the
+correction. A grid is a
 calibration of one lens at one sensor readout rather
 than a per-frame decision, so a consumer that has one for this unit and this
 mode has what the block wants; until a buffer carries one the driver applies

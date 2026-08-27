@@ -606,6 +606,10 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  * name, so both follow this area without anything here saying so.
  */
 #define ISPFE_PDMA_OUTPUT_FLICKER	1
+/*
+ * And the motion map's, named the same way twice for the same reason.
+ */
+#define ISPFE_PDMA_OUTPUT_MOTION	2
 
 /*
  * Where one frame's statistics land while the metadata node is streaming.
@@ -647,7 +651,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_HISTOGRAM	2
 #define ISPFE_STATS_GRID_FLICKER	3
 #define ISPFE_STATS_GRID_LSC		4
-#define ISPFE_STATS_GRIDS		5
+#define ISPFE_STATS_GRID_MOTION		5
+#define ISPFE_STATS_GRIDS		6
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -758,6 +763,47 @@ static bool ispfe_stats_flicker_written(const void *grid)
 	       flicker->rows <= EXYNOS_ISPFE_FLICKER_ROWS;
 }
 
+/*
+ * The motion map is the one result whose row stride is not fixed: the block
+ * packs its rows to the map it was configured for, and reports the stride it
+ * used.  So three fields say it was written rather than one, and they are
+ * checked together -- a consumer indexes @luma with all three, and this is the
+ * only place that can bound what it is handed.  As with the flicker count,
+ * that makes running on the copy rather than on the DMA area load-bearing.
+ */
+static bool ispfe_stats_motion_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_motion *motion = grid;
+	size_t stride = motion->stride;
+
+	if (!stride || !motion->columns || !motion->rows)
+		return false;
+	if (motion->columns > EXYNOS_ISPFE_MOTION_COLUMNS ||
+	    motion->rows > EXYNOS_ISPFE_MOTION_ROWS)
+		return false;
+
+	/*
+	 * A stride wider than the whole array first, so that neither product
+	 * below can overflow whatever width size_t has here.  The hardware
+	 * wrote this word into memory the CPU does not own, which is the whole
+	 * reason this function exists, so a torn 0x02000000 with 128 rows
+	 * multiplying to exactly 2^32 is a case rather than a curiosity.
+	 */
+	if (stride > sizeof(motion->luma))
+		return false;
+
+	/*
+	 * The two bounds the documented index formula needs: a row's cells fit
+	 * inside its own stride, and the last row fits inside the array.
+	 * Together they cover every index it can produce, which is the whole
+	 * of what a consumer needs from here.
+	 */
+	if ((size_t)motion->columns * sizeof(motion->luma[0]) > stride)
+		return false;
+
+	return (size_t)motion->rows * stride <= sizeof(motion->luma);
+}
+
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
@@ -811,6 +857,16 @@ static const struct ispfe_stats_grid {
 		.clear = offsetofend(struct exynos_ispfe_stats_flicker,
 				     reserved1),
 	},
+	[ISPFE_STATS_GRID_MOTION] = {
+		.output = ISPFE_PDMA_OUTPUT_MOTION,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, motion),
+		.size = sizeof(struct exynos_ispfe_stats_motion),
+		.flag = EXYNOS_ISPFE_STATS_MOTION,
+		.written = ispfe_stats_motion_written,
+		/* Named in this structure's own terms, as the flicker one is. */
+		.clear = offsetofend(struct exynos_ispfe_stats_motion,
+				     reserved1),
+	},
 	[ISPFE_STATS_GRID_LSC] = {
 		.output = ISPFE_PDMA_OUTPUT_LSC,
 		.offset = offsetof(struct exynos_ispfe_stats_buffer, lsc),
@@ -843,6 +899,17 @@ static_assert(sizeof(struct exynos_ispfe_stats_flicker) == 0x46c0);
  */
 static_assert(offsetof(struct exynos_ispfe_stats_flicker, rows) == 0x24);
 static_assert(offsetof(struct exynos_ispfe_stats_flicker, row_sum) == 0x40);
+/*
+ * And the motion map, from the same reader:
+ * `LmpMotionMeteringStatsOutput::Make` refuses a buffer under 0x18040 bytes,
+ * `ValidateMetadata` reads the stride at 0x24 and the two dimensions at 0x28
+ * and 0x2a, and `GetRegionLumaSignal` indexes 16-bit cells from 0x40.
+ */
+static_assert(sizeof(struct exynos_ispfe_stats_motion) == 0x18040);
+static_assert(offsetof(struct exynos_ispfe_stats_motion, stride) == 0x24);
+static_assert(offsetof(struct exynos_ispfe_stats_motion, columns) == 0x28);
+static_assert(offsetof(struct exynos_ispfe_stats_motion, rows) == 0x2a);
+static_assert(offsetof(struct exynos_ispfe_stats_motion, luma) == 0x40);
 
 struct ispfe_lmp_wbg_profile {
 	u32 red;
@@ -7815,11 +7882,12 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		 *
 		 * Do not conclude from a test that this line is optional.
 		 * Removing it and running `camera-ispfe-stats --check` over
-		 * 200 buffers **passed**: five areas of two 292 KiB grids each
-		 * cycle 2.9 MiB through more cache than the core has, so by
+		 * 200 buffers **passed**: five areas of a megabyte each
+		 * cycle 5 MiB through more cache than the core has, so by
 		 * the time an area comes round again its lines have usually
-		 * been evicted and the read reaches DRAM by accident.  It caught a torn grid
-		 * once in 220.  The argument for this line is the ownership
+		 * been evicted and the read reaches DRAM by accident.  It
+		 * caught a torn grid once in 220.  The argument for this line
+		 * is the ownership
 		 * one -- the hardware wrote this memory and the CPU has no way
 		 * to know -- and not a measurement.
 		 */

@@ -49,12 +49,15 @@ enum exynos_ispfe_stats_version {
  *	The per-row sums are present, in @flicker.
  * %EXYNOS_ISPFE_STATS_LSC:
  *	The lens shading grid, :c:type:`exynos_ispfe_stats_lsc`
+ * %EXYNOS_ISPFE_STATS_MOTION:
+ *	The motion metering map, :c:type:`exynos_ispfe_stats_motion`
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM		(1U << 2)
 #define EXYNOS_ISPFE_STATS_FLICKER		(1U << 3)
 #define EXYNOS_ISPFE_STATS_LSC			(1U << 4)
+#define EXYNOS_ISPFE_STATS_MOTION		(1U << 5)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -687,6 +690,93 @@ struct exynos_ispfe_stats_flicker {
 	__s32 row_sum[EXYNOS_ISPFE_FLICKER_ROWS];
 };
 
+/*
+ * The largest map the motion metering block will write, which is the
+ * hardware's own bound rather than a picture size:
+ * `lyric::LmpMotionMeteringStatsOutput::Make` refuses more columns or rows
+ * than these, and refuses a buffer smaller than the 0x18040 bytes they need.
+ * The recipes program 128 x 96. Take the map in use from
+ * @exynos_ispfe_stats_motion.columns and @exynos_ispfe_stats_motion.rows.
+ */
+#define EXYNOS_ISPFE_MOTION_COLUMNS		256
+#define EXYNOS_ISPFE_MOTION_ROWS		192
+#define EXYNOS_ISPFE_MOTION_CELLS \
+	(EXYNOS_ISPFE_MOTION_COLUMNS * EXYNOS_ISPFE_MOTION_ROWS)
+
+/**
+ * struct exynos_ispfe_stats_motion - A luma map of the whole frame
+ *
+ * @reserved0: The hardware's own metadata area, undecoded
+ * @stride: The distance in **bytes** from one row of @luma to the next
+ * @columns: Cells per row the hardware wrote
+ * @rows: Rows of cells it wrote
+ * @reserved1: The rest of that metadata area, also undecoded
+ * @luma: The cells, row-major, at ``luma[row * (@stride / 2) + column]``,
+ *	each **centred** on its point of the metering grid
+ *
+ * This is the only one of the front end's measurements that is a *picture*.
+ * The grids reduce the frame to 64 x 48 per-colour sums and the histogram to
+ * one distribution; this reduces it to a small greyscale image -- 128 x 96
+ * as the recipes program it -- with no thresholds, no exclusions and one value
+ * per cell. So it is the cheapest thing here to compare against a raw frame,
+ * and the cheapest to compare against *itself* on the previous frame, which is
+ * what the vendor's name for it describes: a scene that moved changes this map
+ * where a scene that only changed brightness does not.
+ *
+ * **Index with @stride and not with %EXYNOS_ISPFE_MOTION_COLUMNS.** Unlike the
+ * grids, whose row stride is the hardware's fixed 64 regions however many
+ * it reports, this block packs its rows to the map it was configured for:
+ * `LmpMotionMeteringStatsOutput` expects ``ALIGN(columns * 2, 32)`` bytes and
+ * checks the hardware's own report against it, so at 128 columns the rows are
+ * 256 bytes apart rather than 512. A consumer that walks the array by its
+ * declared width reads the second half of every row as the first half of the
+ * next one, and gets a plausible picture rather than an error.
+ *
+ * **@stride, @columns and @rows together are what says a buffer holds a
+ * result.** The driver clears them before the frame is armed and the hardware
+ * writes them, so a frame nothing wrote reads zero -- and the driver publishes
+ * them only when every index the formula above can produce lands inside @luma,
+ * because a consumer indexes with numbers it is handed.
+ *
+ * **A cell is centred on its grid point rather than starting there**
+ * [HW 2026-08-27], which is the one thing about this result that is not
+ * obvious and the one that fails quietly. Cell *k* of a row is filtered about
+ * the pixel ``roi_start + cell_size * k``, so the first cell begins half a
+ * cell *before* the region of interest starts. Reducing a raw frame into cells
+ * that begin at the grid point instead fits this map at an R-squared of 0.905
+ * where centring them gives 0.996 -- a recognisable picture with everything
+ * half a cell out, rather than an error.
+ *
+ * What a cell holds is a **weighted luma of its neighbourhood, in the same
+ * domain the grids meter in** [HW 2026-08-27]. Against a raw frame of the same
+ * scene, applying the block's own filter -- the 25 signed coefficients in its
+ * payload, which are half of a symmetric 31-tap triangle summing to 1 << 10 --
+ * separably down both axes reaches an R-squared of 0.998556, against 0.995952
+ * for a plain mean of the same window; and the fit's intercept puts the black
+ * level at 62.4 counts a sample, where the grids and the per-row sums put it
+ * at 64.1. Letting the four colour weights float reaches 0.999954 and does not
+ * measure them: one scene's Bayer planes are nearly proportional, so what is
+ * determined is the weighted sum and not the split.
+ *
+ * It is metered **after** lens shading correction, with the two grids that
+ * are and not with :c:type:`exynos_ispfe_stats_lsc` [HW 2026-08-27]: under a
+ * shading table with twice the corner gain, the same fit falls from 0.9986 to
+ * 0.9533 exactly as the exposure grid's does.
+ *
+ * The first 64 bytes are the hardware's, in the same place the grids keep
+ * their own metadata area, and only the three fields above are decoded. They
+ * are not assumed to have the grids' layout, though the frame counter is in
+ * the same word: `GetMetadata` reads it at byte 0x14.
+ */
+struct exynos_ispfe_stats_motion {
+	__u32 reserved0[9];
+	__u32 stride;
+	__u16 columns;
+	__u16 rows;
+	__u32 reserved1[5];
+	__u16 luma[EXYNOS_ISPFE_MOTION_CELLS];
+};
+
 /**
  * struct exynos_ispfe_stats_buffer - ISPFE per-frame statistics
  *
@@ -702,6 +792,8 @@ struct exynos_ispfe_stats_flicker {
  *	set
  * @flicker: The per-row sums, valid when %EXYNOS_ISPFE_STATS_FLICKER is set
  * @lsc: The lens shading grid, valid when %EXYNOS_ISPFE_STATS_LSC is set
+ * @motion: The motion metering map, valid when %EXYNOS_ISPFE_STATS_MOTION is
+ *	set
  *
  * One buffer is one frame's statistics. Which frame is said twice, and neither
  * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
@@ -735,6 +827,7 @@ struct exynos_ispfe_stats_buffer {
 	struct exynos_ispfe_stats_histogram histogram;
 	struct exynos_ispfe_stats_flicker flicker;
 	struct exynos_ispfe_stats_lsc lsc;
+	struct exynos_ispfe_stats_motion motion;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

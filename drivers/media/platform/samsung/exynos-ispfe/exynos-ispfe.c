@@ -1227,6 +1227,29 @@ static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
 };
 
 /*
+ * One camera as the board describes it: which link bank its data arrives on --
+ * that is the device tree port number -- and what the link and its mode look
+ * like.  Fixed at probe and never written afterwards.
+ *
+ * Kept apart from struct ispfe_source below, which is what a *stream* runs
+ * with.  That one carries the receiver's own allocations as well, and is
+ * writable from debugfs at any time so a value can be swept between attempts;
+ * this is the board's statement and there is nothing to sweep in it.
+ *
+ * Indexed by bank rather than packed, so an entry's position is the hardware
+ * fact it describes and matches ispfe_link_cfg[] above.
+ */
+struct ispfe_link {
+	bool present;
+	u32 bank;
+	u32 phy;
+	u32 lanes;
+	bool cphy;
+	u32 mode_word0;
+	u32 mode_word1;
+};
+
+/*
  * What one CSI-2 source looks like to the receiver.  The link bank, the lane
  * count and the PHY type come from the device tree's endpoint, and the
  * geometry from the format negotiated on the subdev's source pad.  What is
@@ -1330,6 +1353,9 @@ struct ispfe_device {
 	 */
 	struct ispfe_source src;
 	struct ispfe_source active;
+	/* Every camera the device tree describes, and how many that is. */
+	struct ispfe_link links[CSIS_NUM_LINKS];
+	unsigned int num_links;
 	/*
 	 * Whether the diagnostic has asked for the shared D/C-PHY isolation to
 	 * be held open.  Streaming opens and closes it for itself; this is for
@@ -9367,8 +9393,8 @@ static const struct v4l2_async_notifier_operations ispfe_notifier_ops = {
 };
 
 /*
- * The device tree says which CSIS link bank the sensor arrives on -- that is
- * the port number -- and what the link looks like.  Everything else about the
+ * The device tree says which CSIS link bank a sensor arrives on -- that is the
+ * port number -- and what the link looks like.  Everything else about the
  * source is either the driver's own allocation or the negotiated format.
  */
 static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
@@ -9382,6 +9408,7 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 	 */
 	struct fwnode_endpoint fwep = {};
 	const struct ispfe_link_cfg *cfg;
+	struct ispfe_link *link;
 	int ret;
 
 	ret = fwnode_graph_parse_endpoint(ep, &fwep);
@@ -9394,6 +9421,12 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 				     "no PHY is known for CSIS link %u\n",
 				     fwep.port);
 
+	link = &ispfe->links[fwep.port];
+	if (link->present)
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "two endpoints on CSIS link %u\n",
+				     fwep.port);
+
 	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
 	if (ret)
 		return dev_err_probe(ispfe->dev, ret,
@@ -9401,10 +9434,10 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 
 	switch (vep.bus_type) {
 	case V4L2_MBUS_CSI2_DPHY:
-		ispfe->src.cphy = false;
+		link->cphy = false;
 		break;
 	case V4L2_MBUS_CSI2_CPHY:
-		ispfe->src.cphy = true;
+		link->cphy = true;
 		break;
 	default:
 		return dev_err_probe(ispfe->dev, -EINVAL,
@@ -9413,20 +9446,83 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 	}
 
 	cfg = &ispfe_link_cfg[fwep.port];
-	ispfe->src.link = fwep.port;
-	ispfe->src.phy = cfg->phy;
-	ispfe->src.lanes = vep.bus.mipi_csi2.num_data_lanes;
-	ispfe->src.mode_word0 = cfg->mode_word0;
-	ispfe->src.mode_word1 = cfg->mode_word1;
+	link->bank = fwep.port;
+	link->phy = cfg->phy;
+	link->lanes = vep.bus.mipi_csi2.num_data_lanes;
+	link->mode_word0 = cfg->mode_word0;
+	link->mode_word1 = cfg->mode_word1;
 
-	if (!ispfe->src.lanes ||
-	    ispfe->src.lanes > ispfe_phy_lanes(ispfe->src.phy))
+	if (!link->lanes || link->lanes > ispfe_phy_lanes(link->phy))
 		return dev_err_probe(ispfe->dev, -EINVAL,
 				     "%u data lanes, PHY %u has %u\n",
-				     ispfe->src.lanes, ispfe->src.phy,
-				     ispfe_phy_lanes(ispfe->src.phy));
+				     link->lanes, link->phy,
+				     ispfe_phy_lanes(link->phy));
+
+	link->present = true;
+	ispfe->num_links++;
 
 	return 0;
+}
+
+/*
+ * Every endpoint, not just the first.  Which bank a sensor arrives on is its
+ * port number, so a board with more than one camera describes them as several
+ * ports -- and reading only the first silently ignores the rest, which is not
+ * a failure anything downstream can see.
+ */
+static int ispfe_parse_endpoints(struct ispfe_device *ispfe)
+{
+	struct fwnode_handle *ep;
+	int ret;
+
+	fwnode_graph_for_each_endpoint(dev_fwnode(ispfe->dev), ep) {
+		ret = ispfe_parse_endpoint(ispfe, ep);
+		if (ret) {
+			fwnode_handle_put(ep);
+			return ret;
+		}
+	}
+
+	if (!ispfe->num_links)
+		return dev_err_probe(ispfe->dev, -ENXIO,
+				     "no sensor endpoint\n");
+
+	/*
+	 * Described, but not yet driven: the receiver is one subdevice with one
+	 * sink pad, so it can only be told about one camera.  Refused rather
+	 * than ignored, because a device tree that says two and gets one is a
+	 * silent half-configuration.
+	 */
+	if (ispfe->num_links > 1)
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "%u cameras described, one is supported\n",
+				     ispfe->num_links);
+
+	return 0;
+}
+
+/* The one link's description, as the values a stream starts from. */
+static void ispfe_link_to_src(struct ispfe_device *ispfe,
+			      const struct ispfe_link *link)
+{
+	ispfe->src.link = link->bank;
+	ispfe->src.phy = link->phy;
+	ispfe->src.lanes = link->lanes;
+	ispfe->src.cphy = link->cphy;
+	ispfe->src.mode_word0 = link->mode_word0;
+	ispfe->src.mode_word1 = link->mode_word1;
+}
+
+/* The only camera, while only one is supported. */
+static struct ispfe_link *ispfe_only_link(struct ispfe_device *ispfe)
+{
+	unsigned int i;
+
+	for (i = 0; i < CSIS_NUM_LINKS; i++)
+		if (ispfe->links[i].present)
+			return &ispfe->links[i];
+
+	return NULL;
 }
 
 static int ispfe_media_register(struct ispfe_device *ispfe)
@@ -9436,14 +9532,22 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	struct fwnode_handle *ep;
 	int ret;
 
+	ret = ispfe_parse_endpoints(ispfe);
+	if (ret)
+		return ret;
+
+	ispfe_link_to_src(ispfe, ispfe_only_link(ispfe));
+
+	/*
+	 * The first endpoint, for the notifier to bind against -- which is that
+	 * one link's, because there is exactly one endpoint in total.  When a
+	 * second link lands this walk has to select rather than take the first,
+	 * and so does the copy above.
+	 */
 	ep = fwnode_graph_get_next_endpoint(dev_fwnode(ispfe->dev), NULL);
 	if (!ep)
 		return dev_err_probe(ispfe->dev, -ENXIO,
 				     "no sensor endpoint\n");
-
-	ret = ispfe_parse_endpoint(ispfe, ep);
-	if (ret)
-		goto err_ep;
 
 	ispfe->mdev.dev = ispfe->dev;
 	strscpy(ispfe->mdev.model, "zumapro ISPFE", sizeof(ispfe->mdev.model));
@@ -9594,7 +9698,6 @@ err_v4l2:
 	v4l2_device_unregister(&ispfe->v4l2_dev);
 err_mdev:
 	media_device_cleanup(&ispfe->mdev);
-err_ep:
 	fwnode_handle_put(ep);
 	return ret;
 }

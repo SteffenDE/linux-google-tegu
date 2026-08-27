@@ -503,6 +503,93 @@ int becore_chain_validate(struct device *dev,
 }
 
 /*
+ * The chain raster for an output the caller has asked for: the largest
+ * rectangle with that output's aspect ratio that fits inside
+ * %BECORE_CHAIN_WIDTH x %BECORE_CHAIN_HEIGHT.
+ *
+ * This is what makes an aspect ratio reachable at all, and it is one
+ * derivation rather than a table because everything downstream already reads
+ * the chain.  becore_rgbp_crop() below takes the largest centred window of the
+ * array with the chain's aspect, and MCSC then scales the chain to the output
+ * -- so the *chain's* aspect is the only thing that decides whether those two
+ * scalers work at the same ratio in both axes.  Leave it fixed and a 16:9
+ * request is an anamorphic squeeze: a 4160x3120 chain reaching 1920x1080 is
+ * 2.167 across and 2.889 down, which is the whole of the stretch this replaces.
+ *
+ * The box is the captured chain rather than the array, so a 4:3 request lands
+ * on 4160x3120 exactly as before and nothing about an unchanged consumer
+ * moves.  A 16:9 one lands on 4160x2340, and becore_rgbp_crop() then reaches
+ * 4208x2368 at (0, 376) -- the vendor's own 16:9 readout, to the pixel, from
+ * the other direction.
+ *
+ * The width alignment is the chain's own, and taking it *down* is deliberate:
+ * a chain wider than the box would have nothing to crop from.  What that costs
+ * is at most four columns of aspect, and the two ratios that matter are exact
+ * at both 4:3 and 16:9.
+ *
+ * Whether the chain it returns can *work* with an output is three further
+ * checks between the pair -- becore_geometry_ratios() -- and the caller runs
+ * those, because the caller is the one that knows the array.
+ */
+int becore_chain_for_output(const struct becore_raster *scaled,
+			    struct becore_raster *chain)
+{
+	u32 width = scaled->width;
+	u32 height = scaled->height;
+
+	/*
+	 * A zero extent has no aspect ratio, and inventing one for it would be
+	 * worse than having none: `S_FMT` with 0x0 is the ordinary way to ask
+	 * a V4L2 driver for whatever it likes, and treating it as 1x1 would
+	 * answer that by cropping the sensor square.  The caller keeps the
+	 * chain in force instead.
+	 */
+	if (!width || !height)
+		return -ERANGE;
+
+	/*
+	 * Which extent the box runs out of first.  Compared as a product so
+	 * that neither ratio is rounded before the comparison, and in 64 bits
+	 * because these are the caller's own u32s: saturating them into a
+	 * smaller type first would lose the ratio rather than bound it, and
+	 * 200000x100000 would come back square instead of 2:1.
+	 */
+	if ((u64)width * BECORE_CHAIN_HEIGHT >= (u64)height * BECORE_CHAIN_WIDTH) {
+		chain->width = BECORE_CHAIN_WIDTH;
+		chain->height = (u32)DIV_ROUND_CLOSEST_ULL(
+			(u64)BECORE_CHAIN_WIDTH * height, width);
+	} else {
+		chain->height = BECORE_CHAIN_HEIGHT;
+		chain->width = (u32)DIV_ROUND_CLOSEST_ULL(
+			(u64)BECORE_CHAIN_HEIGHT * width, height);
+	}
+
+	chain->width = ALIGN_DOWN(chain->width, BECORE_CHAIN_WIDTH_ALIGN);
+	chain->height = ALIGN_DOWN(chain->height, 2);
+
+	/*
+	 * And an aspect ratio so extreme that the chain cannot carry the
+	 * node's own smallest output is refused rather than returned.  The
+	 * ratio checks do *not* catch this and it is worth saying why, because
+	 * the obvious reading is that they would: becore_rgbp_crop() fits the
+	 * crop to the chain's aspect, so the binning ratio it feeds is the
+	 * crop over the chain and stays near unity whatever shape the chain
+	 * is.  Nothing below here has an opinion about a chain of 24 rows.
+	 *
+	 * What that would cost is the floor: the caller clamps the output
+	 * between %BECORE_SCALED_EXTENT_MIN and the chain, and a clamp with
+	 * its bounds the wrong way round returns the ceiling.  S_FMT of
+	 * 4160x32 derives a 4160x24 chain and would answer 4160x24, from a
+	 * node whose size enumeration promises thirty-two.
+	 */
+	if (chain->width < BECORE_SCALED_EXTENT_MIN ||
+	    chain->height < BECORE_SCALED_EXTENT_MIN)
+		return -ERANGE;
+
+	return 0;
+}
+
+/*
  * DMSCCROP's window: the largest centred rectangle of the Bayer array that
  * has the aspect ratio the chain hands downstream. Cropping is what makes the
  * two aspects agree, so only one axis is ever narrowed; the other keeps the
@@ -1253,6 +1340,69 @@ int becore_typed_value(struct becore_device *becore,
  * programming a DMA at zero -- becore_run_frame() checks both destination
  * addresses before it writes any of them.
  */
+/*
+ * The three derivations that a *pair* of rasters can fail on their own, which
+ * bounding each extent separately cannot reach: RGBP's crop of the array onto
+ * the chain; YUVNR's binning, which is that crop over the chain at Q10 in
+ * fourteen bits, so the crop may be at most 15.999 times the chain; and DJAG's
+ * ratio of the chain onto the scaled output, which is Q20 and refuses past a
+ * 4096x downscale.  Everything else is either bounded by one extent or a plain
+ * repacking of one.
+ *
+ * YUVNR's is the reason a crop check alone is not enough: with the default
+ * array, any chain narrower than 260 passes the crop and the ratio and then
+ * refuses every run afterwards with a bare -EINVAL.
+ *
+ * @dev may be NULL, which asks the same question without saying anything: the
+ * video node's TRY_FMT has to know whether a geometry it is about to report
+ * would be accepted, and a caller probing a candidate is not a caller making
+ * a mistake.  That it is the same function is the point -- a TRY_FMT that
+ * reported a size S_FMT then refused would be exactly the sort of thing this
+ * node has just stopped doing.
+ */
+int becore_geometry_ratios(struct device *dev,
+			   const struct becore_raster *array,
+			   const struct becore_raster *chain,
+			   const struct becore_raster *scaled)
+{
+	struct becore_rect crop;
+	u32 ratio;
+	int ret;
+
+	ret = becore_rgbp_crop(array, chain, &crop);
+	if (ret) {
+		if (dev)
+			dev_err(dev, "no crop of %ux%u reaches a %ux%u chain\n",
+				array->width, array->height,
+				chain->width, chain->height);
+		return ret;
+	}
+	ret = becore_yuvnr_geometry_value(array, chain,
+					  BECORE_YUVNR_BINNING, &ratio);
+	if (ret) {
+		if (dev)
+			dev_err(dev,
+				"a %ux%u crop of %ux%u is too much for a %ux%u chain to bin\n",
+				crop.width, crop.height,
+				array->width, array->height,
+				chain->width, chain->height);
+		return ret;
+	}
+	ret = becore_mcsc_djag_ratio(chain->width, scaled->width, &ratio);
+	if (!ret)
+		ret = becore_mcsc_djag_ratio(chain->height, scaled->height,
+					     &ratio);
+	if (ret) {
+		if (dev)
+			dev_err(dev, "no scaler ratio takes %ux%u to %ux%u\n",
+				chain->width, chain->height,
+				scaled->width, scaled->height);
+		return ret;
+	}
+
+	return 0;
+}
+
 int becore_geometry_apply(struct becore_device *becore,
 				 const struct becore_raster *array,
 				 const struct becore_raster *chain,
@@ -1261,9 +1411,7 @@ int becore_geometry_apply(struct becore_device *becore,
 	struct becore_raster old_array = becore->array;
 	struct becore_raster old_chain = becore->chain;
 	struct becore_raster old_scaled = becore->scaled;
-	struct becore_rect crop;
 	size_t allocation;
-	u32 ratio;
 	int ret;
 
 	lockdep_assert_held(&becore->lock);
@@ -1300,46 +1448,9 @@ int becore_geometry_apply(struct becore_device *becore,
 				     BECORE_RASTER_EXTENT_MAX);
 	if (ret)
 		return ret;
-	/*
-	 * The three derivations that a *pair* of rasters can fail on their own,
-	 * which bounding each extent separately cannot reach: RGBP's crop of
-	 * the array onto the chain; YUVNR's binning, which is that crop over
-	 * the chain at Q10 in fourteen bits, so the crop may be at most 15.999
-	 * times the chain; and DJAG's ratio of the chain onto the scaled
-	 * output, which is Q20 and refuses past a 4096x downscale. Everything
-	 * else is either bounded by one extent or a plain repacking of one.
-	 *
-	 * YUVNR's is the reason a crop check alone is not enough: with the
-	 * default array, any chain narrower than 260 passes the crop and the
-	 * ratio and then refuses every run afterwards with a bare -EINVAL.
-	 */
-	ret = becore_rgbp_crop(array, chain, &crop);
-	if (ret) {
-		dev_err(becore->dev, "no crop of %ux%u reaches a %ux%u chain\n",
-			array->width, array->height,
-			chain->width, chain->height);
+	ret = becore_geometry_ratios(becore->dev, array, chain, scaled);
+	if (ret)
 		return ret;
-	}
-	ret = becore_yuvnr_geometry_value(array, chain,
-					  BECORE_YUVNR_BINNING, &ratio);
-	if (ret) {
-		dev_err(becore->dev,
-			"a %ux%u crop of %ux%u is too much for a %ux%u chain to bin\n",
-			crop.width, crop.height,
-			array->width, array->height,
-			chain->width, chain->height);
-		return ret;
-	}
-	ret = becore_mcsc_djag_ratio(chain->width, scaled->width, &ratio);
-	if (!ret)
-		ret = becore_mcsc_djag_ratio(chain->height, scaled->height,
-					     &ratio);
-	if (ret) {
-		dev_err(becore->dev, "no scaler ratio takes %ux%u to %ux%u\n",
-			chain->width, chain->height,
-			scaled->width, scaled->height);
-		return ret;
-	}
 
 	becore->array = *array;
 	becore->chain = *chain;

@@ -46,12 +46,17 @@ with the array's declared width: unlike the grids, whose rows are always the
 hardware's 64 regions apart, this block packs its rows to the map it was
 configured for.
 
-Which frame a buffer describes is said by its timestamp, which is bit for bit
-the timestamp the same frame's image buffer carries, and by ``frame_sequence``,
-which is the number that image buffer carries -- whichever node that frame left
-through. The buffer's own ``sequence`` counts this node's buffers instead, one
-per buffer, because a buffer that carries no frame still has to be numbered and
-the front end's counter restarts with every raw capture.
+Which frame a buffer describes is said three ways. The buffer's ``sequence`` is
+that frame's number, which is what V4L2 says a sequence is; ``frame_sequence``
+is the same number in the payload; and the buffer's timestamp is that frame's
+end, bit for bit the timestamp the same frame's image buffer carries --
+whichever node that frame left through.
+
+``sequence`` is the one to pair on where the consumer cannot map the payload.
+A buffer carrying no frame at all repeats the last number rather than inventing
+one, and both numbers restart when the front end's stream does, so a consumer
+that keeps this node streaming across two captures sees the count begin again;
+the timestamp is the pairing key that survives that.
 
 A buffer is only filled while something is capturing. A frame that arrived
 with no statistics buffer queued produces none, which shows up as a jump in

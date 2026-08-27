@@ -386,9 +386,10 @@ struct exynos_ispfe_params_lens_shading {
  * driver only sets the corresponding measurement flag when they are the
  * %EXYNOS_ISPFE_STATS_COLUMNS x %EXYNOS_ISPFE_STATS_ROWS this hardware meters.
  *
- * @frame_id is the hardware's own numbering rather than this interface's;
- * use @exynos_ispfe_stats_buffer.frame_sequence to say which frame a buffer
- * describes.
+ * @frame_id is the hardware's own numbering rather than this interface's; use
+ * the buffer's ``sequence``, or @exynos_ispfe_stats_buffer.frame_sequence
+ * which is the same number for any buffer that carries a frame, to say which
+ * frame a buffer describes.
  */
 struct exynos_ispfe_stats_grid_header {
 	__u32 reserved0[5];
@@ -847,18 +848,26 @@ struct exynos_ispfe_stats_motion {
  * @histogram_roi2: The histogram of the third, valid when
  *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2 is set
  *
- * One buffer is one frame's statistics. Which frame is said twice, and neither
- * is the buffer's ``sequence``: the buffer's timestamp is that frame's end,
- * bit for bit the timestamp the same frame's image buffer carries, and
- * @frame_sequence is the number that image buffer carries. The timestamp is
- * the one that survives a capture being stopped and started, because the
- * frame counter restarts with it.
+ * One buffer is one frame's statistics, and which frame is said three ways.
+ * The buffer's ``sequence`` is that frame's number, which is what V4L2 says a
+ * sequence is; @frame_sequence is the same number in the payload, for a
+ * consumer that has the mapping in front of it; and the buffer's timestamp is
+ * that frame's end, bit for bit the timestamp the same frame's image buffer
+ * carries.
  *
- * The buffer's own ``sequence`` counts this node's buffers instead, one per
- * buffer with no gaps, because a buffer that carries no frame still has to be
- * numbered and a number that goes backwards is the one thing a queue may not
- * produce. Frames that produced no statistics show up as a jump in
- * @frame_sequence, which is where a gap belongs.
+ * ``sequence`` is the one to pair on where the consumer cannot map the
+ * payload -- on a split pipeline the half that owns the sensor is not the half
+ * that reads statistics, and a buffer's metadata is all it has.
+ *
+ * Frames that produced no statistics show up as a gap in both, which is what a
+ * gap is for. A buffer carrying no frame at all repeats the last number rather
+ * than inventing one, so the sequence never goes backwards within a stream;
+ * such a buffer is only ever published when no statistics are coming, never
+ * during a capture, and it says so itself.
+ *
+ * Both numbers restart when the front end's stream does, so a consumer that
+ * keeps this node streaming across two captures sees the count begin again.
+ * The timestamp is the pairing key that survives that.
  *
  * A buffer with no measurement flags set carries no result. Which of the two
  * reasons applies is in @frame_sequence: zero means nothing was capturing when

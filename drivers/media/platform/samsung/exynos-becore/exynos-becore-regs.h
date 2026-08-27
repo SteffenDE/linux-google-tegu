@@ -48,6 +48,17 @@
 #define BECORE_INT1_STATUS		0x0818
 #define BECORE_INT1_CLEAR		0x081c
 
+/*
+ * What a processor says about itself when it will not stop.  Lyric names all
+ * three; `ip_busy_monitor_0` and `ip_stall_out_status_0` are attested on RGBP,
+ * MCFP and YUVP and not on MCSC, whose descriptor table does not reach them --
+ * so MCSC is not read here, because an unimplemented offset on this SoC is an
+ * SError rather than a zero.
+ */
+#define BECORE_IP_BUSY_MONITOR_0	0x0f40
+#define BECORE_IP_STALL_OUT_STATUS_0	0x0f60
+#define BECORE_YUVP_CINFIFO_STALL_CNT	0x101c
+
 #define BECORE_C_LOADER_ENABLE		0x1000
 #define BECORE_C_LOADER_MODE		0x1004
 #define BECORE_STAT_RDMACL_EN		0x1600

@@ -800,14 +800,25 @@ static int becore_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 }
 
 /*
- * What the scaler can be asked for, given the chain raster it reads.
+ * What the scaler can be asked for, and the chain it would read to deliver it.
+ *
+ * **The chain follows the request's aspect ratio.** It is the only thing that
+ * decides the output's: becore_rgbp_crop() takes the largest centred window of
+ * the array with the chain's aspect, and MCSC scales the chain to the output,
+ * so a chain of a different shape from the output is two scalers working at
+ * two ratios -- an anamorphic squeeze, not a crop. Deriving it here is what
+ * makes every size this function reports back an honest one, and it is why the
+ * bounds below do not depend on which size was set last.
+ *
+ * A request whose aspect the chain already has costs nothing: 4:3 lands on
+ * 4160x3120, which is where the chain has always been.
  *
  * Two extents rather than a list: MCSC's DJAG takes any ratio its Q20 register
  * can hold, so the sizes between the bounds are as real as the bounds. The
- * ceiling is the chain itself -- **not** because the register refuses to go
- * above it, but because nothing has established that this scaler upscales:
- * every one of the sixteen captured output rasters is a downscale of its
- * chain, so offering more would be advertising something nobody has run.
+ * ceiling is the chain -- **not** because the register refuses to go above it,
+ * but because nothing has established that this scaler upscales: every one of
+ * the sixteen captured output rasters is a downscale of its chain, so offering
+ * more would be advertising something nobody has run.
  *
  * The floor is the ratio's own: past a 4096x downscale the Q20 value does not
  * fit, which for a 4160-wide chain is a raster of two.
@@ -818,16 +829,68 @@ static int becore_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
  * Both extents are even because the chroma plane is subsampled in both
  * directions; the width needs no more alignment than that, since the stride
  * pads to 64 on its own.
+ *
+ * The aspect is taken from the size the *caller* asked for rather than from
+ * the clamped one, so a request larger than the pipeline can deliver still
+ * says which shape it wanted: 8000x4500 comes back as the largest 16:9 there
+ * is rather than as the largest 4:3.
  */
-static void becore_video_clamp(const struct becore_device *becore,
-			       struct becore_raster *scaled)
+/* One extent, into what a chain of this size can carry. */
+static u32 becore_video_clamp(u32 want, u32 chain)
 {
-	scaled->width = clamp_t(u32, ALIGN_DOWN(scaled->width, 2),
-				BECORE_SCALED_EXTENT_MIN,
-				ALIGN_DOWN(becore->chain.width, 2));
-	scaled->height = clamp_t(u32, ALIGN_DOWN(scaled->height, 2),
-				 BECORE_SCALED_EXTENT_MIN,
-				 ALIGN_DOWN(becore->chain.height, 2));
+	return clamp_t(u32, ALIGN_DOWN(want, 2), BECORE_SCALED_EXTENT_MIN,
+		       ALIGN_DOWN(chain, 2));
+}
+
+static void becore_video_negotiate(const struct becore_device *becore,
+				   struct becore_raster *scaled,
+				   struct becore_raster *chain)
+{
+	struct becore_raster derived;
+	struct becore_raster candidate;
+
+	/*
+	 * The fallback is the compiled-in box, and deliberately not the chain
+	 * in force.  Keeping what is there would buy nothing -- `S_FMT`
+	 * replaces the chain either way -- and what is there is not this
+	 * node's to trust: the debugfs geometry file sets one for the offline
+	 * loop and is bounded only by what the *hardware* accepts.  An 8x8
+	 * chain set there would invert the clamp below, and a clamp with its
+	 * bounds the wrong way round returns the ceiling, so this node would
+	 * answer 8x8 while its size enumeration promises thirty-two.  The box
+	 * is the one chain that always works.
+	 */
+	chain->width = BECORE_CHAIN_WIDTH;
+	chain->height = BECORE_CHAIN_HEIGHT;
+
+	/*
+	 * And a derived chain is taken only if the *pair* it makes is one
+	 * %VIDIOC_S_FMT would accept.  Deriving it is arithmetic; whether it
+	 * works with an output is three ratio checks, and running the same
+	 * function the set runs is what stops `TRY_FMT` reporting a size
+	 * `S_FMT` then rejects -- by construction rather than by this
+	 * function's author having worked out which of the three binds.
+	 *
+	 * The candidate is clamped before it is checked, because the clamped
+	 * one is what would be used: DJAG's ratio is the chain over the
+	 * *output*, so checking the unclamped request would be checking a
+	 * geometry nobody was going to run.
+	 */
+	if (!becore_chain_for_output(scaled, &derived)) {
+		candidate.width = becore_video_clamp(scaled->width,
+						     derived.width);
+		candidate.height = becore_video_clamp(scaled->height,
+						      derived.height);
+		if (!becore_geometry_ratios(NULL, &becore->array, &derived,
+					    &candidate)) {
+			*chain = derived;
+			*scaled = candidate;
+			return;
+		}
+	}
+
+	scaled->width = becore_video_clamp(scaled->width, chain->width);
+	scaled->height = becore_video_clamp(scaled->height, chain->height);
 }
 
 static int becore_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
@@ -837,26 +900,32 @@ static int becore_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		.width = f->fmt.pix.width,
 		.height = f->fmt.pix.height,
 	};
+	struct becore_raster chain;
 
-	becore_video_clamp(becore, &scaled);
+	becore_video_negotiate(becore, &scaled, &chain);
 	becore_video_fill_pix(&scaled, &f->fmt.pix);
 
 	return 0;
 }
 
 /*
- * The scaled raster is the one thing about this pipeline a consumer chooses.
+ * The scaled raster is what a consumer chooses, and the chain comes with it.
  *
- * The array and the chain stay where they are: a 4160x3120 chain reaches every
- * output the captured corpus uses, and moving it would change what RGBP crops
- * and what the denoiser bins, which is a different negotiation from "what size
- * do you want the picture".
+ * The array stays where it is -- it is the producer's, not this node's. The
+ * chain is derived, because it is the only thing that decides the output's
+ * aspect ratio and a consumer that asks for 16:9 is asking for 16:9 rather
+ * than for a squeezed 4:3. What that changes with it is the field of view:
+ * becore_rgbp_crop() narrows the array to the chain's shape, so a 16:9 request
+ * is a 16:9 *crop* of the sensor and not a letterbox of the whole of it. That
+ * is a choice this driver makes on the consumer's behalf and states here;
+ * nothing in this interface lets the two be separated yet.
  *
  * Reallocating the surfaces is the part that can fail, and
- * becore_geometry_apply() is what puts the previous raster back if it does. A
+ * becore_geometry_apply() is what puts the previous rasters back if it does. A
  * request the clamp already satisfied can still be refused there -- the DJAG
- * ratio check is exact where the clamp is a bound -- so the return value
- * matters and the format is only reported back once it has been applied.
+ * and binning ratio checks are exact where the clamp is a bound -- so the
+ * return value matters and the format is only reported back once it has been
+ * applied.
  */
 static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
@@ -865,12 +934,13 @@ static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		.width = f->fmt.pix.width,
 		.height = f->fmt.pix.height,
 	};
+	struct becore_raster chain;
 	int ret;
 
 	if (vb2_is_busy(&becore->queue))
 		return -EBUSY;
 
-	becore_video_clamp(becore, &scaled);
+	becore_video_negotiate(becore, &scaled, &chain);
 
 	/*
 	 * @video_lock is already held: it is the video device's own, so the
@@ -885,11 +955,13 @@ static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	else if (becore->running || becore->video_streaming)
 		ret = -EBUSY;
 	else if (scaled.width == becore->scaled.width &&
-		 scaled.height == becore->scaled.height)
+		 scaled.height == becore->scaled.height &&
+		 chain.width == becore->chain.width &&
+		 chain.height == becore->chain.height)
 		ret = 0;
 	else
 		ret = becore_geometry_apply(becore, &becore->array,
-					    &becore->chain, &scaled);
+					    &chain, &scaled);
 	mutex_unlock(&becore->lock);
 	if (ret)
 		return ret;
@@ -902,17 +974,26 @@ static int becore_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 static int becore_enum_framesizes(struct file *file, void *priv,
 				  struct v4l2_frmsizeenum *fsize)
 {
-	struct becore_device *becore = video_drvdata(file);
-
 	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_NV21)
 		return -EINVAL;
 
+	/*
+	 * The box the chain is fitted inside rather than the chain in force,
+	 * because the chain now follows whatever aspect ratio is asked for --
+	 * so what is reachable does not depend on which size was set last, and
+	 * an enumeration that quoted the current chain would shrink after a
+	 * 16:9 request and mislead the next caller.
+	 *
+	 * Not every pair inside the range is reachable at once: the height at
+	 * the full width is the 4:3 one. That is what VIDIOC_TRY_FMT is for,
+	 * and it is exact where this is a bound.
+	 */
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise.min_width = BECORE_SCALED_EXTENT_MIN;
-	fsize->stepwise.max_width = ALIGN_DOWN(becore->chain.width, 2);
+	fsize->stepwise.max_width = ALIGN_DOWN(BECORE_CHAIN_WIDTH, 2);
 	fsize->stepwise.step_width = 2;
 	fsize->stepwise.min_height = BECORE_SCALED_EXTENT_MIN;
-	fsize->stepwise.max_height = ALIGN_DOWN(becore->chain.height, 2);
+	fsize->stepwise.max_height = ALIGN_DOWN(BECORE_CHAIN_HEIGHT, 2);
 	fsize->stepwise.step_height = 2;
 
 	return 0;

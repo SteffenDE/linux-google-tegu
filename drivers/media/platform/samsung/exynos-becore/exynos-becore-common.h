@@ -943,6 +943,8 @@ int becore_raster_validate(struct device *dev, const char *name,
 			   const struct becore_raster *raster, u32 max);
 int becore_chain_validate(struct device *dev,
 			  const struct becore_raster *chain);
+int becore_chain_for_output(const struct becore_raster *scaled,
+			    struct becore_raster *chain);
 int becore_rgbp_crop(const struct becore_raster *array,
 		     const struct becore_raster *chain,
 		     struct becore_rect *crop);
@@ -985,6 +987,10 @@ int becore_generated_value(const struct becore_device *becore,
 u32 becore_generated_word_count(enum becore_block_id id);
 int becore_generated_tables_validate(struct device *dev);
 int becore_noise_knots_resolve(struct device *dev);
+int becore_geometry_ratios(struct device *dev,
+			   const struct becore_raster *array,
+			   const struct becore_raster *chain,
+			   const struct becore_raster *scaled);
 int becore_geometry_apply(struct becore_device *becore,
 			  const struct becore_raster *array,
 			  const struct becore_raster *chain,

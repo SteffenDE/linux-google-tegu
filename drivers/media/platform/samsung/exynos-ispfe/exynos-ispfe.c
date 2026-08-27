@@ -7511,8 +7511,22 @@ static void ispfe_active_pix(struct ispfe_device *ispfe,
 	v4l2_subdev_unlock_state(state);
 }
 
+/*
+ * Hand the queue's buffers back and put its counters and slot bitmap where a
+ * fresh stream expects them.  All of that is this node's own.
+ *
+ * @untake_stats says whether the statistics areas armed against the front
+ * end's program slots go back too, and that is not this node's own: the array
+ * is indexed by slot and the back end arms it from the same range, so it
+ * belongs to whoever holds ispfe->owner.  Pass true only where the front end
+ * was ours and the stream that armed them is ending, because then nothing is
+ * going to finish them.  Pass false anywhere we never claimed it: an area
+ * armed there is the current owner's, and its IOVAs are live in that owner's
+ * credited programs.
+ */
 static void ispfe_queue_return_all(struct ispfe_device *ispfe,
-				   enum vb2_buffer_state state)
+				   enum vb2_buffer_state state,
+				   bool untake_stats)
 {
 	struct list_head done;
 	struct ispfe_buffer *buf, *tmp;
@@ -7526,7 +7540,8 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
 		ispfe->flight_count = 0;
 		ispfe->credit_count = 0;
 		ispfe->slots_used = 0;
-		ispfe_stats_untake_all_locked(ispfe);
+		if (untake_stats)
+			ispfe_stats_untake_all_locked(ispfe);
 	}
 
 	list_for_each_entry_safe(buf, tmp, &done, list) {
@@ -7710,14 +7725,22 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
 	int ret;
 
+	/*
+	 * Two ways to fail before the front end is ours, and neither has armed
+	 * a slot or a statistics area, so the buffers are all there is to hand
+	 * back.  Untaking here would take back areas armed by whoever does own
+	 * the front end and is still streaming against them.
+	 */
 	if (ispfe->owner != ISPFE_OWNER_NONE) {
-		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
+		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, false);
 		return -EBUSY;
 	}
 
 	ret = video_device_pipeline_start(&ispfe->vdev, &ispfe->pipe);
-	if (ret)
-		goto err_return;
+	if (ret) {
+		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, false);
+		return ret;
+	}
 
 	ispfe->owner = ISPFE_OWNER_V4L2;
 
@@ -7766,8 +7789,8 @@ err_power:
 err_pipeline:
 	ispfe->owner = ISPFE_OWNER_NONE;
 	video_device_pipeline_stop(&ispfe->vdev);
-err_return:
-	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
+	/* Every path reaching here had the front end, so the areas are ours. */
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, true);
 	return ret;
 }
 
@@ -7797,7 +7820,7 @@ static void ispfe_stop_streaming(struct vb2_queue *q)
 	cancel_work_sync(&ispfe->fill_work);
 	ispfe->owner = ISPFE_OWNER_NONE;
 	video_device_pipeline_stop(&ispfe->vdev);
-	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR);
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR, true);
 }
 
 static const struct vb2_ops ispfe_vb2_ops = {

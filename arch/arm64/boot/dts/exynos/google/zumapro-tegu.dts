@@ -2168,6 +2168,58 @@
 
 &hsi2c_3 {
 	status = "okay";
+
+	/*
+	 * leshen, the front camera.  The same IMX712 as the ultrawide, on its
+	 * own bus with its own master clock and its own pair of module rails:
+	 * CIS_CLK1 off the same 24.576 MHz oscillator, and the camera PMIC's
+	 * ldo2/ldo7 rather than ldo3/ldo6.
+	 *
+	 * The link frequency is the same 552.96 MHz, which is not an
+	 * assumption -- the two modules' *output* PLLs are identical
+	 * (op_pre_pll_clk_div 3, op_pll_multiplier 135, op_sys_clk_div 1) and
+	 * only their pixel-clock PLLs differ, 119 against 122.
+	 */
+	cam_front: camera@1a {
+		compatible = "sony,imx712";
+		reg = <0x1a>;
+
+		clocks = <&cmu_top CLK_GOUT_CMU_DFTMUX_CIS_CLK1>;
+		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK1>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clock-parents = <&ext_24_5m>;
+		assigned-clock-rates = <0>, <24576000>;
+
+		reset-gpios = <&gpp6 2 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_front_reset>, <&cam_front_mclk>;
+		pinctrl-1 = <&cam_front_reset>, <&cam_front_mclk_off>;
+
+		iovdd-supply = <&s2mpg15_ldo12>;
+		avdd-supply = <&cam_ldo2>;
+		dvdd-supply = <&cam_ldo7>;
+
+		/* Front-facing. */
+		orientation = <0>;
+
+		/*
+		 * No "rotation" yet.  The ultrawide's was measured by
+		 * photographing a desk and the front's has to be too: the
+		 * vendor's image_orientation of 3 says the die is mounted a
+		 * half turn from the module, not how the module sits in the
+		 * phone.  Stating a wrong one is worse than stating none.
+		 */
+
+		port {
+			cam_front_out: endpoint {
+				remote-endpoint = <&ispfe_front_in>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <552960000>;
+			};
+		};
+	};
 };
 
 /*
@@ -2291,8 +2343,8 @@
  * The camera receive complex.  A port is one of the twelve CSIS link banks,
  * named by its number, so the port a sensor's endpoint hangs off is the bank
  * its data arrives on -- which is a fact about how the board is wired.  The
- * ultrawide is on bank 1; the main camera is on bank 0 and the front camera on
- * bank 6, and neither has a sensor driver yet.
+ * ultrawide is on bank 1 and the front camera on bank 6 -- the same part, so
+ * the same driver.  The main camera is on bank 0 and has no driver yet.
  */
 &ispfe {
 	status = "okay";
@@ -2306,6 +2358,16 @@
 
 			ispfe_uw_in: endpoint {
 				remote-endpoint = <&cam_uw_out>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+
+		port@6 {
+			reg = <6>;
+
+			ispfe_front_in: endpoint {
+				remote-endpoint = <&cam_front_out>;
 				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
 				data-lanes = <1 2 3 4>;
 			};

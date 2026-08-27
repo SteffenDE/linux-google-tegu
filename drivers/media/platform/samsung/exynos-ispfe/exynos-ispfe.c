@@ -1628,6 +1628,12 @@ struct ispfe_device {
 	struct list_head ready;
 	struct list_head flight;
 	unsigned int flight_count;
+	/*
+	 * Every credit, not just the ones that carried a buffer.  A dump credit
+	 * still consumes a frame, so it still ages whatever is in flight -- see
+	 * ispfe_queue_credit().
+	 */
+	u64 credit_count;
 	unsigned long slots_used;
 	struct ispfe_pdma_desc *ring;
 	dma_addr_t ring_dma;
@@ -2271,6 +2277,8 @@ struct ispfe_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	unsigned int slot;
+	/* The credit count at which this buffer's frame has been and gone. */
+	u64 retire_credit;
 };
 
 static struct ispfe_buffer *to_ispfe_buffer(struct vb2_v4l2_buffer *vbuf)
@@ -2467,9 +2475,26 @@ static void ispfe_queue_credit(struct ispfe_device *ispfe)
 	unsigned int slot = PDMA_DUMP_SLOT;
 
 	spin_lock(&ispfe->slock);
+	ispfe->credit_count++;
 	if (!list_empty(&ispfe->ready)) {
 		buf = list_first_entry(&ispfe->ready, struct ispfe_buffer, list);
 		list_move_tail(&buf->list, &ispfe->flight);
+		/*
+		 * Clamped for the same reason the back end clamps it: a latency
+		 * the ring cannot reach would leave the buffer in flight for
+		 * ever and DQBUF blocked with nothing said.
+		 *
+		 * Snapshotted per buffer, so a latency *raised* while frames
+		 * are in flight cannot strand what is already there.  Lowering
+		 * it reaches only buffers credited afterwards, which can leave
+		 * one behind the head due earlier than the head is -- retiring
+		 * the head alone then holds it for up to the difference, and it
+		 * is stamped that many frames late.  Bounded, self-correcting
+		 * and only reachable from debugfs.
+		 */
+		buf->retire_credit = ispfe->credit_count +
+			min_t(u32, READ_ONCE(ispfe->credit_latency),
+			      PDMA_BUF_SLOTS - 1);
 		ispfe->flight_count++;
 		slot = buf->slot;
 	}
@@ -2497,20 +2522,20 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	bool captured = false;
 
 	spin_lock(&ispfe->slock);
-	/*
-	 * Clamped: a latency the queue can never reach means no buffer is ever
-	 * completed and DQBUF blocks for ever, with nothing said.
-	 */
-	if (ispfe->flight_count >
-	    min_t(u32, READ_ONCE(ispfe->credit_latency), PDMA_BUF_SLOTS - 1)) {
+	/* Dump credits age a real buffer too; they are backpressure, not a stall. */
+	if (!list_empty(&ispfe->flight)) {
 		buf = list_first_entry(&ispfe->flight, struct ispfe_buffer,
 				       list);
-		list_del(&buf->list);
-		ispfe->flight_count--;
-		captured = ispfe_stats_capture_locked(ispfe, buf->slot,
-						      timestamp,
-						      ispfe->sequence);
-		__clear_bit(buf->slot, &ispfe->slots_used);
+		if (ispfe->credit_count >= buf->retire_credit) {
+			list_del(&buf->list);
+			ispfe->flight_count--;
+			captured = ispfe_stats_capture_locked(ispfe, buf->slot,
+							      timestamp,
+							      ispfe->sequence);
+			__clear_bit(buf->slot, &ispfe->slots_used);
+		} else {
+			buf = NULL;
+		}
 	}
 	spin_unlock(&ispfe->slock);
 
@@ -2533,6 +2558,14 @@ static void ispfe_queue_complete(struct ispfe_device *ispfe)
 	 * before the newest placed -- so the two cancel, and they stop
 	 * cancelling by one frame for every credit of latency above the
 	 * default.
+	 *
+	 * That cancellation holds only because a buffer is now aged by every
+	 * credit.  It used to be aged only by credits that carried a buffer, so
+	 * a queue that ran dry left one in flight across the dump frames while
+	 * this counter kept counting them, and it was handed back naming a
+	 * frame several later than the one it held -- with its statistics
+	 * carrying the same wrong number.  Measured: labels 62, 66, 70 against
+	 * grids whose hardware frame ids were 59, 62, 66.
 	 */
 	buf->vb.vb2_buf.timestamp = timestamp;
 	buf->vb.sequence = ispfe->sequence;
@@ -6829,6 +6862,7 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	unsigned int backend_ready = 0, backend_done = 0;
 	unsigned int backend_flight, backend_completed, backend_dropped;
 	u64 backend_credits;
+	u64 credits;
 	unsigned int isolation, i, flight;
 	dma_addr_t backend_dma;
 	unsigned long backend_programs, slots;
@@ -6850,6 +6884,7 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		backend_flight = ispfe->backend_flight_count;
 		backend_programs = ispfe->backend_programs_used;
 		backend_credits = ispfe->backend_credit_count;
+		credits = ispfe->credit_count;
 		backend_completed = ispfe->backend_completed;
 		backend_dropped = ispfe->backend_dropped;
 		backend_error = ispfe->backend_queue_error;
@@ -6859,8 +6894,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		list_for_each(pos, &ispfe->backend_done)
 			backend_done++;
 	}
-	seq_printf(s, "queue        %u in flight, slots %#lx, seq %u\n",
-		   flight, slots, ispfe->sequence);
+	seq_printf(s,
+		   "queue        %u in flight, slots %#lx, credits %llu, seq %u\n",
+		   flight, slots, credits, ispfe->sequence);
 	seq_printf(s,
 		   "backend_queue active %u, consumer %u, ready %u, flight %u, done %u, programs %#lx, credits %llu, completed %u, dropped %u, error %d\n",
 		   backend_active, ispfe->backend_queue_consumer, backend_ready,
@@ -7488,6 +7524,7 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
 		list_splice_tail_init(&ispfe->ready, &done);
 		list_splice_tail_init(&ispfe->pending, &done);
 		ispfe->flight_count = 0;
+		ispfe->credit_count = 0;
 		ispfe->slots_used = 0;
 		ispfe_stats_untake_all_locked(ispfe);
 	}

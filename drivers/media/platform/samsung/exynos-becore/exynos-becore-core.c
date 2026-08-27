@@ -478,6 +478,88 @@ static int becore_wait_reset(struct becore_block *block)
 				 block->base + BECORE_SW_RESET, block->name);
 }
 
+/*
+ * What the chain says about itself when a reset will not complete.
+ *
+ * A processor refusing to reset is the end of a story this driver cannot
+ * otherwise read: `reset_failed` latches, the device is quarantined until
+ * reboot, and nothing says *why*.  Lyric names three registers that do --
+ * `ip_busy_monitor_0`, `ip_stall_out_status_0` and, on YUVP, the input FIFO's
+ * own stall counter -- and the C2SERV windows carry the other half, since a
+ * VOTF producer and consumer that have stalled against each other are exactly
+ * what the failing case has in it.
+ *
+ * MCSC is deliberately not asked for the first two: Lyric's descriptor table
+ * does not reach them on that block, and an unimplemented offset here is an
+ * SError rather than a zero.
+ *
+ * The C2SERV windows are read whatever the driver thinks of their link state,
+ * because that state is not what makes them readable -- becore_c2serv_prepare()
+ * reads and writes the same window before it sets `ready`, and both windows are
+ * mapped or the probe fails.  Gating on `ready` would silence exactly the caller
+ * that needs this most: the runtime suspend, which unprepares the windows -- and
+ * so clears `ready` -- immediately before the reset that can fail.
+ *
+ * Read-only and only on the failure path, so a healthy teardown pays nothing.
+ */
+static void becore_report_stuck(struct becore_device *becore)
+{
+	unsigned int i;
+
+	for (i = 0; i < BECORE_NUM_BLOCKS; i++) {
+		struct becore_block *block = &becore->blocks[i];
+
+		if (i == BECORE_MCSC) {
+			dev_err(becore->dev,
+				"%s stuck: reset %#010x processing %#010x cinfifo %#010x\n",
+				block->name,
+				readl_relaxed(block->base + BECORE_SW_RESET),
+				readl_relaxed(block->base + BECORE_SET_CTRL),
+				readl_relaxed(block->base + BECORE_C_LOADER_ENABLE));
+			continue;
+		}
+
+		dev_err(becore->dev,
+			"%s stuck: reset %#010x processing %#010x cinfifo %#010x busy %#010x stall %#010x\n",
+			block->name,
+			readl_relaxed(block->base + BECORE_SW_RESET),
+			readl_relaxed(block->base + BECORE_SET_CTRL),
+			readl_relaxed(block->base + BECORE_C_LOADER_ENABLE),
+			readl_relaxed(block->base + BECORE_IP_BUSY_MONITOR_0),
+			readl_relaxed(block->base + BECORE_IP_STALL_OUT_STATUS_0));
+
+		if (i == BECORE_YUVP)
+			dev_err(becore->dev, "%s stuck: cinfifo stalls %u\n",
+				block->name,
+				readl_relaxed(block->base +
+					      BECORE_YUVP_CINFIFO_STALL_CNT));
+	}
+
+	for (i = 0; i < BECORE_NUM_C2SERV; i++) {
+		void __iomem *base = becore->c2serv[i];
+		unsigned int n;
+
+		dev_err(becore->dev, "%s stuck: reset %#010x ring %#010x/%#010x\n",
+			becore_c2serv[i].name,
+			readl_relaxed(base + BECORE_C2SERV_SW_RESET),
+			readl_relaxed(base + BECORE_C2SERV_RING_CLK_EN),
+			readl_relaxed(base + BECORE_C2SERV_RING_ENABLE));
+
+		for (n = 0; n < BECORE_C2SERV_LINK_PLANES; n++)
+			dev_err(becore->dev,
+				"%s stuck: plane %u tws busy %#x full %#x, trs busy %#x lost %#x\n",
+				becore_c2serv[i].name, n,
+				readl_relaxed(base + BECORE_C2SERV_TWS(n) +
+					      BECORE_C2SERV_TWS_BUSY),
+				readl_relaxed(base + BECORE_C2SERV_TWS(n) +
+					      BECORE_C2SERV_TWS_FULLNESS),
+				readl_relaxed(base + BECORE_C2SERV_TRS(n) +
+					      BECORE_C2SERV_TRS_BUSY),
+				readl_relaxed(base + BECORE_C2SERV_TRS(n) +
+					      BECORE_C2SERV_TRS_LOST_CONNECTION));
+	}
+}
+
 static int becore_reset_all(struct becore_device *becore)
 {
 	int first_error = 0;
@@ -494,6 +576,9 @@ static int becore_reset_all(struct becore_device *becore)
 		if (ret && !first_error)
 			first_error = ret;
 	}
+
+	if (first_error)
+		becore_report_stuck(becore);
 
 	return first_error;
 }

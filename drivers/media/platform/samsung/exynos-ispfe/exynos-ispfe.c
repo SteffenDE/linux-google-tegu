@@ -1241,12 +1241,24 @@ static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
  */
 struct ispfe_link {
 	bool present;
+	/* Which of the receiver's sink pads this camera arrives on. */
+	u16 pad;
 	u32 bank;
 	u32 phy;
 	u32 lanes;
 	bool cphy;
 	u32 mode_word0;
 	u32 mode_word1;
+
+	/*
+	 * The sensor on this link, and which of its pads the link comes from.
+	 * Written by the notifier under the driver's own lock, and read from
+	 * the capture queue, which holds that lock for the whole of start and
+	 * stop -- so an unbind cannot take a subdev away from under a stream,
+	 * it waits for the stream to finish instead.
+	 */
+	struct v4l2_subdev *sensor;
+	u32 sensor_pad;
 };
 
 /*
@@ -1565,16 +1577,14 @@ struct ispfe_device {
 	struct v4l2_subdev sd;
 	struct media_pad pads[ISPFE_MAX_PADS];
 	u16 source_pad;
-	struct v4l2_async_notifier notifier;
 	/*
-	 * The sensor, and which of its pads the link comes from.  Written by
-	 * the notifier under the driver's own lock, and read from the capture
-	 * queue, which holds that lock for the whole of start and stop -- so an
-	 * unbind cannot take the subdev away from under a stream, it waits for
-	 * the stream to finish instead.
+	 * The camera whose sink link is enabled, which is the one a stream will
+	 * run.  Written from .link_setup under the media core's graph mutex and
+	 * read at stream start; a link cannot be changed while a pad is
+	 * streaming, so it does not move under a session.
 	 */
-	struct v4l2_subdev *sensor;
-	u32 sensor_pad;
+	struct ispfe_link *active_link;
+	struct v4l2_async_notifier notifier;
 	struct video_device vdev;
 	struct media_pad vdev_pad;
 	struct media_pipeline pipe;
@@ -1690,6 +1700,55 @@ struct ispfe_device {
 	u32 core_seen[4];
 	u32 pdma_seen[3];
 };
+
+/* A camera's description, as the values a stream starts from. */
+static void ispfe_link_to_src(struct ispfe_device *ispfe,
+			      const struct ispfe_link *link)
+{
+	ispfe->src.link = link->bank;
+	ispfe->src.phy = link->phy;
+	ispfe->src.lanes = link->lanes;
+	ispfe->src.cphy = link->cphy;
+	ispfe->src.mode_word0 = link->mode_word0;
+	ispfe->src.mode_word1 = link->mode_word1;
+}
+
+/* The camera on a given sink pad, or NULL if that is not a sink pad of ours. */
+static struct ispfe_link *ispfe_link_by_pad(struct ispfe_device *ispfe,
+					    unsigned int pad)
+{
+	unsigned int i;
+
+	for (i = 0; i < CSIS_NUM_LINKS; i++)
+		if (ispfe->links[i].present && ispfe->links[i].pad == pad)
+			return &ispfe->links[i];
+
+	return NULL;
+}
+
+/*
+ * The camera the enabled sink link selects.
+ *
+ * Maintained from .link_setup rather than walked for, because the media core
+ * calls that under its own graph mutex and a stream start would otherwise have
+ * to take it -- and because a link cannot be changed while a pad is streaming,
+ * so what this returns is stable for the whole of a session.
+ */
+static struct ispfe_link *ispfe_active_link(struct ispfe_device *ispfe)
+{
+	return READ_ONCE(ispfe->active_link);
+}
+
+/*
+ * The sink pad the source mirrors: the enabled camera's, or the first if
+ * userspace has disabled every link, so that the format ops still answer.
+ */
+static unsigned int ispfe_active_sink_pad(struct ispfe_device *ispfe)
+{
+	struct ispfe_link *link = ispfe_active_link(ispfe);
+
+	return link ? link->pad : ISPFE_PAD_SINK;
+}
 
 /*
  * reg of downstream's dcphy_m0s4s4s4s4s4_csi0@* nodes, minus the
@@ -7737,17 +7796,18 @@ static void ispfe_buf_queue(struct vb2_buffer *vb)
  */
 static int ispfe_sensor_power(struct ispfe_device *ispfe, bool on)
 {
+	struct ispfe_link *link = ispfe_active_link(ispfe);
 	int ret;
 
-	if (!ispfe->sensor)
+	if (!link || !link->sensor)
 		return on ? -ENODEV : 0;
 
 	if (on) {
-		ret = v4l2_subdev_call(ispfe->sensor, video, pre_streamon, 0);
+		ret = v4l2_subdev_call(link->sensor, video, pre_streamon, 0);
 		return ret == -ENOIOCTLCMD ? 0 : ret;
 	}
 
-	ret = v4l2_subdev_call(ispfe->sensor, video, post_streamoff);
+	ret = v4l2_subdev_call(link->sensor, video, post_streamoff);
 	if (ret && ret != -ENOIOCTLCMD)
 		dev_err(ispfe->dev, "cannot power the sensor down: %d\n", ret);
 
@@ -9127,20 +9187,27 @@ static int ispfe_sd_init_state(struct v4l2_subdev *sd,
 			       struct v4l2_subdev_state *state)
 {
 	struct ispfe_device *ispfe = sd_to_ispfe(sd);
-	struct v4l2_mbus_framefmt *sink =
-		v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
 	struct v4l2_mbus_framefmt *source =
 		v4l2_subdev_state_get_format(state, ispfe->source_pad);
+	struct v4l2_mbus_framefmt *sink;
+	unsigned int pad;
 
-	sink->code = ISPFE_DEFAULT_CODE;
-	sink->width = ISPFE_DEFAULT_WIDTH;
-	sink->height = ISPFE_DEFAULT_HEIGHT;
-	sink->field = V4L2_FIELD_NONE;
-	sink->colorspace = V4L2_COLORSPACE_RAW;
-	sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
-	sink->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	sink->xfer_func = V4L2_XFER_FUNC_NONE;
-	*source = *sink;
+	/* Every camera starts from the same default; each keeps its own. */
+	for (pad = 0; pad < ispfe->source_pad; pad++) {
+		sink = v4l2_subdev_state_get_format(state, pad);
+
+		sink->code = ISPFE_DEFAULT_CODE;
+		sink->width = ISPFE_DEFAULT_WIDTH;
+		sink->height = ISPFE_DEFAULT_HEIGHT;
+		sink->field = V4L2_FIELD_NONE;
+		sink->colorspace = V4L2_COLORSPACE_RAW;
+		sink->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		sink->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		sink->xfer_func = V4L2_XFER_FUNC_NONE;
+	}
+
+	*source = *v4l2_subdev_state_get_format(state,
+						ispfe_active_sink_pad(ispfe));
 
 	return 0;
 }
@@ -9156,7 +9223,7 @@ static int ispfe_sd_enum_mbus_code(struct v4l2_subdev *sd,
 		if (code->index)
 			return -EINVAL;
 		code->code = v4l2_subdev_state_get_format(state,
-							  ISPFE_PAD_SINK)->code;
+				ispfe_active_sink_pad(ispfe))->code;
 		return 0;
 	}
 
@@ -9179,7 +9246,8 @@ static int ispfe_sd_enum_frame_size(struct v4l2_subdev *sd,
 
 	if (fse->pad == ispfe->source_pad) {
 		const struct v4l2_mbus_framefmt *sink =
-			v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
+			v4l2_subdev_state_get_format(state,
+					ispfe_active_sink_pad(ispfe));
 
 		if (fse->code != sink->code)
 			return -EINVAL;
@@ -9236,10 +9304,21 @@ static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
 	format->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	format->format.xfer_func = V4L2_XFER_FUNC_NONE;
 
-	sink = v4l2_subdev_state_get_format(state, ISPFE_PAD_SINK);
-	source = v4l2_subdev_state_get_format(state, ispfe->source_pad);
+	sink = v4l2_subdev_state_get_format(state, format->pad);
 	*sink = format->format;
-	*source = *sink;
+
+	/*
+	 * The source carries what the receiver will actually deliver, so it
+	 * follows the camera that is selected and not whichever sink was last
+	 * written.  Setting a format on a camera that is not the enabled one
+	 * is allowed and remembered; it just does not change the output until
+	 * that camera is selected.
+	 */
+	if (format->pad == ispfe_active_sink_pad(ispfe)) {
+		source = v4l2_subdev_state_get_format(state,
+						      ispfe->source_pad);
+		*source = *sink;
+	}
 
 	return 0;
 }
@@ -9254,11 +9333,12 @@ static int ispfe_sd_enable_streams(struct v4l2_subdev *sd,
 				   u64 streams_mask)
 {
 	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	struct ispfe_link *link = ispfe_active_link(ispfe);
 
-	if (!ispfe->sensor)
+	if (!link || !link->sensor)
 		return -ENODEV;
 
-	return v4l2_subdev_enable_streams(ispfe->sensor, ispfe->sensor_pad,
+	return v4l2_subdev_enable_streams(link->sensor, link->sensor_pad,
 					  BIT_ULL(0));
 }
 
@@ -9274,12 +9354,13 @@ static int ispfe_sd_disable_streams(struct v4l2_subdev *sd,
 				    u64 streams_mask)
 {
 	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	struct ispfe_link *link = ispfe_active_link(ispfe);
 	int ret;
 
-	if (!ispfe->sensor)
+	if (!link || !link->sensor)
 		return 0;
 
-	ret = v4l2_subdev_disable_streams(ispfe->sensor, ispfe->sensor_pad,
+	ret = v4l2_subdev_disable_streams(link->sensor, link->sensor_pad,
 					  BIT_ULL(0));
 	if (ret)
 		dev_err(ispfe->dev, "sensor would not stop: %d\n", ret);
@@ -9333,11 +9414,142 @@ static const struct v4l2_subdev_internal_ops ispfe_subdev_internal_ops = {
 	.init_state = ispfe_sd_init_state,
 };
 
+/*
+ * Which camera feeds the receiver.  One sink link at a time: enabling a second
+ * is refused rather than silently switching, so a consumer has to say what it
+ * is giving up before it says what it wants -- and that refusal is this
+ * driver's, not the core's.  The core only blocks a change to a link whose pad
+ * is in a running pipeline, and .has_pad_interdep deliberately keeps the
+ * *inactive* sinks out of it, so nothing above would stop the other link being
+ * enabled underneath a capture.
+ *
+ * Which is also why the whole selection is refused while the front end has an
+ * owner.  Only the raw node's start takes a media pipeline; the back end's
+ * processed path -- the one libcamera uses by default -- and the debugfs
+ * capture do not, so no pad of this entity is ever marked as streaming for
+ * them and the core would let a link change through mid-capture.  Disabling
+ * the active link there would clear active_link, and then the teardown would
+ * find no sensor to stop and leave it streaming into a halted receiver, which
+ * costs the next capture an -EALREADY that nothing clears.
+ *
+ * `owner` is read without ispfe->lock, and that is deliberate rather than an
+ * omission: the media core calls this holding its graph mutex, while a stream
+ * start holds ispfe->lock and then takes the graph mutex inside
+ * video_device_pipeline_start(), so taking ispfe->lock here would close an
+ * ABBA.  What is left is a link change racing a start that has not yet claimed
+ * ownership.  For the raw node that race does not exist -- its start blocks on
+ * the graph mutex this is holding -- but for the two paths that take no
+ * pipeline it does, and it is not benign: ispfe_link_to_src() is six
+ * unsynchronised stores and ispfe_start() copies the struct, so an interleave
+ * arms the receiver on one camera's bank with another's PHY.  Every field is
+ * individually valid, so nothing downstream rejects it; the capture is simply
+ * wrong.  Narrow, and the same shape as the unlocked debugfs writes this
+ * driver already accepts -- but the fix is the back end taking a pipeline the
+ * way the raw node does, not a wider lock here.
+ */
+static int ispfe_link_setup(struct media_entity *entity,
+			    const struct media_pad *local,
+			    const struct media_pad *remote, u32 flags)
+{
+	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	struct v4l2_subdev_state *state;
+	struct ispfe_link *link;
+
+	/* The graph below the source pad is fixed; only a sink link chooses. */
+	if (!(local->flags & MEDIA_PAD_FL_SINK))
+		return 0;
+
+	if (READ_ONCE(ispfe->owner) != ISPFE_OWNER_NONE)
+		return -EBUSY;
+
+	link = ispfe_link_by_pad(ispfe, local->index);
+	if (!link)
+		return -EINVAL;
+
+	if (!(flags & MEDIA_LNK_FL_ENABLED)) {
+		if (ispfe_active_link(ispfe) == link)
+			WRITE_ONCE(ispfe->active_link, NULL);
+		return 0;
+	}
+
+	if (ispfe_active_link(ispfe) && ispfe_active_link(ispfe) != link)
+		return -EBUSY;
+
+	WRITE_ONCE(ispfe->active_link, link);
+
+	/*
+	 * Only when the camera actually changes.  `src` is what a debugfs sweep
+	 * of `phy` or the mode words writes into, and re-selecting the camera
+	 * already selected -- which is what disabling and re-enabling one link
+	 * is -- must not throw that away.  Switching to a *different* camera
+	 * resets them, because a sweep belongs to the camera it was made on.
+	 */
+	if (ispfe->src.link != link->bank)
+		ispfe_link_to_src(ispfe, link);
+
+	/*
+	 * The source pad carries what the receiver will deliver, and it is what
+	 * ispfe_start() arms the hardware from and what the capture node sizes
+	 * its buffers by -- so selecting a camera has to bring that camera's
+	 * geometry with it.  Without this the source would keep the *previous*
+	 * camera's, and link validation would not catch it: it compares the
+	 * sensor against the sink, and never the sink against the source.
+	 */
+	state = v4l2_subdev_lock_and_get_active_state(sd);
+	if (state) {
+		*v4l2_subdev_state_get_format(state, ispfe->source_pad) =
+			*v4l2_subdev_state_get_format(state, link->pad);
+		v4l2_subdev_unlock_state(state);
+	}
+
+	return 0;
+}
+
+/*
+ * Only the *enabled* sink is connected to the source inside this entity.
+ *
+ * Without this the default applies, which says every sink is interdependent
+ * with every source -- and then the pipeline walk reaches the inactive sink
+ * pads too, because it adds the local pad of a link whether or not the link is
+ * enabled.  Each of those carries MUST_CONNECT, so a capture on one camera
+ * would be refused with -ENOLINK naming the pad of another.
+ */
+static bool ispfe_has_pad_interdep(struct media_entity *entity,
+				   unsigned int pad0, unsigned int pad1)
+{
+	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
+	struct ispfe_device *ispfe = sd_to_ispfe(sd);
+	struct ispfe_link *link = ispfe_active_link(ispfe);
+	unsigned int sink = pad0 == ispfe->source_pad ? pad1 : pad0;
+
+	/* The core has already established that one of the two is the source. */
+	return link && sink == link->pad;
+}
+
 static const struct media_entity_operations ispfe_subdev_entity_ops = {
 	.link_validate = v4l2_subdev_link_validate,
+	.link_setup = ispfe_link_setup,
+	.has_pad_interdep = ispfe_has_pad_interdep,
 };
 
 /* ---- binding the sensor ------------------------------------------------ */
+
+/*
+ * One async connection per camera, each carrying the link it was added for.
+ * The connection's own fwnode is the *sensor's* endpoint, which says nothing
+ * about which of the receiver's sink pads the data arrives on, so the mapping
+ * has to be recorded when the connection is made.
+ */
+struct ispfe_asc {
+	struct v4l2_async_connection base;
+	struct ispfe_link *link;
+};
+
+static struct ispfe_asc *to_ispfe_asc(struct v4l2_async_connection *asc)
+{
+	return container_of(asc, struct ispfe_asc, base);
+}
 
 static int ispfe_notify_bound(struct v4l2_async_notifier *nf,
 			      struct v4l2_subdev *sd,
@@ -9345,6 +9557,7 @@ static int ispfe_notify_bound(struct v4l2_async_notifier *nf,
 {
 	struct ispfe_device *ispfe =
 		container_of(nf, struct ispfe_device, notifier);
+	struct ispfe_link *link = to_ispfe_asc(asc)->link;
 	int pad;
 
 	pad = media_entity_get_fwnode_pad(&sd->entity, asc->match.fwnode,
@@ -9356,8 +9569,8 @@ static int ispfe_notify_bound(struct v4l2_async_notifier *nf,
 	}
 
 	guard(mutex)(&ispfe->lock);
-	ispfe->sensor = sd;
-	ispfe->sensor_pad = pad;
+	link->sensor = sd;
+	link->sensor_pad = pad;
 
 	return 0;
 }
@@ -9370,26 +9583,47 @@ static void ispfe_notify_unbind(struct v4l2_async_notifier *nf,
 		container_of(nf, struct ispfe_device, notifier);
 
 	guard(mutex)(&ispfe->lock);
-	ispfe->sensor = NULL;
+	to_ispfe_asc(asc)->link->sensor = NULL;
 }
 
 /*
- * Both links are immutable.  This block has twelve link banks, but the driver
- * runs one stream and which bank it is on is a statement about how the board is
- * wired rather than something userspace chooses.
+ * A link per camera, and the enabled one is the selector: this block has twelve
+ * link banks and the driver runs one stream, so which camera feeds the receiver
+ * is a choice, made by enabling that camera's link and refused anywhere else.
+ *
+ * The links downstream of the source pad stay immutable, because the graph
+ * below the receiver really is fixed.
+ *
+ * With a single camera there is no choice to make, so its link is immutable
+ * too and the graph is as rigid as it was before this could hold two.
  */
 static int ispfe_notify_complete(struct v4l2_async_notifier *nf)
 {
 	struct ispfe_device *ispfe =
 		container_of(nf, struct ispfe_device, notifier);
+	struct ispfe_link *active = ispfe_active_link(ispfe);
+	unsigned int i;
 	int ret;
 
-	ret = media_create_pad_link(&ispfe->sensor->entity, ispfe->sensor_pad,
-				    &ispfe->sd.entity, ISPFE_PAD_SINK,
-				    MEDIA_LNK_FL_ENABLED |
-				    MEDIA_LNK_FL_IMMUTABLE);
-	if (ret)
-		return ret;
+	for (i = 0; i < CSIS_NUM_LINKS; i++) {
+		struct ispfe_link *link = &ispfe->links[i];
+		u32 flags = 0;
+
+		if (!link->present)
+			continue;
+
+		if (link == active)
+			flags = MEDIA_LNK_FL_ENABLED;
+		if (ispfe->num_links == 1)
+			flags |= MEDIA_LNK_FL_IMMUTABLE;
+
+		ret = media_create_pad_link(&link->sensor->entity,
+					    link->sensor_pad,
+					    &ispfe->sd.entity, link->pad,
+					    flags);
+		if (ret)
+			return ret;
+	}
 
 	ret = v4l2_device_register_subdev_nodes(&ispfe->v4l2_dev);
 	if (ret)
@@ -9485,6 +9719,7 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 static int ispfe_parse_endpoints(struct ispfe_device *ispfe)
 {
 	struct fwnode_handle *ep;
+	unsigned int i, pad;
 	int ret;
 
 	fwnode_graph_for_each_endpoint(dev_fwnode(ispfe->dev), ep) {
@@ -9500,69 +9735,39 @@ static int ispfe_parse_endpoints(struct ispfe_device *ispfe)
 				     "no sensor endpoint\n");
 
 	/*
-	 * Described, but not yet driven: the receiver is one subdevice with one
-	 * sink pad, so it can only be told about one camera.  Refused rather
-	 * than ignored, because a device tree that says two and gets one is a
-	 * silent half-configuration.
+	 * A sink pad each, in ascending bank order, so the pad numbering is
+	 * stable for a given device tree and the source lands after them.
 	 */
-	if (ispfe->num_links > 1)
-		return dev_err_probe(ispfe->dev, -EINVAL,
-				     "%u cameras described, one is supported\n",
-				     ispfe->num_links);
-
-	return 0;
-}
-
-/* The one link's description, as the values a stream starts from. */
-static void ispfe_link_to_src(struct ispfe_device *ispfe,
-			      const struct ispfe_link *link)
-{
-	ispfe->src.link = link->bank;
-	ispfe->src.phy = link->phy;
-	ispfe->src.lanes = link->lanes;
-	ispfe->src.cphy = link->cphy;
-	ispfe->src.mode_word0 = link->mode_word0;
-	ispfe->src.mode_word1 = link->mode_word1;
-}
-
-/* The only camera, while only one is supported. */
-static struct ispfe_link *ispfe_only_link(struct ispfe_device *ispfe)
-{
-	unsigned int i;
-
+	pad = 0;
 	for (i = 0; i < CSIS_NUM_LINKS; i++)
 		if (ispfe->links[i].present)
-			return &ispfe->links[i];
+			ispfe->links[i].pad = pad++;
 
-	return NULL;
+	return 0;
 }
 
 static int ispfe_media_register(struct ispfe_device *ispfe)
 {
 	struct vb2_queue *q = &ispfe->queue;
-	struct v4l2_async_connection *asc;
 	struct fwnode_handle *ep;
+	unsigned int i;
 	int ret;
 
 	ret = ispfe_parse_endpoints(ispfe);
 	if (ret)
 		return ret;
 
-	ispfe_link_to_src(ispfe, ispfe_only_link(ispfe));
-
 	/* Sink pads first, one per camera, then the source. */
 	ispfe->source_pad = ispfe->num_links;
 
 	/*
-	 * The first endpoint, for the notifier to bind against -- which is that
-	 * one link's, because there is exactly one endpoint in total.  When a
-	 * second link lands this walk has to select rather than take the first,
-	 * and so does the copy above.
+	 * The lowest-numbered bank is the camera a graph nobody has touched
+	 * comes up on, so that a single-camera board needs no link enabling and
+	 * a multi-camera one has a defined starting point rather than none.
+	 * Every later change of it goes through .link_setup.
 	 */
-	ep = fwnode_graph_get_next_endpoint(dev_fwnode(ispfe->dev), NULL);
-	if (!ep)
-		return dev_err_probe(ispfe->dev, -ENXIO,
-				     "no sensor endpoint\n");
+	ispfe->active_link = ispfe_link_by_pad(ispfe, 0);
+	ispfe_link_to_src(ispfe, ispfe->active_link);
 
 	ispfe->mdev.dev = ispfe->dev;
 	strscpy(ispfe->mdev.model, "zumapro ISPFE", sizeof(ispfe->mdev.model));
@@ -9593,8 +9798,9 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	 * MUST_CONNECT, so that a pipeline with no sensor is refused before any
 	 * of the receiver is programmed rather than after it is fully armed.
 	 */
-	ispfe->pads[ISPFE_PAD_SINK].flags = MEDIA_PAD_FL_SINK |
-					    MEDIA_PAD_FL_MUST_CONNECT;
+	for (i = 0; i < ispfe->source_pad; i++)
+		ispfe->pads[i].flags = MEDIA_PAD_FL_SINK |
+				       MEDIA_PAD_FL_MUST_CONNECT;
 	ispfe->pads[ispfe->source_pad].flags = MEDIA_PAD_FL_SOURCE;
 	ret = media_entity_pads_init(&ispfe->sd.entity, ispfe->source_pad + 1,
 				     ispfe->pads);
@@ -9675,11 +9881,32 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_params;
 
+	/*
+	 * A connection per camera, each told which link it is for.  The port
+	 * number was bounds-checked and marked present by
+	 * ispfe_parse_endpoints() above, so indexing links[] with it here is
+	 * safe by construction.
+	 */
 	v4l2_async_nf_init(&ispfe->notifier, &ispfe->v4l2_dev);
-	asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
-					      struct v4l2_async_connection);
-	if (IS_ERR(asc)) {
-		ret = PTR_ERR(asc);
+	fwnode_graph_for_each_endpoint(dev_fwnode(ispfe->dev), ep) {
+		struct fwnode_endpoint fwep = {};
+		struct ispfe_asc *asc;
+
+		ret = fwnode_graph_parse_endpoint(ep, &fwep);
+		if (ret)
+			break;
+
+		asc = v4l2_async_nf_add_fwnode_remote(&ispfe->notifier, ep,
+						      struct ispfe_asc);
+		if (IS_ERR(asc)) {
+			ret = PTR_ERR(asc);
+			break;
+		}
+
+		asc->link = &ispfe->links[fwep.port];
+	}
+	if (ret) {
+		fwnode_handle_put(ep);
 		goto err_nf;
 	}
 
@@ -9687,8 +9914,6 @@ static int ispfe_media_register(struct ispfe_device *ispfe)
 	ret = v4l2_async_nf_register(&ispfe->notifier);
 	if (ret)
 		goto err_nf;
-
-	fwnode_handle_put(ep);
 
 	return 0;
 
@@ -9718,7 +9943,6 @@ err_v4l2:
 	v4l2_device_unregister(&ispfe->v4l2_dev);
 err_mdev:
 	media_device_cleanup(&ispfe->mdev);
-	fwnode_handle_put(ep);
 	return ret;
 }
 

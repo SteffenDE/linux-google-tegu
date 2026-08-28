@@ -146,11 +146,12 @@
  * version.  The enable is at 31 and the two spacer counts are 15 bits each --
  * so the IMX712s' 0x7fff7fff is the feature off with both counts saturated,
  * and the main camera's 0x80020002 turns it on with two spacers each, which is
- * a C-PHY link asking for a shorter gap than the default.  Only the disabled
- * form is written here; a C-PHY source will want the other.
+ * a C-PHY link asking for a shorter gap than the default.  Both forms are the
+ * measured ones; neither is derived from the link rate.
  */
 #define CSIS_LRTE_CONFIG		0x0600
 #define CSIS_LRTE_CONFIG_OFF		0x7fff7fff
+#define CSIS_LRTE_CONFIG_CPHY		0x80020002
 /* Debug options, cleared rather than left at whatever the last session set. */
 #define CSIS_DBG_OPTION_SUITE		0x0690
 
@@ -1794,12 +1795,17 @@ static u32 ispfe_phy_lanes(u32 phy)
 /*
  * PHY settings, transcribed from what the vendor stack writes for either
  * IMX712 -- both sensors get byte-identical sequences, which is what says this
- * is one code path with the geometry as its only argument.  The main camera
- * differs in exactly one word (the master block's +0x10 is 0x240 rather than
- * 0x200) and in using three lane blocks instead of four, so a C-PHY source
- * will need this table split; nothing here is decoded far enough to derive
- * either from the link rate.
+ * is one code path with the geometry as its only argument.
+ *
+ * The main camera differs in exactly one word of them, the master block's
+ * +0x10, and in using three lane blocks instead of four.  Neither value is
+ * decoded far enough to derive from the link rate, so both are carried as the
+ * measured pair and chosen by the link type.
  */
+#define PHY_MASTER_MODE			0x10
+#define PHY_MASTER_MODE_DPHY		0x00000200
+#define PHY_MASTER_MODE_CPHY		0x00000240
+
 struct ispfe_reg {
 	u32 off;
 	u32 val;
@@ -1807,7 +1813,8 @@ struct ispfe_reg {
 
 static const struct ispfe_reg ispfe_phy_master[] = {
 	{ 0x00, 0x00000010 }, { 0x04, 0x00000110 }, { 0x08, 0x00003223 },
-	{ 0x0c, 0x00000000 }, { 0x10, 0x00000200 }, { 0x14, 0x00000000 },
+	{ 0x0c, 0x00000000 }, { PHY_MASTER_MODE, PHY_MASTER_MODE_DPHY },
+	{ 0x14, 0x00000000 },
 };
 
 static const struct ispfe_reg ispfe_phy_common[] = {
@@ -2193,6 +2200,26 @@ static void ispfe_write_seq(void __iomem *base, const struct ispfe_reg *seq,
 }
 
 /*
+ * The shared master block, with the one word that depends on the link type
+ * substituted as it goes out rather than corrected afterwards: this driver's
+ * write set is diffed against the vendor's register for register, and a D-PHY
+ * value followed by a C-PHY one is a difference where the hardware has none.
+ */
+static void ispfe_phy_write_master(void __iomem *base, bool cphy)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_phy_master); i++) {
+		u32 val = ispfe_phy_master[i].val;
+
+		if (ispfe_phy_master[i].off == PHY_MASTER_MODE && cphy)
+			val = PHY_MASTER_MODE_CPHY;
+
+		writel_relaxed(val, base + ispfe_phy_master[i].off);
+	}
+}
+
+/*
  * A link's PHY, in the order the vendor stack brings it up: every block reset
  * to zero, then the shared master, then the common block and its lane blocks,
  * each closed by writing its own enable last.
@@ -2207,8 +2234,7 @@ static void ispfe_phy_start(struct ispfe_device *ispfe)
 	for (lane = 0; lane < ispfe->active.lanes; lane++)
 		writel_relaxed(0, phy + PHY_LANE(lane));
 
-	ispfe_write_seq(csis + PHY_MASTER, ispfe_phy_master,
-			ARRAY_SIZE(ispfe_phy_master));
+	ispfe_phy_write_master(csis + PHY_MASTER, ispfe->active.cphy);
 
 	ispfe_write_seq(phy, ispfe_phy_common, ARRAY_SIZE(ispfe_phy_common));
 	writel_relaxed(PHY_ENABLE_COMMON, phy);
@@ -2311,7 +2337,9 @@ static void ispfe_link_start(struct ispfe_device *ispfe)
 	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, 1),
 		       link + CSIS_ISP_RESOL_CH(1));
 
-	writel_relaxed(CSIS_LRTE_CONFIG_OFF, link + CSIS_LRTE_CONFIG);
+	writel_relaxed(ispfe->active.cphy ? CSIS_LRTE_CONFIG_CPHY
+					 : CSIS_LRTE_CONFIG_OFF,
+		       link + CSIS_LRTE_CONFIG);
 	writel_relaxed(CSIS_CLK_CTRL_VAL, link + CSIS_CLK_CTRL);
 
 	ctrl = CSIS_CMN_CTRL_COMMON | CSIS_CMN_CTRL_CSI_EN |

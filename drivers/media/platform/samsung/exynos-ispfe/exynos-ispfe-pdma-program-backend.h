@@ -10,7 +10,7 @@
  * Source: buf-126-iova000000001d1d8000-fd423-size12288.bin
  * SHA-256: 275a47cfde9f7f6e12e618638a3d24e346d0ee12e35300a9f798dec23fe1e529
  * Capture: 0x17d0 bytes in 61 commands
- * Program: 0x1420 bytes in 52 commands, 18 relocations
+ * Program: 0x13c4 bytes in 52 commands, 18 relocations
  *
  * Blocks emitted blank: a NULL payload the encoder writes as
  * zeroes.  The hardware is written every register these blocks
@@ -24,7 +24,9 @@
  *   0x00054b2c  lmp/gtm  blank
  *   0x00054b34  lmp/gamma  blank
  *   0x00054b64  lmp/rgb_dg  blank
+ *   0x00054b70  lmp/rgb_scaler  blank
  *   0x00054c94  lmp/rgb_tapout  blank
+ *   0x00054b90  lmp/scaler  blank
  *   0x00054df4  lmp/lightness  blank
  *
  * Records the driver builds.  The command carries no payload at
@@ -80,7 +82,7 @@
 
 #include "exynos-ispfe-pdma.h"
 
-#define ISPFE_PDMA_BACKEND_RECIPE_BYTES		0x1420
+#define ISPFE_PDMA_BACKEND_RECIPE_BYTES		0x13c4
 #define ISPFE_PDMA_BACKEND_BLOCKS_BYTES		0x6000
 
 /*
@@ -359,23 +361,6 @@ static const u8 ispfe_pdma_backend_payload_25[0x1c] = {
 	0x00, 0x00, 0x00, 0x00,
 };
 
-/* command 32, inline-burst, lmp/rgb_scaler */
-static const u8 ispfe_pdma_backend_payload_32[0x20] = {
-	0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x00, 0x00, 0x40, 0x41, 0x00,
-	0x00, 0x00, 0x41, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x0e, 0x02, 0x86, 0x01, 0x00, 0x00, 0x00, 0x00,
-};
-
-/* command 35, inline-burst, lmp/scaler */
-static const u8 ispfe_pdma_backend_payload_35[0x44] = {
-	0x50, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x1c, 0x04, 0x0c, 0x03, 0x80, 0x02, 0xe0, 0x01,
-	0x80, 0x02, 0xe0, 0x01, 0x40, 0x01, 0x40, 0x01, 0x00, 0x00, 0x34, 0x00,
-	0x00, 0x00, 0x34, 0x00, 0x99, 0x99, 0x34, 0x00, 0x00, 0x00, 0x34, 0x00,
-	0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x4e, 0x00,
-};
-
 /* command 45, inline-burst, lmp/alignment_formatter */
 static const u8 ispfe_pdma_backend_payload_45[0x88] = {
 	0x70, 0x10, 0x30, 0x0c, 0xf1, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00,
@@ -567,13 +552,13 @@ static const struct ispfe_pdma_cmd ispfe_pdma_backend_recipe[] = {
 	  .payload = NULL, .len = 0x0004 },
 	/* 0x0076c  inline-burst, lmp/rgb_scaler */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054b70,
-	  .payload = ispfe_pdma_backend_payload_32, .len = sizeof(ispfe_pdma_backend_payload_32) },
+	  .payload = NULL, .len = 0x0004 },
 	/* 0x007a8  inline-burst, lmp/rgb_tapout */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054c94,
 	  .payload = NULL, .len = 0x0004 },
 	/* 0x007d0  inline-burst, lmp/scaler */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054b90,
-	  .payload = ispfe_pdma_backend_payload_35, .len = sizeof(ispfe_pdma_backend_payload_35) },
+	  .payload = NULL, .len = 0x0004 },
 	/* 0x00844  inline-burst, lmp/output_formatter */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054bd4,
 	  .payload = NULL, .len = 0x0040 },

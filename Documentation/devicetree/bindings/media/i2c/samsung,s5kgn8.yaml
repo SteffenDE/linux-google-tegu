@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/samsung,s5kgn8.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung S5KGN8 CMOS Digital Image Sensor
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  The S5KGN8 is a Samsung ISOCELL CMOS active pixel digital image sensor. It is
+  programmed over I2C with 16-bit register addresses and 16-bit values through a
+  paged register file, and sends image data over three MIPI CSI-2 C-PHY data
+  lanes. The mode this driver programs reads the array out 2x2 binned.
+
+allOf:
+  - $ref: /schemas/media/video-interface-devices.yaml#
+
+properties:
+  compatible:
+    const: samsung,s5kgn8
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    description: EXTCLK, the sensor master clock
+    maxItems: 1
+
+  reset-gpios:
+    description: Asserted low to hold the sensor in reset
+    maxItems: 1
+
+  pinctrl-names:
+    items:
+      - const: default
+      - const: sleep
+    description:
+      The master clock pad is muxed to its clock function in the default state
+      and parked in the sleep state, so that it is only driven while the sensor
+      is powered.
+
+  iovdd-supply:
+    description: Interface power supply (1.8V)
+
+  avdd-supply:
+    description: First analog power supply
+
+  avdd2-supply:
+    description: Second analog power supply
+
+  avdd3-supply:
+    description: Third analog power supply
+
+  dvdd-supply:
+    description: Digital power supply
+
+  port:
+    additionalProperties: false
+    $ref: /schemas/graph.yaml#/$defs/port-base
+
+    properties:
+      endpoint:
+        $ref: /schemas/media/video-interfaces.yaml#
+        unevaluatedProperties: false
+
+        properties:
+          data-lanes:
+            minItems: 3
+            maxItems: 3
+
+        required:
+          - data-lanes
+
+    required:
+      - endpoint
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - reset-gpios
+  - iovdd-supply
+  - avdd-supply
+  - avdd2-supply
+  - avdd3-supply
+  - dvdd-supply
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        camera@56 {
+            compatible = "samsung,s5kgn8";
+            reg = <0x56>;
+
+            clocks = <&s5kgn8_clk>;
+
+            iovdd-supply = <&camera_vddio_1v8>;
+            avdd-supply = <&camera_vdda_2v9_b>;
+            avdd2-supply = <&camera_vdda_2v9_a>;
+            avdd3-supply = <&camera_vdda_2v25>;
+            dvdd-supply = <&camera_vddd>;
+
+            reset-gpios = <&gpio 2 GPIO_ACTIVE_LOW>;
+
+            orientation = <1>;
+            rotation = <270>;
+
+            port {
+                s5kgn8_output: endpoint {
+                    bus-type = <1>; /* MIPI CSI-2 C-PHY */
+                    data-lanes = <1 2 3>;
+                    remote-endpoint = <&csi_input>;
+                };
+            };
+        };
+    };
+...

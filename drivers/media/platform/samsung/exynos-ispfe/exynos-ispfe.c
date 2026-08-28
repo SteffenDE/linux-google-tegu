@@ -442,7 +442,23 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_LMP_IDMA_MAX_BURST_VAL	0x00000001
 #define FC_LMP_IDMA_AXI_REORDER_EN_VAL	0x00000001
 #define FC_LMP_IDMA_AXCACHE_VAL		0x00000000
+/*
+ * The LMP input DMA's outstanding-transaction limit.  The vendor stack sets it
+ * by *concurrency* rather than by camera: 0x1a with either IMX712 streaming
+ * alone, 0x6c with the main camera alone, 0x88 with two sensors up, and 0x2
+ * idle.  This driver runs one link at a time, so what a camera needs is its
+ * alone value, and that is what these two are.
+ *
+ * It is a bandwidth limit rather than a correctness one: sweeping all four
+ * values against the ultrawide changed nothing at all [HW 2026-08-18].  There
+ * is still no reason to give a camera another's.
+ *
+ * Only a back-end recipe carries one.  Every other start writes the probe
+ * default, which is the IMX712's -- see ispfe->fc_axi_max_ost, and the debugfs
+ * knob that overrides it.
+ */
 #define FC_LMP_IDMA_AXI_MAX_OST_IMX712	0x0000001a
+#define FC_LMP_IDMA_AXI_MAX_OST_S5KGN8	0x0000006c
 #define FC_LMP_IDMA1_AXI_MAX_OST_VAL	0x00000002
 /* What both max-outstanding words read idle, and what stop writes. */
 #define FC_LMP_IDMA_AXI_MAX_OST_IDLE	0x00000002
@@ -1212,7 +1228,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.fixed_resources = true,
 		.required_loch = 0,
 		.required_fcctx = 3,
-		.required_fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712,
+		.required_fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_S5KGN8,
 	},
 };
 

@@ -1986,9 +1986,9 @@
  * main module's combined AF/OIS/EEPROM part, a TI LM3644 flash driver, and
  * the analog supplies all three run on.
  *
- * There are no sensor drivers yet.  What is described here is the power tree,
- * the buses and the pins, so that the rails can be brought up in the recorded
- * order and the sensors answer on i2c.
+ * All three sensors have drivers.  What is also described here is the power
+ * tree, the buses and the pins, so that the rails come up in the recorded
+ * order.
  *
  * The supply topology, from the board rails inward:
  *
@@ -2361,8 +2361,8 @@
 };
 
 /*
- * Main camera: sensor at 0x56, and the combined AF/OIS/EEPROM part at 0x24.
- * Neither has a driver yet.
+ * Main camera: sensor at 0x56, and the combined AF/OIS/EEPROM part at 0x24,
+ * which has no driver.
  */
 &usi5 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -2371,6 +2371,69 @@
 
 &hsi2c_5 {
 	status = "okay";
+
+	/*
+	 * barghest, the main camera.  A Samsung ISOCELL part with a paged
+	 * register file and 16-bit values, on CIS_CLK3 off the same 24.576 MHz
+	 * oscillator as the other two -- which is what the sensor's PLL closes
+	 * against, not the 24.0 MHz its own 0x0136 claims and not the 26 MHz
+	 * the downstream device tree asks for.
+	 *
+	 * Five rails rather than the other modules' three, in the order the
+	 * recorded power sequence brings them up.  The last of them is the
+	 * switched rail downstream calls vdig_enable: the module has no 1.2 V
+	 * LDO of its own on the camera PMIC, and without that switch the sensor
+	 * does not answer on i2c at all.
+	 *
+	 * No link-frequencies.  The sensor's output PLL is not decoded well
+	 * enough to state one, and nothing on this board reads the property --
+	 * the receiver takes the lane count and the bus type and nothing else.
+	 */
+	cam_main: camera@56 {
+		compatible = "samsung,s5kgn8";
+		reg = <0x56>;
+
+		clocks = <&cmu_top CLK_GOUT_CMU_DFTMUX_CIS_CLK3>;
+		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK3>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK3>;
+		assigned-clock-parents = <&ext_24_5m>;
+		assigned-clock-rates = <0>, <24576000>;
+
+		reset-gpios = <&gpp10 2 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_main_reset>, <&cam_main_mclk>;
+		pinctrl-1 = <&cam_main_reset>, <&cam_main_mclk_off>;
+
+		iovdd-supply = <&s2mpg15_ldo12>;
+		avdd-supply = <&cam_ldo5>;
+		avdd2-supply = <&cam_ldo4>;
+		avdd3-supply = <&cam_ldo1>;
+		dvdd-supply = <&cam_main_vdig>;
+
+		/* Rear-facing. */
+		orientation = <1>;
+
+		/*
+		 * Not measured for this module.  Both modules on this board
+		 * whose rotation has been measured are 270 -- the ultrawide
+		 * from a frame taken at a known pose, the front camera from a
+		 * camera application -- and this one is on the same face of the
+		 * same board as the ultrawide.  That is a strong expectation
+		 * and not a measurement, so: TRACE NEEDED.  What would settle
+		 * it is what settled the front camera's, which is to point a
+		 * real application at it and look.
+		 */
+		rotation = <270>;
+
+		port {
+			cam_main_out: endpoint {
+				remote-endpoint = <&ispfe_main_in>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+				data-lanes = <1 2 3>;
+			};
+		};
+	};
 };
 
 /*
@@ -2378,7 +2441,9 @@
  * named by its number, so the port a sensor's endpoint hangs off is the bank
  * its data arrives on -- which is a fact about how the board is wired.  The
  * ultrawide is on bank 1 and the front camera on bank 6 -- the same part, so
- * the same driver.  The main camera is on bank 0 and has no driver yet.
+ * the same driver.  The main camera is on bank 0, and it is the one C-PHY
+ * source here: three lanes rather than four, which at its pixel rate is the
+ * only thing three lanes could physically be.
  */
 &ispfe {
 	status = "okay";
@@ -2386,6 +2451,16 @@
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			ispfe_main_in: endpoint {
+				remote-endpoint = <&cam_main_out>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+				data-lanes = <1 2 3>;
+			};
+		};
 
 		port@1 {
 			reg = <1>;

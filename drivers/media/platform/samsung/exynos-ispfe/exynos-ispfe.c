@@ -7275,12 +7275,25 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "# link %u loch %u fcctx %u\n", ispfe->active.link,
 		   ispfe->active.loch, ispfe->active.fcctx);
 
-	for (i = 0; i <= 0x2c; i += 4)
+	for (i = 0; i <= 0x3c; i += 4)
 		seq_printf(s, "link   +0x%04x %#010x\n", i,
 			   readl_relaxed(link + i));
 	for (i = 0x40; i < 0x40 + CSIS_NUM_CHANNELS * 0x10; i += 4)
 		seq_printf(s, "link   +0x%04x %#010x\n", i,
 			   readl_relaxed(link + i));
+
+	/*
+	 * The PHY's own blocks, which is where a link that receives nothing has
+	 * to be told from one that is not configured: the vendor stack reads a
+	 * lane block's first word back after programming it and sees bit 1 set
+	 * beside the enable it wrote, so the hardware reports something there.
+	 */
+	seq_printf(s, "phymast+0x%05x %#010x\n", PHY_MASTER + PHY_MASTER_MODE,
+		   readl_relaxed(ispfe->base[ISPFE_WIN_CSIS] + PHY_MASTER +
+				 PHY_MASTER_MODE));
+	for (i = 0; i < ispfe->active.lanes; i++)
+		seq_printf(s, "phylane%u       %#010x\n", i,
+			   readl_relaxed(ispfe_phy(ispfe) + PHY_LANE(i)));
 
 	for (i = 0; i <= 0x11c; i += 4)
 		seq_printf(s, "fc     +0x%05x %#010x\n", 0x20000 + i,

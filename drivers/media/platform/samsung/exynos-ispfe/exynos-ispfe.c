@@ -1538,6 +1538,13 @@ struct ispfe_device {
 	int backend_queue_error;
 	bool backend_queue_active;
 	bool backend_queue_consumer;
+	/*
+	 * The consumer holds the front end from its own STREAMON, before it has
+	 * anything to stream.  While this is set `owner` is ISPFE_OWNER_BACKEND
+	 * with nothing armed, and a backend stream starting and stopping inside
+	 * it must not take or give back what it did not claim.  Under `lock`.
+	 */
+	bool backend_reserved;
 	void *backend_spare;
 	dma_addr_t backend_spare_dma;
 	size_t backend_input_size;
@@ -6523,6 +6530,19 @@ static void ispfe_backend_queue_abort_all(struct ispfe_device *ispfe)
 	spin_unlock_irq(&ispfe->slock);
 }
 
+/*
+ * Give the front end back unless a reservation is still holding it.
+ *
+ * A consumer that reserved at its STREAMON keeps the front end across a stop
+ * and across a failed start -- what it asked for was the producer, not this
+ * one stream -- and hands it back from .unreserve alone.
+ */
+static void ispfe_backend_release_owner(struct ispfe_device *ispfe)
+{
+	if (!ispfe->backend_reserved)
+		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
+}
+
 static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
 	bool consumer,
 	const struct exynos_becore_input_stream_config *stream_config)
@@ -6530,7 +6550,17 @@ static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
 	bool ready;
 	int ret;
 
-	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+	if (ispfe->streaming)
+		return -EBUSY;
+	/*
+	 * The consumer may start inside its own reservation, and only the
+	 * consumer: the debugfs diagnostic reaches this function too, and
+	 * letting it in on `owner == BACKEND` would let it arm the receiver
+	 * inside somebody else's claim.
+	 */
+	if (ispfe->owner != ISPFE_OWNER_NONE &&
+	    !(consumer && ispfe->backend_reserved &&
+	      ispfe->owner == ISPFE_OWNER_BACKEND))
 		return -EBUSY;
 	if (consumer != !!stream_config)
 		return -EINVAL;
@@ -6582,7 +6612,7 @@ err_queue:
 	spin_lock_irq(&ispfe->slock);
 	ispfe->backend_queue_active = false;
 	spin_unlock_irq(&ispfe->slock);
-	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
+	ispfe_backend_release_owner(ispfe);
 	return ret;
 }
 
@@ -6603,7 +6633,48 @@ static void ispfe_backend_queue_stop(struct ispfe_device *ispfe)
 	ispfe_sensor_power(ispfe, false);
 	ispfe->sensor_streaming = false;
 	ispfe_backend_queue_abort_all(ispfe);
-	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
+	ispfe_backend_release_owner(ispfe);
+}
+
+/*
+ * Hold the front end for a consumer without starting it, and give it back.
+ *
+ * The pair exists so that the consumer's STREAMON can mean something: see the
+ * producer ops in <media/exynos-becore.h>.  What it leaves this driver in is a
+ * state it has never had -- owned, with `streaming` false and no sensor
+ * running -- so every reader that means "a frame is coming" has to say so, and
+ * the ones that do already check `streaming` beside `owner`.
+ */
+static int ispfe_backend_reserve(void *data)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
+		return -EBUSY;
+
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_BACKEND);
+	ispfe->backend_reserved = true;
+
+	return 0;
+}
+
+static void ispfe_backend_unreserve(void *data)
+{
+	struct ispfe_device *ispfe = data;
+
+	guard(mutex)(&ispfe->lock);
+	if (!ispfe->backend_reserved)
+		return;
+
+	ispfe->backend_reserved = false;
+	/*
+	 * A consumer that stops before it unreserves has already been through
+	 * ispfe_backend_queue_stop(), which left the owner alone because the
+	 * reservation was still up.  One that unreserves without ever having
+	 * started has nothing else to undo.  Either way this is the release.
+	 */
+	ispfe_backend_release_owner(ispfe);
 }
 
 static int ispfe_backend_stream_start(void *data,
@@ -6636,6 +6707,8 @@ static void ispfe_backend_stream_stop(void *data)
 }
 
 static const struct exynos_becore_input_producer_ops ispfe_backend_ops = {
+	.reserve = ispfe_backend_reserve,
+	.unreserve = ispfe_backend_unreserve,
 	.start_streaming = ispfe_backend_stream_start,
 	.stop_streaming = ispfe_backend_stream_stop,
 };
@@ -6648,7 +6721,12 @@ static int ispfe_backend_queue_set(void *data, u64 val)
 		return -EINVAL;
 
 	guard(mutex)(&ispfe->lock);
-	if (ispfe->backend_queue_consumer)
+	/*
+	 * `backend_reserved` as well as `backend_queue_consumer`: a consumer
+	 * that has reserved and not yet started owns the front end and has no
+	 * stream flag up, so this would otherwise read as idle.
+	 */
+	if (ispfe->backend_queue_consumer || ispfe->backend_reserved)
 		return -EBUSY;
 	if (!!val == ispfe->backend_queue_active)
 		return 0;
@@ -7011,10 +7089,17 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 
 	seq_printf(s, "streaming    %u\n", ispfe->streaming);
 	seq_printf(s, "sensor_stream %u\n", ispfe->sensor_streaming);
-	seq_printf(s, "owner        %s\n",
+	seq_printf(s, "owner        %s%s\n",
 		   ispfe->owner == ISPFE_OWNER_V4L2 ? "v4l2" :
 		   ispfe->owner == ISPFE_OWNER_BACKEND ? "backend" :
-		   ispfe->owner == ISPFE_OWNER_DEBUGFS ? "debugfs" : "none");
+		   ispfe->owner == ISPFE_OWNER_DEBUGFS ? "debugfs" : "none",
+		   /*
+		    * Owned and idle is a state worth being able to see: it is
+		    * what a consumer's STREAMON leaves behind until it has a
+		    * buffer to stream, and it reads exactly like a stopped
+		    * front end everywhere else in this file.
+		    */
+		   ispfe->backend_reserved ? " (reserved)" : "");
 	scoped_guard(spinlock_irqsave, &ispfe->slock) {
 		flight = ispfe->flight_count;
 		slots = ispfe->slots_used;

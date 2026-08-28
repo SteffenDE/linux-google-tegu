@@ -36,7 +36,40 @@ struct exynos_becore_input_gains {
 	u32 blue;
 };
 
+/*
+ * What a consumer asks of the front end that feeds it.
+ *
+ * @reserve and @start_streaming are separate because a consumer's own
+ * VIDIOC_STREAMON has to mean "the producer is mine" from the moment it
+ * returns, and vb2 will not always have called the consumer's .start_streaming
+ * by then: with a non-zero min_queued_buffers it defers that until *that many*
+ * buffers are queued, which is userspace's decision and can be a long time.
+ * (An application that queues before STREAMON never opens the gap; one that
+ * queues after -- as a consumer with an IPA to consult must -- opens a wide
+ * one.)  So a consumer reserves from .prepare_streaming, and starts when it
+ * actually has something to stream.
+ *
+ * Between the two the producer is held and idle -- nothing armed, no sensor
+ * running.  A producer must therefore not confuse being reserved with being
+ * started, and must keep the reservation across a @stop_streaming: the
+ * consumer gives it back from @unreserve and from nowhere else.
+ *
+ * @reserve returns 0 or a negative errno, -EBUSY if the producer is already
+ * spoken for.  @unreserve is idempotent and is the only release a producer
+ * will be *called* for: it must keep the reservation across @stop_streaming
+ * and across a @start_streaming that failed.  The exception is
+ * exynos_becore_input_disconnect(), after which neither @unreserve nor
+ * @stop_streaming is called at all -- the producer is being torn down and its
+ * own teardown must not wait on a callback from the consumer, exactly as it
+ * already does not for streaming.
+ *
+ * Both are required of a producer that feeds a V4L2 capture, because the
+ * consumer's .prepare_streaming has nothing else to hold it with, and
+ * exynos_becore_input_map() refuses a producer that offers neither.
+ */
 struct exynos_becore_input_producer_ops {
+	int (*reserve)(void *data);
+	void (*unreserve)(void *data);
 	int (*start_streaming)(void *data,
 			       const struct exynos_becore_input_stream_config *config);
 	void (*stop_streaming)(void *data);

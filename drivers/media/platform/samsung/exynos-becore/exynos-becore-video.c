@@ -434,6 +434,34 @@ static void becore_video_stop_producer(struct becore_device *becore)
 	becore_input_callback_put(input);
 }
 
+/*
+ * Release the media pipeline, if this device is holding one.
+ *
+ * **Always before becore_video_stop_producer().**  The two are claims over the
+ * same hardware and the front end's raw node takes them the other way round --
+ * it checks ownership, then starts a pipeline containing this device's sink
+ * pad.  So a window with the pipeline held and ownership released is a window
+ * where its start passes the ownership check and then meets
+ * `WARN_ON(origin->pipe && origin->pipe != pipe)`, which is a splat and
+ * -EINVAL rather than the -EBUSY it should get.  Last taken, first released.
+ *
+ * Idempotent, because three paths tear a stream down and two of them can run
+ * in either order: a failed run from the work item and the STREAMOFF that
+ * follows it.
+ */
+static void becore_video_stop_pipeline(struct becore_device *becore)
+{
+	bool held;
+
+	mutex_lock(&becore->lock);
+	held = becore->pipeline_held;
+	becore->pipeline_held = false;
+	mutex_unlock(&becore->lock);
+
+	if (held)
+		media_pipeline_stop(&becore->sink_pad);
+}
+
 static void becore_video_fail(struct becore_device *becore,
 			      struct becore_video_buffer *buf)
 {
@@ -442,6 +470,7 @@ static void becore_video_fail(struct becore_device *becore,
 	becore_stream_power_put(becore);
 	mutex_unlock(&becore->lock);
 
+	becore_video_stop_pipeline(becore);
 	becore_video_stop_producer(becore);
 	becore_video_controls_ungrab(becore);
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
@@ -713,6 +742,70 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 		becore_params_drain_idle(becore);
 		return ret;
 	}
+
+	/*
+	 * The pipeline, on the *subdevice's* sink pad: the capture node has no
+	 * link in the graph, so what connects this device to the producer is
+	 * the subdevice, and a walk has to start where the links are.  It is
+	 * what marks every pad of the path in use as streaming, which is what
+	 * makes the media core refuse a link change under a capture instead of
+	 * leaving that to the front end's own ownership check.
+	 *
+	 * **After the producer has accepted, not before.**  The front end's
+	 * raw node puts this very pad in *its* pipeline, and starting a second
+	 * one on a pad that is already in another is a WARN_ON and -EINVAL
+	 * rather than a refusal.  Whoever holds the front end holds the
+	 * pipeline, so asking the producer first is what makes "the other node
+	 * is streaming" come back as the -EBUSY it should be, from one place.
+	 *
+	 * Outside becore->lock, because the walk takes the media device's
+	 * graph mutex and the front end takes that mutex from inside its own
+	 * stream start.  Neither order is wrong today -- nothing under the
+	 * graph mutex reaches for this lock -- and keeping the two apart is
+	 * what keeps it that way.
+	 */
+	ret = media_pipeline_start(&becore->sink_pad, &becore->pipe);
+	if (ret) {
+		unsigned long flags;
+		bool cancel = false;
+
+		/*
+		 * The producer is already delivering, so this is the teardown
+		 * becore_stop_streaming() does, in its order and for its
+		 * reasons -- vb2 will not call it after a failed start.  That
+		 * includes aborting a run: the work item only checks
+		 * video_streaming *between* runs, so one already inside a
+		 * stage would otherwise hold cancel_work_sync() here for its
+		 * timeout.  becore_video_stop_pipeline() is a no-op on this
+		 * path and is left out for that reason alone.
+		 */
+		mutex_lock(&becore->lock);
+		becore->video_streaming = false;
+		spin_lock_irqsave(&becore->run_lock, flags);
+		if (becore->running) {
+			becore->abort_run = true;
+			cancel = true;
+		}
+		spin_unlock_irqrestore(&becore->run_lock, flags);
+		if (cancel)
+			complete(&becore->run_completion);
+		mutex_unlock(&becore->lock);
+
+		cancel_work_sync(&becore->video_work);
+		becore_video_stop_producer(becore);
+		becore_video_controls_ungrab(becore);
+		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
+		mutex_lock(&becore->lock);
+		becore_stream_power_put(becore);
+		mutex_unlock(&becore->lock);
+		becore_params_drain_idle(becore);
+		return ret;
+	}
+
+	mutex_lock(&becore->lock);
+	becore->pipeline_held = true;
+	mutex_unlock(&becore->lock);
+
 	schedule_work(&becore->video_work);
 
 	return 0;
@@ -752,6 +845,7 @@ static void becore_stop_streaming(struct vb2_queue *q)
 	mutex_unlock(&becore->lock);
 
 	cancel_work_sync(&becore->video_work);
+	becore_video_stop_pipeline(becore);
 	becore_video_stop_producer(becore);
 	becore_video_controls_ungrab(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);

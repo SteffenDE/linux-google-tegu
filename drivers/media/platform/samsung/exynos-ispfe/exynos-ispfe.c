@@ -579,6 +579,27 @@ struct ispfe_awb_snapshot_file {
  * camera allocates its header and image 0x40 * 3000 apart.
  */
 #define ISPFE_BACKEND_HEADER_STRIDE	0x40
+/*
+ * What a back-end recipe writes into one of those slots, so that a program
+ * table entry too large for one fails at probe rather than at the first frame.
+ *
+ * The consumer allocates the slots for one layout of the board's array and
+ * refuses at STREAMON a producer whose own layout does not fit.  That is the
+ * bound that matters and it is the consumer's, because the consumer owns both
+ * the allocation and the arithmetic; this is the same bound applied to the
+ * table this file writes, which the consumer cannot see until a stream selects
+ * an entry from it.
+ *
+ * The arithmetic is restated here rather than shared because nothing on the
+ * interface between the two drivers carries it yet.  It is the second copy of
+ * this layout -- the first is the SBWC input profile's -- and the point at
+ * which a third would be one too many.
+ */
+#define ISPFE_BACKEND_SBWC_BLOCK_WIDTH	256
+#define ISPFE_BACKEND_INPUT_LAYOUT(w, h)				\
+	((size_t)ISPFE_BACKEND_HEADER_STRIDE * (h) +			\
+	 (size_t)ALIGN((w), ISPFE_BACKEND_SBWC_BLOCK_WIDTH) *		\
+	 ISPFE_BYTES_PER_PIXEL * (h))
 /* Separate full-mode TNR-pyramid output allocation from the same request. */
 #define ISPFE_TNR_PYRAMID_SIZE		0x00468000
 
@@ -10480,6 +10501,21 @@ static int ispfe_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	ispfe_lsc_unity(ispfe->lsc_unity);
+
+	for (i = 0; i < ARRAY_SIZE(ispfe_pdma_programs); i++) {
+		const struct ispfe_pdma_program *prog = &ispfe_pdma_programs[i];
+
+		if (!prog->backend_recipe)
+			continue;
+		if (ISPFE_BACKEND_INPUT_LAYOUT(prog->width, prog->height) >
+		    ISPFE_BACKEND_INPUT_SIZE)
+			return dev_err_probe(dev, -EINVAL,
+					     "the %ux%u back-end recipe lays out in %zu bytes, and an input slot is %u\n",
+					     prog->width, prog->height,
+					     ISPFE_BACKEND_INPUT_LAYOUT(prog->width,
+									prog->height),
+					     ISPFE_BACKEND_INPUT_SIZE);
+	}
 
 	ispfe->dev = dev;
 	ispfe->cam_clk = devm_clk_get(dev, "cam");

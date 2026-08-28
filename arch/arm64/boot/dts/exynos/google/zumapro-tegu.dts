@@ -2141,11 +2141,12 @@
 		 * correctly only after a clockwise quarter turn.
 		 *
 		 * Nothing in this pipeline can apply it. A quarter turn is a
-		 * transpose, the sensor has no flip controls at all, and
-		 * neither the front end nor MCSC transposes -- so libcamera's
-		 * computeTransform() reports the native orientation back and
-		 * the consumer rotates. Stating it is still what lets a
-		 * consumer know which way round the frame is.
+		 * transpose, the driver exposes no flip control (the part has
+		 * flip bits, at image_orientation; nothing here writes them),
+		 * and neither the front end nor MCSC transposes -- so
+		 * libcamera's computeTransform() reports the native orientation
+		 * back and the consumer rotates. Stating it is still what lets
+		 * a consumer know which way round the frame is.
 		 */
 		rotation = <270>;
 
@@ -2204,12 +2205,55 @@
 		orientation = <0>;
 
 		/*
-		 * No "rotation" yet.  The ultrawide's was measured by
-		 * photographing a desk and the front's has to be too: the
-		 * vendor's image_orientation of 3 says the die is mounted a
-		 * half turn from the module, not how the module sits in the
-		 * phone.  Stating a wrong one is worse than stating none.
+		 * A quarter turn the other way from the ultrawide's 270, which
+		 * is the ordinary arrangement for a camera on the other side of
+		 * a phone rather than anything unusual about this module.
+		 *
+		 * Measured [HW 2026-08-28] by capturing both cameras at one
+		 * pose, without moving the handset between them, and reading
+		 * the two frames against each other: both come out with the
+		 * world the right way up.
+		 *
+		 * The rule that gets from there to here is
+		 *
+		 *	R_front + R_uw = 0 (mod 360)
+		 *
+		 * whenever both frames are upright at one pose, because the
+		 * pose cancels: a turn of the handset about its screen normal
+		 * is a turn one way about one camera's optical axis and the
+		 * other way about the other's, the two axes pointing opposite
+		 * ways.  With the ultrawide's measured 270 that is 90.  It is
+		 * *not* "270 - 180"; the two happen to agree here and disagree
+		 * for any R_uw that is not a quarter turn.
+		 *
+		 * The rule needs both readouts to have the same handedness,
+		 * which is why this is the rotation of the readout *the driver
+		 * programs*: an odd number of flips would mirror one of them
+		 * and turn the sum into a difference.  imx712.c writes
+		 * image_orientation = 0 in both of its mode tables, so there
+		 * are none.  The vendor stack writes 3 on this module, which is
+		 * an even number -- it would leave the rule standing and take
+		 * this value to 270, reading out BGGR; why mainline does not
+		 * follow it is in
+		 * docs/subsystems/camera/reference/sensor-modes.md.
+		 *
+		 * So the chain rests on the ultrawide's own measurement, which
+		 * is what makes this a reading rather than a second guess.
+		 *
+		 * The one independent check available is the convention, and it
+		 * is worth saying exactly what it can and cannot do.  Android
+		 * expresses the same correction clockwise, so this readout is
+		 * SENSOR_ORIENTATION 270 against the ultrawide's 90 -- the pair
+		 * almost every handset reports.  But every conventional pair
+		 * sums to 360 just as the rule above does, so what it tests is
+		 * the *ultrawide's* 270 rather than this value.  And it is a
+		 * prior about handsets rather than a reading of this one: this
+		 * handset's own SENSOR_ORIENTATION has never been read, and if
+		 * its static value tracks its flipped readout it would be 90
+		 * here rather than the conventional 270.  TRACE NEEDED --
+		 * `dumpsys media.camera` prints it.
 		 */
+		rotation = <90>;
 
 		port {
 			cam_front_out: endpoint {

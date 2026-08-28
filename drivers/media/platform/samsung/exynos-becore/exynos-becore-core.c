@@ -1978,8 +1978,14 @@ exynos_becore_input_map(struct device *backend, struct device *producer,
 	unsigned int i;
 	int ret;
 
+	/*
+	 * Every op, including the reservation pair: the consumer's
+	 * .prepare_streaming calls them on a producer it has already accepted,
+	 * so a producer that offers neither would fault there rather than be
+	 * refused here.
+	 */
 	if (!backend || !producer || !ops || !ops->start_streaming ||
-	    !ops->stop_streaming)
+	    !ops->stop_streaming || !ops->reserve || !ops->unreserve)
 		return ERR_PTR(-EINVAL);
 	becore = dev_get_drvdata(backend);
 	if (!becore || !becore->inputs[0].buffer.sgt)

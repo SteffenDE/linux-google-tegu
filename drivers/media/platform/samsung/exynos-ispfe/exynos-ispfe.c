@@ -143,6 +143,70 @@
 #define CSIS_ISP_RESOL(w, h)		(((h) << 16) | (w))
 
 /*
+ * The two slot descriptions every camera here uses, named because the
+ * per-camera table below is a list of them: the picture, and the block of
+ * packets the sensor sends beside it.  Both are pinned to the word the
+ * vendor's own trace writes, so that a change to any of the fields above is a
+ * deliberate edit rather than a drift.
+ */
+#define CSIS_ISPCFG_IMAGE		(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) | \
+					 CSIS_ISPCFG_DATAFORMAT(CSIS_DT_RAW10))
+#define CSIS_ISPCFG_EMBEDDED		(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) | \
+					 CSIS_ISPCFG_PARALLEL_MODE(CSIS_ISPCFG_PARALLEL_64BIT) | \
+					 CSIS_ISPCFG_DATAFORMAT(CSIS_DT_EMBEDDED8))
+static_assert(CSIS_ISPCFG_IMAGE == 0x000030ac);
+static_assert(CSIS_ISPCFG_EMBEDDED == 0x0000b048);
+
+/*
+ * One demultiplexer slot on a link: a data type and a virtual channel, with
+ * the size of what arrives on it.
+ *
+ * The slots are the *camera's* and not the driver's.  A link delivers only
+ * what one of its slots describes, so a sensor that sends a stream the slots
+ * do not name is a sensor whose frames do not arrive -- which is what the main
+ * camera did until its second stream was described here.  Both IMX712s send an
+ * image and a single line of embedded data; the main camera sends an image, a
+ * quarter-height phase-detect stream on virtual channel 1, and four lines of
+ * embedded data.  All of it is read off the vendor stack's own trace of each
+ * camera streaming.
+ *
+ * Only the first slot has a consumer.  The others are described so that the
+ * image slot is handed the picture and nothing else; a slot with no logical
+ * channel behind it discards what it takes, which is what the vendor stack
+ * does with the embedded one and what this driver additionally does with the
+ * phase-detect one it has no use for.
+ */
+struct ispfe_link_channel {
+	u32 config;
+	/* Rows, or %ISPFE_CHANNEL_STREAM_HEIGHT for the picture itself. */
+	u32 height;
+};
+#define ISPFE_CHANNEL_STREAM_HEIGHT	0
+
+/* As many slots as any camera here sends on, which bounds the table below. */
+#define CSIS_NUM_CHANNELS		3
+
+static const struct ispfe_link_channel ispfe_channels_imx712[] = {
+	{ CSIS_ISPCFG_IMAGE, ISPFE_CHANNEL_STREAM_HEIGHT },
+	{ CSIS_ISPCFG_EMBEDDED, 1 },
+};
+
+/*
+ * The phase-detect stream is 750 lines against the picture's 3000 in the one
+ * mode this sensor has, and the embedded block is four lines rather than one.
+ * Both are transcribed rather than derived: a quarter is what a quad-Bayer
+ * part's phase-detect readout comes to, but nothing here has seen a second
+ * mode to test that against.
+ */
+static const struct ispfe_link_channel ispfe_channels_s5kgn8[] = {
+	{ CSIS_ISPCFG_IMAGE, ISPFE_CHANNEL_STREAM_HEIGHT },
+	{ CSIS_ISPCFG_IMAGE | CSIS_ISPCFG_VIRTUAL_CHANNEL(1), 750 },
+	{ CSIS_ISPCFG_EMBEDDED, 4 },
+};
+static_assert(ARRAY_SIZE(ispfe_channels_imx712) <= CSIS_NUM_CHANNELS);
+static_assert(ARRAY_SIZE(ispfe_channels_s5kgn8) <= CSIS_NUM_CHANNELS);
+
+/*
  * Low-power spacer insertion, from Samsung's register table for this IP
  * version.  The enable is at 31 and the two spacer counts are 15 bits each --
  * so the IMX712s' 0x7fff7fff is the feature off with both counts saturated,
@@ -1297,12 +1361,20 @@ struct ispfe_link_cfg {
 	u8 phy;
 	u32 mode_word0;
 	u32 mode_word1;
+	const struct ispfe_link_channel *channels;
+	unsigned int num_channels;
 };
 
+#define ISPFE_CHANNELS(set)	.channels = (set), \
+				.num_channels = ARRAY_SIZE(set)
+
 static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
-	[0] = { true, 0, 0x013bd6d0, 0x00000180 },	/* barghest, main */
-	[1] = { true, 1, 0x000c44a0, 0x000014f8 },	/* leshen-uw */
-	[6] = { true, 5, 0x0007ca00, 0x000015f0 },	/* leshen, front */
+	[0] = { true, 0, 0x013bd6d0, 0x00000180,	/* barghest, main */
+		ISPFE_CHANNELS(ispfe_channels_s5kgn8) },
+	[1] = { true, 1, 0x000c44a0, 0x000014f8,	/* leshen-uw */
+		ISPFE_CHANNELS(ispfe_channels_imx712) },
+	[6] = { true, 5, 0x0007ca00, 0x000015f0,	/* leshen, front */
+		ISPFE_CHANNELS(ispfe_channels_imx712) },
 };
 
 /*
@@ -1328,6 +1400,8 @@ struct ispfe_link {
 	bool cphy;
 	u32 mode_word0;
 	u32 mode_word1;
+	const struct ispfe_link_channel *channels;
+	unsigned int num_channels;
 
 	/*
 	 * The sensor on this link, and which of its pads the link comes from.
@@ -1367,6 +1441,10 @@ struct ispfe_source {
 	/* Not derived from anything: measured for one sensor mode. */
 	u32 mode_word0;
 	u32 mode_word1;
+
+	/* The camera's own demultiplexer slots, from ispfe_link_cfg[]. */
+	const struct ispfe_link_channel *channels;
+	unsigned int num_channels;
 };
 
 /*
@@ -1797,6 +1875,8 @@ static void ispfe_link_to_src(struct ispfe_device *ispfe,
 	ispfe->src.cphy = link->cphy;
 	ispfe->src.mode_word0 = link->mode_word0;
 	ispfe->src.mode_word1 = link->mode_word1;
+	ispfe->src.channels = link->channels;
+	ispfe->src.num_channels = link->num_channels;
 }
 
 /* The camera on a given sink pad, or NULL if that is not a sink pad of ours. */
@@ -2425,31 +2505,30 @@ static void ispfe_phy_link_stop(struct ispfe_device *ispfe)
 }
 
 /*
- * One CSIS link, and two demultiplexer slots on its first virtual channel: the
- * image in RAW10 and the sensor's one line of embedded data, which the
- * receiver has to be told about or the image slot is handed a frame that is
- * one line too tall.  Nothing consumes the second slot -- it has no logical
- * channel behind it, which is also what the vendor stack does with it.
+ * One CSIS link and the demultiplexer slots its camera sends on.  Every stream
+ * the sensor puts on the link has to be described or its frames are not
+ * delivered at all, and the sizes matter as much as the types: an embedded
+ * block described as one line where the sensor sends four leaves the image
+ * slot handed a frame that is three lines too tall.
+ *
+ * Only the first slot has a consumer; see struct ispfe_link_channel.
  */
 static void ispfe_link_start(struct ispfe_device *ispfe)
 {
 	void __iomem *link = ispfe_link(ispfe);
+	unsigned int i;
 	u32 ctrl;
 
 	writel_relaxed(0, link + CSIS_DBG_OPTION_SUITE);
 
-	writel_relaxed(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) |
-		       CSIS_ISPCFG_DATAFORMAT(CSIS_DT_RAW10),
-		       link + CSIS_ISP_CONFIG_CH(0));
-	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, ispfe->active.height),
-		       link + CSIS_ISP_RESOL_CH(0));
+	for (i = 0; i < ispfe->active.num_channels; i++) {
+		const struct ispfe_link_channel *ch = &ispfe->active.channels[i];
+		u32 height = ch->height ? ch->height : ispfe->active.height;
 
-	writel_relaxed(CSIS_ISPCFG_PIXEL_MODE(CSIS_ISPCFG_PIXEL_MODE_VAL) |
-		       CSIS_ISPCFG_PARALLEL_MODE(CSIS_ISPCFG_PARALLEL_64BIT) |
-		       CSIS_ISPCFG_DATAFORMAT(CSIS_DT_EMBEDDED8),
-		       link + CSIS_ISP_CONFIG_CH(1));
-	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, 1),
-		       link + CSIS_ISP_RESOL_CH(1));
+		writel_relaxed(ch->config, link + CSIS_ISP_CONFIG_CH(i));
+		writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, height),
+			       link + CSIS_ISP_RESOL_CH(i));
+	}
 
 	writel_relaxed(ispfe->active.cphy ? CSIS_LRTE_CONFIG_CPHY
 					 : CSIS_LRTE_CONFIG_OFF,
@@ -6267,6 +6346,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	    source.phy >= PHY_NUM_INSTANCES ||
 	    source.lanes < 1 ||
 	    source.lanes > ispfe_phy_lanes(source.phy) ||
+	    !source.num_channels || source.num_channels > CSIS_NUM_CHANNELS ||
 	    source.loch >= LOCH_COUNT || source.fcctx >= FC_NUM_CTX ||
 	    backend_recipe > 1 || source.width - 1 >= U16_MAX ||
 	    source.height - 1 >= U16_MAX)
@@ -7198,7 +7278,7 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 	for (i = 0; i <= 0x2c; i += 4)
 		seq_printf(s, "link   +0x%04x %#010x\n", i,
 			   readl_relaxed(link + i));
-	for (i = 0x40; i <= 0x54; i += 4)
+	for (i = 0x40; i < 0x40 + CSIS_NUM_CHANNELS * 0x10; i += 4)
 		seq_printf(s, "link   +0x%04x %#010x\n", i,
 			   readl_relaxed(link + i));
 
@@ -10143,6 +10223,8 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 	link->lanes = vep.bus.mipi_csi2.num_data_lanes;
 	link->mode_word0 = cfg->mode_word0;
 	link->mode_word1 = cfg->mode_word1;
+	link->channels = cfg->channels;
+	link->num_channels = cfg->num_channels;
 
 	if (!link->lanes || link->lanes > ispfe_phy_lanes(link->phy))
 		return dev_err_probe(ispfe->dev, -EINVAL,

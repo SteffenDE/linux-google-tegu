@@ -24,13 +24,20 @@
  *   0x00054f24  lmp/bayer_gamma0  blank
  *   0x00054f2c  lmp/bayer_gamma1  blank
  *   0x00055130  lmp/batch_mode_bayer_size | lmp/batch_mode_config  blank
- *   0x00054b2c  lmp/gtm  blank
- *   0x00054b34  lmp/gamma  blank
- *   0x00054b64  lmp/rgb_dg  blank
- *   0x00054b70  lmp/rgb_scaler  blank
- *   0x00054c94  lmp/rgb_tapout  blank
- *   0x00054b90  lmp/scaler  blank
- *   0x00054df4  lmp/lightness  blank
+ *
+ * Blocks stubbed to their first register, which carries the
+ * block's enable.  Unlike the blank blocks above the hardware is
+ * *not* written every register these have: the command is that
+ * one write, zeroed, and every register after it keeps whatever
+ * it reset to.  What LMP refuses is an enabled stage that was
+ * never configured, so the enable write is the whole of it:
+ *   0x00054b2c  lmp/gtm  stub 0x4 bytes
+ *   0x00054b34  lmp/gamma  stub 0x4 bytes
+ *   0x00054b64  lmp/rgb_dg  stub 0x4 bytes
+ *   0x00054b70  lmp/rgb_scaler  stub 0x4 bytes
+ *   0x00054c94  lmp/rgb_tapout  stub 0x4 bytes
+ *   0x00054b90  lmp/scaler  stub 0x4 bytes
+ *   0x00054df4  lmp/lightness  stub 0x4 bytes
  *
  * Records the driver builds.  The command carries no payload at
  * all: every word the hardware reads is written by the encoder,

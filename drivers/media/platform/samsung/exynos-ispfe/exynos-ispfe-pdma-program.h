@@ -12,6 +12,16 @@
  * Capture: 0x1800 bytes in 59 commands
  * Program: 0x1800 bytes in 59 commands, 16 relocations
  *
+ * Blocks emitted blank: a NULL payload the encoder writes as
+ * zeroes.  The hardware is written every register these blocks
+ * have -- it will not run a program that skips a stage in the
+ * line-memory chain -- but no captured value reaches it, and
+ * none is stored here:
+ *   0x00056464  lmp/pre_lsc_ae_stats  blank
+ *   0x000565bc  lmp/bayer_gamma0  blank
+ *   0x000565c4  lmp/bayer_gamma1  blank
+ *   0x000567c8  lmp/batch_mode_bayer_size | lmp/batch_mode_config  blank
+ *
  * Records the driver builds.  The command carries no payload at
  * all: every word the hardware reads is written by the encoder,
  * from an apply function or from a relocation.  The captured
@@ -587,14 +597,6 @@ static const u8 ispfe_pdma_payload_41[0x118] = {
 	0x70, 0x10, 0x30, 0x0c,
 };
 
-/* command 42, inline-burst, lmp/pre_lsc_ae_stats */
-static const u8 ispfe_pdma_payload_42[0x28] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00,
-};
-
 /* command 43, inline-burst, lmp/lightness */
 static const u8 ispfe_pdma_payload_43[0x18] = {
 	0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
@@ -642,16 +644,6 @@ static const u8 ispfe_pdma_payload_47[0x20] = {
 	0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-/* command 48, inline-burst, lmp/bayer_gamma0 */
-static const u8 ispfe_pdma_payload_48[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-/* command 49, inline-burst, lmp/bayer_gamma1 */
-static const u8 ispfe_pdma_payload_49[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
 /* command 50, inline-burst, lmp/bayer_output_formatter0 */
 static const u8 ispfe_pdma_payload_50[0xc] = {
 	0x02, 0x00, 0x0d, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -691,13 +683,6 @@ static const u8 ispfe_pdma_payload_55[0x2c] = {
 	0x14, 0x00, 0x00, 0x00, 0xdc, 0x90, 0x3e, 0x00, 0x20, 0x21, 0x00, 0x00,
 	0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-};
-
-/* command 56, inline-burst, lmp/batch_mode_bayer_size |
- * lmp/batch_mode_config
- */
-static const u8 ispfe_pdma_payload_56[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 /* command 58, grouped-write */
@@ -838,7 +823,7 @@ static const struct ispfe_pdma_cmd ispfe_pdma_recipe[] = {
 	  .payload = ispfe_pdma_payload_41, .len = sizeof(ispfe_pdma_payload_41) },
 	/* 0x00a8c  inline-burst, lmp/pre_lsc_ae_stats */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00056464,
-	  .payload = ispfe_pdma_payload_42, .len = sizeof(ispfe_pdma_payload_42) },
+	  .payload = NULL, .len = 0x0028 },
 	/* 0x00abc  inline-burst, lmp/lightness */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x0005648c,
 	  .payload = ispfe_pdma_payload_43, .len = sizeof(ispfe_pdma_payload_43) },
@@ -856,10 +841,10 @@ static const struct ispfe_pdma_cmd ispfe_pdma_recipe[] = {
 	  .payload = ispfe_pdma_payload_47, .len = sizeof(ispfe_pdma_payload_47) },
 	/* 0x00c14  inline-burst, lmp/bayer_gamma0 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x000565bc,
-	  .payload = ispfe_pdma_payload_48, .len = sizeof(ispfe_pdma_payload_48) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00c24  inline-burst, lmp/bayer_gamma1 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x000565c4,
-	  .payload = ispfe_pdma_payload_49, .len = sizeof(ispfe_pdma_payload_49) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00c34  inline-burst, lmp/bayer_output_formatter0 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x000565cc,
 	  .payload = ispfe_pdma_payload_50, .len = sizeof(ispfe_pdma_payload_50) },
@@ -882,7 +867,7 @@ static const struct ispfe_pdma_cmd ispfe_pdma_recipe[] = {
 	 * lmp/batch_mode_config
 	 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x000567c8,
-	  .payload = ispfe_pdma_payload_56, .len = sizeof(ispfe_pdma_payload_56) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00d3c  inline-burst, lmp/batch_mode_bayer_config |
 	 * lmp/batch_mode_bayer_config_offset
 	 */

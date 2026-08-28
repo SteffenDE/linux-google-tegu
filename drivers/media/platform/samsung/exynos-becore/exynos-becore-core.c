@@ -2450,15 +2450,24 @@ int exynos_becore_input_producer_complete(struct exynos_becore_input *input,
 	 * The caller has quiesced the producer at a completed-frame boundary.
 	 * Nothing is synced: ISPFE wrote these pages to DRAM and RGBP will read
 	 * them from DRAM, and no CPU mapping was read or written in between.
-	 */
-	slot->buffer.staged_bytes = slot->buffer.size;
-	/*
+	 *
 	 * The producer's raster and not becore->array, which the offline loop
 	 * may have set to something else entirely.  A frame is at the raster
 	 * whoever wrote it wrote it at, and the run refuses to encode for any
 	 * other -- see becore_recipe_validate().
 	 */
 	slot->raster = becore->producer_array;
+	/*
+	 * What the producer laid out, which is not the same as what it was
+	 * handed: the slots are allocated once for the board's whole array, so
+	 * a producer that reads out smaller fills fewer bytes of one.  Staging
+	 * the whole allocation was right for as long as every producer *was*
+	 * the array, and becore_recipe_validate() compares this against the
+	 * live profile's layout of the same raster -- so a length that is the
+	 * slot's rather than the frame's refuses every frame from a smaller
+	 * producer.
+	 */
+	slot->buffer.staged_bytes = becore_input_allocation_size(&slot->raster);
 	/*
 	 * And the producer's gains, for the same reason the raster is the
 	 * producer's: a frame is at the balance whoever took it took it at.

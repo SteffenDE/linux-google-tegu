@@ -557,9 +557,25 @@ struct ispfe_awb_snapshot_file {
 #define PDMA_OUTPUT(_size)	{ .size = (_size) }
 #define PDMA_TAPOUT()		{ .tapout = true }
 
-/* Exact full-mode LMP main-Bayer allocation observed on the ultrawide. */
+/*
+ * The back end's input slot, as it allocates it: one layout of the board's
+ * whole array, which is what every producer has to fit inside.
+ */
 #define ISPFE_BACKEND_INPUT_SIZE		0x01a17000
-#define ISPFE_BACKEND_IMAGE_OFFSET	0x00030c00
+
+/*
+ * The SBWC header region the back end reads before the image -- one 0x40-byte
+ * record per picture row, so the image starts that many bytes into the slot.
+ *
+ * It follows the *producer's* raster and not the board's array, which is a
+ * distinction the ultrawide cannot make: its readout is the array, 4208 x 3120,
+ * so both rules give the same number and this was a constant for as long as it
+ * was the only camera. A camera that reads out smaller separates them. Two
+ * things say which rule is right -- the consumer computes the same offset from
+ * the raster its producer latched, and the vendor's own capture of the main
+ * camera allocates its header and image 0x40 * 3000 apart.
+ */
+#define ISPFE_BACKEND_HEADER_STRIDE	0x40
 /* Separate full-mode TNR-pyramid output allocation from the same request. */
 #define ISPFE_TNR_PYRAMID_SIZE		0x00468000
 
@@ -2987,6 +3003,17 @@ static void ispfe_device_init(struct ispfe_device *ispfe)
 }
 
 /*
+ * Where the image starts inside a back-end input slot: past the SBWC header
+ * region, which is one record per row of the picture being written.  See
+ * ISPFE_BACKEND_HEADER_STRIDE for why this is the stream's height and not the
+ * array's.
+ */
+static u32 ispfe_backend_image_offset(const struct ispfe_device *ispfe)
+{
+	return ISPFE_BACKEND_HEADER_STRIDE * ispfe->active.height;
+}
+
+/*
  * Which grid of a statistics area an auxiliary output feeds, or -1 for an
  * output that is not one of them.
  */
@@ -3057,7 +3084,7 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 		case 0:
 			return backend;
 		case 1:
-			return backend + ISPFE_BACKEND_IMAGE_OFFSET;
+			return backend + ispfe_backend_image_offset(ispfe);
 		case 2:
 			return ispfe->tnr_pyramid_dma;
 		}
@@ -3619,14 +3646,14 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 		if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN)
 			return -EINVAL;
 		if (upper_32_bits(dma) ||
-		    upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET) ||
+		    upper_32_bits(dma + ispfe_backend_image_offset(ispfe)) ||
 		    upper_32_bits(ispfe->tnr_pyramid_dma))
 			return -ERANGE;
 		put_unaligned_le32(lower_32_bits(dma +
-						 ISPFE_BACKEND_IMAGE_OFFSET),
+						 ispfe_backend_image_offset(ispfe)),
 				     payload + 0x80);
 		put_unaligned_le32(upper_32_bits(dma +
-						 ISPFE_BACKEND_IMAGE_OFFSET),
+						 ispfe_backend_image_offset(ispfe)),
 				     payload + 0x84);
 		put_unaligned_le32(lower_32_bits(dma), payload + 0x88);
 		put_unaligned_le32(upper_32_bits(dma), payload + 0x8c);
@@ -5275,9 +5302,9 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 static void ispfe_backend_retarget(struct ispfe_device *ispfe, u8 *program,
 				   dma_addr_t dma)
 {
-	put_unaligned_le32(lower_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET),
+	put_unaligned_le32(lower_32_bits(dma + ispfe_backend_image_offset(ispfe)),
 			   program + ispfe->backend_image_lo);
-	put_unaligned_le32(upper_32_bits(dma + ISPFE_BACKEND_IMAGE_OFFSET),
+	put_unaligned_le32(upper_32_bits(dma + ispfe_backend_image_offset(ispfe)),
 			   program + ispfe->backend_image_hi);
 	put_unaligned_le32(lower_32_bits(dma),
 			   program + ispfe->backend_header_lo);

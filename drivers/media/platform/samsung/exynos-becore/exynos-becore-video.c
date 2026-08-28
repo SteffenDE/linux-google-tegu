@@ -437,13 +437,20 @@ static void becore_video_stop_producer(struct becore_device *becore)
 /*
  * Release the media pipeline, if this device is holding one.
  *
- * **Always before becore_video_stop_producer().**  The two are claims over the
- * same hardware and the front end's raw node takes them the other way round --
- * it checks ownership, then starts a pipeline containing this device's sink
- * pad.  So a window with the pipeline held and ownership released is a window
- * where its start passes the ownership check and then meets
- * `WARN_ON(origin->pipe && origin->pipe != pipe)`, which is a splat and
+ * **Always before the producer's reservation goes back.**  The two are claims
+ * over the same hardware and the front end's raw node takes them the other way
+ * round -- it checks ownership, then starts a pipeline containing this
+ * device's sink pad.  So a window with the pipeline held and ownership
+ * released is a window where its start passes the ownership check and then
+ * meets `WARN_ON(origin->pipe && origin->pipe != pipe)`, which is a splat and
  * -EINVAL rather than the -EBUSY it should get.  Last taken, first released.
+ *
+ * That used to be a rule about the order of two calls inside
+ * becore_stop_streaming(), and it is now a property of the reservation: the
+ * front end stays owned from .prepare_streaming to .unprepare_streaming, so
+ * every teardown in between -- this one, becore_video_stop_producer(), a
+ * failed run -- happens with the ownership still held whatever order they run
+ * in.  Only .unprepare_streaming gives it back, and it releases this first.
  *
  * Idempotent, because three paths tear a stream down and two of them can run
  * in either order: a failed run from the work item and the STREAMOFF that
@@ -460,6 +467,101 @@ static void becore_video_stop_pipeline(struct becore_device *becore)
 
 	if (held)
 		media_pipeline_stop(&becore->sink_pad);
+}
+
+/*
+ * Reserve the producer and take the pipeline at STREAMON.
+ *
+ * vb2 calls this from VIDIOC_STREAMON, where it defers .start_streaming until
+ * a buffer is queued -- and this handler queues the first one only after its
+ * IPA has answered, so the gap is tens of milliseconds.  Claiming there left
+ * that whole window with the front end unowned and no pad marked streaming,
+ * which is long enough for a second camera's configure() to switch the sensor
+ * link under a capture STREAMON had already acknowledged.
+ *
+ * The reservation is what makes this possible: exynos_becore_input_producer_ops
+ * separates holding the producer from starting it, so the front end can be
+ * ours from here while the sensor stays off until there is a frame to take.
+ *
+ * Order, and it is the constraint the whole teardown rests on: the producer
+ * first, the pipeline second.  The front end's raw node checks ownership and
+ * *then* walks a pipeline containing this pad, so a pipeline held without the
+ * ownership is a WARN_ON in its start rather than the -EBUSY it should see.
+ *
+ * **The reserve call must be outside becore->lock, and not for the reason the
+ * walk must be.**  The producer takes ispfe->lock inside it, and ispfe_start()
+ * already calls exynos_becore_input_producer_acquire() -- which takes
+ * becore->lock -- while holding ispfe->lock.  So ispfe->lock -> becore->lock
+ * is an established edge and reserving under this lock would be a real ABBA,
+ * not a theoretical one.  Folding this call into the scoped_guard above reads
+ * like a tidy-up and deadlocks.
+ *
+ * The walk is outside it for the separate and weaker reason the old code gave:
+ * it takes the media device's graph mutex, and nothing under that mutex may
+ * reach for this lock.
+ */
+static int becore_prepare_streaming(struct vb2_queue *q)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+	struct exynos_becore_input *input;
+	int ret;
+
+	scoped_guard(mutex, &becore->lock)
+		input = becore_input_callback_get(becore);
+	if (!input)
+		return -ENODEV;
+
+	ret = input->ops->reserve(input->producer_data);
+	if (ret)
+		goto out_put;
+
+	scoped_guard(mutex, &becore->lock)
+		becore->producer_reserved = true;
+
+	ret = media_pipeline_start(&becore->sink_pad, &becore->pipe);
+	if (ret) {
+		scoped_guard(mutex, &becore->lock)
+			becore->producer_reserved = false;
+		input->ops->unreserve(input->producer_data);
+		goto out_put;
+	}
+
+	scoped_guard(mutex, &becore->lock)
+		becore->pipeline_held = true;
+
+out_put:
+	becore_input_callback_put(input);
+
+	return ret;
+}
+
+/*
+ * And give both back, in the opposite order.
+ *
+ * vb2 matches this to every successful prepare exactly once -- at STREAMOFF,
+ * on close, and from its own STREAMON unwind when a start attempted there
+ * fails, where `q->streaming` was never set.  So it is also the release for a
+ * STREAMON that never received a buffer, where .stop_streaming is not called
+ * at all.
+ */
+static void becore_unprepare_streaming(struct vb2_queue *q)
+{
+	struct becore_device *becore = vb2_get_drv_priv(q);
+	struct exynos_becore_input *input = NULL;
+
+	becore_video_stop_pipeline(becore);
+
+	scoped_guard(mutex, &becore->lock) {
+		if (becore->producer_reserved) {
+			becore->producer_reserved = false;
+			input = becore_input_callback_get(becore);
+		}
+	}
+	if (!input)
+		return;
+
+	input->ops->unreserve(input->producer_data);
+	becore_input_callback_put(input);
 }
 
 static void becore_video_fail(struct becore_device *becore,
@@ -744,68 +846,13 @@ static int becore_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 
 	/*
-	 * The pipeline, on the *subdevice's* sink pad: the capture node has no
-	 * link in the graph, so what connects this device to the producer is
-	 * the subdevice, and a walk has to start where the links are.  It is
-	 * what marks every pad of the path in use as streaming, which is what
-	 * makes the media core refuse a link change under a capture instead of
-	 * leaving that to the front end's own ownership check.
-	 *
-	 * **After the producer has accepted, not before.**  The front end's
-	 * raw node puts this very pad in *its* pipeline, and starting a second
-	 * one on a pad that is already in another is a WARN_ON and -EINVAL
-	 * rather than a refusal.  Whoever holds the front end holds the
-	 * pipeline, so asking the producer first is what makes "the other node
-	 * is streaming" come back as the -EBUSY it should be, from one place.
-	 *
-	 * Outside becore->lock, because the walk takes the media device's
-	 * graph mutex and the front end takes that mutex from inside its own
-	 * stream start.  Neither order is wrong today -- nothing under the
-	 * graph mutex reaches for this lock -- and keeping the two apart is
-	 * what keeps it that way.
+	 * The pipeline is .prepare_streaming's, not this function's: it has to
+	 * be held from STREAMON, and by the time we get here the producer has
+	 * already accepted.  What that ordering was protecting -- the front
+	 * end's raw node walking a pipeline over this pad without owning it --
+	 * is protected a step earlier now, by the reservation taken before the
+	 * walk.
 	 */
-	ret = media_pipeline_start(&becore->sink_pad, &becore->pipe);
-	if (ret) {
-		unsigned long flags;
-		bool cancel = false;
-
-		/*
-		 * The producer is already delivering, so this is the teardown
-		 * becore_stop_streaming() does, in its order and for its
-		 * reasons -- vb2 will not call it after a failed start.  That
-		 * includes aborting a run: the work item only checks
-		 * video_streaming *between* runs, so one already inside a
-		 * stage would otherwise hold cancel_work_sync() here for its
-		 * timeout.  becore_video_stop_pipeline() is a no-op on this
-		 * path and is left out for that reason alone.
-		 */
-		mutex_lock(&becore->lock);
-		becore->video_streaming = false;
-		spin_lock_irqsave(&becore->run_lock, flags);
-		if (becore->running) {
-			becore->abort_run = true;
-			cancel = true;
-		}
-		spin_unlock_irqrestore(&becore->run_lock, flags);
-		if (cancel)
-			complete(&becore->run_completion);
-		mutex_unlock(&becore->lock);
-
-		cancel_work_sync(&becore->video_work);
-		becore_video_stop_producer(becore);
-		becore_video_controls_ungrab(becore);
-		becore_video_return_all(becore, VB2_BUF_STATE_QUEUED);
-		mutex_lock(&becore->lock);
-		becore_stream_power_put(becore);
-		mutex_unlock(&becore->lock);
-		becore_params_drain_idle(becore);
-		return ret;
-	}
-
-	mutex_lock(&becore->lock);
-	becore->pipeline_held = true;
-	mutex_unlock(&becore->lock);
-
 	schedule_work(&becore->video_work);
 
 	return 0;
@@ -845,7 +892,13 @@ static void becore_stop_streaming(struct vb2_queue *q)
 	mutex_unlock(&becore->lock);
 
 	cancel_work_sync(&becore->video_work);
-	becore_video_stop_pipeline(becore);
+	/*
+	 * The pipeline and the reservation are .unprepare_streaming's, which
+	 * vb2 runs straight after this.  Stopping the producer here without
+	 * them is safe because the reservation still holds the front end: this
+	 * is the window the old ordering rule existed to keep shut, and the
+	 * reservation keeps it shut whatever runs in it.
+	 */
 	becore_video_stop_producer(becore);
 	becore_video_controls_ungrab(becore);
 	becore_video_return_all(becore, VB2_BUF_STATE_ERROR);
@@ -860,8 +913,10 @@ static const struct vb2_ops becore_vb2_ops = {
 	.queue_setup = becore_queue_setup,
 	.buf_prepare = becore_buf_prepare,
 	.buf_queue = becore_buf_queue,
+	.prepare_streaming = becore_prepare_streaming,
 	.start_streaming = becore_start_streaming,
 	.stop_streaming = becore_stop_streaming,
+	.unprepare_streaming = becore_unprepare_streaming,
 };
 
 static int becore_querycap(struct file *file, void *priv,

@@ -586,6 +586,13 @@ struct becore_device {
 	 * gets past the check and into a WARN_ON.  Under `lock`.
 	 */
 	bool pipeline_held;
+	/*
+	 * Whether the producer is reserved for this device.  Taken at STREAMON
+	 * and given back at STREAMOFF, so it spans a stream that has not begun
+	 * and one that has ended -- which is what lets the pipeline be released
+	 * before the front end's ownership on every path.  Under `lock`.
+	 */
+	bool producer_reserved;
 	bool sd_registered;
 	/* Set once the entities exist; probe can return success without them. */
 	bool video_ready;

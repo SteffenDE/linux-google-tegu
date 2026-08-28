@@ -352,9 +352,13 @@ int becore_recipe_validate(struct becore_device *becore)
 
 	/*
 	 * The staged length is the check that the frame and the profile agree.
-	 * A slot the producer filled always holds a whole allocation, so it
-	 * only ever matches the live profile -- which is the second half of
-	 * refusing a producer frame under the linear profile.
+	 * Every stage records the layout it wrote rather than the allocation it
+	 * used, so the two match exactly when the profile that laid the frame
+	 * out is the one about to encode it -- which is the second half of
+	 * refusing a producer frame under the linear profile.  The margin is
+	 * never small: a compressed layout of any raster carries a header row
+	 * per picture row and pads its width to 256 columns, so it exceeds the
+	 * linear one by at least a page at every height a crop can reach.
 	 *
 	 * And the raster the frame was written at, which the length cannot
 	 * stand in for: becore_rgbp_input_size() reaches the width only

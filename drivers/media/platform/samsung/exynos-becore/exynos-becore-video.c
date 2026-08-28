@@ -136,17 +136,19 @@ static int becore_input_format(struct becore_device *becore,
  *
  * A raster is refused on three counts, and only the first is about the number
  * itself. It has to be one the register fields can carry; it has to lay a
- * frame out in exactly the slot the producer was handed; and there has to be
- * a crop of it that reaches the chain, which is the one derivation between the
+ * frame out inside the slot the producer was handed; and there has to be a
+ * crop of it that reaches the chain, which is the one derivation between the
  * two rasters that can fail on its own. Everything else the raster feeds is
  * range-checked where it is encoded.
  *
- * The middle one is an equality and not a bound, which looks stricter than it
- * needs to be and is not. A slot the producer filled stages its whole
- * allocation, and becore_recipe_validate() then requires the staged length to
- * equal what the raster and the profile say the frame is -- so a raster that
- * merely *fits* is accepted here and refuses every frame afterwards, which is
- * a far worse failure than a refusal at STREAMON.
+ * The middle one is a bound and not an equality, and it took being wrong twice
+ * to get there. A slot is allocated once, for one layout of the board's whole
+ * array, so a producer that reads out smaller fills fewer of its bytes and an
+ * equality refuses it here -- at STREAMON, cleanly, but for no reason. What
+ * makes the bound safe is that a frame stages the length it actually laid out
+ * rather than the whole allocation it was handed; staging the allocation and
+ * relaxing this to a bound is the combination that accepts a producer here and
+ * then refuses every frame it sends, which is far worse than either.
  */
 static int becore_latch_input_format(struct becore_device *becore)
 {
@@ -179,7 +181,14 @@ static int becore_latch_input_format(struct becore_device *becore)
 	ret = becore_input_profiles_validate(becore->dev, &array);
 	if (ret)
 		return ret;
-	if (becore_input_allocation_size(&array) !=
+	/*
+	 * Fits, not equals.  The slots are allocated once, for one layout of
+	 * the board's whole array, and a producer that reads out smaller than
+	 * the array lays out in fewer bytes -- which is a slot with room to
+	 * spare rather than a mismatch.  Larger is still refused, because that
+	 * is the producer writing past the allocation.
+	 */
+	if (becore_input_allocation_size(&array) >
 	    becore->inputs[0].buffer.size) {
 		dev_err(becore->dev,
 			"producer sends %ux%u, which lays out in %zu bytes a slot where the slots are %zu\n",

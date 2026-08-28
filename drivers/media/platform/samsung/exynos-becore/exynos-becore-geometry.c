@@ -1424,11 +1424,10 @@ int becore_geometry_apply(struct becore_device *becore,
 	 * Both input profiles have to lay a frame of this array out inside a
 	 * slot, which is the same pair of checks probe makes -- one that the
 	 * harness profile fits the live one, and one that the live one fits
-	 * the allocation.  The second is an inequality here where
-	 * becore_latch_input_format() makes it an equality, and deliberately:
-	 * a producer hands over a whole allocation, so a raster that merely
-	 * fits would refuse every frame it sent, where the offline loop stages
-	 * exactly the frame the raster describes.
+	 * the allocation.  Both are inequalities, here and in
+	 * becore_latch_input_format(), and the thing that lets them be is that
+	 * a frame stages the length it laid out rather than the allocation it
+	 * was handed -- the offline loop always did, and a producer does now.
 	 */
 	ret = becore_input_profiles_validate(becore->dev, array);
 	if (ret)

@@ -2098,6 +2098,14 @@ void exynos_becore_input_disconnect(struct exynos_becore_input *input)
 	streaming = becore->video_streaming;
 	becore->video_streaming = false;
 	becore->producer_streaming = false;
+	/*
+	 * Dropped rather than handed back, exactly as producer_streaming is
+	 * above: the producer is being torn down, and its teardown must not
+	 * wait on a callback from here.  What is left is .unprepare_streaming
+	 * finding nothing to unreserve, which is the answer -- there is no
+	 * producer left to hold.
+	 */
+	becore->producer_reserved = false;
 	spin_lock_irqsave(&becore->run_lock, flags);
 	if (becore->running) {
 		becore->abort_run = true;

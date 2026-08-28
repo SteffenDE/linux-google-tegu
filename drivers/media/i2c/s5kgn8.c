@@ -874,7 +874,7 @@ static int s5kgn8_enable_streams(struct v4l2_subdev *sd,
 	struct s5kgn8 *sensor = sd_to_s5kgn8(sd);
 	struct device *dev = regmap_get_device(sensor->regmap);
 	const struct s5kgn8_mode *mode = sensor->mode;
-	int ret;
+	int ret, stop;
 
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret)
@@ -888,21 +888,13 @@ static int s5kgn8_enable_streams(struct v4l2_subdev *sd,
 	}
 
 	/*
-	 * Exposure, both gains and the frame length, so that a stream starts
-	 * with the values that were asked for rather than with the ones the
-	 * mode list carries.
+	 * Stream on immediately after the list, with nothing in between.  The
+	 * list's last two writes are a page select and one undecoded register,
+	 * and the recording's next write to this part is this one; putting a
+	 * group of nine in the gap is a shape the sensor has never been seen in.
 	 *
-	 * This is a group the recording does not have here: the vendor's own is
-	 * inside the list, 215 writes earlier, and its next one comes after the
-	 * stream is running.  Writing the same registers again, with the same
-	 * values when no control has been touched, is the price of controls
-	 * that take effect on the first frame.
+	 * The mode list ends on the CCS page, which is where this belongs.
 	 */
-	ret = s5kgn8_apply_frame_group(sensor);
-	if (ret)
-		goto err_put;
-
-	/* The mode list ends on the CCS page, which is where this belongs. */
 	ret = cci_write(sensor->regmap, S5KGN8_MODE_SELECT,
 			S5KGN8_MODE_STREAMING, NULL);
 	if (ret) {
@@ -910,8 +902,37 @@ static int s5kgn8_enable_streams(struct v4l2_subdev *sd,
 		goto err_put;
 	}
 
+	/*
+	 * Exposure, both gains and the frame length, so that a stream runs with
+	 * the values that were asked for rather than with the ones the mode
+	 * list carries.  After the stream-on and not before it, which is where
+	 * the recording puts its own copy of this group: the first frame is
+	 * therefore the mode list's exposure, and every frame after it is the
+	 * control's.
+	 */
+	ret = s5kgn8_apply_frame_group(sensor);
+	if (ret)
+		goto err_stop;
+
 	return 0;
 
+err_stop:
+	/*
+	 * The part is transmitting, and nothing else will stop it.  The v4l2
+	 * core never marked the stream enabled, so it answers a later
+	 * disable_streams() with -EALREADY and this driver's teardown is not
+	 * reached; the only other thing that ends the transmission is the
+	 * autosuspend a second later cutting power to a live sensor.  A retry
+	 * inside that second is the real hazard -- it finds the device still
+	 * runtime-active and writes the whole mode list into a streaming part.
+	 */
+	stop = 0;
+	s5kgn8_select_ccs_page(sensor, &stop);
+	cci_write(sensor->regmap, S5KGN8_MODE_SELECT, S5KGN8_MODE_STANDBY,
+		  &stop);
+	if (stop)
+		dev_err(dev, "cannot stop a stream that failed to start: %d\n",
+			stop);
 err_put:
 	pm_runtime_put_autosuspend(dev);
 	return ret;

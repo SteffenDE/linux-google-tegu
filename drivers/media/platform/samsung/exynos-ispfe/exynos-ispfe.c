@@ -7652,18 +7652,18 @@ static void ispfe_active_pix(struct ispfe_device *ispfe,
  * Hand the queue's buffers back and put its counters and slot bitmap where a
  * fresh stream expects them.  All of that is this node's own.
  *
- * @untake_stats says whether the statistics areas armed against the front
- * end's program slots go back too, and that is not this node's own: the array
- * is indexed by slot and the back end arms it from the same range, so it
- * belongs to whoever holds ispfe->owner.  Pass true only where the front end
- * was ours and the stream that armed them is ending, because then nothing is
- * going to finish them.  Pass false anywhere we never claimed it: an area
- * armed there is the current owner's, and its IOVAs are live in that owner's
- * credited programs.
+ * The statistics areas armed against the front end's program slots go back
+ * too, and those are *not* this node's own: the array is indexed by slot and
+ * the back end arms it from the same range, so it belongs to whoever holds
+ * ispfe->owner.  Untaking them is only safe where the front end was ours and
+ * the stream that armed them is ending, because then nothing is going to
+ * finish them -- and both callers are now inside the claim
+ * .prepare_streaming took, which is what makes that unconditional.  It used
+ * to be a parameter, for two early exits that ran before the front end was
+ * claimed and no longer exist.
  */
 static void ispfe_queue_return_all(struct ispfe_device *ispfe,
-				   enum vb2_buffer_state state,
-				   bool untake_stats)
+				   enum vb2_buffer_state state)
 {
 	struct list_head done;
 	struct ispfe_buffer *buf, *tmp;
@@ -7677,8 +7677,7 @@ static void ispfe_queue_return_all(struct ispfe_device *ispfe,
 		ispfe->flight_count = 0;
 		ispfe->credit_count = 0;
 		ispfe->slots_used = 0;
-		if (untake_stats)
-			ispfe_stats_untake_all_locked(ispfe);
+		ispfe_stats_untake_all_locked(ispfe);
 	}
 
 	list_for_each_entry_safe(buf, tmp, &done, list) {
@@ -7827,8 +7826,14 @@ static void ispfe_buf_queue(struct vb2_buffer *vb)
 	 * start_streaming.  So the queue can be streaming while there is still
 	 * no program area to encode into.  Gate on the driver's own state
 	 * instead; ispfe_start_streaming() drains what accumulated.
+	 *
+	 * And not on `owner` alone either, since the front end is claimed from
+	 * .prepare_streaming: owning it now means STREAMON returned, not that
+	 * the receiver is armed.  `streaming` is what ispfe_start() sets, and
+	 * the pair is the same test ispfe_stats_producing() makes for the same
+	 * distinction.
 	 */
-	if (ispfe->owner == ISPFE_OWNER_V4L2)
+	if (ispfe->owner == ISPFE_OWNER_V4L2 && ispfe->streaming)
 		ispfe_queue_fill(ispfe);
 }
 
@@ -7859,43 +7864,88 @@ static int ispfe_sensor_power(struct ispfe_device *ispfe, bool on)
 	return 0;
 }
 
-static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
+/*
+ * Claim the front end at STREAMON, before any buffer reaches the driver.
+ *
+ * vb2 calls this from VIDIOC_STREAMON unconditionally, where it defers
+ * start_streaming until %min_queued_buffers are *queued* -- so this is the
+ * only hook that can make a successful STREAMON mean "the front end is ours".
+ * Between the two nothing is armed and no frame is coming; what changes is
+ * that a sink link change, a second consumer and a debugfs capture are all
+ * refused from the moment userspace was told the stream was on, rather than
+ * from whenever it gets round to queueing a buffer.
+ *
+ * Claimed before the walk rather than after it, for two reasons that are the
+ * same reason: what runs inside the walk needs to know whose start this is.
+ * ispfe_vdev_link_validate() reads it to tell its own capture from a processed
+ * one that merely reaches this pad, and ispfe_link_setup() reads it to refuse
+ * a link change under a stream -- which it can only do for a start that has
+ * already claimed, and the walk takes the graph mutex that .link_setup runs
+ * under.
+ *
+ * No buffer is handed back on either failure because the driver holds none:
+ * vb2 enqueues into the driver from vb2_start_streaming(), which is downstream
+ * of here on every path.
+ *
+ * The walk can succeed with *no* camera selected, which is a state worth
+ * naming: .has_pad_interdep answers false for every pair when there is no
+ * active link, so the walk never reaches a MUST_CONNECT sink and nothing
+ * refuses it.  STREAMON then returns success and the first buffer fails with
+ * -ENODEV out of ispfe_sensor_power(), with the claim held until STREAMOFF --
+ * so a caller that disabled every link by hand cannot re-enable one without
+ * stopping first.  Deliberate to reach, self-healing on STREAMOFF, and the
+ * honest reading of a STREAMON that was told yes.
+ */
+static int ispfe_prepare_streaming(struct vb2_queue *q)
 {
 	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
 	int ret;
 
-	/*
-	 * Two ways to fail before the front end is ours, and neither has armed
-	 * a slot or a statistics area, so the buffers are all there is to hand
-	 * back.  Untaking here would take back areas armed by whoever does own
-	 * the front end and is still streaming against them.
-	 */
-	if (ispfe->owner != ISPFE_OWNER_NONE) {
-		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, false);
+	if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
 		return -EBUSY;
-	}
 
-	/*
-	 * Claimed before the walk rather than after it, for two reasons that
-	 * are the same reason: what runs inside the walk needs to know whose
-	 * start this is.  ispfe_vdev_link_validate() reads it to tell its own
-	 * capture from a processed one that merely reaches this pad, and
-	 * ispfe_link_setup() reads it to refuse a link change under a stream --
-	 * which it can only do for a start that has already claimed, and the
-	 * walk takes the graph mutex that .link_setup runs under.
-	 */
 	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_V4L2);
 
 	ret = video_device_pipeline_start(&ispfe->vdev, &ispfe->pipe);
 	if (ret) {
 		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
-		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, false);
 		return ret;
 	}
 
+	return 0;
+}
+
+/*
+ * And give it back.  The rule is that every *successful* prepare is matched by
+ * exactly one unprepare, which is worth stating that way because the three
+ * places vb2 calls it from do not share a simpler one: STREAMOFF and close
+ * when `q->streaming` is set, and vb2_core_streamon()'s own unwind when a
+ * start attempted from there fails -- where `q->streaming` was never set,
+ * because it is assigned after the attempt.  So this is the counterpart on
+ * every path, including a STREAMON that never received a buffer and a deferred
+ * start that failed at the first QBUF.
+ *
+ * The order is the take's, not its reverse, and it is safe for a reason the
+ * back end's teardown cannot use: this runs under ispfe->lock, which is the
+ * raw queue's own %vb2_queue.lock, and every other claimer of the front end
+ * takes it before it can act on the owner it reads.
+ */
+static void ispfe_unprepare_streaming(struct vb2_queue *q)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
+	video_device_pipeline_stop(&ispfe->vdev);
+}
+
+static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct ispfe_device *ispfe = vb2_get_drv_priv(q);
+	int ret;
+
 	ret = ispfe_sensor_power(ispfe, true);
 	if (ret)
-		goto err_pipeline;
+		goto err_return;
 
 	ret = ispfe_start(ispfe, false, NULL);
 	if (ret)
@@ -7948,11 +7998,14 @@ err_stop:
 	cancel_work_sync(&ispfe->fill_work);
 err_power:
 	ispfe_sensor_power(ispfe, false);
-err_pipeline:
-	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
-	video_device_pipeline_stop(&ispfe->vdev);
-	/* Every path reaching here had the front end, so the areas are ours. */
-	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, true);
+err_return:
+	/*
+	 * The front end is ours on every path here -- .prepare_streaming
+	 * claimed it and .unprepare_streaming is what gives it back -- so the
+	 * areas are ours to untake, and untaking under the claim is what makes
+	 * that true rather than merely likely.
+	 */
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
 
@@ -7980,17 +8033,22 @@ static void ispfe_stop_streaming(struct vb2_queue *q)
 	ispfe_sensor_power(ispfe, false);
 	ispfe->sensor_streaming = false;
 	cancel_work_sync(&ispfe->fill_work);
-	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
-	video_device_pipeline_stop(&ispfe->vdev);
-	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR, true);
+	/*
+	 * The claim and the pipeline are .unprepare_streaming's, which vb2 runs
+	 * straight after this.  The buffers are not: vb2 audits them the moment
+	 * this returns.
+	 */
+	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR);
 }
 
 static const struct vb2_ops ispfe_vb2_ops = {
 	.queue_setup = ispfe_queue_setup,
 	.buf_prepare = ispfe_buf_prepare,
 	.buf_queue = ispfe_buf_queue,
+	.prepare_streaming = ispfe_prepare_streaming,
 	.start_streaming = ispfe_start_streaming,
 	.stop_streaming = ispfe_stop_streaming,
+	.unprepare_streaming = ispfe_unprepare_streaming,
 };
 
 static int ispfe_querycap(struct file *file, void *priv,
@@ -8137,7 +8195,7 @@ static const struct video_device ispfe_video_template = {
  * buffers to be too small, so validating it there would refuse a processed
  * capture over the size of buffers nobody is filling.
  *
- * `owner` is what separates the two, and it is why ispfe_start_streaming()
+ * `owner` is what separates the two, and it is why ispfe_prepare_streaming()
  * claims it before it walks: inside that walk, this node owning the front end
  * means this node is the one starting.
  */

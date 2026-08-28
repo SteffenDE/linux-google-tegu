@@ -56,6 +56,7 @@
 #include "exynos-ispfe-pdma-program.h"
 #include "exynos-ispfe-pdma-program-binned.h"
 #include "exynos-ispfe-pdma-program-backend.h"
+#include "exynos-ispfe-pdma-program-main-backend.h"
 
 /*
  * CSIS is licensed Samsung IP that mainline already drives as
@@ -487,12 +488,14 @@ struct ispfe_pdma_desc {
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 /*
  * One allocation serves whichever recipe is selected, so it is sized for the
- * largest.  The three stopped agreeing when the back-end recipe stopped
- * carrying the scaler tables its cleared enables no longer ask for.
+ * largest.  They stopped agreeing when the back-end recipe stopped carrying
+ * the scaler tables its cleared enables no longer ask for; every recipe has to
+ * be in here, because nothing else bounds what one of them streams.
  */
 #define ISPFE_PDMA_MAX_BLOCKS_BYTES					\
-	MAX(ISPFE_PDMA_BLOCKS_BYTES, MAX(ISPFE_PDMA_BINNED_BLOCKS_BYTES,	\
-					 ISPFE_PDMA_BACKEND_BLOCKS_BYTES))
+	MAX(MAX(ISPFE_PDMA_BLOCKS_BYTES, ISPFE_PDMA_BINNED_BLOCKS_BYTES),\
+	    MAX(ISPFE_PDMA_BACKEND_BLOCKS_BYTES,			\
+		ISPFE_PDMA_MAINBE_BLOCKS_BYTES))
 
 /*
  * The shading table as the hardware reads it: 33 x 25 x four unsigned Q12
@@ -992,12 +995,30 @@ static const struct ispfe_lmp_metering_profile ispfe_lmp_metering_captured = {
 	.ae_dark = -32768,
 };
 
-/* The two LMP WBG stages use the same captured unsigned-Q12 gains. */
+/*
+ * The two LMP WBG stages use the same captured unsigned-Q12 gains, and each
+ * recipe carries its own camera's.
+ *
+ * A back-end consumer replaces the red and blue with the gains its stream
+ * configuration carries, so on that path these are never programmed -- but
+ * three paths reach them: the two debugfs diagnostics with the back-end recipe
+ * selected, and a parameters buffer that disables the white balance block,
+ * which restores exactly this. They also feed the defect-pixel corrector's
+ * red and blue. One lens's white balance on another lens is what a shared
+ * profile would give all three.
+ */
 static const struct ispfe_lmp_wbg_profile ispfe_lmp_wbg_backend = {
 	.red = 8473,
 	.green_red = 4096,
 	.green_blue = 4096,
 	.blue = 6851,
+};
+
+static const struct ispfe_lmp_wbg_profile ispfe_lmp_wbg_mainbe = {
+	.red = 7363,
+	.green_red = 4096,
+	.green_blue = 4096,
+	.blue = 6038,
 };
 
 /*
@@ -1090,17 +1111,37 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.required_fcctx = 3,
 		.required_fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712,
 	},
+	{
+		.cmds = ispfe_pdma_mainbe_recipe,
+		.num_cmds = ARRAY_SIZE(ispfe_pdma_mainbe_recipe),
+		.relocs = ispfe_pdma_mainbe_relocs,
+		.num_relocs = ARRAY_SIZE(ispfe_pdma_mainbe_relocs),
+		.inputs = ispfe_pdma_mainbe_inputs,
+		.num_inputs = ARRAY_SIZE(ispfe_pdma_mainbe_inputs),
+		.width = 4000, .height = 3000, .stride = 8000,
+		.recipe_bytes = ISPFE_PDMA_MAINBE_RECIPE_BYTES,
+		.blocks_bytes = ISPFE_PDMA_MAINBE_BLOCKS_BYTES,
+		.backend_output = true,
+		.backend_recipe = true,
+		.lmp_wbg = &ispfe_lmp_wbg_mainbe,
+		.fixed_resources = true,
+		.required_loch = 0,
+		.required_fcctx = 3,
+		.required_fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712,
+	},
 };
 
 /*
  * The program area is sized once for all recipes; the two raw ones happen to
  * agree, and if a future capture does not these say so at build time rather
- * than by overrunning an allocation.  The block area is the largest of the
- * three by construction, so there is nothing to assert about it.
+ * than by overrunning an allocation.  The block area is
+ * %ISPFE_PDMA_MAX_BLOCKS_BYTES, which every recipe is named in, so there is
+ * nothing to assert about it -- a slot has to hold each recipe's own commands.
  */
 static_assert(ISPFE_PDMA_BINNED_RECIPE_BYTES == ISPFE_PDMA_RECIPE_BYTES);
 static_assert(ISPFE_PDMA_BINNED_BLOCKS_BYTES == ISPFE_PDMA_BLOCKS_BYTES);
 static_assert(ISPFE_PDMA_BACKEND_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
+static_assert(ISPFE_PDMA_MAINBE_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
 
 /* The recipe for a geometry, or NULL if none was captured for it. */
 static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,

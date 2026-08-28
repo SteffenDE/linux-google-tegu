@@ -3259,15 +3259,15 @@ static_assert(ISPFE_LMP_FRAME_CONFIG_REG0 == 0x0005467c);
 					 ISPFE_LMP_INSTANCE_STRIDE)
 static_assert(ISPFE_LMP_SCALER_CONFIG_REG0 == 0x00054b90);
 static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
-#define ISPFE_LMP_SCALER_INPUT_SCALE	GENMASK(6, 4)
-#define ISPFE_LMP_RGB_SCALER_INPUT_SCALE	BIT(1)
 /*
- * What the back-end recipe was captured with.  `lmp/scaler` takes only three
- * values in the corpus -- 0x10, 0x50 and 0x70, one per enabled output -- and
- * `lmp/rgb_scaler` two, 0x02 and 0x06, differing in `sw_binning_enable`.
+ * The enables are `sw_input_scale[i]` in bits 6:4 of the first word and
+ * `sw_input_scale_rgb` in bit 1 of the other's, and the driver writes both
+ * words whole rather than masking a captured one, so neither needs a name of
+ * its own.  What the corpus holds there, for reading the register: `lmp/scaler`
+ * takes only three values across all 54 programs -- 0x10, 0x50 and 0x70, one
+ * per enabled output -- and `lmp/rgb_scaler` two, 0x02 and 0x06, differing in
+ * `sw_binning_enable`.  See ispfe_pdma_apply_scalers().
  */
-#define ISPFE_LMP_CAPTURED_SCALER	0x50
-#define ISPFE_LMP_CAPTURED_RGB_SCALER	0x06
 #define ISPFE_LMP_SCALER_APPLIED	BIT(0)
 #define ISPFE_LMP_RGB_SCALER_APPLIED	BIT(1)
 #define ISPFE_LMP_SCALERS_APPLIED	(ISPFE_LMP_SCALER_APPLIED | \
@@ -3610,7 +3610,8 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 }
 
 /*
- * Turn off the scaler outputs whose destinations this driver does not run.
+ * State both scaler stages off, which is the whole of what the recipe carries
+ * for them.
  *
  * Not the same move as the gate word and the interface mask beside it.  Those
  * stop a destination being *written*; this stops the stage computing anything
@@ -3618,40 +3619,54 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
  * builder emits a scaler's table only behind these bits, it is what lets the
  * recipe stop carrying 768 bytes of scaler and RGB-scaler coefficients.
  *
- * The two have to move together.  A cleared enable whose table is still in the
- * program is a shape no capture holds, and so is the reverse; the recipe drops
- * exactly the tables whose bits are cleared here, and the encoder's own
- * completeness check below is what says both commands were present to clear.
+ * This used to clear the input-scale bits out of a captured word and leave the
+ * other sixteen registers of `lmp/scaler` and seven of `lmp/rgb_scaler`
+ * replayed.  They were configuring a stage that had already been told it is
+ * off, so the recipe stubs both commands to this one register and the driver
+ * writes it: the payload arrives as four zero bytes and this is what says so
+ * on purpose rather than by omission.  Everything past it keeps its reset
+ * value, the same shape the five other stubbed blocks take.
  *
- * Back-end recipe only.  The raw recipes still carry all three tables, and the
- * pairing is per recipe rather than per driver.
+ * The two still have to move together.  A cleared enable whose table is still
+ * in the program is a shape no capture holds, and so is the reverse; the recipe
+ * drops exactly the tables whose stages are stated off here, and the encoder's
+ * own completeness check below is what says both commands were present.
+ *
+ * Back-end recipe only.  The raw recipes still carry all three tables and both
+ * stages in full, and the pairing is per recipe rather than per driver.
  */
 static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
 				    const struct ispfe_pdma_cmd *cmd,
 				    u8 *payload, unsigned int *applied)
 {
-	u32 word, mask, captured, flag;
+	u32 flag;
 
 	if (!ispfe->prog->backend_recipe)
 		return 0;
-	if (cmd->reg == ISPFE_LMP_SCALER_CONFIG_REG0) {
-		mask = ISPFE_LMP_SCALER_INPUT_SCALE;
-		captured = ISPFE_LMP_CAPTURED_SCALER;
+	if (cmd->reg == ISPFE_LMP_SCALER_CONFIG_REG0)
 		flag = ISPFE_LMP_SCALER_APPLIED;
-	} else if (cmd->reg == ISPFE_LMP_RGB_SCALER_CONFIG_REG0) {
-		mask = ISPFE_LMP_RGB_SCALER_INPUT_SCALE;
-		captured = ISPFE_LMP_CAPTURED_RGB_SCALER;
+	else if (cmd->reg == ISPFE_LMP_RGB_SCALER_CONFIG_REG0)
 		flag = ISPFE_LMP_RGB_SCALER_APPLIED;
-	} else {
+	else
 		return 0;
-	}
-	if (cmd->len < sizeof(u32) || (*applied & flag))
+	/*
+	 * Exactly the enable register and nothing after it: a recipe that went
+	 * back to carrying the rest of either block would be replaying tuning
+	 * for a stage this says is off, and the stage's coefficient tables are
+	 * dropped on the strength of that.
+	 */
+	if (cmd->len != sizeof(u32) || (*applied & flag))
 		return -EINVAL;
 
-	word = get_unaligned_le32(payload);
-	if ((word & 0xff) != captured)
-		return -EINVAL;
-	put_unaligned_le32(word & ~mask, payload);
+	/*
+	 * The encoder has already memset a NULL payload to zero, so this write
+	 * changes nothing today; it is here so that the word is *stated* rather
+	 * than left to that, and so a staged program cannot arrive with an
+	 * enable set.  What the function is really for is the two lines around
+	 * it -- the shape assertion above and the completeness bookkeeping
+	 * below, which is what pairs these stages with the dropped tables.
+	 */
+	put_unaligned_le32(0, payload);
 	*applied |= flag;
 
 	return 0;

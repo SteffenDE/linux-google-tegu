@@ -4108,6 +4108,26 @@ static bool ispfe_pdma_scale_factor_matches(const u8 *payload, size_t offset,
 	       get_unaligned_le32(payload + offset) == factor;
 }
 
+/*
+ * How far into each of those payloads the geometry check below reads, so the
+ * collector can refuse a command too short to hold it.
+ *
+ * Every recipe in the tree satisfies these and the check cannot fire today.
+ * It is here because the recipe's command lengths are a *shell script's*
+ * declaration -- `--stub` shortens a command to four bytes, and it has already
+ * been applied to `lmp/scaler` and `lmp/rgb_scaler` on the back-end recipe.
+ * Doing the same to a raw recipe would leave this reading past the payload and
+ * into the next command's bytes: still inside the staged buffer, so garbage
+ * rather than an oops, and a geometry that validated against nothing.  A
+ * length is the cheapest way to make that a refusal rather than an invariant
+ * held somewhere else.
+ */
+#define ISPFE_STAGED_DDS_MIN		0x0c
+#define ISPFE_STAGED_RGB_SCALER_MIN	0x1c
+#define ISPFE_STAGED_SCALER_MIN		0x44
+#define ISPFE_STAGED_FORMATTER_MIN	0x28
+#define ISPFE_STAGED_BATCH_MIN		0x10
+
 static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 						const u8 *scaler,
 						const u8 *formatter,
@@ -4268,6 +4288,8 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 					return -EINVAL;
 			switch (cmd->reg) {
 			case ISPFE_LMP_DDS_CONFIG_REG:
+				if (cmd->len < ISPFE_STAGED_DDS_MIN)
+					return -EINVAL;
 				dds = payload;
 				/*
 				 * Both vendor recipes deliver 1052x780 here.  The
@@ -4282,15 +4304,23 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 					return -EINVAL;
 				break;
 			case ISPFE_LMP_RGB_SCALER_CONFIG_REG:
+				if (cmd->len < ISPFE_STAGED_RGB_SCALER_MIN)
+					return -EINVAL;
 				rgb = payload;
 				break;
 			case ISPFE_LMP_SCALER_CONFIG_REG:
+				if (cmd->len < ISPFE_STAGED_SCALER_MIN)
+					return -EINVAL;
 				scaler = payload;
 				break;
 			case ISPFE_LMP_FORMATTER0_CONFIG_REG:
+				if (cmd->len < ISPFE_STAGED_FORMATTER_MIN)
+					return -EINVAL;
 				formatter = payload;
 				break;
 			case ISPFE_LMP_BATCH_CONFIG_REG:
+				if (cmd->len < ISPFE_STAGED_BATCH_MIN)
+					return -EINVAL;
 				batch = payload;
 				break;
 			}

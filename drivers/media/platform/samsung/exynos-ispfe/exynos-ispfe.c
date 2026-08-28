@@ -6337,13 +6337,13 @@ static int ispfe_enable_set(void *data, u64 val)
 	    ispfe->owner == ISPFE_OWNER_BACKEND)
 		return -EBUSY;
 	if (val) {
-		ispfe->owner = ISPFE_OWNER_DEBUGFS;
+		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_DEBUGFS);
 		ret = ispfe_start(ispfe, false, NULL);
 		if (ret)
-			ispfe->owner = ISPFE_OWNER_NONE;
+			WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	} else {
 		ispfe_stop(ispfe);
-		ispfe->owner = ISPFE_OWNER_NONE;
+		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	}
 
 	return ret;
@@ -6381,7 +6381,7 @@ static int ispfe_capture_set(void *data, u64 val)
 	if (val) {
 		if (ispfe->streaming || ispfe->owner != ISPFE_OWNER_NONE)
 			return -EBUSY;
-		ispfe->owner = ISPFE_OWNER_DEBUGFS;
+		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_DEBUGFS);
 		ret = ispfe_sensor_power(ispfe, true);
 		if (ret)
 			goto err_owner;
@@ -6403,7 +6403,7 @@ static int ispfe_capture_set(void *data, u64 val)
 		dev_err(ispfe->dev, "cannot stop the sensor: %d\n", ret);
 	ispfe_sensor_power(ispfe, false);
 	ispfe->sensor_streaming = false;
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 
 	return 0;
 
@@ -6412,7 +6412,7 @@ err_stop:
 err_power:
 	ispfe_sensor_power(ispfe, false);
 err_owner:
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	return ret;
 }
 
@@ -6492,7 +6492,7 @@ static int ispfe_backend_queue_start(struct ispfe_device *ispfe,
 	if (!consumer && ispfe->backend_recipe != 1)
 		return -EINVAL;
 
-	ispfe->owner = ISPFE_OWNER_BACKEND;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_BACKEND);
 	ispfe_backend_queue_reset(ispfe);
 	spin_lock_irq(&ispfe->slock);
 	ispfe->backend_queue_active = true;
@@ -6537,7 +6537,7 @@ err_queue:
 	spin_lock_irq(&ispfe->slock);
 	ispfe->backend_queue_active = false;
 	spin_unlock_irq(&ispfe->slock);
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	return ret;
 }
 
@@ -6558,7 +6558,7 @@ static void ispfe_backend_queue_stop(struct ispfe_device *ispfe)
 	ispfe_sensor_power(ispfe, false);
 	ispfe->sensor_streaming = false;
 	ispfe_backend_queue_abort_all(ispfe);
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 }
 
 static int ispfe_backend_stream_start(void *data,
@@ -7830,13 +7830,23 @@ static int ispfe_start_streaming(struct vb2_queue *q, unsigned int count)
 		return -EBUSY;
 	}
 
+	/*
+	 * Claimed before the walk rather than after it, for two reasons that
+	 * are the same reason: what runs inside the walk needs to know whose
+	 * start this is.  ispfe_vdev_link_validate() reads it to tell its own
+	 * capture from a processed one that merely reaches this pad, and
+	 * ispfe_link_setup() reads it to refuse a link change under a stream --
+	 * which it can only do for a start that has already claimed, and the
+	 * walk takes the graph mutex that .link_setup runs under.
+	 */
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_V4L2);
+
 	ret = video_device_pipeline_start(&ispfe->vdev, &ispfe->pipe);
 	if (ret) {
+		WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 		ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, false);
 		return ret;
 	}
-
-	ispfe->owner = ISPFE_OWNER_V4L2;
 
 	ret = ispfe_sensor_power(ispfe, true);
 	if (ret)
@@ -7894,7 +7904,7 @@ err_stop:
 err_power:
 	ispfe_sensor_power(ispfe, false);
 err_pipeline:
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	video_device_pipeline_stop(&ispfe->vdev);
 	/* Every path reaching here had the front end, so the areas are ours. */
 	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_QUEUED, true);
@@ -7925,7 +7935,7 @@ static void ispfe_stop_streaming(struct vb2_queue *q)
 	ispfe_sensor_power(ispfe, false);
 	ispfe->sensor_streaming = false;
 	cancel_work_sync(&ispfe->fill_work);
-	ispfe->owner = ISPFE_OWNER_NONE;
+	WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 	video_device_pipeline_stop(&ispfe->vdev);
 	ispfe_queue_return_all(ispfe, VB2_BUF_STATE_ERROR, true);
 }
@@ -8071,7 +8081,20 @@ static const struct video_device ispfe_video_template = {
 /*
  * The buffers were sized from the source pad's format at REQBUFS.  If a format
  * has been set on the pads since, the pipeline is inconsistent and starting it
- * would have the receiver write frames of one size into buffers of another.
+ * would have the receiver write frames of one size into buffers of another,
+ * which is what this refuses.
+ *
+ * **It is a check on this node's own capture, and this node is not the only
+ * thing that starts a pipeline containing it.** The back end's processed path
+ * starts one from its own sink pad, and that walk reaches this pad too,
+ * because the receiver's source pad links to both and the walk follows every
+ * enabled link of a pad it has taken. A queue with no capture in flight has no
+ * buffers to be too small, so validating it there would refuse a processed
+ * capture over the size of buffers nobody is filling.
+ *
+ * `owner` is what separates the two, and it is why ispfe_start_streaming()
+ * claims it before it walks: inside that walk, this node owning the front end
+ * means this node is the one starting.
  */
 static int ispfe_vdev_link_validate(struct media_link *link)
 {
@@ -8079,6 +8102,9 @@ static int ispfe_vdev_link_validate(struct media_link *link)
 		media_entity_to_video_device(link->sink->entity);
 	struct ispfe_device *ispfe = video_get_drvdata(vdev);
 	struct v4l2_pix_format pix;
+
+	if (READ_ONCE(ispfe->owner) != ISPFE_OWNER_V4L2)
+		return 0;
 
 	ispfe_active_pix(ispfe, &pix);
 	if (pix.width != ispfe->fmt.width || pix.height != ispfe->fmt.height ||
@@ -9424,28 +9450,35 @@ static const struct v4l2_subdev_internal_ops ispfe_subdev_internal_ops = {
  * enabled underneath a capture.
  *
  * Which is also why the whole selection is refused while the front end has an
- * owner.  Only the raw node's start takes a media pipeline; the back end's
- * processed path -- the one libcamera uses by default -- and the debugfs
- * capture do not, so no pad of this entity is ever marked as streaming for
- * them and the core would let a link change through mid-capture.  Disabling
- * the active link there would clear active_link, and then the teardown would
- * find no sensor to stop and leave it streaming into a halted receiver, which
- * costs the next capture an -EALREADY that nothing clears.
+ * owner.  Both V4L2 paths take a media pipeline now -- the raw node from its
+ * own capture node, the back end from its subdevice's sink pad -- so the core
+ * already refuses a link change under either of them, and this is the second
+ * lock on the same door.  The debugfs capture is the one path that still takes
+ * none, and it is where the refusal is load-bearing rather than belt and
+ * braces.
  *
- * `owner` is read without ispfe->lock, and that is deliberate rather than an
- * omission: the media core calls this holding its graph mutex, while a stream
- * start holds ispfe->lock and then takes the graph mutex inside
+ * What the pipeline buys beyond the refusal is the *race*.  `owner` is read
+ * without ispfe->lock, deliberately: the media core calls this holding its
+ * graph mutex, while a stream start takes that mutex inside
  * video_device_pipeline_start(), so taking ispfe->lock here would close an
- * ABBA.  What is left is a link change racing a start that has not yet claimed
- * ownership.  For the raw node that race does not exist -- its start blocks on
- * the graph mutex this is holding -- but for the two paths that take no
- * pipeline it does, and it is not benign: ispfe_link_to_src() is six
+ * ABBA.  That leaves a link change racing a start that has not yet claimed
+ * ownership -- and it is not benign, because ispfe_link_to_src() is six
  * unsynchronised stores and ispfe_start() copies the struct, so an interleave
  * arms the receiver on one camera's bank with another's PHY.  Every field is
  * individually valid, so nothing downstream rejects it; the capture is simply
- * wrong.  Narrow, and the same shape as the unlocked debugfs writes this
- * driver already accepts -- but the fix is the back end taking a pipeline the
- * way the raw node does, not a wider lock here.
+ * wrong.
+ *
+ * The raw node closes that race outright: it claims ownership *before* it
+ * walks, so a link change racing it blocks on this graph mutex and then finds
+ * an owner.  The back end claims the front end first and walks after, so its
+ * window is this check's alone -- and once its walk has run, the *active*
+ * camera's link is pinned by the core as well, because both of that link's
+ * pads are in its pipeline.  The inactive cameras' links never are, by
+ * .has_pad_interdep, so those changes reach here and are refused below.
+ *
+ * The debugfs capture takes no pipeline at all and stays the same shape as the
+ * unlocked debugfs writes this driver already accepts, so this is the whole of
+ * its protection rather than a second lock on the same door.
  */
 static int ispfe_link_setup(struct media_entity *entity,
 			    const struct media_pad *local,
@@ -10267,7 +10300,7 @@ static void ispfe_remove(struct platform_device *pdev)
 			}
 			cancel_work_sync(&ispfe->backend_fill_work);
 			ispfe_backend_queue_abort_all(ispfe);
-			ispfe->owner = ISPFE_OWNER_NONE;
+			WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 		}
 	}
 	ispfe_media_unregister(ispfe);
@@ -10280,7 +10313,7 @@ static void ispfe_remove(struct platform_device *pdev)
 						    ispfe->source_pad, BIT_ULL(0));
 			ispfe_sensor_power(ispfe, false);
 			ispfe->sensor_streaming = false;
-			ispfe->owner = ISPFE_OWNER_NONE;
+			WRITE_ONCE(ispfe->owner, ISPFE_OWNER_NONE);
 		} else if (ispfe->streaming) {
 			ispfe_stop(ispfe);
 		}

@@ -570,6 +570,22 @@ struct becore_device {
 	struct becore_raster scaled;
 	struct v4l2_subdev sd;
 	struct media_pad sink_pad;
+	/*
+	 * The pipeline a processed capture runs in.  Started from sink_pad
+	 * rather than from the capture node, because the capture node is not
+	 * in the graph at all -- what the producer connects to is this
+	 * subdevice, and the walk has to start where the links are.
+	 */
+	struct media_pipeline pipe;
+	/*
+	 * Whether `pipe` is taken.  The pipeline and the front end's ownership
+	 * are two claims over the same hardware and they have to be released
+	 * in the reverse of the order they were taken -- the front end's raw
+	 * node checks ownership and *then* starts a pipeline, so a moment with
+	 * the pipeline held and ownership released is a moment where its start
+	 * gets past the check and into a WARN_ON.  Under `lock`.
+	 */
+	bool pipeline_held;
 	bool sd_registered;
 	/* Set once the entities exist; probe can return success without them. */
 	bool video_ready;

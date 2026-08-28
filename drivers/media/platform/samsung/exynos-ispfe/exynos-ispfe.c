@@ -3196,22 +3196,30 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 static_assert(ISPFE_LMP_STATISTICS_GATES == 0x000001f8);
 
 /*
- * And what it does not: the three image destinations the vendor's own programs
- * enable -- a small linear RGB frame and two machine-learning ones -- which
- * nothing here reads.  Named rather than merely omitted, because the same
- * three have to stay absent from three separate places: this word, the DRAM
- * write-interface mask further down, and the encoder's own output table.
+ * And what it does not: the four image destinations the vendor's own programs
+ * enable -- a small linear RGB frame and three machine-learning ones -- which
+ * nothing here reads.  Named rather than merely omitted, because the same four
+ * have to stay absent from this word and from the DRAM write-interface mask
+ * further down.  Three of the four are named a third time in the encoder's own
+ * output table; the fourth's destination is not an output at all but an
+ * address slot inside the batch record, which the encoder blanks whole.
  *
  * There is no relation between the first two to assert -- they are different
  * bit spaces, three interfaces to one destination -- so both are pinned to a
  * literal instead, which makes a change to either a deliberate edit rather
  * than a drift.  The disjointness below is the one mistake that *is*
  * expressible: a tapout bit finding its way into the word the driver builds.
+ *
+ * Three of the four are what the ultrawide's and the front camera's programs
+ * enable; the main camera's enable the second machine-learning output as well,
+ * which is why the fourth is here rather than only the three that would make
+ * every captured program on two cameras pass.
  */
 #define ISPFE_LMP_TAPOUT_GATES		(ISPFE_LMP_GATE_RGB_OUTPUT | \
 					 ISPFE_LMP_GATE_ML_OUTPUT0 | \
+					 ISPFE_LMP_GATE_ML_OUTPUT1 | \
 					 ISPFE_LMP_GATE_ML_OUTPUT2)
-static_assert(ISPFE_LMP_TAPOUT_GATES == 0x0000b000);
+static_assert(ISPFE_LMP_TAPOUT_GATES == 0x0000f000);
 static_assert(!(ISPFE_LMP_STATISTICS_GATES & ISPFE_LMP_TAPOUT_GATES));
 
 /*
@@ -3281,12 +3289,16 @@ static_assert(ISPFE_LMP_BATCH_CONFIG_REG0 == 0x00055140);
  *
  * The model accounts for every set bit in the low half -- 2, 3, 4 from the
  * tapout being planar, 6 and 7 from formatter 0's two planes, 12 from
- * formatter 2's one -- and for every clear one, with a single exception: bit
- * 15 is set in both words and has no name here.  It sits immediately above
- * formatter 2's run and is deliberately left alone, because withdrawing a bit
- * whose owner is unknown is not a bounded change.  If it turns out to belong
- * to one of these three destinations the withdrawal is incomplete rather than
- * wrong.
+ * formatter 2's one -- and for every clear one.  Bit 15 is the white balance
+ * statistics: `GetActiveDramInterfaces` sets it from its own condition rather
+ * than from a formatter, so it belongs to none of the image destinations, and
+ * it stays because this driver reads that tap.
+ *
+ * The main camera's programs add two more of these destinations' worth: bits
+ * 9 and 10 from output formatter 1, whose gate the other two cameras leave
+ * clear, and the fourteen at 22..31 and 33..36, which are one literal in
+ * `GetActiveDramInterfaces` behind the contrast-detect autofocus statistics'
+ * enable.  Neither is a destination this driver runs.
  */
 #define ISPFE_LMP_FRAME_CONFIG_REG	0x00055d14
 #define ISPFE_LMP_FRAME_CONFIG_REG0	(ISPFE_LMP_FRAME_CONFIG_REG - \
@@ -3336,27 +3348,49 @@ static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
 					 ISPFE_LMP_RGB_SCALER_APPLIED)
 
 /*
- * The interfaces of the same three image destinations %ISPFE_LMP_TAPOUT_GATES
- * names -- the RGB tapout and output formatters 0 and 2, three interfaces
- * each.  Pinned to a literal for the reason given there: nothing can assert
- * that these are the same three destinations, so the pair of literals is what
- * makes dropping one of them from either list a deliberate edit.
+ * The interfaces of the same four image destinations %ISPFE_LMP_TAPOUT_GATES
+ * names -- the RGB tapout and the three output formatters, three interfaces
+ * each -- and the fourteen the contrast-detect autofocus statistics keep.
+ * Pinned to literals for the reason given there: nothing can assert that these
+ * are the same destinations, so the two lists are what make dropping one from
+ * either a deliberate edit.
+ *
+ * The CDAF word is not a run of three: `GetActiveDramInterfaces` ORs this one
+ * constant behind that block's enable, bit 32 skipped, so it is transcribed
+ * rather than built out of a first interface and a count.
  */
 #define ISPFE_LMP_TAPOUT_IFS		(GENMASK_ULL(4, 2) | \
-					 GENMASK_ULL(8, 6) | \
-					 GENMASK_ULL(14, 12))
-static_assert(ISPFE_LMP_TAPOUT_IFS == 0x00000000000071dcULL);
+					 GENMASK_ULL(14, 6))
+static_assert(ISPFE_LMP_TAPOUT_IFS == 0x0000000000007fdcULL);
+#define ISPFE_LMP_CDAF_IFS		0x0000001effc00000ULL
+#define ISPFE_LMP_WITHDRAWN_IFS		(ISPFE_LMP_TAPOUT_IFS | \
+					 ISPFE_LMP_CDAF_IFS)
 /*
- * What both raw recipes were captured with, and the back-end recipe's own word
- * is this plus the alignment formatter's two.  Held as literals because this
- * driver reads the word rather than deriving it: 44 of its bits belong to
- * blocks nothing here interprets, and asserting the whole word is what makes
- * clearing three destinations' worth of it a bounded change.
+ * What is left of the word once those are taken out, which is what every
+ * captured program on all three cameras carries: 27 bits belonging to blocks
+ * nothing here interprets.  Checking that remainder rather than the whole word
+ * is what keeps clearing five destinations' worth a bounded change while still
+ * refusing a capture that moved anything else.
+ *
+ * The alignment formatter's two are the one part of it that varies: the
+ * back-end programs set them and the raw ones do not, because
+ * `GetActiveDramInterfaces` declares them only when
+ * `csr_alignmentformatter_enable` is.
  */
 #define ISPFE_LMP_CAPTURED_ACTIVE_IFS	0x00002120003e90dcULL
 #define ISPFE_LMP_ALIGNMENT_FORMATTER_IFS	(BIT_ULL(43) | BIT_ULL(44))
-static_assert((ISPFE_LMP_CAPTURED_ACTIVE_IFS |
-	       ISPFE_LMP_ALIGNMENT_FORMATTER_IFS) == 0x00003920003e90dcULL);
+#define ISPFE_LMP_FIXED_ACTIVE_IFS	(ISPFE_LMP_CAPTURED_ACTIVE_IFS & \
+					 ~ISPFE_LMP_WITHDRAWN_IFS)
+/*
+ * Both halves are pinned, and not only the one the code compares against: the
+ * withdrawn bits of the captured word are cleared before anything looks at
+ * them, so a typo in them would fire nothing at all if only the remainder were
+ * asserted -- and this constant is named for a value a capture carries.
+ */
+static_assert(ISPFE_LMP_CAPTURED_ACTIVE_IFS == 0x00002120003e90dcULL);
+static_assert(ISPFE_LMP_FIXED_ACTIVE_IFS == 0x00002120003e8000ULL);
+static_assert(!(ISPFE_LMP_ALIGNMENT_FORMATTER_IFS &
+		ISPFE_LMP_WITHDRAWN_IFS));
 
 /*
  * The LUT target area is one instance apart too, and by a *different* stride:
@@ -3745,12 +3779,13 @@ static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
  * a destination is off while this word still claims its interfaces is a shape
  * no capture contains.
  *
- * Only bits are cleared, and only ones belonging to the same three image
- * destinations %ISPFE_LMP_TAPOUT_GATES names: the batch record's enable word
- * is built without those three, and this is the other half of saying so.  The
- * word is checked against the two shapes the captured recipes carry first, so a
- * future capture whose interfaces differ is refused rather than re-derived on
- * an assumption about the other 44 bits.
+ * Only bits are cleared, and only ones belonging to the four image
+ * destinations %ISPFE_LMP_TAPOUT_GATES names and to the contrast-detect
+ * autofocus statistics: the batch record's enable word is built without all
+ * five, and this is the other half of saying so.  What is left of the word
+ * after they are taken out is checked against the one shape every captured
+ * program carries, so a future capture that moved anything else is refused
+ * rather than re-derived on an assumption about the other 27 bits.
  */
 static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 				       const struct ispfe_pdma_cmd *cmd,
@@ -3764,12 +3799,12 @@ static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 		return -EINVAL;
 
 	ifs = get_unaligned_le64(payload + ISPFE_LMP_ACTIVE_IFS_AT);
-	if (ifs != ISPFE_LMP_CAPTURED_ACTIVE_IFS &&
-	    ifs != (ISPFE_LMP_CAPTURED_ACTIVE_IFS |
+	ifs &= ~ISPFE_LMP_WITHDRAWN_IFS;
+	if (ifs != ISPFE_LMP_FIXED_ACTIVE_IFS &&
+	    ifs != (ISPFE_LMP_FIXED_ACTIVE_IFS |
 		    ISPFE_LMP_ALIGNMENT_FORMATTER_IFS))
 		return -EINVAL;
 
-	ifs &= ~ISPFE_LMP_TAPOUT_IFS;
 	put_unaligned_le64(ifs, payload + ISPFE_LMP_ACTIVE_IFS_AT);
 	*applied = true;
 
@@ -3793,9 +3828,13 @@ static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
  * reaches the hardware is these two words and the relocated addresses.
  *
  * The enable word is one bit per destination.  Three of the ones the vendor's
- * programs set are the image tapouts above; leaving them on would cost 5.1 MiB
- * of coherent memory and about a megabyte of DMA writes per frame for a
- * picture with no consumer, so they are simply not in the word.
+ * programs set are the image tapouts above -- four on the main camera, which
+ * enables the second machine-learning output as well; leaving them on would
+ * cost 5.1 MiB of coherent memory and about a megabyte of DMA writes per frame
+ * for a picture with no consumer, so they are simply not in the word.  The
+ * main camera's contrast-detect autofocus statistics go the same way and for
+ * the same reason, which is why its generated header lists two captured
+ * addresses the encoder nulls where the ultrawide's lists none.
  *
  * Stating the word rather than masking a replayed one moves a check earlier
  * rather than losing it.  The recipe generator lists every non-zero word of

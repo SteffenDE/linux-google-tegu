@@ -21,6 +21,9 @@
  *   0x00054bd4  lmp/output_formatter  blank
  *   0x00054c14  lmp/output_formatter  blank
  *   0x00054c54  lmp/output_formatter  blank
+ *   0x00054f24  lmp/bayer_gamma0  blank
+ *   0x00054f2c  lmp/bayer_gamma1  blank
+ *   0x00055130  lmp/batch_mode_bayer_size | lmp/batch_mode_config  blank
  *   0x00054b2c  lmp/gtm  blank
  *   0x00054b34  lmp/gamma  blank
  *   0x00054b64  lmp/rgb_dg  blank
@@ -395,16 +398,6 @@ static const u8 ispfe_pdma_backend_payload_49[0x20] = {
 	0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
 };
 
-/* command 50, inline-burst, lmp/bayer_gamma0 */
-static const u8 ispfe_pdma_backend_payload_50[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-/* command 51, inline-burst, lmp/bayer_gamma1 */
-static const u8 ispfe_pdma_backend_payload_51[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
 /* command 52, inline-burst, lmp/bayer_output_formatter0 */
 static const u8 ispfe_pdma_backend_payload_52[0xc] = {
 	0x03, 0x00, 0x0d, 0x00, 0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
@@ -444,13 +437,6 @@ static const u8 ispfe_pdma_backend_payload_57[0x2c] = {
 	0x14, 0x00, 0x00, 0x00, 0xdc, 0x90, 0x3e, 0x00, 0x20, 0x39, 0x00, 0x00,
 	0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-};
-
-/* command 58, inline-burst, lmp/batch_mode_bayer_size |
- * lmp/batch_mode_config
- */
-static const u8 ispfe_pdma_backend_payload_58[0x8] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 /* command 60, grouped-write */
@@ -588,10 +574,10 @@ static const struct ispfe_pdma_cmd ispfe_pdma_backend_recipe[] = {
 	  .payload = ispfe_pdma_backend_payload_49, .len = sizeof(ispfe_pdma_backend_payload_49) },
 	/* 0x00bec  inline-burst, lmp/bayer_gamma0 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054f24,
-	  .payload = ispfe_pdma_backend_payload_50, .len = sizeof(ispfe_pdma_backend_payload_50) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00bfc  inline-burst, lmp/bayer_gamma1 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054f2c,
-	  .payload = ispfe_pdma_backend_payload_51, .len = sizeof(ispfe_pdma_backend_payload_51) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00c0c  inline-burst, lmp/bayer_output_formatter0 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054f34,
 	  .payload = ispfe_pdma_backend_payload_52, .len = sizeof(ispfe_pdma_backend_payload_52) },
@@ -614,7 +600,7 @@ static const struct ispfe_pdma_cmd ispfe_pdma_backend_recipe[] = {
 	 * lmp/batch_mode_config
 	 */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00055130,
-	  .payload = ispfe_pdma_backend_payload_58, .len = sizeof(ispfe_pdma_backend_payload_58) },
+	  .payload = NULL, .len = 0x0008 },
 	/* 0x00d14  inline-burst, lmp/batch_mode_bayer_config |
 	 * lmp/batch_mode_bayer_config_offset
 	 */

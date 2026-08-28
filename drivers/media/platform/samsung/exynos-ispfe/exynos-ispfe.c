@@ -9656,13 +9656,21 @@ static const struct v4l2_subdev_internal_ops ispfe_subdev_internal_ops = {
  * individually valid, so nothing downstream rejects it; the capture is simply
  * wrong.
  *
- * The raw node closes that race outright: it claims ownership *before* it
- * walks, so a link change racing it blocks on this graph mutex and then finds
- * an owner.  The back end claims the front end first and walks after, so its
- * window is this check's alone -- and once its walk has run, the *active*
- * camera's link is pinned by the core as well, because both of that link's
- * pads are in its pipeline.  The inactive cameras' links never are, by
- * .has_pad_interdep, so those changes reach here and are refused below.
+ * **Both V4L2 paths close that race the same way now**, by claiming before
+ * they walk: the raw node from .prepare_streaming, the back end by reserving
+ * its producer from its own .prepare_streaming.  A link change racing either
+ * blocks on this graph mutex and then finds an owner -- and even one that got
+ * in first completes its six stores before the walk can finish, because it
+ * holds the graph mutex for the whole of this function.  Once the walk has
+ * run, the *active* camera's link is pinned by the core as well, both of its
+ * pads being in the pipeline.  The inactive cameras' links never are, by
+ * .has_pad_interdep, so those changes reach here and are refused below --
+ * which is why this check cannot be replaced by the pipeline.
+ *
+ * The claims are also the reason a successful STREAMON on either node means
+ * this, rather than meaning it from whenever userspace queues a buffer: vb2
+ * defers .start_streaming until min_queued_buffers are queued, and both
+ * queues set it.
  *
  * The debugfs capture takes no pipeline at all and stays the same shape as the
  * unlocked debugfs writes this driver already accepts, so this is the whole of

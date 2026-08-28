@@ -9595,8 +9595,32 @@ static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
 	if (format->pad == ispfe->source_pad)
 		return v4l2_subdev_get_fmt(sd, state, format);
 
+	/*
+	 * An active format is refused while anything owns the front end, and
+	 * the queue is only one of the three things that can.  The raster on
+	 * the source pad is read twice per back-end session -- once by the
+	 * consumer, which latches it as the geometry it will decode, crop and
+	 * stamp every frame by, and once here at ispfe_start(), which chooses
+	 * the program from it -- so a write landing between those two reads has
+	 * the front end writing one raster into a slot the back end reads as
+	 * another, with nothing to catch it.  Ownership is taken before the
+	 * consumer's read and released after the stream is down, so refusing
+	 * for as long as it is held is what makes the two reads agree.
+	 *
+	 * Every sink pad and not only the selected one.  A format on an
+	 * unselected camera cannot reach the source pad, so it is not one of
+	 * the writes this is for -- but "owned means frozen" is a rule that can
+	 * be stated, and selecting that camera is refused while the front end
+	 * is owned anyway.
+	 *
+	 * `owner` is read without the device lock, which the subdev state lock
+	 * held here cannot be nested inside.  That is enough: every reader of
+	 * the pad takes this same state lock, so a write either completes
+	 * before both reads or is refused, and it can never fall between them.
+	 */
 	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
-	    vb2_is_busy(&ispfe->queue))
+	    (vb2_is_busy(&ispfe->queue) ||
+	     READ_ONCE(ispfe->owner) != ISPFE_OWNER_NONE))
 		return -EBUSY;
 
 	if (!ispfe_format_by_code(format->format.code))
@@ -9618,9 +9642,10 @@ static int ispfe_sd_set_fmt(struct v4l2_subdev *sd,
 	/*
 	 * The source carries what the receiver will actually deliver, so it
 	 * follows the camera that is selected and not whichever sink was last
-	 * written.  Setting a format on a camera that is not the enabled one
-	 * is allowed and remembered; it just does not change the output until
-	 * that camera is selected.
+	 * written.  While the front end is free, setting a format on a camera
+	 * that is not the enabled one is allowed and remembered; it just does
+	 * not change the output until that camera is selected.  While it is
+	 * owned nothing is written at all -- see the refusal above.
 	 */
 	if (format->pad == ispfe_active_sink_pad(ispfe)) {
 		source = v4l2_subdev_state_get_format(state,

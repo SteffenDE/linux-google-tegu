@@ -1875,10 +1875,11 @@ static u32 ispfe_phy_lanes(u32 phy)
  * IMX712 -- both sensors get byte-identical sequences, which is what says this
  * is one code path with the geometry as its only argument.
  *
- * The main camera differs in exactly one word of them, the master block's
- * +0x10, and in using three lane blocks instead of four.  Neither value is
- * decoded far enough to derive from the link rate, so both are carried as the
- * measured pair and chosen by the link type.
+ * The main camera differs in the master block's +0x10, in using three lane
+ * blocks instead of four, and in the lane sequence itself, which is not a
+ * variation on this one -- see ispfe_phy_lane_cphy below.  Nothing here is
+ * decoded far enough to derive from the link rate, so every sequence is
+ * carried as measured and chosen by the link type.
  */
 #define PHY_MASTER_MODE			0x10
 #define PHY_MASTER_MODE_DPHY		0x00000200
@@ -1906,6 +1907,29 @@ static const struct ispfe_reg ispfe_phy_lane[] = {
 	{ 0x10, 0x00000302 }, { 0x14, 0x00008600 }, { 0x18, 0x00004000 },
 	{ 0x30, 0x00000137 }, { 0x34, 0x00000003 }, { 0x40, 0x00000001 },
 	{ 0x50, 0x0000081a },
+};
+
+/*
+ * A C-PHY source's lane blocks, which are a different sequence and not a
+ * variation on the one above.  Six of the words the D-PHY sequence writes hold
+ * a different value here, two of them it writes are absent, seven more are
+ * written that it never touches, and the block's own first word comes *first*
+ * rather than last -- so the enable is not the closing write it is for D-PHY.
+ * The common block is not written at all.
+ *
+ * Transcribed word for word and in order from the vendor stack's trace of the
+ * main camera streaming, which is the only C-PHY source on this board.  What
+ * any of it means is not known; what is known is that the D-PHY sequence in a
+ * C-PHY lane block delivers nothing at all -- no frame start, no error, no
+ * interrupt of any kind.
+ */
+static const struct ispfe_reg ispfe_phy_lane_cphy[] = {
+	{ 0x00, 0x00000001 }, { 0x04, 0x00001334 }, { 0x08, 0x00000011 },
+	{ 0x0c, 0x0000f399 }, { 0x10, 0x00000005 }, { 0x14, 0x00008600 },
+	{ 0x18, 0x00004040 }, { 0x1c, 0x00000200 }, { 0x20, 0x00000e08 },
+	{ 0x24, 0x00000040 }, { 0x30, 0x00000000 }, { 0x34, 0x00000034 },
+	{ 0x64, 0x00001501 }, { 0x68, 0x00000003 }, { 0x5c, 0x00001000 },
+	{ 0x9c, 0x00000080 },
 };
 
 /* Enable is the last write to a PHY block, and zero is how one is reset. */
@@ -2299,8 +2323,12 @@ static void ispfe_phy_write_master(void __iomem *base, bool cphy)
 
 /*
  * A link's PHY, in the order the vendor stack brings it up: every block reset
- * to zero, then the shared master, then the common block and its lane blocks,
- * each closed by writing its own enable last.
+ * to zero, then the shared master, then the lane blocks.
+ *
+ * A D-PHY source's common block is configured and enabled before them, and
+ * each lane block is closed by writing its own enable last.  A C-PHY source
+ * has no common block written at all and opens each lane block with that same
+ * word instead -- see ispfe_phy_lane_cphy.
  */
 static void ispfe_phy_start(struct ispfe_device *ispfe)
 {
@@ -2313,6 +2341,14 @@ static void ispfe_phy_start(struct ispfe_device *ispfe)
 		writel_relaxed(0, phy + PHY_LANE(lane));
 
 	ispfe_phy_write_master(csis + PHY_MASTER, ispfe->active.cphy);
+
+	if (ispfe->active.cphy) {
+		for (lane = 0; lane < ispfe->active.lanes; lane++)
+			ispfe_write_seq(phy + PHY_LANE(lane),
+					ispfe_phy_lane_cphy,
+					ARRAY_SIZE(ispfe_phy_lane_cphy));
+		return;
+	}
 
 	ispfe_write_seq(phy, ispfe_phy_common, ARRAY_SIZE(ispfe_phy_common));
 	writel_relaxed(PHY_ENABLE_COMMON, phy);

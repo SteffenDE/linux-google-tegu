@@ -1350,12 +1350,19 @@ static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,
  * Restored last, and the reason the block can be powered *down* again.  Bits
  * 28 and 29 are ENABLE_AUTOMATIC_CLKGATING and ENABLE_POWER_MANAGEMENT: with
  * them clear the CMU does not take part in the power handshake at all, the PMU
- * status never clears, and the power-off times out.  genpd touches this
- * register only on the way down, to clear the reset-disable in bit 24, so
- * nothing else in mainline ever sets it.
+ * status never clears, and the power-off times out.
+ *
+ * Bit 24 is the reset-disable, and it is this driver's to set.  genpd touches
+ * this register only on the way *down*, clearing that bit before the PMU write
+ * (exynos_pd_power(), pmdomain/samsung/exynos-pm-domains.c), so nothing in
+ * mainline puts it back -- and this value used to be written without it, which
+ * left the block running with the value downstream's `ispfe_off[]` starts
+ * from.  The vendor's live value is 0xf11ff03f, nine times in one captured
+ * session and never anything else, which is also what reference/ispfe.md's
+ * transcription of `ispfe_save[]` says the restore ends at.
  */
 #define CMU_CONTROLLER_OPTION		0x0800
-#define CMU_CONTROLLER_OPTION_VAL	0xf01ff03f
+#define CMU_CONTROLLER_OPTION_VAL	0xf11ff03f
 
 /*
  * The stage-2 protection units in front of this block's System MMUs.  They

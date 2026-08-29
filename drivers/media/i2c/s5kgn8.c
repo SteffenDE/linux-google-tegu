@@ -145,10 +145,10 @@
 #define S5KGN8_FRAME_LENGTH_MAX		0xffff
 
 /*
- * The external clock, and it is *not* what the mode list tells the sensor it
- * is.  0x0136 is written 0x1800, which is 24.0 MHz in the CCS Q8.8 encoding,
- * while the pad carries oscclk undivided at 24.576 MHz.  The frame timing says
- * which of the two the PLL runs on, at two different frame lengths:
+ * The external clock, and it is *not* what the part is told it is.  0x0136, in
+ * the power-up sequence below, is written 0x1800 -- 24.0 MHz in the CCS Q8.8
+ * encoding -- while the pad carries oscclk undivided at 24.576 MHz.  The frame
+ * timing says which of the two the PLL runs on, at two different frame lengths:
  *
  *   5600 * 9540  / (196.608 MHz * 8) = 33.9661 ms, measured 33.9660
  *   5600 * 11773 / (196.608 MHz * 8) = 41.9164 ms, measured 41.9195
@@ -266,43 +266,37 @@ static inline struct s5kgn8 *ctrl_to_s5kgn8(struct v4l2_ctrl *ctrl)
 }
 
 /*
- * The 2x2-binned preview mode, 4000x3000 at 29.4 fps, transcribed from a
- * recording of the vendor stack programming this sensor.  622 writes in the
- * order they were recorded, page selects included; the geometry inside it
- * decodes as
+ * The part's power-up initialisation, whose middle the i2c capture does not
+ * contain.  That middle is a 5,620-byte image uploaded through a single
+ * register, and the tracepoint the capture was decoded from drops a message
+ * that large -- so what the recording shows in its place is a 54 ms gap that
+ * reads as an idle pause.  The whole sequence is in the vendor HAL instead, as
+ * one array of register/value pairs that Lyric logs as "BARGHEST ... using v1
+ * init settings"; tools/camera-sensor-init-extract.py reads it back out, and
+ * the two tables below are what it emits.
  *
- *   0x0112 = 0x0a0a            RAW10 in, RAW10 out
- *   0x0114 = 0x0201            CCS csi_lane_mode 2 in the high byte, so
- *                              three lanes; the low byte is 0x0115, which
- *                              CCS does not define
- *   0x0342 = 5600              line_length_pck
- *   0x0340 = 9320              frame_length_lines, and then 9540: the list
- *                              carries the vendor's first exposure group at
- *                              entry 407 and it raises the frame before the
- *                              stream starts
- *   0x0344..0x034a             window (80, 64) to (8142, 6110)
- *   0x034c = 4000, 0x034e = 3000
- *   0x0350 = 16, 0x0352 = 12   the margin binning leaves over
- *   0x0380..0x0386 = 2         x/y even/odd increment, so 2x2 binning
- *   0x0900 = 0x2222            binning mode
- *   0x0304/0x0306 = 4/288      pixel-clock PLL, with 0x0300/0x0302 = 9/1
+ * It runs once per power-up: the wake write, these six -- which point the
+ * part's indirect port at internal address 0x20030800 -- and then these
+ * thirty-two.  The image belongs between them; it is uploaded two commits on,
+ * behind the bus rate that message needs.
+ *
+ * All thirty-eight used to be the head of the mode list, because the i2c
+ * capture is where they were read from and that is where they appear in it.
+ * They are not the mode.  They carry the PLL, and the mode list never writes
+ * it again:
+ *
+ *   0x0304/0x0306 = 4/288      pre_pll_clk_div and pll_multiplier
+ *   0x0300/0x0302 = 9/1        vt_pix_clk_div and vt_sys_clk_div
  *   0x0136 = 0x1800            the external clock it is told it has, and that
  *                              is not the one it gets
- *
- * Nothing here is reordered or deduplicated.  The geometry block appears
- * twice, several registers are written more than once, and which write lands
- * last is the one that counts.
- *
- * The recording's second streaming segment writes the same 622 registers in
- * the same order, and 621 of them with the same values.  The one that differs
- * is entry 407, the frame length inside the vendor's own exposure group, which
- * is 9540 here and 11773 there -- a value the controls own, so the table's
- * copy of it is overwritten on every stream start anyway.
  */
-static const struct cci_reg_sequence s5kgn8_mode_4000x3000[] = {
+static const struct cci_reg_sequence s5kgn8_init_port[] = {
 	{ CCI_REG16(0xfcfc), 0x2000 }, { CCI_REG16(0x0ea8), 0x0100 },
 	{ CCI_REG16(0x0e4e), 0x0300 }, { CCI_REG16(0xfcfc), 0x4000 },
 	{ CCI_REG16(0x6028), 0x2003 }, { CCI_REG16(0x602a), 0x0800 },
+};
+
+static const struct cci_reg_sequence s5kgn8_init_settings[] = {
 	{ CCI_REG16(0xfcfc), 0x4000 }, { CCI_REG16(0x0a72), 0x0100 },
 	{ CCI_REG16(0x0a70), 0x0001 }, { CCI_REG16(0xfcfc), 0x2000 },
 	{ CCI_REG16(0x101e), 0x0003 }, { CCI_REG16(0xb3b6), 0x00fc },
@@ -319,6 +313,41 @@ static const struct cci_reg_sequence s5kgn8_mode_4000x3000[] = {
 	{ CCI_REG16(0x0300), 0x0009 }, { CCI_REG16(0x030c), 0x0000 },
 	{ CCI_REG16(0x0306), 0x0120 }, { CCI_REG16(0x0304), 0x0004 },
 	{ CCI_REG16(0x013e), 0x0240 }, { CCI_REG16(0x0136), 0x1800 },
+};
+
+/*
+ * The 2x2-binned preview mode, 4000x3000 at 29.4 fps, transcribed from a
+ * recording of the vendor stack programming this sensor.  584 writes in the
+ * order they were recorded, page selects included; the thirty-eight this
+ * list used to start with belong to the power-up above.  The geometry inside
+ * it decodes as
+ *
+ *   0x0112 = 0x0a0a            RAW10 in, RAW10 out
+ *   0x0114 = 0x0201            CCS csi_lane_mode 2 in the high byte, so
+ *                              three lanes; the low byte is 0x0115, which
+ *                              CCS does not define
+ *   0x0342 = 5600              line_length_pck
+ *   0x0340 = 9320              frame_length_lines, and then 9540: the list
+ *                              carries the vendor's first exposure group at
+ *                              entries 362..369 and it raises the frame
+ *                              before the stream starts
+ *   0x0344..0x034a             window (80, 64) to (8142, 6110)
+ *   0x034c = 4000, 0x034e = 3000
+ *   0x0350 = 16, 0x0352 = 12   the margin binning leaves over
+ *   0x0380..0x0386 = 2         x/y even/odd increment, so 2x2 binning
+ *   0x0900 = 0x2222            binning mode
+ *
+ * Nothing here is reordered or deduplicated.  The geometry block appears
+ * twice, several registers are written more than once, and which write lands
+ * last is the one that counts.
+ *
+ * The recording's second streaming segment writes the same 584 registers in
+ * the same order, and 583 of them with the same values.  The one that differs
+ * is entry 368, the frame length inside the vendor's own exposure group, which
+ * is 9540 here and 11773 there -- a value the controls own, so the table's
+ * copy of it is overwritten on every stream start anyway.
+ */
+static const struct cci_reg_sequence s5kgn8_mode_4000x3000[] = {
 	{ CCI_REG16(0xfcfc), 0x2000 }, { CCI_REG16(0xcf2a), 0x0400 },
 	{ CCI_REG16(0xfcfc), 0x2001 }, { CCI_REG16(0x3080), 0x0200 },
 	{ CCI_REG16(0x3084), 0x0000 }, { CCI_REG16(0x3086), 0x27c0 },
@@ -1221,18 +1250,19 @@ static void s5kgn8_power_off(struct s5kgn8 *sensor)
 }
 
 /*
- * Telling the part it is powered.  The recording writes 0x6010 once per
- * power-up, immediately after reading the model id, and waits 10 ms; every
- * occurrence in it follows a fresh identification, never a second stream start
- * on a part that is already awake.  So it belongs to the power-up rather than
- * to enable_streams, which with a one-second autosuspend delay would replay it
- * onto a part that never suspended.
+ * Initialising the part.  The recording writes 0x6010 once per power-up,
+ * immediately after reading the model id, and waits 10 ms; every occurrence in
+ * it follows a fresh identification, never a second stream start on a part
+ * that is already awake.  So it belongs to the power-up rather than to
+ * enable_streams, which with a one-second autosuspend delay would replay it
+ * onto a part that never suspended.  The two tables that follow it are the
+ * rest of that same once-per-power-up sequence.
  *
  * Both power-ups call it: probe's, which does not come through runtime PM, and
  * every one after it.  Probe's is not optional -- the device is left active for
  * an autosuspend delay afterwards, so a capture started inside that second
  * resumes nothing and would otherwise program the mode list onto a part that
- * had never had this write, and a device whose runtime PM userspace has
+ * had never been initialised, and a device whose runtime PM userspace has
  * forbidden would never get it at all.
  */
 static int s5kgn8_init_part(struct s5kgn8 *sensor)
@@ -1246,7 +1276,12 @@ static int s5kgn8_init_part(struct s5kgn8 *sensor)
 
 	fsleep(S5KGN8_INIT_SETTLE_US);
 
-	return 0;
+	cci_multi_reg_write(sensor->regmap, s5kgn8_init_port,
+			    ARRAY_SIZE(s5kgn8_init_port), &ret);
+	cci_multi_reg_write(sensor->regmap, s5kgn8_init_settings,
+			    ARRAY_SIZE(s5kgn8_init_settings), &ret);
+
+	return ret;
 }
 
 static int s5kgn8_runtime_resume(struct device *dev)
@@ -1365,8 +1400,8 @@ static int s5kgn8_probe(struct i2c_client *client)
 				     "no master clock\n");
 
 	/*
-	 * The mode list's PLL dividers are constants, so the pixel rate this
-	 * driver reports is only true at one input rate.
+	 * The power-up sequence's PLL dividers are constants, so the pixel rate
+	 * this driver reports is only true at one input rate.
 	 */
 	rate = clk_get_rate(sensor->extclk);
 	if (rate != S5KGN8_EXTCLK_RATE)

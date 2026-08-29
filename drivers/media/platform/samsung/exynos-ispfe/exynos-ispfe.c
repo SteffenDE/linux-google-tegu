@@ -57,6 +57,7 @@
 #include "exynos-ispfe-pdma-program-binned.h"
 #include "exynos-ispfe-pdma-program-backend.h"
 #include "exynos-ispfe-pdma-program-main-backend.h"
+#include "exynos-ispfe-pdma-program-main-raw.h"
 
 /*
  * CSIS is licensed Samsung IP that mainline already drives as
@@ -564,7 +565,20 @@ struct ispfe_pdma_desc {
  */
 #define PDMA_DUMP_SLOT			PDMA_BUF_SLOTS
 #define PDMA_SLOTS			(PDMA_BUF_SLOTS + 1)
-#define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_RECIPE_BYTES, PAGE_SIZE)
+/*
+ * A slot holds whichever recipe is selected, so like the block area below it is
+ * sized for the largest and every recipe has to be named in it.  It was the
+ * physical-ultrawide raw recipe's own length for as long as that was the
+ * longest; naming one recipe is what stops being true when a longer one lands.
+ */
+#define ISPFE_PDMA_MAX_RECIPE_BYTES					\
+	MAX(MAX(MAX(ISPFE_PDMA_RECIPE_BYTES,				\
+		    ISPFE_PDMA_BINNED_RECIPE_BYTES),			\
+		MAX(ISPFE_PDMA_BACKEND_RECIPE_BYTES,			\
+		    ISPFE_PDMA_MAINBE_RECIPE_BYTES)),			\
+	    ISPFE_PDMA_MAINRAW_RECIPE_BYTES)
+#define PDMA_SLOT_STRIDE		ALIGN(ISPFE_PDMA_MAX_RECIPE_BYTES,\
+					      PAGE_SIZE)
 #define PDMA_PROGRAMS_SIZE		(PDMA_SLOTS * PDMA_SLOT_STRIDE)
 /*
  * One allocation serves whichever recipe is selected, so it is sized for the
@@ -573,9 +587,11 @@ struct ispfe_pdma_desc {
  * be in here, because nothing else bounds what one of them streams.
  */
 #define ISPFE_PDMA_MAX_BLOCKS_BYTES					\
-	MAX(MAX(ISPFE_PDMA_BLOCKS_BYTES, ISPFE_PDMA_BINNED_BLOCKS_BYTES),\
-	    MAX(ISPFE_PDMA_BACKEND_BLOCKS_BYTES,			\
-		ISPFE_PDMA_MAINBE_BLOCKS_BYTES))
+	MAX(MAX(MAX(ISPFE_PDMA_BLOCKS_BYTES,				\
+		    ISPFE_PDMA_BINNED_BLOCKS_BYTES),			\
+		MAX(ISPFE_PDMA_BACKEND_BLOCKS_BYTES,			\
+		    ISPFE_PDMA_MAINBE_BLOCKS_BYTES)),			\
+	    ISPFE_PDMA_MAINRAW_BLOCKS_BYTES)
 
 /*
  * The shading table as the hardware reads it: 33 x 25 x four unsigned Q12
@@ -1194,6 +1210,34 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.blocks_bytes = ISPFE_PDMA_BINNED_BLOCKS_BYTES,
 		.raw_output = true,
 	},
+	/*
+	 * The main camera's RAW readout.  Its own recipe rather than a geometry
+	 * of the ultrawide's: the capture holds 65 commands where the
+	 * ultrawide's holds 59.  Five of the six extra are this camera's
+	 * phase-detect pipeline, which the generator takes back out because two
+	 * of them carry captured addresses and nothing here allocates a buffer
+	 * for them.  The sixth is the contrast-detect gamma table, which stays:
+	 * unlike the back-end recipes, a raw recipe emits that block's
+	 * configuration, so the table has a reader.  It is also what makes this
+	 * recipe's block area the largest of the five.
+	 *
+	 * This is the only path on this camera that writes a Bayer frame to
+	 * DRAM.  Both back-end recipes read their Bayer from memory and so have
+	 * no frame destination at all, which is why frame_dirty says nothing on
+	 * them.
+	 */
+	{
+		.cmds = ispfe_pdma_mainraw_recipe,
+		.num_cmds = ARRAY_SIZE(ispfe_pdma_mainraw_recipe),
+		.relocs = ispfe_pdma_mainraw_relocs,
+		.num_relocs = ARRAY_SIZE(ispfe_pdma_mainraw_relocs),
+		.inputs = ispfe_pdma_mainraw_inputs,
+		.num_inputs = ARRAY_SIZE(ispfe_pdma_mainraw_inputs),
+		.width = 4000, .height = 3000, .stride = 8000,
+		.recipe_bytes = ISPFE_PDMA_MAINRAW_RECIPE_BYTES,
+		.blocks_bytes = ISPFE_PDMA_MAINRAW_BLOCKS_BYTES,
+		.raw_output = true,
+	},
 	{
 		.cmds = ispfe_pdma_backend_recipe,
 		.num_cmds = ARRAY_SIZE(ispfe_pdma_backend_recipe),
@@ -1233,16 +1277,19 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 };
 
 /*
- * The program area is sized once for all recipes; the two raw ones happen to
- * agree, and if a future capture does not these say so at build time rather
- * than by overrunning an allocation.  The block area is
- * %ISPFE_PDMA_MAX_BLOCKS_BYTES, which every recipe is named in, so there is
- * nothing to assert about it -- a slot has to hold each recipe's own commands.
+ * Two of the three raw recipes happen to agree, and if a future capture of
+ * either changes that these say so at build time.  The third does not agree and
+ * is not meant to: the main camera's readout is its own program.
+ *
+ * The bounds themselves are %ISPFE_PDMA_MAX_RECIPE_BYTES and
+ * %ISPFE_PDMA_MAX_BLOCKS_BYTES, which every recipe is named in; the asserts
+ * below are what catches one that is not.
  */
 static_assert(ISPFE_PDMA_BINNED_RECIPE_BYTES == ISPFE_PDMA_RECIPE_BYTES);
 static_assert(ISPFE_PDMA_BINNED_BLOCKS_BYTES == ISPFE_PDMA_BLOCKS_BYTES);
 static_assert(ISPFE_PDMA_BACKEND_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
 static_assert(ISPFE_PDMA_MAINBE_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
+static_assert(ISPFE_PDMA_MAINRAW_RECIPE_BYTES <= PDMA_SLOT_STRIDE);
 
 /* The recipe for a geometry, or NULL if none was captured for it. */
 static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,

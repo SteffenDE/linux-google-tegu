@@ -2595,13 +2595,30 @@ static dma_addr_t ispfe_slot_dma(struct ispfe_device *ispfe, unsigned int slot)
 	return ispfe->programs_dma + slot * PDMA_SLOT_STRIDE;
 }
 
+/*
+ * How many bytes of a slot the ring tells PDMA to read: the selected recipe's
+ * own length, unless the parser-experiment knob has been written.  Zero is what
+ * it holds until then, and zero means the recipe's.
+ *
+ * It used to default to ISPFE_PDMA_RECIPE_BYTES and be consulted only off the
+ * back-end path.  Every raw recipe was exactly that long, so nothing showed --
+ * but the number came from a constant rather than from the recipe, and a raw
+ * recipe of any other length would have had its tail cut off.  The tail of a
+ * recipe is its enables.
+ */
+static u32 ispfe_ring_bytes(struct ispfe_device *ispfe)
+{
+	u32 bytes = READ_ONCE(ispfe->pdma_bytes);
+
+	return bytes ? bytes : ispfe->prog->recipe_bytes;
+}
+
 /* Point one ring record at a program.  The caller owns the head. */
 static void ispfe_ring_record(struct ispfe_device *ispfe, unsigned int index,
 			      unsigned int slot)
 {
 	dma_addr_t dma = ispfe_slot_dma(ispfe, slot);
-	u32 bytes = ispfe->active_backend_recipe ?
-		    ispfe->prog->recipe_bytes : READ_ONCE(ispfe->pdma_bytes);
+	u32 bytes = ispfe_ring_bytes(ispfe);
 
 	ispfe->ring[index].cmd = cpu_to_le32(READ_ONCE(ispfe->pdma_cmd));
 	ispfe->ring[index].addr_lo = cpu_to_le32(lower_32_bits(dma));
@@ -5257,7 +5274,7 @@ static void ispfe_ring_fill(struct ispfe_device *ispfe)
 			ispfe->ring[i].addr_hi = cpu_to_le32(0);
 		}
 		/* Keep the separate first-record control for parser experiments. */
-		if (!i && !ispfe->active_backend_recipe)
+		if (!i && READ_ONCE(ispfe->pdma_bytes_first))
 			ispfe->ring[i].bytes =
 				cpu_to_le32(READ_ONCE(ispfe->pdma_bytes_first));
 	}
@@ -10677,8 +10694,9 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->settle_us = ISPFE_SETTLE_US_DEFAULT;
 	ispfe->fc_axi_max_ost = FC_LMP_IDMA_AXI_MAX_OST_IMX712;
 	ispfe->pdma_cmd = PDMA_DESC_CMD;
-	ispfe->pdma_bytes = ISPFE_PDMA_RECIPE_BYTES;
-	ispfe->pdma_bytes_first = ISPFE_PDMA_RECIPE_BYTES;
+	/* Zero: follow whichever recipe a stream selects.  See ispfe_ring_bytes(). */
+	ispfe->pdma_bytes = 0;
+	ispfe->pdma_bytes_first = 0;
 	platform_set_drvdata(pdev, ispfe);
 
 	ret = devm_mutex_init(dev, &ispfe->lock);

@@ -1505,14 +1505,17 @@ struct ispfe_link_cfg {
 				.num_channels = ARRAY_SIZE(set)
 
 static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
-	[0] = { true, 0, ISPFE_CAM_RATE_S5KGN8,		/* barghest, main */
-		0x013bd6d0, 0x00000180,
+	[0] = {	/* barghest, main */
+		.known = true, .phy = 0, .cam_rate = ISPFE_CAM_RATE_S5KGN8,
+		.mode_word0 = 0x013bd6d0, .mode_word1 = 0x00000180,
 		ISPFE_CHANNELS(ispfe_channels_s5kgn8) },
-	[1] = { true, 1, ISPFE_CAM_RATE_IMX712,		/* leshen-uw */
-		0x000c44a0, 0x000014f8,
+	[1] = {	/* leshen-uw */
+		.known = true, .phy = 1, .cam_rate = ISPFE_CAM_RATE_IMX712,
+		.mode_word0 = 0x000c44a0, .mode_word1 = 0x000014f8,
 		ISPFE_CHANNELS(ispfe_channels_imx712) },
-	[6] = { true, 5, ISPFE_CAM_RATE_IMX712,		/* leshen, front */
-		0x0007ca00, 0x000015f0,
+	[6] = {	/* leshen, front */
+		.known = true, .phy = 5, .cam_rate = ISPFE_CAM_RATE_IMX712,
+		.mode_word0 = 0x0007ca00, .mode_word1 = 0x000015f0,
 		ISPFE_CHANNELS(ispfe_channels_imx712) },
 };
 
@@ -10438,6 +10441,16 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 	link->mode_word1 = cfg->mode_word1;
 	link->channels = cfg->channels;
 	link->num_channels = cfg->num_channels;
+
+	/*
+	 * A rate of zero is the bug this table exists to prevent, and it is
+	 * silent: clk_set_rate() would be handed max(saved_cam_rate, 0), which
+	 * is the idle rate, and a camera clocked below its line rate streams
+	 * and writes nothing.  Refuse at probe rather than at the first frame.
+	 */
+	if (!link->cam_rate)
+		return dev_err_probe(ispfe->dev, -EINVAL,
+				     "link %u has no CAM rate\n", link->bank);
 
 	if (!link->lanes || link->lanes > ispfe_phy_lanes(link->phy))
 		return dev_err_probe(ispfe->dev, -EINVAL,

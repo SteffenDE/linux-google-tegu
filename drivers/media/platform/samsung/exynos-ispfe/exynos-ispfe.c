@@ -2465,13 +2465,26 @@ static void ispfe_phy_write_master(void __iomem *base, bool cphy)
 }
 
 /*
- * A link's PHY, in the order the vendor stack brings it up: every block reset
- * to zero, then the shared master, then the lane blocks.
+ * A link's PHY, in the order the vendor stack brings it up: the shared master,
+ * then the lane blocks.
  *
- * A D-PHY source's common block is configured and enabled before them, and
- * each lane block is closed by writing its own enable last.  A C-PHY source
- * has no common block written at all and opens each lane block with that same
- * word instead -- see ispfe_phy_lane_cphy.
+ * A D-PHY source's blocks are reset to zero first, its common block is
+ * configured and enabled before the lanes, and each lane block is closed by
+ * writing its own enable last.
+ *
+ * A C-PHY source gets none of that reset, and this is a difference the vendor
+ * makes deliberately: across a whole session
+ * (research/data/camera-session-2026-08-17) the main camera's common block at
+ * +0x0c1200 is never written at all -- not here, not at teardown, not once --
+ * and both of its bring-ups start straight at the master's +0x0c1000, while
+ * the ultrawide's D-PHY instance takes the zeroing pass every time.  This
+ * driver used to zero both anyway, on the reading that a reset cannot hurt.
+ *
+ * It does not hurt, and it does not help either: the common block reads
+ * 0x00000000 with or without the write [HW 2026-08-29], so this is a
+ * difference removed rather than a fault fixed.  It is worth removing because
+ * this driver's write set is diffed against the vendor's register for
+ * register, and every write the vendor does not make is noise in that diff.
  */
 static void ispfe_phy_start(struct ispfe_device *ispfe)
 {
@@ -2479,9 +2492,11 @@ static void ispfe_phy_start(struct ispfe_device *ispfe)
 	void __iomem *phy = ispfe_phy(ispfe);
 	u32 lane;
 
-	writel_relaxed(0, phy);
-	for (lane = 0; lane < ispfe->active.lanes; lane++)
-		writel_relaxed(0, phy + PHY_LANE(lane));
+	if (!ispfe->active.cphy) {
+		writel_relaxed(0, phy);
+		for (lane = 0; lane < ispfe->active.lanes; lane++)
+			writel_relaxed(0, phy + PHY_LANE(lane));
+	}
 
 	ispfe_phy_write_master(csis + PHY_MASTER, ispfe->active.cphy);
 
@@ -2538,9 +2553,17 @@ static void ispfe_phy_reset_set(struct ispfe_device *ispfe, bool released)
  *   pass over the lane blocks writing PHY_LANE_STOP, and only then the sysreg
  *   reset -- with the link's interrupt masks cleared afterwards, not before.
  *
+ * The common block is not written here at all, and for a D-PHY source that is
+ * an omission rather than a placement: the vendor zeroes it at *both* ends --
+ * +0x0c1700 before the master at 1130.874033 and again before the lane pass at
+ * 1138.233297 -- where this driver only zeroes it on the way up.  So between a
+ * stop and the next start the block holds PHY_ENABLE_COMMON here and zero
+ * there.  A C-PHY source's the vendor never writes at either end, and since
+ * ispfe_phy_start() stopped zeroing it neither does this driver.  See
+ * open.md.
+ *
  * This driver used to assert the sysreg reset first and write the blocks into
- * a PHY that was already in it.  The common block is deliberately left alone:
- * the vendor never writes it here, and ispfe_phy_start() zeroes it anyway.
+ * a PHY that was already in it.
  */
 static void ispfe_phy_link_stop(struct ispfe_device *ispfe)
 {

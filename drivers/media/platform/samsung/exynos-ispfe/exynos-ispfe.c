@@ -1427,9 +1427,74 @@ static const char * const ispfe_window_names[ISPFE_NUM_WINDOWS] = {
  * between the two identical IMX712s, so nothing about them is derivable yet.
  * A second mode on one of these links needs them measured again.
  */
+/*
+ * What the receive path has to be clocked at while a camera streams, which is
+ * a property of the camera and not of the block.
+ *
+ * What binds is the **unpacked write side**: eight bytes, which is four 16-bit
+ * samples, per CAM clock.  So a mode delivering @width pixels every line
+ * period needs
+ *
+ *	width * pixel_rate / line_length_pck / 4
+ *
+ * hertz sustained across the whole active region, with only the horizontal
+ * blanking to catch up in.  That is 101.3 MHz for an IMX712 and 280.9 MHz for
+ * the main camera -- a 2.8x spread, which is why one number for all three was
+ * wrong.
+ *
+ * It is a *burst* rate and not average bandwidth, which is what makes the main
+ * camera the harder one despite writing fewer bytes per second overall: its
+ * 8000-byte line has to land in 3.56 us (2.25 GB/s) against the ultrawide's
+ * 8416 bytes in 10.39 us (810 MB/s), and it then idles through 20.6 ms of
+ * vertical blanking.
+ *
+ * **Lyric's `width >> 3` is a different boundary and is not evidence for this
+ * one.**  `tpg_sync_calculator` computes a line's active cycles that way for
+ * the CSIS OTF auto-recovery windows (see reference/ispfe-events.md), which
+ * says the receive side moves eight pixels per clock -- it says nothing about
+ * what the RAW write DMA can retire.  S5KGN8_PIXEL_RATE's own factor of eight
+ * is a third unrelated thing: pixels per the *sensor's* vt_pix clock, where
+ * IMX712_PIXELS_PER_VT_CLK is four.
+ *
+ * It is a property of the *mode*, like the two words below, and is carried per
+ * link only because each of these cameras has one mode here.  A second mode or
+ * a crop on any of them needs it recomputed; both sensor drivers export
+ * V4L2_CID_PIXEL_RATE and V4L2_CID_HBLANK, so a driver that grew more modes
+ * should derive it and keep only the margin and the rungs as constants.
+ *
+ * Ask for the first rung above that floor; there is no margin to choose.  The
+ * vendor's measured 111 MHz for an ultrawide session is 1.096x its 101.3, and
+ * the main camera runs clean at 310 MHz (1.104x) and fails at 233 -- *below*
+ * its floor -- with EbufOverflow, the elastic buffer between link and core
+ * saying it could not drain [HW 2026-08-29].  The boundary falls where the
+ * arithmetic puts it, with nothing fitted.
+ *
+ * Corroborated from the other side: Lyric's own
+ * ZumaFrontEndContext::GetQosRequirement carries a stepped table (rodata
+ * 0x1a9d08) whose rates are 111, 310, 533 and 711 MHz -- so 310 is the
+ * vendor's own second front-end step, and it skips 233 and 465 entirely.  What
+ * the table's thresholds are measuring is not recovered.
+ *
+ * These are ladder rungs -- 711, 533, 465, 310, 233, 111 MHz -- and they have
+ * to be, because a request between rungs is served by the rung *below*: asking
+ * for 280.9 MHz ran the block at 233 and failed exactly as 233 does, while
+ * clk_get_rate() went on reporting 280900000.  The kernel cannot see this --
+ * clk-acpm's determine_rate returns the request verbatim and recalc_rate asks
+ * the firmware -- and it is the opposite direction from the devfreq *minimum*
+ * in reference/ispfe.md, which rounds up.  See traps.md.
+ *
+ * ISPFE_MEMORY_BW_KBPS is deliberately not treated this way.  It is also an
+ * ultrawide measurement, but the ultrawide's frame is the largest of the
+ * three, so one vote bounds all of them; scaling it per camera would save
+ * power and cannot fix anything.
+ */
+#define ISPFE_CAM_RATE_IMX712		111000000UL
+#define ISPFE_CAM_RATE_S5KGN8		310000000UL
+
 struct ispfe_link_cfg {
 	bool known;
 	u8 phy;
+	unsigned long cam_rate;
 	u32 mode_word0;
 	u32 mode_word1;
 	const struct ispfe_link_channel *channels;
@@ -1440,11 +1505,14 @@ struct ispfe_link_cfg {
 				.num_channels = ARRAY_SIZE(set)
 
 static const struct ispfe_link_cfg ispfe_link_cfg[CSIS_NUM_LINKS] = {
-	[0] = { true, 0, 0x013bd6d0, 0x00000180,	/* barghest, main */
+	[0] = { true, 0, ISPFE_CAM_RATE_S5KGN8,		/* barghest, main */
+		0x013bd6d0, 0x00000180,
 		ISPFE_CHANNELS(ispfe_channels_s5kgn8) },
-	[1] = { true, 1, 0x000c44a0, 0x000014f8,	/* leshen-uw */
+	[1] = { true, 1, ISPFE_CAM_RATE_IMX712,		/* leshen-uw */
+		0x000c44a0, 0x000014f8,
 		ISPFE_CHANNELS(ispfe_channels_imx712) },
-	[6] = { true, 5, 0x0007ca00, 0x000015f0,	/* leshen, front */
+	[6] = { true, 5, ISPFE_CAM_RATE_IMX712,		/* leshen, front */
+		0x0007ca00, 0x000015f0,
 		ISPFE_CHANNELS(ispfe_channels_imx712) },
 };
 
@@ -1469,6 +1537,7 @@ struct ispfe_link {
 	u32 phy;
 	u32 lanes;
 	bool cphy;
+	unsigned long cam_rate;
 	u32 mode_word0;
 	u32 mode_word1;
 	const struct ispfe_link_channel *channels;
@@ -1508,6 +1577,9 @@ struct ispfe_source {
 	 */
 	u32 loch;
 	u32 fcctx;
+
+	/* What the receive path is clocked at for this camera; see above. */
+	unsigned long cam_rate;
 
 	/* Not derived from anything: measured for one sensor mode. */
 	u32 mode_word0;
@@ -1569,7 +1641,6 @@ static const struct ispfe_format ispfe_formats[] = {
 /* Exact ultrawide session requests measured at downstream's public APIs. */
 #define ISPFE_MEMORY_BW_KBPS		974745U
 #define ISPFE_CAM_SETUP_RATE		711000000UL
-#define ISPFE_CAM_ACTIVE_RATE		111000000UL
 
 struct ispfe_device {
 	struct device *dev;
@@ -1944,6 +2015,7 @@ static void ispfe_link_to_src(struct ispfe_device *ispfe,
 	ispfe->src.phy = link->phy;
 	ispfe->src.lanes = link->lanes;
 	ispfe->src.cphy = link->cphy;
+	ispfe->src.cam_rate = link->cam_rate;
 	ispfe->src.mode_word0 = link->mode_word0;
 	ispfe->src.mode_word1 = link->mode_word1;
 	ispfe->src.channels = link->channels;
@@ -6339,7 +6411,7 @@ err_clear:
 static int ispfe_qos_set_active(struct ispfe_device *ispfe)
 {
 	return clk_set_rate(ispfe->cam_clk,
-			    max(ispfe->saved_cam_rate, ISPFE_CAM_ACTIVE_RATE));
+			    max(ispfe->saved_cam_rate, ispfe->active.cam_rate));
 }
 
 /*
@@ -10086,9 +10158,10 @@ static const struct v4l2_subdev_internal_ops ispfe_subdev_internal_ops = {
  * graph mutex, while a stream start takes that mutex inside
  * video_device_pipeline_start(), so taking ispfe->lock here would close an
  * ABBA.  That leaves a link change racing a start that has not yet claimed
- * ownership -- and it is not benign, because ispfe_link_to_src() is six
+ * ownership -- and it is not benign, because ispfe_link_to_src() is a run of
  * unsynchronised stores and ispfe_start() copies the struct, so an interleave
- * arms the receiver on one camera's bank with another's PHY.  Every field is
+ * arms the receiver on one camera's bank with another's PHY -- or, since the
+ * CAM rate joined them, at another's clock.  Every field is
  * individually valid, so nothing downstream rejects it; the capture is simply
  * wrong.
  *
@@ -10359,6 +10432,7 @@ static int ispfe_parse_endpoint(struct ispfe_device *ispfe,
 	cfg = &ispfe_link_cfg[fwep.port];
 	link->bank = fwep.port;
 	link->phy = cfg->phy;
+	link->cam_rate = cfg->cam_rate;
 	link->lanes = vep.bus.mipi_csi2.num_data_lanes;
 	link->mode_word0 = cfg->mode_word0;
 	link->mode_word1 = cfg->mode_word1;

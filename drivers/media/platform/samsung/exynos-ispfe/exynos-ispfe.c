@@ -224,9 +224,10 @@ static_assert(ARRAY_SIZE(ispfe_channels_s5kgn8) <= CSIS_NUM_CHANNELS);
 /*
  * The nine D/C-PHYs live inside the csis-link-phy window rather than behind a
  * phy driver, so the receiver programs them directly, as the vendor stack
- * does.  Bases are the reg of downstream's dcphy_m0s4s4s4s4s4_csi0@* nodes;
- * each is a 0x500 region with a common block at +0x000 and four lane blocks at
- * +0x100 upwards.  The block at +0xC1000 is described by nothing in the device
+ * does.  Bases are the reg of downstream's dcphy_m0s4s4s4s4s4_csi0@* nodes,
+ * and so are the sizes: eight are 0x500, a common block at +0x000 and four
+ * lane blocks at +0x100 upwards, and instance 6 at 0x1C103600 is 0x100 -- a
+ * common block and nothing else.  See ispfe_phy_lanes().  The block at +0xC1000 is described by nothing in the device
  * tree and is programmed by every sensor before its own PHY -- the "m0" of
  * m0s4s4s4s4s4, a master in front of the four-lane slaves.
  */
@@ -1992,9 +1993,9 @@ static const u32 ispfe_phy_base[PHY_NUM_INSTANCES] = {
 /*
  * How many lane blocks each instance actually has room for, from the gaps
  * between those bases: most are 0x500 apart and hold a common block plus four
- * lanes, but instances 5 and 6 are only 0x100 apart, so neither has any lane
- * block of its own before the next instance's common block starts.  Writing
- * four lanes into one of those walks into its neighbour.
+ * lanes, but instances 6 and 7 are only 0x100 apart, so instance 6 has no
+ * lane block of its own before instance 7's common block starts.  Writing
+ * four lanes into it walks into its neighbour.
  */
 #define ISPFE_PHY_MAX_LANES		4
 
@@ -2075,7 +2076,12 @@ static const struct ispfe_reg ispfe_phy_lane_cphy[] = {
 	{ 0x9c, 0x00000080 },
 };
 
-/* Enable is the last write to a PHY block, and zero is how one is reset. */
+/*
+ * How a D-PHY block is opened and closed: the enable is the last write to it,
+ * and zero is how one is reset.  A C-PHY lane block does the opposite and
+ * opens with its own first word -- see ispfe_phy_lane_cphy above, whose first
+ * entry is {0x00, 0x1}.
+ */
 #define PHY_ENABLE_COMMON		0x3
 #define PHY_ENABLE_LANE			0x1
 

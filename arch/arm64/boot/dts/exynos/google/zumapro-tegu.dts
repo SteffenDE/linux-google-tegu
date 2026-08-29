@@ -2373,6 +2373,16 @@
 	status = "okay";
 
 	/*
+	 * The rate the recording runs this bus at, and the rate the sensor's
+	 * 5,622-byte initialisation message needs: at the SoC default of 400
+	 * kHz that one message takes 126 ms, and this controller's driver gives
+	 * every message a fixed 100 ms, so it would fail as a timeout and a bus
+	 * reset.  The divider off the 200 MHz source lands on 961 kHz, and the
+	 * message takes 53 ms -- which is what it takes in the recording.
+	 */
+	clock-frequency = <950000>;
+
+	/*
 	 * barghest, the main camera.  A Samsung ISOCELL part with a paged
 	 * register file and 16-bit values, on CIS_CLK3 off the same 24.576 MHz
 	 * oscillator as the other two -- which is what the sensor's PLL closes

@@ -7371,6 +7371,16 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "phymast+0x%05x %#010x\n", PHY_MASTER + PHY_MASTER_MODE,
 		   readl_relaxed(ispfe->base[ISPFE_WIN_CSIS] + PHY_MASTER +
 				 PHY_MASTER_MODE));
+	/*
+	 * The common block.  A D-PHY source's is configured and enabled; a
+	 * C-PHY source's is neither, so what its lane blocks sit on top of is
+	 * otherwise an assumption.  Only the active instance's is printed,
+	 * which is a blind spot for the front camera: the vendor brings up a
+	 * second common block at +0x0c3600 beside its +0x0c3100 and this
+	 * driver brings up one -- see reference/ispfe.md.
+	 */
+	seq_printf(s, "phycmn         %#010x\n",
+		   readl_relaxed(ispfe_phy(ispfe)));
 	for (i = 0; i < ispfe->active.lanes; i++)
 		seq_printf(s, "phylane%u       %#010x\n", i,
 			   readl_relaxed(ispfe_phy(ispfe) + PHY_LANE(i)));

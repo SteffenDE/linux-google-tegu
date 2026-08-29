@@ -26,6 +26,7 @@
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
@@ -34,6 +35,7 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/unaligned.h>
 
 #include <media/v4l2-cci.h>
 #include <media/v4l2-common.h>
@@ -63,6 +65,28 @@
 #define S5KGN8_INIT_6010		CCI_REG16(0x6010)
 #define S5KGN8_INIT_6010_VAL		0x0001
 #define S5KGN8_INIT_SETTLE_US		10000
+
+/*
+ * The part's initialisation image, and the indirect port it goes through.
+ * Writing 0x6f12 does not advance the register, it advances the internal
+ * address that 0x6028/0x602a set -- so the whole image is one i2c message of
+ * the register number and then 5,620 bytes, which is what the recording sends
+ * and what regmap_noinc_write() builds.
+ *
+ * The image describes itself: 'S' 'Z', a version, and then the number of bytes
+ * that follow those three words.  It is rejected if it does not, and rejected
+ * if it is over 8 KiB.  That bound is a round number rather than a derived one,
+ * but it is well inside what the i2c controller can finish: at this bus's 961
+ * kHz and nine clocks a byte, its fixed 100 ms per-message timeout reaches
+ * 10,684 bytes, and the real image's 5,622 take 53 ms of it.  A file past the
+ * bound would otherwise fail as a timeout and a controller reset rather than
+ * as a bad file.
+ */
+#define S5KGN8_IMAGE_NAME		"samsung/s5kgn8-init-v1.bin"
+#define S5KGN8_IMAGE_PORT		0x6f12
+#define S5KGN8_IMAGE_MAGIC		0x535a
+#define S5KGN8_IMAGE_HEADER		6
+#define S5KGN8_IMAGE_MAX		8192
 
 /*
  * Values, not bits: on a 16-bit-value part a write to 0x0100 covers 0x0101 as
@@ -253,6 +277,10 @@ struct s5kgn8 {
 	struct v4l2_ctrl *pixel_rate;
 
 	const struct s5kgn8_mode *mode;
+
+	/* The initialisation image, held for the device's lifetime. */
+	const void *image;
+	size_t image_len;
 };
 
 static inline struct s5kgn8 *sd_to_s5kgn8(struct v4l2_subdev *sd)
@@ -275,10 +303,9 @@ static inline struct s5kgn8 *ctrl_to_s5kgn8(struct v4l2_ctrl *ctrl)
  * init settings"; tools/camera-sensor-init-extract.py reads it back out, and
  * the two tables below are what it emits.
  *
- * It runs once per power-up: the wake write, these six -- which point the
- * part's indirect port at internal address 0x20030800 -- and then these
- * thirty-two.  The image belongs between them; it is uploaded two commits on,
- * behind the bus rate that message needs.
+ * It runs once per power-up, in four parts: the wake write, these six -- which
+ * point the part's indirect port at internal address 0x20030800 -- the image
+ * itself, and then these thirty-two.
  *
  * All thirty-eight used to be the head of the mode list, because the i2c
  * capture is where they were read from and that is where they appear in it.
@@ -1250,13 +1277,54 @@ static void s5kgn8_power_off(struct s5kgn8 *sensor)
 }
 
 /*
+ * The initialisation image is the vendor's data rather than this driver's, and
+ * it is 5,620 bytes of it, so it is loaded from the filesystem instead of being
+ * carried here.  Once, at probe: the part needs it on every power-up, and a
+ * request_firmware() per resume would put a filesystem lookup inside a
+ * runtime-PM callback.
+ */
+static int s5kgn8_load_image(struct s5kgn8 *sensor)
+{
+	struct device *dev = regmap_get_device(sensor->regmap);
+	const struct firmware *fw;
+	size_t len;
+	void *image;
+	int ret;
+
+	ret = request_firmware(&fw, S5KGN8_IMAGE_NAME, dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot load %s\n",
+				     S5KGN8_IMAGE_NAME);
+
+	len = fw->size;
+	if (len < S5KGN8_IMAGE_HEADER || len > S5KGN8_IMAGE_MAX || len % 2 ||
+	    get_unaligned_be16(fw->data) != S5KGN8_IMAGE_MAGIC ||
+	    get_unaligned_be16(fw->data + 4) != len - S5KGN8_IMAGE_HEADER) {
+		release_firmware(fw);
+		return dev_err_probe(dev, -EINVAL,
+				     "%s is %zu bytes and is not an initialisation image\n",
+				     S5KGN8_IMAGE_NAME, len);
+	}
+
+	image = devm_kmemdup(dev, fw->data, len, GFP_KERNEL);
+	release_firmware(fw);
+	if (!image)
+		return -ENOMEM;
+
+	sensor->image = image;
+	sensor->image_len = len;
+
+	return 0;
+}
+
+/*
  * Initialising the part.  The recording writes 0x6010 once per power-up,
  * immediately after reading the model id, and waits 10 ms; every occurrence in
  * it follows a fresh identification, never a second stream start on a part
  * that is already awake.  So it belongs to the power-up rather than to
  * enable_streams, which with a one-second autosuspend delay would replay it
- * onto a part that never suspended.  The two tables that follow it are the
- * rest of that same once-per-power-up sequence.
+ * onto a part that never suspended.  The two tables and the image between them
+ * are the rest of that same once-per-power-up sequence.
  *
  * Both power-ups call it: probe's, which does not come through runtime PM, and
  * every one after it.  Probe's is not optional -- the device is left active for
@@ -1278,6 +1346,14 @@ static int s5kgn8_init_part(struct s5kgn8 *sensor)
 
 	cci_multi_reg_write(sensor->regmap, s5kgn8_init_port,
 			    ARRAY_SIZE(s5kgn8_init_port), &ret);
+	if (ret)
+		return ret;
+
+	ret = regmap_noinc_write(sensor->regmap, S5KGN8_IMAGE_PORT,
+				 sensor->image, sensor->image_len);
+	if (ret)
+		return ret;
+
 	cci_multi_reg_write(sensor->regmap, s5kgn8_init_settings,
 			    ARRAY_SIZE(s5kgn8_init_settings), &ret);
 
@@ -1424,6 +1500,10 @@ static int s5kgn8_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	ret = s5kgn8_load_image(sensor);
+	if (ret)
+		return ret;
+
 	/*
 	 * The driver core applies the default pin state before probe runs, so
 	 * the master clock pad is already muxed to CIS_CLK with no rail behind
@@ -1540,6 +1620,7 @@ static struct i2c_driver s5kgn8_i2c_driver = {
 };
 module_i2c_driver(s5kgn8_i2c_driver);
 
+MODULE_FIRMWARE(S5KGN8_IMAGE_NAME);
 MODULE_DESCRIPTION("Samsung S5KGN8 image sensor driver");
 MODULE_AUTHOR("Steffen Deusch <steffen@deusch.me>");
 MODULE_LICENSE("GPL");

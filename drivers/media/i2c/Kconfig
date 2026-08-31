@@ -947,6 +947,14 @@ config VIDEO_DW9807_VCM
 	  capability. This is designed for linear control of
 	  voice coil motors, controlled via I2C serial interface.
 
+config VIDEO_LC898129
+	tristate "LC898129 lens voice coil support"
+	help
+	  This is a driver for the autofocus half of the ON Semiconductor
+	  LC898129 OIS and closed-loop AF control LSI. The host writes a
+	  target position and the part's own servo reaches it against a Hall
+	  sensor, over an I2C serial interface.
+
 endif
 
 menu "Flash devices"

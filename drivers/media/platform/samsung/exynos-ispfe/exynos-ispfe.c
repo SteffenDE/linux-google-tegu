@@ -409,6 +409,13 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX(n)		(0x31000 + (n) * 0x2000)
 #define LMP_NUM_PDAF			4
 #define LMP_PDAF(m)			(0x50148 + (m) * 0x18)
+/*
+ * And the phase-detect frame-controller banks, which are half the stride of
+ * the bayer ones and hold the same registers at the same offsets.  They are on
+ * the "fc" line with the bayer banks; the line-memory instances above have a
+ * line of their own.
+ */
+#define FC_PDAF_CTX(m)			(0x3b000 + (m) * 0x1000)
 
 #define FC_BIND_ENABLE			0x00
 #define FC_BIND_LOCH		0x04
@@ -1773,6 +1780,7 @@ struct ispfe_device {
 	int core_irq;
 	int fc_irq;
 	int lmp_irq;
+	int lmp_pdaf_irq;
 	int pdma_irq;
 	/*
 	 * request_irq() keeps the name it is given rather than copying it, so
@@ -2008,6 +2016,15 @@ struct ispfe_device {
 	u32 lmp_seen;
 	u32 core_seen[4];
 	u32 pdma_seen[3];
+	/*
+	 * The frame controller's and the line memory's phase-detect halves,
+	 * kept apart from the words above rather than merged into them: what
+	 * makes them worth reading is which side of the receiver raised them.
+	 */
+	u32 pd_fc_seen;
+	u32 pd_lmp_seen;
+	atomic_t pd_fc_events;
+	atomic_t pd_lmp_events;
 };
 
 /* A camera's description, as the values a stream starts from. */
@@ -5785,7 +5802,8 @@ static irqreturn_t ispfe_fc_isr(int irq, void *data)
 	struct ispfe_device *ispfe = data;
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 	void __iomem *bank = core + FC_CTX(ispfe->active.fcctx);
-	u32 src, ovf;
+	u32 src, ovf, seen = 0;
+	unsigned int i;
 
 	/*
 	 * The frame controller's own source, not the CSIS-core aggregate at
@@ -5795,17 +5813,99 @@ static irqreturn_t ispfe_fc_isr(int irq, void *data)
 	 * another line's registers when it was not.
 	 */
 	src = readl_relaxed(bank + FC_CTX_SRC);
-	if (!src)
+	if (src) {
+		writel_relaxed(src, bank + FC_CTX_SRC);
+
+		ovf = readl_relaxed(bank + FC_CTX_OVF);
+		if (ovf)
+			writel_relaxed(ovf, bank + FC_CTX_OVF);
+
+		WRITE_ONCE(ispfe->fc_seen, READ_ONCE(ispfe->fc_seen) | src);
+		atomic_inc(&ispfe->fc_events);
+		seen = src;
+	}
+
+	/*
+	 * The four phase-detect banks are on this line too -- the device tree's
+	 * "fc" is the whole frame controller, both halves -- so they are
+	 * acknowledged here or not at all.  Returning early on a clear bayer
+	 * source, which is what this used to do, would have left one asserted.
+	 */
+	for (i = 0; i < LMP_NUM_PDAF; i++) {
+		void __iomem *pd = core + FC_PDAF_CTX(i);
+
+		src = readl_relaxed(pd + FC_CTX_SRC);
+		if (!src)
+			continue;
+		writel_relaxed(src, pd + FC_CTX_SRC);
+
+		ovf = readl_relaxed(pd + FC_CTX_OVF);
+		if (ovf)
+			writel_relaxed(ovf, pd + FC_CTX_OVF);
+
+		WRITE_ONCE(ispfe->pd_fc_seen,
+			   READ_ONCE(ispfe->pd_fc_seen) | src);
+		atomic_inc(&ispfe->pd_fc_events);
+		seen |= src;
+	}
+
+	if (!seen)
 		return IRQ_NONE;
 
-	writel_relaxed(src, bank + FC_CTX_SRC);
+	return IRQ_HANDLED;
+}
 
-	ovf = readl_relaxed(bank + FC_CTX_OVF);
-	if (ovf)
-		writel_relaxed(ovf, bank + FC_CTX_OVF);
+/*
+ * The four phase-detect line-memory instances, which have a GIC line of their
+ * own -- the device tree names it "lmp-pdaf" beside the bayer pool's
+ * "lmp-bayer".  All four are drained because one line serves four instances,
+ * so acknowledging only the configured one would leave the line asserted by
+ * any of the others.  (The bayer handler below says the same thing but gives a
+ * different reason -- that device init unmasks every instance -- which is not
+ * what ispfe_device_init() does: it masks all nine.  The argument that holds
+ * for both pools is the shared line, not the mask.)
+ *
+ * Nothing here completes a frame; the bayer pool's EOF is what a stream is
+ * driven by, and this exists so that the phase-detect side can be unmasked at
+ * all.
+ */
+static irqreturn_t ispfe_lmp_pdaf_isr(int irq, void *data)
+{
+	struct ispfe_device *ispfe = data;
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	unsigned int i;
+	u32 seen = 0;
 
-	WRITE_ONCE(ispfe->fc_seen, READ_ONCE(ispfe->fc_seen) | src);
-	atomic_inc(&ispfe->fc_events);
+	for (i = 0; i < LMP_NUM_PDAF; i++) {
+		void __iomem *lmp = core + LMP_PDAF(i);
+		u32 src = readl_relaxed(lmp + LMP_INT_SRC);
+		u32 ovf;
+
+		if (!src)
+			continue;
+		writel_relaxed(src, lmp + LMP_INT_SRC);
+
+		/*
+		 * And the overflow word beside it, which the event-info nodes
+		 * declare as this leaf's irq-overflow-reg (+0x04) and which
+		 * LWIS clears the same way.  The bayer pool's handler does not
+		 * do this; whether the word holds the line up is unmeasured on
+		 * either.
+		 */
+		ovf = readl_relaxed(lmp + 0x04);
+		if (ovf)
+			writel_relaxed(ovf, lmp + 0x04);
+
+		WRITE_ONCE(ispfe->pd_lmp_seen,
+			   READ_ONCE(ispfe->pd_lmp_seen) | src);
+		seen |= src;
+	}
+
+	if (!seen)
+		return IRQ_NONE;
+
+	atomic_inc(&ispfe->pd_lmp_events);
+
 	return IRQ_HANDLED;
 }
 
@@ -6293,9 +6393,10 @@ static int ispfe_request_irqs(struct ispfe_device *ispfe)
 	ispfe->core_irq = platform_get_irq_byname(pdev, "csis-core");
 	ispfe->fc_irq = platform_get_irq_byname(pdev, "fc");
 	ispfe->lmp_irq = platform_get_irq_byname(pdev, "lmp-bayer");
+	ispfe->lmp_pdaf_irq = platform_get_irq_byname(pdev, "lmp-pdaf");
 	ispfe->pdma_irq = platform_get_irq_byname(pdev, "pdma");
 	if (ispfe->core_irq < 0 || ispfe->fc_irq < 0 || ispfe->lmp_irq < 0 ||
-	    ispfe->pdma_irq < 0) {
+	    ispfe->lmp_pdaf_irq < 0 || ispfe->pdma_irq < 0) {
 		ret = -ENODEV;
 		goto err_link;
 	}
@@ -6313,13 +6414,20 @@ static int ispfe_request_irqs(struct ispfe_device *ispfe)
 	if (ret)
 		goto err_fc;
 
-	ret = request_irq(ispfe->pdma_irq, ispfe_pdma_isr, 0, "ispfe-pdma",
-			  ispfe);
+	ret = request_irq(ispfe->lmp_pdaf_irq, ispfe_lmp_pdaf_isr, 0,
+			  "ispfe-lmp-pdaf", ispfe);
 	if (ret)
 		goto err_lmp;
 
+	ret = request_irq(ispfe->pdma_irq, ispfe_pdma_isr, 0, "ispfe-pdma",
+			  ispfe);
+	if (ret)
+		goto err_lmp_pdaf;
+
 	return 0;
 
+err_lmp_pdaf:
+	free_irq(ispfe->lmp_pdaf_irq, ispfe);
 err_lmp:
 	free_irq(ispfe->lmp_irq, ispfe);
 err_fc:
@@ -6334,6 +6442,7 @@ err_link:
 static void ispfe_free_irqs(struct ispfe_device *ispfe)
 {
 	free_irq(ispfe->pdma_irq, ispfe);
+	free_irq(ispfe->lmp_pdaf_irq, ispfe);
 	free_irq(ispfe->lmp_irq, ispfe);
 	free_irq(ispfe->fc_irq, ispfe);
 	free_irq(ispfe->core_irq, ispfe);
@@ -6640,11 +6749,15 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	atomic_set(&ispfe->fc_events, 0);
 	atomic_set(&ispfe->core_events, 0);
 	atomic_set(&ispfe->lmp_events, 0);
+	atomic_set(&ispfe->pd_fc_events, 0);
+	atomic_set(&ispfe->pd_lmp_events, 0);
 	atomic_set(&ispfe->pdma_events, 0);
 	ispfe->int0_seen = 0;
 	ispfe->int1_seen = 0;
 	ispfe->fc_seen = 0;
 	ispfe->lmp_seen = 0;
+	ispfe->pd_fc_seen = 0;
+	ispfe->pd_lmp_seen = 0;
 	memset(ispfe->core_seen, 0, sizeof(ispfe->core_seen));
 	memset(ispfe->pdma_seen, 0, sizeof(ispfe->pdma_seen));
 
@@ -7694,6 +7807,9 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 			   READ_ONCE(ispfe->core_seen[i]));
 	seq_printf(s, "fc_events    %u\n", atomic_read(&ispfe->fc_events));
 	seq_printf(s, "lmp_events   %u\n", atomic_read(&ispfe->lmp_events));
+	seq_printf(s, "pd_events    %u fc, %u lmp\n",
+		   atomic_read(&ispfe->pd_fc_events),
+		   atomic_read(&ispfe->pd_lmp_events));
 	seq_printf(s, "pdma_events  %u\n", atomic_read(&ispfe->pdma_events));
 	seq_printf(s, "pdma_int0    %#010x\n", READ_ONCE(ispfe->pdma_seen[0]));
 	seq_printf(s, "pdma_int1    %#010x  (isp_fe_ctx%u_pdma_err)\n",
@@ -7703,6 +7819,8 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "int1_seen    %#010x\n", READ_ONCE(ispfe->int1_seen));
 	seq_printf(s, "fc_seen      %#010x\n", READ_ONCE(ispfe->fc_seen));
 	seq_printf(s, "lmp_seen     %#010x\n", READ_ONCE(ispfe->lmp_seen));
+	seq_printf(s, "pd_fc_seen   %#010x\n", READ_ONCE(ispfe->pd_fc_seen));
+	seq_printf(s, "pd_lmp_seen  %#010x\n", READ_ONCE(ispfe->pd_lmp_seen));
 	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
 	seq_printf(s, "spare_iova   %pad\n", &ispfe->spare_frame_dma);
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);

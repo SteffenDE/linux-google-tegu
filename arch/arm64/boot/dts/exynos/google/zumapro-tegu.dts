@@ -2361,8 +2361,9 @@
 };
 
 /*
- * Main camera: sensor at 0x56, and the combined AF/OIS/EEPROM part at 0x24,
- * which has no driver.
+ * Main camera: sensor at 0x56, and the combined AF/OIS/EEPROM part at 0x24.
+ * That part is one chip addressed as three functions; only its autofocus half
+ * is described here, because only that half has a driver.
  */
 &usi5 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -2421,6 +2422,8 @@
 		avdd3-supply = <&cam_ldo1>;
 		dvdd-supply = <&cam_main_vdig>;
 
+		lens-focus = <&cam_main_af>;
+
 		/* Rear-facing. */
 		orientation = <1>;
 
@@ -2443,6 +2446,21 @@
 				data-lanes = <1 2 3>;
 			};
 		};
+	};
+
+	/*
+	 * The module's focus actuator, which is the autofocus half of the
+	 * combined part at 0x24.  It has no supplies and no reset of its own
+	 * here: it is powered by the camera module's rails, so it answers on
+	 * i2c exactly when the sensor above does, and the sensor's node owns
+	 * that sequence.  The downstream device tree gives this address the
+	 * sensor's whole rail list three times over -- once each for the
+	 * actuator, the stabiliser and the EEPROM -- which describes the module
+	 * rather than the chip.
+	 */
+	cam_main_af: focus@24 {
+		compatible = "onnn,lc898129";
+		reg = <0x24>;
 	};
 };
 

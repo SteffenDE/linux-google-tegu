@@ -931,7 +931,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_MOTION		5
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI1	6
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI2	7
-#define ISPFE_STATS_GRIDS		8
+#define ISPFE_STATS_GRID_PDAF		8
+#define ISPFE_STATS_GRIDS		9
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -1083,6 +1084,48 @@ static bool ispfe_stats_motion_written(const void *grid)
 	return (size_t)motion->rows * stride <= sizeof(motion->luma);
 }
 
+/* Defined below; the phase-detect decode needs the recipe it is running. */
+struct ispfe_device;
+
+/*
+ * The phase-detect statistics block's result, which is the one this driver
+ * publishes in a different shape from the one the hardware writes.
+ *
+ * The area is %ISPFE_PDAF_STATS_SIZE -- 520 KiB -- of which 2.8 KB is a
+ * focus loop's: a header, then a 384 KiB full-frame region this driver has
+ * no consumer for, then the windows.  Every quantity below is a compile-time
+ * offset -- nothing here indexes with a number the hardware wrote -- which is
+ * what lets the decode read the area directly and the predicate then test the
+ * copy.
+ *
+ * The layout is Lyric's, confirmed against a real buffer; see the camera
+ * subsystem's reference/ispfe.md.
+ */
+/*
+ * The configuration id the block stamps, which nothing here reads: it names
+ * which configuration produced a result, and this driver runs one.  Named
+ * because a decode that skips a field should say the field exists.
+ */
+#define ISPFE_PDAF_HEADER_CONFIG_ID	0x04
+#define ISPFE_PDAF_HEADER_FRAME		0x14
+#define ISPFE_PDAF_HEADER_DISPARITIES	0x24
+#define ISPFE_PDAF_WINDOW_REGION	0x60000
+#define ISPFE_PDAF_WINDOW_STRIDE	0x3c00
+#define ISPFE_PDAF_TILE_SUM_LEFT	0x148
+#define ISPFE_PDAF_TILE_SUM_RIGHT	0x150
+#define ISPFE_PDAF_OVERFLOW		0x158
+#define ISPFE_PDAF_NUMERATOR		0x160
+#define ISPFE_PDAF_DENOM_RIGHT		0x1c0
+#define ISPFE_PDAF_DENOM_LEFT		0x220
+
+/*
+ * Defined with the rest of the phase-detect handling, below @ispfe_device: the
+ * decode reads the disparity origin out of the recipe that is running.
+ */
+static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    void *out, const void *grid);
+static bool ispfe_stats_pdaf_written(const void *grid);
+
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
@@ -1092,8 +1135,25 @@ static const struct ispfe_stats_grid {
 	 * which has to cover whatever @written reads.
 	 */
 	size_t clear;
+	/*
+	 * And a second range, for a result whose predicate reads something the
+	 * first cannot reach.  The phase-detect area is 520 KiB and its windows
+	 * sit 384 KiB in, so clearing as far as them would be a memset the size
+	 * of the picture -- and a ranged sync that crossed a page would be the
+	 * bug at the top of this file.  Eight bytes inside one page instead.
+	 */
+	size_t clear_at;
+	size_t clear_at_len;
 	u32 flag;
 	bool (*written)(const void *grid);
+	/*
+	 * How a result gets from the area into the buffer, when a straight
+	 * copy of the first @size bytes is not it.  The phase-detect block
+	 * writes a 384 KiB full-frame region before the windows a focus loop
+	 * reads, and publishes 2.8 KB out of 520 KiB.
+	 */
+	void (*decode)(const struct ispfe_device *ispfe, void *out,
+		       const void *grid);
 } ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
 	[ISPFE_STATS_GRID_AWB] = {
 		.output = ISPFE_PDMA_OUTPUT_AWB,
@@ -1145,6 +1205,32 @@ static const struct ispfe_stats_grid {
 		/* Named in this structure's own terms, as the flicker one is. */
 		.clear = offsetofend(struct exynos_ispfe_stats_motion,
 				     reserved1),
+	},
+	[ISPFE_STATS_GRID_PDAF] = {
+		.output = ISPFE_PDMA_OUTPUT_PDAF_STATS,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, pdaf),
+		.size = sizeof(struct exynos_ispfe_stats_pdaf),
+		.flag = EXYNOS_ISPFE_STATS_PDAF,
+		.written = ispfe_stats_pdaf_written,
+		.decode = ispfe_stats_pdaf_decode,
+		/*
+		 * Two ranges, because the predicate reads two places and a
+		 * cleared byte is the only thing that makes either of them a
+		 * statement about *this* frame.
+		 *
+		 * The first is the disparity count in the block's own header,
+		 * which the predicate tests first, so a frame the block did
+		 * not write at all is rejected.  The second is the left
+		 * denominator at the first shift, and it is what closes the
+		 * case the first cannot: a block that wrote its header and not
+		 * its windows would otherwise pass on the previous frame's
+		 * correlation -- self-consistent, positive, and stale --
+		 * carrying this frame's number.  That is the one failure a
+		 * focus loop cannot detect for itself.
+		 */
+		.clear = ISPFE_PDAF_HEADER_DISPARITIES + sizeof(__u32),
+		.clear_at = ISPFE_PDAF_WINDOW_REGION + ISPFE_PDAF_DENOM_LEFT,
+		.clear_at_len = sizeof(__s64),
 	},
 	[ISPFE_STATS_GRID_LSC] = {
 		.output = ISPFE_PDMA_OUTPUT_LSC,
@@ -1207,6 +1293,18 @@ static_assert(offsetof(struct exynos_ispfe_stats_motion, stride) == 0x24);
 static_assert(offsetof(struct exynos_ispfe_stats_motion, columns) == 0x28);
 static_assert(offsetof(struct exynos_ispfe_stats_motion, rows) == 0x2a);
 static_assert(offsetof(struct exynos_ispfe_stats_motion, luma) == 0x40);
+
+/*
+ * The phase-detect result, pinned the same way -- and one more: the decode
+ * reads the *area* at fixed offsets, so the furthest byte it touches has to be
+ * inside the allocation those offsets are indexing.  Nothing else states that.
+ */
+static_assert(sizeof(struct exynos_ispfe_stats_pdaf_window) == 0x138);
+static_assert(sizeof(struct exynos_ispfe_stats_pdaf) == 0x0b18);
+static_assert(offsetof(struct exynos_ispfe_stats_pdaf, window) == 0x20);
+static_assert(ISPFE_PDAF_WINDOW_REGION + ISPFE_PDAF_DENOM_LEFT +
+	      sizeof(__s64) * EXYNOS_ISPFE_PDAF_DISPARITIES <=
+	      ISPFE_PDAF_STATS_SIZE);
 
 struct ispfe_lmp_wbg_profile {
 	u32 red;
@@ -1918,6 +2016,13 @@ struct ispfe_device {
 	bool pdma_program_override;
 	bool active_pdma_program_override;
 	/* Bring-up overrides for the measured opcode/length and head push. */
+	/*
+	 * Where the phase-detect block's correlation axis starts, read out of
+	 * the running recipe's own configuration rather than assumed: it is a
+	 * signed six-bit field and the captured value is -5, but nothing about
+	 * the interface promises that and a consumer indexes with it.
+	 */
+	s32 pdaf_disparity_start;
 	u32 pdma_cmd;
 	/*
 	 * Override the descriptor's program address. Zero selects the relocated
@@ -3070,11 +3175,17 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 	 * dma_sync_sgtable_for_device() and this deliberately does not.  What
 	 * makes that safe is that the device direction is only ever a clean on
 	 * this architecture, so the sole thing skipping it can cost is a lost
-	 * dirty line -- and the body is never dirty.
+	 * dirty line.
+	 *
+	 * A descriptor's second range, below, is the one CPU write to a body,
+	 * and it does not weaken that: it hands its own eight bytes straight
+	 * back with a sync of their own, so no dirty line outlives this
+	 * function either way.
 	 */
 	BUILD_BUG_ON(sizeof(struct exynos_ispfe_stats_grid_header) > PAGE_SIZE);
 	for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
 		size_t clear = ispfe_stats_grids[grid].clear;
+		size_t off;
 
 		/*
 		 * The BUILD_BUG_ON above asserts the size of a *type*, which is
@@ -3088,6 +3199,24 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		memset(area->grid[grid], 0, clear);
 		dma_sync_single_for_device(ispfe->dev, area->dma[grid], clear,
 					   DMA_TO_DEVICE);
+
+		clear = ispfe_stats_grids[grid].clear_at_len;
+		if (!clear)
+			continue;
+
+		/*
+		 * The same two conjuncts as above, and here neither is free:
+		 * the range has to stay inside one page, which is why the
+		 * descriptor's offset is asserted page-aligned plus an offset
+		 * that leaves room for it.
+		 */
+		off = ispfe_stats_grids[grid].clear_at;
+		if (WARN_ON_ONCE(off % PAGE_SIZE + clear > PAGE_SIZE))
+			continue;
+
+		memset((u8 *)area->grid[grid] + off, 0, clear);
+		dma_sync_single_for_device(ispfe->dev, area->dma[grid] + off,
+					   clear, DMA_TO_DEVICE);
 	}
 
 	return area;
@@ -4655,6 +4784,118 @@ static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
  * a recipe this code has not seen -- and a zeroed weight map would meter
  * nothing at all.
  */
+/*
+ * The phase-detect block's disparity origin, out of the recipe about to run.
+ *
+ * `lmp/pdaf_stats_config` is a 200-byte inline burst whose second 64-bit word
+ * holds the block's scalars; `csr_pdaf_stats_disparity_range_start` is six
+ * signed bits at 16.  Both the field positions and the register are Lyric's;
+ * see the camera subsystem's reference/ispfe.md.
+ *
+ * A recipe without the block leaves this zero, which is harmless: the
+ * statistics it would describe are not published either.
+ */
+#define ISPFE_LMP_PDAF_STATS_CONFIG_REG		0x00040004
+#define ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS	0x08
+#define ISPFE_LMP_PDAF_RANGE_START_SHIFT	16
+#define ISPFE_LMP_PDAF_RANGE_START_BITS		6
+
+static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    void *out, const void *grid)
+{
+	struct exynos_ispfe_stats_pdaf *pdaf = out;
+	const u8 *area = grid;
+	const u8 *win = area + ISPFE_PDAF_WINDOW_REGION;
+	unsigned int k;
+
+	memset(pdaf, 0, sizeof(*pdaf));
+
+	pdaf->disparities = get_unaligned_le32(area + ISPFE_PDAF_HEADER_DISPARITIES);
+	pdaf->frame = get_unaligned_le32(area + ISPFE_PDAF_HEADER_FRAME);
+	pdaf->disparity_start = ispfe->pdaf_disparity_start;
+
+	/*
+	 * One window, and not because one is all there is.  The reader's own
+	 * accessors put window *m* at a stride of 0x3c00 while the header's
+	 * "bytes in use" for a single window implies 0x3c80; the two agree
+	 * only at window 0, and no capture configures a second one to tell
+	 * them apart.  So this publishes the window every recipe here asks
+	 * for, and a recipe that asks for more has to settle the stride
+	 * first -- which is what ISPFE_PDAF_WINDOW_STRIDE is named for and
+	 * why nothing multiplies by it yet.
+	 */
+	pdaf->windows = 1;
+
+	pdaf->window[0].tile_sum_left =
+		get_unaligned_le64(win + ISPFE_PDAF_TILE_SUM_LEFT);
+	pdaf->window[0].tile_sum_right =
+		get_unaligned_le64(win + ISPFE_PDAF_TILE_SUM_RIGHT);
+	pdaf->window[0].overflow =
+		get_unaligned_le64(win + ISPFE_PDAF_OVERFLOW);
+
+	for (k = 0; k < EXYNOS_ISPFE_PDAF_DISPARITIES; k++) {
+		pdaf->window[0].numerator[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_NUMERATOR + 8 * k);
+		pdaf->window[0].denominator_right[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_DENOM_RIGHT + 8 * k);
+		pdaf->window[0].denominator_left[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_DENOM_LEFT + 8 * k);
+	}
+}
+
+/*
+ * Whether the block wrote this frame, tested on the published copy.
+ *
+ * The left denominator is a sum of squares over a window that does not move,
+ * so the hardware has to write the same value at every shift -- and it cannot
+ * be zero over a window with any light in it at all.  That is a stronger
+ * statement than "some byte is not zero", and it is free.
+ */
+static bool ispfe_stats_pdaf_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_pdaf *pdaf = grid;
+	unsigned int k;
+
+	if (pdaf->disparities != EXYNOS_ISPFE_PDAF_DISPARITIES)
+		return false;
+	if (pdaf->window[0].denominator_left[0] <= 0)
+		return false;
+	for (k = 1; k < EXYNOS_ISPFE_PDAF_DISPARITIES; k++)
+		if (pdaf->window[0].denominator_left[k] !=
+		    pdaf->window[0].denominator_left[0])
+			return false;
+
+	return true;
+}
+
+static void ispfe_pdaf_read_config(struct ispfe_device *ispfe)
+{
+	const struct ispfe_pdma_program *prog = ispfe->prog;
+	unsigned int i;
+
+	ispfe->pdaf_disparity_start = 0;
+
+	for (i = 0; i < prog->num_cmds; i++) {
+		const struct ispfe_pdma_cmd *cmd = &prog->cmds[i];
+		u32 field;
+		u64 word;
+
+		if (cmd->op != ISPFE_PDMA_INLINE_BURST ||
+		    cmd->reg != ISPFE_LMP_PDAF_STATS_CONFIG_REG ||
+		    !cmd->payload ||
+		    cmd->len < ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS + sizeof(u64))
+			continue;
+
+		word = get_unaligned_le64(cmd->payload +
+					  ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS);
+		field = (word >> ISPFE_LMP_PDAF_RANGE_START_SHIFT) &
+			(BIT(ISPFE_LMP_PDAF_RANGE_START_BITS) - 1);
+		ispfe->pdaf_disparity_start =
+			sign_extend32(field, ISPFE_LMP_PDAF_RANGE_START_BITS - 1);
+		return;
+	}
+}
+
 static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
@@ -5618,6 +5859,7 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 		ret = ispfe_pdma_state_luts(ispfe);
 		if (ret)
 			return ret;
+		ispfe_pdaf_read_config(ispfe);
 	}
 
 	/*
@@ -6564,7 +6806,10 @@ static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
 			size_t size = ispfe_pdma_outputs[output].size;
 
 			if (size < ispfe_stats_grids[grid].size ||
-			    size < ispfe_stats_grids[grid].clear)
+			    size < ispfe_stats_grids[grid].clear ||
+			    size_add(ispfe_stats_grids[grid].clear_at,
+				     ispfe_stats_grids[grid].clear_at_len) >
+			    size)
 				return -EINVAL;
 			/*
 			 * __GFP_ZERO, and it is not belt and braces:
@@ -8448,9 +8693,11 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
  * packed ten-bit.
  *
  * Not gated on a snapshot the way the Bayer frame above is.  This is one
- * shared destination that every frame overwrites in place -- the recipe names
- * it once and nothing retargets it -- so a read taken while a stream runs can
- * tear, and a read after it stops is the last frame the receiver wrote.
+ * shared destination that every frame overwrites in place, so a read taken
+ * while a stream runs can tear, and a read after it stops is the last frame
+ * the receiver wrote.
+ *
+ * That holds for `pd`.  `pdaf` is retargeted per frame instead; see it below.
  */
 static ssize_t ispfe_output_read(struct ispfe_device *ispfe, unsigned int out,
 				 char __user *buf, size_t count, loff_t *ppos)
@@ -8478,8 +8725,15 @@ static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
 /*
  * The phase-detect *statistics*, out of the area the line memory's batch
  * record was pointed at -- the block's reduction of the same frame the file
- * above carries whole.  Same caveat: one shared destination every frame
- * overwrites in place.
+ * above carries whole.
+ *
+ * **Not the same caveat as `pd` above.**  Since this result became a
+ * statistics grid the encoder retargets its destination to a per-frame area
+ * whenever the metadata node is streaming, and the shared allocation this
+ * reads is written only when a frame finds no area to take -- a dropped
+ * frame, or the dump slot.  So this is the diagnostic for when nothing is
+ * consuming the metadata node, and the metadata node is where a live result
+ * comes from.
  */
 static ssize_t ispfe_pdaf_read(struct file *file, char __user *buf,
 			       size_t count, loff_t *ppos)
@@ -9591,7 +9845,12 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		 * at all -- and a buffer with no frame behind it never reaches
 		 * this loop.
 		 */
-		memcpy((u8 *)out + desc->offset, area->grid[grid], desc->size);
+		if (desc->decode)
+			desc->decode(ispfe, (u8 *)out + desc->offset,
+				     area->grid[grid]);
+		else
+			memcpy((u8 *)out + desc->offset, area->grid[grid],
+			       desc->size);
 
 		if (!desc->written((u8 *)out + desc->offset))
 			continue;

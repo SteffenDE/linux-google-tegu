@@ -460,6 +460,16 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
  * line of their own.
  */
 #define FC_PDAF_CTX(m)			(0x3b000 + (m) * 0x1000)
+/*
+ * The phase-detect path's bind bank is the one **past** the five bayer
+ * contexts', at the same 0x400 stride -- 0x29000, which the vendor session
+ * writes with FC_BIND_LOCH 0 and FC_BIND_ENABLE 1 beside the image context's
+ * own bind at 0x28c00, and clears at stream stop.  There is a third word in
+ * the bank at +0x08 that the same session writes zero to and the image bind
+ * never touches.
+ */
+#define FC_PDAF_BIND			FC_CTX_BIND(FC_NUM_CTX)
+#define FC_BIND_PDAF_EXTRA		0x08
 
 #define FC_BIND_ENABLE			0x00
 #define FC_BIND_LOCH		0x04
@@ -478,6 +488,20 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX_MSK			0x30c
 #define FC_CTX_MSK_ARM		0x000007f8
 #define FC_CTX_MSK_RUN		0x000007fc
+/*
+ * The phase-detect frame-controller bank takes neither of those.  The vendor
+ * session writes its mask once, with 0x3, and never writes its FC_CTX_CTRL at
+ * all -- so the bank is not armed and run the way a bayer context is.
+ */
+#define FC_PDAF_CTX_MSK_VAL	0x00000003
+/*
+ * And the phase-detect line-memory pool's mask is ten bits wide, not the
+ * bayer pool's thirty.  %LMP_INT_MSK_VAL is the bayer value and does not
+ * belong here.  The session unmasks everything but Context0RegisterUpdate
+ * while it configures, then everything once the channel is running.
+ */
+#define LMP_INT_MSK_PDAF_CONFIGURE	0x000003ef
+#define LMP_INT_MSK_PDAF_VAL		0x000003ff
 
 /*
  * Two frame-controller LMP-IDMA AXI common banks.  Lyric's register
@@ -5694,18 +5718,51 @@ static int ispfe_pd_channel(const struct ispfe_source *src)
  * without the statistics block that reduces it.
  */
 #define ISPFE_PD_LOCH		0
+/*
+ * The phase-detect frame-controller bank and line-memory instance the recipe
+ * configures.  Both are 0: the captured program writes fc/pdaf_cfg and
+ * fc/pdaf_ctx at 0x3b020 and 0x3b028, which is %FC_PDAF_CTX(0), and its
+ * lmp/pdaf_stats enable is that pool's first instance.
+ */
+#define ISPFE_PD_FCCTX		0
+#define ISPFE_PD_LMP		0
 static_assert(ISPFE_PD_LOCH < LOCH_PD_COUNT);
 
 static void ispfe_pd_start(struct ispfe_device *ispfe)
 {
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 	void __iomem *ctx = core + LOCH_PD(ISPFE_PD_LOCH);
+	void __iomem *bank = core + FC_PDAF_CTX(ISPFE_PD_FCCTX);
 	unsigned int i;
+
+	/*
+	 * The frame-controller bank and the line-memory instance behind it.
+	 * Without these the CSIS side runs on its own, which is a working raw
+	 * phase-detect stream and an empty statistics buffer, because nothing
+	 * ever hands the line memory a frame.
+	 *
+	 * Neither takes the image channel's values: the bank's mask is 0x3 and
+	 * its FC_CTX_CTRL is never written, and the instance's mask is ten bits
+	 * rather than thirty.  All three are what the vendor session writes.
+	 */
+	writel_relaxed(FC_PDAF_CTX_MSK_VAL, bank + FC_CTX_MSK);
+	writel_relaxed(LMP_INT_MSK_PDAF_CONFIGURE,
+		       core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
 
 	writel_relaxed(LOCH_ABORT_MSK_VAL, ctx + LOCH_ABORT_MSK);
 	writel_relaxed(LOCH_PROC_MSK_CONFIGURE, ctx + LOCH_PROC_MSK);
 	writel_relaxed(LOCH_ERR_MSK_VAL, ctx + LOCH_ERR_MSK);
 	writel_relaxed(LOCH_MUTE_MSK_VAL, ctx + LOCH_MUTE_MSK);
+
+	/*
+	 * Bound before the channel is started, which is where this driver puts
+	 * the image channel's bind for the reason stated there.  The session
+	 * binds both channels after starting them instead; if a frame never
+	 * reaches the line memory, that difference is the first thing to try.
+	 */
+	writel_relaxed(ISPFE_PD_LOCH, core + FC_PDAF_BIND + FC_BIND_LOCH);
+	writel_relaxed(1, core + FC_PDAF_BIND + FC_BIND_ENABLE);
+	writel_relaxed(0, core + FC_PDAF_BIND + FC_BIND_PDAF_EXTRA);
 
 	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
 	writel_relaxed(LOCH_PD_BIT(ISPFE_PD_LOCH), core + LOCH_START);
@@ -5729,6 +5786,8 @@ static void ispfe_pd_run(struct ispfe_device *ispfe)
 {
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 
+	writel_relaxed(LMP_INT_MSK_PDAF_VAL,
+		       core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
 	writel_relaxed(LOCH_PROC_MSK_PD,
 		       core + LOCH_PD(ISPFE_PD_LOCH) + LOCH_PROC_MSK);
 }
@@ -5753,6 +5812,11 @@ static void ispfe_pd_stop(struct ispfe_device *ispfe)
 	writel_relaxed(0, ctx + LOCH_PROC_MSK);
 	writel_relaxed(0, ctx + LOCH_ERR_MSK);
 	writel_relaxed(0, ctx + LOCH_MUTE_MSK);
+
+	/* And what ispfe_pd_start() took.  The session clears the bind too. */
+	writel_relaxed(0, core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
+	writel_relaxed(0, core + FC_PDAF_CTX(ISPFE_PD_FCCTX) + FC_CTX_MSK);
+	writel_relaxed(0, core + FC_PDAF_BIND + FC_BIND_ENABLE);
 }
 
 /*

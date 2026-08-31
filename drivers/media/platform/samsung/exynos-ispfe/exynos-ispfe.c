@@ -5934,11 +5934,17 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 
 	/*
 	 * The line memory is bound to the context here, before the context is
-	 * started -- which is what the comment above has always said and what
-	 * the capture shows, and is not what this function used to do: the
-	 * bind had drifted to the very end, after the mode words and the
-	 * source.  A context started with no line memory behind it is a
-	 * candidate for accepting no frames at all.
+	 * started, and not at the very end after the mode words and the source
+	 * the way this function used to do it: a context started with no line
+	 * memory behind it is a candidate for accepting no frames at all.
+	 *
+	 * **The capture does not show this**, which the comment used to claim
+	 * it did.  Both vendor sessions write the image channel's LOCH_START
+	 * before its bind, and camera-pdma-main-2026-08-28 does the same for
+	 * the phase-detect channel while camera-pdma-main-raw-2026-08-28 binds
+	 * that one first.  So the vendor is not consistent about it either, and
+	 * the order is not load-bearing on either channel.  What was measured
+	 * was that binding at the end did not work; binding here does.
 	 */
 	writel_relaxed(ispfe->active.loch, bind + FC_BIND_LOCH);
 	writel_relaxed(1, bind + FC_BIND_ENABLE);
@@ -6037,11 +6043,15 @@ static void ispfe_fc_stop(struct ispfe_device *ispfe)
 	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_STOP);
 	writel_relaxed(0, ctx + LOCH_ARM);
 	/*
-	 * The image channel first and the phase-detect one after.  The vendor
-	 * interleaves the two -- it stops the image channel first but clears
-	 * the phase-detect masks before the image ones -- so this is that
-	 * order only for the stop; within each channel the order is the
-	 * vendor's.
+	 * The image channel first and the phase-detect one after.
+	 *
+	 * The comment here used to say the vendor clears the phase-detect masks
+	 * *before* the image ones and that this order followed it.  **Both
+	 * sessions do the reverse**, twice each -- image at +0x020410/430/444
+	 * then phase-detect at +0x022010/030/044, in the step-down and again in
+	 * the final zeroing.  So this order is the vendor's after all, and the
+	 * reason given for it was not.  Both channels are already stopped by
+	 * the time either mask is cleared, so nothing depended on it.
 	 */
 	if (ispfe->pd_channel >= 0)
 		ispfe_pd_stop(ispfe);

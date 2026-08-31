@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/onnn,lc898129.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ON Semiconductor LC898129 lens voice coil actuator
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description: |
+  The LC898129 is an OIS and closed-loop AF control LSI: one I2C address
+  carrying the camera module's focus actuator, its optical stabiliser and its
+  EEPROM. This binding describes the focus actuator alone.
+
+  The part has no supply of its own to describe. It is powered by the rails of
+  the camera module it is built into, and comes up with that module's image
+  sensor, so it answers on I2C exactly when the sensor does. Where a device
+  tree needs to express that ordering it does so on the sensor's node, which is
+  where the module's power sequence belongs; this node names the actuator so
+  that the sensor's lens-focus property has something to point at.
+
+properties:
+  compatible:
+    const: onnn,lc898129
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        focus@24 {
+            compatible = "onnn,lc898129";
+            reg = <0x24>;
+        };
+    };
+...

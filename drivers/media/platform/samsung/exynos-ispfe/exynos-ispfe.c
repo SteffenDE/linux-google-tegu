@@ -1224,9 +1224,9 @@ static const struct ispfe_stats_grid {
 		 * denominator at the first shift, and it is what closes the
 		 * case the first cannot: a block that wrote its header and not
 		 * its windows would otherwise pass on the previous frame's
-		 * correlation -- self-consistent, positive, and stale --
-		 * carrying this frame's number.  That is the one failure a
-		 * focus loop cannot detect for itself.
+		 * correlation -- positive, plausible and stale -- carrying
+		 * this frame's number.  That is the one failure a focus loop
+		 * cannot detect for itself.
 		 */
 		.clear = ISPFE_PDAF_HEADER_DISPARITIES + sizeof(__u32),
 		.clear_at = ISPFE_PDAF_WINDOW_REGION + ISPFE_PDAF_DENOM_LEFT,
@@ -4851,21 +4851,26 @@ static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
  * be zero over a window with any light in it at all.  That is a stronger
  * statement than "some byte is not zero", and it is free.
  */
+/*
+ * Both tests are of bytes this driver cleared before the frame was armed, and
+ * that is the whole of what makes either one a statement about *this* frame.
+ *
+ * Nothing here tests the block's arithmetic.  An earlier version did -- it
+ * required the left denominator to be equal at all twelve shifts, on the
+ * argument that a sum of squares over a window that does not move cannot
+ * depend on the shift -- and that argument is wrong on this hardware: the
+ * value is bit-identical over the non-positive shifts and drifts down by about
+ * 0.003% over the positive ones, so the block's left window does move, or is
+ * clipped, on one side of the range.  The check rejected almost every frame
+ * and passed the occasional one, which is a worse failure than rejecting all
+ * of them.
+ */
 static bool ispfe_stats_pdaf_written(const void *grid)
 {
 	const struct exynos_ispfe_stats_pdaf *pdaf = grid;
-	unsigned int k;
 
-	if (pdaf->disparities != EXYNOS_ISPFE_PDAF_DISPARITIES)
-		return false;
-	if (pdaf->window[0].denominator_left[0] <= 0)
-		return false;
-	for (k = 1; k < EXYNOS_ISPFE_PDAF_DISPARITIES; k++)
-		if (pdaf->window[0].denominator_left[k] !=
-		    pdaf->window[0].denominator_left[0])
-			return false;
-
-	return true;
+	return pdaf->disparities == EXYNOS_ISPFE_PDAF_DISPARITIES &&
+	       pdaf->window[0].denominator_left[0] > 0;
 }
 
 static void ispfe_pdaf_read_config(struct ispfe_device *ispfe)

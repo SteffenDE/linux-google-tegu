@@ -56,6 +56,9 @@ enum exynos_ispfe_stats_version {
  *	The histogram of the second region of interest, in @histogram_roi1
  * %EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2:
  *	The histogram of the third, in @histogram_roi2
+ *
+ * %EXYNOS_ISPFE_STATS_PDAF:
+ *	The phase-detect correlation, in @pdaf
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
@@ -65,6 +68,7 @@ enum exynos_ispfe_stats_version {
 #define EXYNOS_ISPFE_STATS_MOTION		(1U << 5)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1	(1U << 6)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2	(1U << 7)
+#define EXYNOS_ISPFE_STATS_PDAF			(1U << 8)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -826,6 +830,70 @@ struct exynos_ispfe_stats_motion {
 	__u16 luma[EXYNOS_ISPFE_MOTION_CELLS];
 };
 
+/* Windows the phase-detect statistics block can meter, and shifts per window. */
+#define EXYNOS_ISPFE_PDAF_WINDOWS		9
+#define EXYNOS_ISPFE_PDAF_DISPARITIES		12
+
+/**
+ * struct exynos_ispfe_stats_pdaf_window - one window's phase correlation
+ * @tile_sum_left: sum of the left half-image over the window
+ * @tile_sum_right: and of the right half-image over the same window
+ * @overflow: samples the block could not accumulate
+ * @numerator: sum of products of the two half-images, per shift
+ * @denominator_left: sum of squares of the left half-image, per shift
+ * @denominator_right: sum of squares of the right half-image, per shift
+ *
+ * The block correlates the sensor's two phase images over
+ * %EXYNOS_ISPFE_PDAF_DISPARITIES shifts starting at
+ * @exynos_ispfe_stats_pdaf.disparity_start.  The normalised correlation at
+ * shift *k* is::
+ *
+ *	numerator[k] / sqrt(denominator_left[k] * denominator_right[k])
+ *
+ * and the sub-pixel maximum of that, interpolated across its three highest
+ * terms, is the phase: zero where the window is in focus, and signed by which
+ * side of focus it is on.
+ *
+ * @denominator_left does not vary with *k* -- the left window does not move --
+ * which is the cheapest check that a result is a result.  @numerator is signed
+ * and can be negative at the ends of the range.
+ */
+struct exynos_ispfe_stats_pdaf_window {
+	__s64 tile_sum_left;
+	__s64 tile_sum_right;
+	__s64 overflow;
+	__s64 numerator[EXYNOS_ISPFE_PDAF_DISPARITIES];
+	__s64 denominator_left[EXYNOS_ISPFE_PDAF_DISPARITIES];
+	__s64 denominator_right[EXYNOS_ISPFE_PDAF_DISPARITIES];
+};
+
+/**
+ * struct exynos_ispfe_stats_pdaf - the phase-detect correlation of one frame
+ * @windows: how many of @window carry a result
+ * @disparities: shifts in each window's arrays
+ * @disparity_start: the shift @numerator[0] was taken at, in half-image columns
+ * @frame: the frame counter the hardware stamped on this result
+ * @reserved: must be zero
+ * @window: the per-window correlations, @windows of them
+ *
+ * @frame is the block's own count and is *not*
+ * @exynos_ispfe_stats_buffer.frame_sequence, which is the driver's.  The two
+ * are published side by side deliberately: they come from different counters
+ * and agreeing is what says a result belongs to the frame it arrived with.
+ *
+ * The geometry of the windows -- where each one sits and how large it is -- is
+ * not published, because this driver does not choose it: the block's
+ * configuration comes from the recipe.
+ */
+struct exynos_ispfe_stats_pdaf {
+	__u32 windows;
+	__u32 disparities;
+	__s32 disparity_start;
+	__u32 frame;
+	__u32 reserved[4];
+	struct exynos_ispfe_stats_pdaf_window window[EXYNOS_ISPFE_PDAF_WINDOWS];
+};
+
 /**
  * struct exynos_ispfe_stats_buffer - ISPFE per-frame statistics
  *
@@ -847,6 +915,8 @@ struct exynos_ispfe_stats_motion {
  *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1 is set
  * @histogram_roi2: The histogram of the third, valid when
  *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2 is set
+ * @pdaf: The phase-detect correlation, valid when %EXYNOS_ISPFE_STATS_PDAF is
+ *	set
  *
  * One buffer is one frame's statistics, and which frame is said three ways.
  * The buffer's ``sequence`` is that frame's number, which is what V4L2 says a
@@ -896,6 +966,7 @@ struct exynos_ispfe_stats_buffer {
 	 */
 	struct exynos_ispfe_stats_histogram histogram_roi1;
 	struct exynos_ispfe_stats_histogram histogram_roi2;
+	struct exynos_ispfe_stats_pdaf pdaf;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

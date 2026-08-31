@@ -199,9 +199,19 @@ static const struct ispfe_link_channel ispfe_channels_imx712[] = {
  * part's phase-detect readout comes to, but nothing here has seen a second
  * mode to test that against.
  */
+#define ISPFE_PD_HEIGHT			750
+/*
+ * And what a line of it comes to in memory: 4000 columns of packed 10-bit is
+ * 5000 bytes, rounded up to the write DMA's 32-byte alignment.  This restates
+ * what the recipe puts in the phase-detect write DMA's stride register, and is
+ * here because the destination has to be allocated before the program that
+ * points at it can be encoded.
+ */
+#define ISPFE_PD_STRIDE			0x13a0
+
 static const struct ispfe_link_channel ispfe_channels_s5kgn8[] = {
 	{ CSIS_ISPCFG_IMAGE, ISPFE_CHANNEL_STREAM_HEIGHT },
-	{ CSIS_ISPCFG_IMAGE | CSIS_ISPCFG_VIRTUAL_CHANNEL(1), 750 },
+	{ CSIS_ISPCFG_IMAGE | CSIS_ISPCFG_VIRTUAL_CHANNEL(1), ISPFE_PD_HEIGHT },
 	{ CSIS_ISPCFG_EMBEDDED, 4 },
 };
 static_assert(ARRAY_SIZE(ispfe_channels_imx712) <= CSIS_NUM_CHANNELS);
@@ -315,6 +325,26 @@ static_assert(ARRAY_SIZE(ispfe_channels_s5kgn8) <= CSIS_NUM_CHANNELS);
 
 #define LOCH_COUNT		5
 #define LOCH(c)			(0x20400 + (c) * 0x400)
+/*
+ * The phase-detect logical channels, which are the same block again.  The
+ * downstream device tree names three pools of them -- isp_fe_loch0..6
+ * csis_core_img, loch0..6 csis_core_pd and loch0..13 csis_core_vc -- so they
+ * run contiguously at +0x20400, +0x22000 and +0x23c00, 0x400 apart, with the
+ * same four interrupt leaves at the same offsets inside each.  Seven and seven
+ * is not the five-and-four the *frame controller* and the *line memory* have;
+ * those are different pools.
+ *
+ * That is what puts phase-detect channel c at bit 7 + c of the global start,
+ * stop and enable bitmasks, image channel c being at bit c -- so a session
+ * running one of each reads 0x81.
+ *
+ * LOCH_COUNT above is smaller than this pool for a different reason: it is how
+ * many image channels this driver will run, which PDMA's five contexts bound.
+ */
+#define LOCH_IMG_COUNT		7
+#define LOCH_PD_COUNT		7
+#define LOCH_PD(c)		(0x22000 + (c) * 0x400)
+#define LOCH_PD_BIT(c)		BIT(LOCH_IMG_COUNT + (c))
 
 /* Offsets within one context. */
 #define LOCH_ABORT_SRC			0x04
@@ -338,6 +368,13 @@ static_assert(ARRAY_SIZE(ispfe_channels_s5kgn8) <= CSIS_NUM_CHANNELS);
  */
 #define LOCH_ARM			0x18
 #define LOCH_ARM_VAL			0x00000001
+/*
+ * The write DMA's second enable.  Lyric's register descriptors name +0x18
+ * csis_core/wdma_context_enable and this one csis_core/wdma_config_enable; a
+ * program that configures the DMA sets it in its final grouped write, and the
+ * vendor's teardown clears both.
+ */
+#define LOCH_WDMA_CONFIG		0x1c
 #define LOCH_PROC_SRC			0x24
 #define LOCH_CFG2			0x2c
 #define LOCH_CFG2_VAL		0x0000001b
@@ -354,6 +391,13 @@ static_assert(ARRAY_SIZE(ispfe_channels_s5kgn8) <= CSIS_NUM_CHANNELS);
  */
 #define LOCH_PROC_MSK_RAW		0x0000001b
 #define LOCH_PROC_MSK_DRAIN		0x00000009
+/*
+ * What a phase-detect channel subscribes to once it runs.  The six bits of
+ * this leaf are Sof, Eof, Eol, ShadowUpdate, DmaDone and FrameDone, so the
+ * image channel's 0x1b above is start, end, shadow update and DMA done -- and
+ * a phase-detect channel takes the same set without the start of frame.
+ */
+#define LOCH_PROC_MSK_PD		0x0000001a
 #define LOCH_ERR_SRC			0x38
 #define LOCH_ERR_MSK			0x44
 #define LOCH_ERR_MSK_VAL		0x00003fff
@@ -647,6 +691,13 @@ struct ispfe_backend_buffer {
 struct ispfe_pdma_output {
 	size_t size;
 	/*
+	 * Filled with %ISPFE_FRAME_POISON at each stream start rather than
+	 * zeroed.  For a statistics or completion area zero is the answer to
+	 * "nothing was written"; for one holding a picture it is not, because
+	 * a dark scene reads zero too.
+	 */
+	bool poison;
+	/*
 	 * An LMP image destination rather than a completion or statistics
 	 * area.  The driver does not run these: it states no gate for any of
 	 * them and the encoder zeroes their address slots, so they are named
@@ -662,6 +713,7 @@ struct ispfe_awb_snapshot_file {
 };
 
 #define PDMA_OUTPUT(_size)	{ .size = (_size) }
+#define PDMA_IMAGE_OUTPUT(_size) { .size = (_size), .poison = true }
 #define PDMA_TAPOUT()		{ .tapout = true }
 
 /*
@@ -715,7 +767,12 @@ struct ispfe_awb_snapshot_file {
  * planar linear RGB, YUV420 ML output 0 and interleaved RGB888 ML output 2 --
  * which nothing on this driver's path reads, so they are named without a size:
  * no gate is stated for any of the three and the encoder writes a null address
- * for each.
+ * for each.  Outputs 13 and 14 are the phase-detect write DMA's pair, and 14
+ * is the only one of the fifteen this driver reads as a picture.
+ *
+ * All of them except the three tapouts are allocated for every stream,
+ * whether or not the recipe it runs names them, which is what output 14's
+ * 3.6 MB costs a camera that sends no phase-detect stream.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -731,7 +788,19 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_TAPOUT(),
 	PDMA_TAPOUT(),
 	PDMA_TAPOUT(),
+	PDMA_OUTPUT(4096),
+	PDMA_IMAGE_OUTPUT(ISPFE_PD_STRIDE * ISPFE_PD_HEIGHT),
 };
+
+/*
+ * The phase-detect write DMA's two addresses, which are the same pair the
+ * image channel's write DMA has: a 4 KB area at the channel's +0x110 that goes
+ * with a config id, and the frame destination itself at +0x1c0.  Only a recipe
+ * carrying the phase-detect path names either, and the second is the only
+ * output this driver reads as a picture.
+ */
+#define ISPFE_PDMA_OUTPUT_PD_CONFIG	13
+#define ISPFE_PDMA_OUTPUT_PD_IMAGE	14
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
@@ -1181,6 +1250,12 @@ struct ispfe_pdma_program {
 	u32 recipe_bytes;
 	u32 blocks_bytes;
 	bool raw_output;
+	/*
+	 * The recipe configures the receiver's second write DMA, which puts
+	 * the sensor's phase-detect stream in memory beside the picture.  It
+	 * needs a logical channel of its own, which ispfe_pd_start() gives it.
+	 */
+	bool pd_output;
 	bool backend_output;
 	bool patch_backend_output;
 	bool backend_recipe;
@@ -1221,13 +1296,28 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 	/*
 	 * The main camera's RAW readout.  Its own recipe rather than a geometry
 	 * of the ultrawide's: the capture holds 65 commands where the
-	 * ultrawide's holds 59.  Five of the six extra are this camera's
-	 * phase-detect pipeline, which the generator takes back out because two
-	 * of them carry captured addresses and nothing here allocates a buffer
-	 * for them.  The sixth is the contrast-detect gamma table, which stays:
-	 * unlike the back-end recipes, a raw recipe emits that block's
-	 * configuration, so the table has a reader.  It is also what makes this
-	 * recipe's block area the largest of the five.
+	 * ultrawide's holds 59, and the six extra are what this camera has and
+	 * the ultrawide does not.
+	 *
+	 * Five of them are the *line-memory processor's* phase-detect
+	 * pipeline: a statistics block that reduces the stream to a phase per
+	 * window, a lookup table, a status queue and two batch records.  The
+	 * generator takes all five out.  That block's table is 576 bytes of
+	 * per-unit calibration and its output format is not decoded, so the
+	 * phase-detect line-memory instance stays at reset -- and a stage that
+	 * is enabled and unconfigured is what this hardware refuses.
+	 *
+	 * What is *not* taken out, since the phase-detect stream became worth
+	 * having, is the receiver's own half: a second CSIS write DMA inside
+	 * logical channel +0x22000 with its own stride, format, config id and
+	 * two destinations, and the frame-controller context that drives it.
+	 * That writes the sensor's phase-detect readout to memory as it
+	 * arrives, needing nothing from the line memory -- see .pd_output.
+	 *
+	 * The sixth extra command is the contrast-detect gamma table, which
+	 * stays: unlike the back-end recipes, a raw recipe emits that block's
+	 * configuration, so the table has a reader.  It is also what makes
+	 * this recipe's block area the largest of the five.
 	 *
 	 * This is the only path on this camera that writes a Bayer frame to
 	 * DRAM.  Both back-end recipes read their Bayer from memory and so have
@@ -1245,6 +1335,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.recipe_bytes = ISPFE_PDMA_MAINRAW_RECIPE_BYTES,
 		.blocks_bytes = ISPFE_PDMA_MAINRAW_BLOCKS_BYTES,
 		.raw_output = true,
+		.pd_output = true,
 	},
 	{
 		.cmds = ispfe_pdma_backend_recipe,
@@ -1762,6 +1853,14 @@ struct ispfe_device {
 	 * place src is snapshotted so it cannot move under a running stream.
 	 */
 	const struct ispfe_pdma_program *prog;
+	/*
+	 * Which of the link's demultiplexer slots this stream takes its
+	 * phase-detect stream from, or -1 for one that runs none.  Latched
+	 * where the recipe is, and the single answer for all five readers:
+	 * the four that configure, enable, run and tear down the channel, and
+	 * the interrupt handler that decides whether to drain its leaves.
+	 */
+	int pd_channel;
 	u32 pdma_bytes;
 	u32 pdma_bytes_first;
 	bool pdma_no_kick;
@@ -2017,12 +2116,15 @@ struct ispfe_device {
 	u32 core_seen[4];
 	u32 pdma_seen[3];
 	/*
-	 * The frame controller's and the line memory's phase-detect halves,
+	 * The phase-detect channel's four leaves, and the frame controller's
+	 * and the line memory's phase-detect halves,
 	 * kept apart from the words above rather than merged into them: what
 	 * makes them worth reading is which side of the receiver raised them.
 	 */
+	u32 pd_seen[4];
 	u32 pd_fc_seen;
 	u32 pd_lmp_seen;
+	atomic_t pd_core_events;
 	atomic_t pd_fc_events;
 	atomic_t pd_lmp_events;
 };
@@ -5516,6 +5618,116 @@ static void ispfe_pdma_stop(struct ispfe_device *ispfe)
 }
 
 /*
+ * Which demultiplexer slot the phase-detect stream arrives on, or -1 for a
+ * camera that sends none.
+ *
+ * A logical channel's source register takes the *slot*, not the virtual
+ * channel; the two agree on this camera because its phase-detect stream is
+ * slot 1 and VC1 both, and they come apart on the embedded-data slot, which is
+ * slot 2 on VC0.  So it is looked up rather than assumed.
+ */
+static int ispfe_pd_channel(const struct ispfe_source *src)
+{
+	unsigned int i;
+
+	for (i = 0; i < src->num_channels; i++)
+		if (src->channels[i].config ==
+		    (CSIS_ISPCFG_IMAGE | CSIS_ISPCFG_VIRTUAL_CHANNEL(1)) &&
+		    src->channels[i].height == ISPFE_PD_HEIGHT)
+			return i;
+
+	return -1;
+}
+
+/*
+ * The phase-detect channel, which is a second logical channel out of the same
+ * link: the same registers as the image channel's below, one pool along.
+ *
+ * It takes channel 0 of the seven at +0x22000, which is the one the captured
+ * session took.  Which channel a stream gets is an allocation rather than a
+ * property of the camera, and this driver runs one stream at a time.
+ *
+ * **And it stops there, which is not what the vendor does** [HW 2026-08-31].
+ * The capture also starts a phase-detect frame-controller context and binds a
+ * phase-detect line-memory instance to this channel.  Replaying that stopped
+ * the *picture* arriving: the image channel latched EbufOverflow, the line
+ * memory completed one frame in six thousand, and v4l2-ctl waited for a buffer
+ * that never came -- the signature of a line-memory chain that receives frames
+ * and finishes none.  It is what that pool is for, and this driver does not
+ * configure it: the five commands behind lmp/pdaf_stats are dropped from the
+ * recipe, so binding an instance to a running context hands the stream to a
+ * stage that cannot process it.
+ *
+ * Without them -- no frame-controller context, no bind, nothing but the CSIS
+ * core's own logical channel and the write DMA inside it -- both channels run
+ * clean: core_err and pd_err zero, one line-memory event per frame, and the
+ * phase-detect frame in memory.  So the write DMA is upstream of everything
+ * the line memory does, which is the useful fact: the stream can be had
+ * without the statistics block that reduces it.
+ */
+#define ISPFE_PD_LOCH		0
+static_assert(ISPFE_PD_LOCH < LOCH_PD_COUNT);
+
+static void ispfe_pd_start(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *ctx = core + LOCH_PD(ISPFE_PD_LOCH);
+	unsigned int i;
+
+	writel_relaxed(LOCH_ABORT_MSK_VAL, ctx + LOCH_ABORT_MSK);
+	writel_relaxed(LOCH_PROC_MSK_CONFIGURE, ctx + LOCH_PROC_MSK);
+	writel_relaxed(LOCH_ERR_MSK_VAL, ctx + LOCH_ERR_MSK);
+	writel_relaxed(LOCH_MUTE_MSK_VAL, ctx + LOCH_MUTE_MSK);
+
+	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
+	writel_relaxed(LOCH_PD_BIT(ISPFE_PD_LOCH), core + LOCH_START);
+
+	writel_relaxed(ispfe->active.mode_word0, ctx + LOCH_WORD0);
+	writel_relaxed(ispfe->active.mode_word1, ctx + LOCH_WORD1);
+	for (i = 0; i < ARRAY_SIZE(fc_ctx_ones); i++)
+		writel_relaxed(1, ctx + fc_ctx_ones[i]);
+	writel_relaxed(LOCH_SOURCE_LINK(ispfe->active.link) |
+		       LOCH_SOURCE_CHANNEL(ispfe->pd_channel) |
+		       LOCH_SOURCE_COMMON,
+		       ctx + LOCH_SOURCE);
+	writel_relaxed(0, ctx + LOCH_ZERO);
+	writel_relaxed(CSIS_ISP_RESOL(ispfe->active.width, ISPFE_PD_HEIGHT),
+		       ctx + LOCH_RESOL);
+	writel_relaxed(LOCH_CFG2_VAL, ctx + LOCH_CFG2);
+}
+
+/* Its half of the write that puts a configured channel into service. */
+static void ispfe_pd_run(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+
+	writel_relaxed(LOCH_PROC_MSK_PD,
+		       core + LOCH_PD(ISPFE_PD_LOCH) + LOCH_PROC_MSK);
+}
+
+/*
+ * And the way back out: the write DMA's two enables first, then the channel,
+ * then the line memory it was bound to, and the masks last.  That is the
+ * vendor's order for everything except the masks, which it steps down through
+ * an intermediate value -- 0x1a to 0x8 to 0 on the channel, 0x3ff to 0x10 to 0
+ * on the line memory -- where this writes the zero directly, exactly as the
+ * image channel's teardown beside it already does.
+ */
+static void ispfe_pd_stop(struct ispfe_device *ispfe)
+{
+	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+	void __iomem *ctx = core + LOCH_PD(ISPFE_PD_LOCH);
+
+	writel_relaxed(0, ctx + LOCH_WDMA_CONFIG);
+	writel_relaxed(0, ctx + LOCH_ARM);
+	writel_relaxed(LOCH_PD_BIT(ISPFE_PD_LOCH), core + LOCH_STOP);
+	writel_relaxed(0, ctx + LOCH_ABORT_MSK);
+	writel_relaxed(0, ctx + LOCH_PROC_MSK);
+	writel_relaxed(0, ctx + LOCH_ERR_MSK);
+	writel_relaxed(0, ctx + LOCH_MUTE_MSK);
+}
+
+/*
  * The frame controller context, in the order the vendor stack writes it for a
  * raw stream: the four configuration words, the line-memory instance bound to
  * this context, the context started, then everything the mode describes, and
@@ -5592,6 +5804,15 @@ static void ispfe_fc_start(struct ispfe_device *ispfe)
 	writel_relaxed(LOCH_CFG2_VAL, ctx + LOCH_CFG2);
 
 	/*
+	 * The phase-detect channel after the image one, where the vendor
+	 * interleaves the two.  Each channel's own writes stay in the vendor's
+	 * order, which is what the hardware sees; nothing in either sequence
+	 * refers to the other.
+	 */
+	if (ispfe->pd_channel >= 0)
+		ispfe_pd_start(ispfe);
+
+	/*
 	 * Deliberately NOT writing LOCH_ENABLE here.  It is not a mask -- it
 	 * appears in none of the 202 event-info nodes -- and downstream writes
 	 * it from its event thread only after the flush that the start pulse
@@ -5619,7 +5840,13 @@ static void ispfe_fc_arm(struct ispfe_device *ispfe)
 		usleep_range(200, 300);
 	}
 
-	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_ENABLE);
+	/*
+	 * Both channels in one write, which is what the capture does: an
+	 * image channel on 0 and a phase-detect channel on 0 read 0x81.
+	 */
+	writel_relaxed(BIT(ispfe->active.loch) |
+		       (ispfe->pd_channel >= 0 ? LOCH_PD_BIT(ISPFE_PD_LOCH) : 0),
+		       core + LOCH_ENABLE);
 	readl(core + LOCH_ENABLE);
 
 	dev_info(ispfe->dev, "arm: %u core events after %d us, abort_done %#x\n",
@@ -5635,6 +5862,8 @@ static void ispfe_fc_run(struct ispfe_device *ispfe)
 		       core + FC_CTX(ispfe->active.fcctx) + FC_CTX_MSK);
 	writel_relaxed(LOCH_PROC_MSK_RAW,
 		       core + LOCH(ispfe->active.loch) + LOCH_PROC_MSK);
+	if (ispfe->pd_channel >= 0)
+		ispfe_pd_run(ispfe);
 }
 
 static void ispfe_fc_stop(struct ispfe_device *ispfe)
@@ -5645,6 +5874,15 @@ static void ispfe_fc_stop(struct ispfe_device *ispfe)
 	writel_relaxed(0, core + LOCH_ENABLE);
 	writel_relaxed(BIT(ispfe->active.loch), core + LOCH_STOP);
 	writel_relaxed(0, ctx + LOCH_ARM);
+	/*
+	 * The image channel first and the phase-detect one after.  The vendor
+	 * interleaves the two -- it stops the image channel first but clears
+	 * the phase-detect masks before the image ones -- so this is that
+	 * order only for the stop; within each channel the order is the
+	 * vendor's.
+	 */
+	if (ispfe->pd_channel >= 0)
+		ispfe_pd_stop(ispfe);
 	writel_relaxed(0, ctx + LOCH_ABORT_MSK);
 	writel_relaxed(0, ctx + LOCH_PROC_MSK);
 	writel_relaxed(0, ctx + LOCH_ERR_MSK);
@@ -5694,7 +5932,7 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 	struct ispfe_device *ispfe = data;
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 	void __iomem *ctx = core + LOCH(ispfe->active.loch);
-	u32 agg, leaf, all = 0;
+	u32 agg, leaf, all = 0, pd = 0;
 	unsigned int i;
 
 	agg = ispfe_ack(core, CORE_AGG_SRC);
@@ -5713,12 +5951,46 @@ static irqreturn_t ispfe_core_isr(int irq, void *data)
 			   READ_ONCE(ispfe->core_seen[i]) | leaf);
 	}
 
+	/*
+	 * And the phase-detect channel's four, which are leaves of this same
+	 * line: the csis-core SPI carries all twenty-eight logical channels.
+	 * Only the one this stream configured, for the reason the image
+	 * channel above is the only one of its pool that is walked -- the
+	 * others' masks are untouched, and a masked leaf cannot hold the line.
+	 */
+	if (ispfe->pd_channel >= 0) {
+		void __iomem *pdctx = core + LOCH_PD(ISPFE_PD_LOCH);
+
+		for (i = 0; i < ARRAY_SIZE(ispfe_core_leaves); i++) {
+			u32 ovf;
+
+			leaf = ispfe_ack(pdctx, ispfe_core_leaves[i]);
+			pd |= leaf;
+
+			ovf = readl_relaxed(pdctx + ispfe_core_leaves[i] + 4);
+			if (ovf)
+				writel_relaxed(ovf,
+					       pdctx + ispfe_core_leaves[i] + 4);
+			WRITE_ONCE(ispfe->pd_seen[i],
+				   READ_ONCE(ispfe->pd_seen[i]) | leaf);
+		}
+	}
+
 	ispfe_ack(core, CORE_EBUF_SRC);
 
-	if (!agg && !all)
+	if (!agg && !all && !pd)
 		return IRQ_NONE;
 
-	atomic_inc(&ispfe->core_events);
+	/*
+	 * Counted apart from the image channel's, because ispfe_fc_arm() waits
+	 * on core_events as its statement that the *image* channel's start
+	 * pulse produced a flush.  Folding the phase-detect channel in would
+	 * let the other channel's flush satisfy that wait.
+	 */
+	if (pd)
+		atomic_inc(&ispfe->pd_core_events);
+	if (agg || all)
+		atomic_inc(&ispfe->core_events);
 
 	return IRQ_HANDLED;
 }
@@ -6240,7 +6512,8 @@ static void ispfe_pdma_outputs_reset(struct ispfe_device *ispfe)
 
 		if (!ispfe->pdma_output[i].cpu)
 			continue;
-		memset(ispfe->pdma_output[i].cpu, 0, output->size);
+		memset(ispfe->pdma_output[i].cpu,
+		       output->poison ? ISPFE_FRAME_POISON : 0, output->size);
 	}
 }
 
@@ -6653,6 +6926,26 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 		return -EINVAL;
 	if (ispfe->prog->backend_recipe && ispfe->owner == ISPFE_OWNER_V4L2)
 		return -EOPNOTSUPP;
+	/*
+	 * A recipe carrying the phase-detect write path needs a camera that
+	 * sends one, because the logical channel it arms is pointed at a
+	 * demultiplexer slot by number.  Refused here rather than at the first
+	 * frame: a channel aimed at a slot the link does not describe receives
+	 * nothing, and says so only by staying silent.
+	 */
+	if (ispfe->prog->pd_output && ispfe_pd_channel(&source) < 0) {
+		dev_err(ispfe->dev,
+			"PDMA recipe expects a phase-detect stream this camera does not send\n");
+		return -EINVAL;
+	}
+	/*
+	 * Decided once, here, and read everywhere else.  Configuring the
+	 * channel, enabling it, putting it into service and tearing it down
+	 * are four places, and testing four separate conditions would let one
+	 * of them enable a channel another had declined to configure.
+	 */
+	ispfe->pd_channel = ispfe->prog->pd_output ? ispfe_pd_channel(&source)
+						   : -1;
 	if (ispfe->prog->fixed_resources &&
 	    (source.loch != ispfe->prog->required_loch ||
 	     source.fcctx != ispfe->prog->required_fcctx ||
@@ -6749,6 +7042,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	atomic_set(&ispfe->fc_events, 0);
 	atomic_set(&ispfe->core_events, 0);
 	atomic_set(&ispfe->lmp_events, 0);
+	atomic_set(&ispfe->pd_core_events, 0);
 	atomic_set(&ispfe->pd_fc_events, 0);
 	atomic_set(&ispfe->pd_lmp_events, 0);
 	atomic_set(&ispfe->pdma_events, 0);
@@ -6759,6 +7053,7 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->pd_fc_seen = 0;
 	ispfe->pd_lmp_seen = 0;
 	memset(ispfe->core_seen, 0, sizeof(ispfe->core_seen));
+	memset(ispfe->pd_seen, 0, sizeof(ispfe->pd_seen));
 	memset(ispfe->pdma_seen, 0, sizeof(ispfe->pdma_seen));
 
 	ret = ispfe_qos_enable(ispfe);
@@ -7669,6 +7964,30 @@ static int ispfe_regs_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ispfe_regs);
 
+/*
+ * How much of a buffer is still poison, sampled rather than counted in full:
+ * the question a bring-up asks of an untouched buffer -- the 24 MB frame or
+ * the 3.6 MB phase-detect one -- is only "did anything at all write to it",
+ * and where.
+ */
+static void ispfe_seq_dirty(struct seq_file *s, const char *name, const u8 *p,
+			    size_t size)
+{
+	size_t i, step = max_t(size_t, size / 4096, 1);
+	size_t touched = 0, samples = 0;
+	ssize_t first = -1;
+
+	for (i = 0; i < size; i += step, samples++) {
+		if (p[i] == ISPFE_FRAME_POISON)
+			continue;
+		if (first < 0)
+			first = i;
+		touched++;
+	}
+	seq_printf(s, "%-12s %zu of %zu samples, first %zd\n", name, touched,
+		   samples, first);
+}
+
 static int ispfe_status_show(struct seq_file *s, void *unused)
 {
 	struct ispfe_device *ispfe = s->private;
@@ -7805,9 +8124,13 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	for (i = 0; i < ARRAY_SIZE(ispfe_core_leaf_names); i++)
 		seq_printf(s, "core_%-9s %#010x\n", ispfe_core_leaf_names[i],
 			   READ_ONCE(ispfe->core_seen[i]));
+	for (i = 0; i < ARRAY_SIZE(ispfe_core_leaf_names); i++)
+		seq_printf(s, "pd_%-9s   %#010x\n", ispfe_core_leaf_names[i],
+			   READ_ONCE(ispfe->pd_seen[i]));
 	seq_printf(s, "fc_events    %u\n", atomic_read(&ispfe->fc_events));
 	seq_printf(s, "lmp_events   %u\n", atomic_read(&ispfe->lmp_events));
-	seq_printf(s, "pd_events    %u fc, %u lmp\n",
+	seq_printf(s, "pd_events    %u core, %u fc, %u lmp\n",
+		   atomic_read(&ispfe->pd_core_events),
 		   atomic_read(&ispfe->pd_fc_events),
 		   atomic_read(&ispfe->pd_lmp_events));
 	seq_printf(s, "pdma_events  %u\n", atomic_read(&ispfe->pdma_events));
@@ -7877,27 +8200,13 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 					 PDMA_CTX(ispfe->active.loch) + PDMA_HEAD));
 	}
 
-	/*
-	 * How much of the buffer is still poison, sampled rather than counted
-	 * in full: the question a bring-up asks of an untouched 25 MB buffer is
-	 * only "did anything at all write to it", and where.
-	 */
-	if (ispfe->frame) {
-		const u8 *p = ispfe->frame;
-		size_t i, step = max_t(size_t, ispfe->frame_size / 4096, 1);
-		size_t touched = 0, samples = 0;
-		ssize_t first = -1;
-
-		for (i = 0; i < ispfe->frame_size; i += step, samples++) {
-			if (p[i] == ISPFE_FRAME_POISON)
-				continue;
-			if (first < 0)
-				first = i;
-			touched++;
-		}
-		seq_printf(s, "frame_dirty  %zu of %zu samples, first %zd\n",
-			   touched, samples, first);
-	}
+	if (ispfe->frame)
+		ispfe_seq_dirty(s, "frame_dirty", ispfe->frame,
+				ispfe->frame_size);
+	if (ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu)
+		ispfe_seq_dirty(s, "pd_dirty",
+				ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu,
+				ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PD_IMAGE].size);
 
 	return 0;
 }
@@ -7923,6 +8232,38 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
 	return simple_read_from_buffer(buf, count, ppos, ispfe->frame,
 				       ispfe->frame_size);
 }
+
+/*
+ * The phase-detect frame, straight out of the area the second write DMA was
+ * pointed at: ISPFE_PD_HEIGHT rows of ISPFE_PD_STRIDE bytes, 4000 columns of
+ * packed ten-bit.
+ *
+ * Not gated on a snapshot the way the Bayer frame above is.  This is one
+ * shared destination that every frame overwrites in place -- the recipe names
+ * it once and nothing retargets it -- so a read taken while a stream runs can
+ * tear, and a read after it stops is the last frame the receiver wrote.
+ */
+static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
+			     loff_t *ppos)
+{
+	struct ispfe_device *ispfe = file->private_data;
+
+	guard(mutex)(&ispfe->lock);
+
+	if (!ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu)
+		return -ENODATA;
+
+	return simple_read_from_buffer(buf, count, ppos,
+			ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu,
+			ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PD_IMAGE].size);
+}
+
+static const struct file_operations ispfe_pd_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_pd_read,
+	.llseek = default_llseek,
+};
 
 static const struct file_operations ispfe_frame_fops = {
 	.owner = THIS_MODULE,
@@ -8239,6 +8580,7 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 			    &ispfe_backend_queue_fops);
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
+	debugfs_create_file("pd", 0444, d, ispfe, &ispfe_pd_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
 	debugfs_create_file("blocks", 0644, d, ispfe, &ispfe_blocks_fops);
 	debugfs_create_file("lmp_shading", 0444, d, ispfe,
@@ -10947,6 +11289,13 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe = devm_kzalloc(dev, sizeof(*ispfe), GFP_KERNEL);
 	if (!ispfe)
 		return -ENOMEM;
+	/*
+	 * Zero is a valid demultiplexer slot, so "no phase-detect stream" has
+	 * to be stated rather than left to the allocation.  Every stream sets
+	 * it before anything reads it; this is what the interrupt handlers see
+	 * if one is somehow reached without a stream.
+	 */
+	ispfe->pd_channel = -1;
 	ispfe->pdma_program_staged =
 		devm_kmalloc(dev, ISPFE_PDMA_RECIPE_BYTES, GFP_KERNEL);
 	ispfe->pdma_blocks_staged =

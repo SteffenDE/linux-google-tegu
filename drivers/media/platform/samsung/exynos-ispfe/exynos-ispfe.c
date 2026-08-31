@@ -931,7 +931,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_MOTION		5
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI1	6
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI2	7
-#define ISPFE_STATS_GRIDS		8
+#define ISPFE_STATS_GRID_PDAF		8
+#define ISPFE_STATS_GRIDS		9
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -1083,6 +1084,42 @@ static bool ispfe_stats_motion_written(const void *grid)
 	return (size_t)motion->rows * stride <= sizeof(motion->luma);
 }
 
+/* Defined below; the phase-detect decode needs the recipe it is running. */
+struct ispfe_device;
+
+/*
+ * The phase-detect statistics block's result, which is the one this driver
+ * publishes in a different shape from the one the hardware writes.
+ *
+ * The area is 400 KB of which 2.8 KB is a focus loop's: a header, then a
+ * 0x60000-byte full-frame region this driver has no consumer for, then the
+ * windows.  Every quantity below is a compile-time offset -- nothing here
+ * indexes with a number the hardware wrote -- which is what lets the decode
+ * read the area directly and the predicate then test the copy.
+ *
+ * The layout is Lyric's, confirmed against a real buffer; see the camera
+ * subsystem's reference/ispfe.md.
+ */
+#define ISPFE_PDAF_HEADER_CONFIG_ID	0x04
+#define ISPFE_PDAF_HEADER_FRAME		0x14
+#define ISPFE_PDAF_HEADER_DISPARITIES	0x24
+#define ISPFE_PDAF_WINDOW_REGION	0x60000
+#define ISPFE_PDAF_WINDOW_STRIDE	0x3c00
+#define ISPFE_PDAF_TILE_SUM_LEFT	0x148
+#define ISPFE_PDAF_TILE_SUM_RIGHT	0x150
+#define ISPFE_PDAF_OVERFLOW		0x158
+#define ISPFE_PDAF_NUMERATOR		0x160
+#define ISPFE_PDAF_DENOM_RIGHT		0x1c0
+#define ISPFE_PDAF_DENOM_LEFT		0x220
+
+/*
+ * Defined with the rest of the phase-detect handling, below @ispfe_device: the
+ * decode reads the disparity origin out of the recipe that is running.
+ */
+static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    void *out, const void *grid);
+static bool ispfe_stats_pdaf_written(const void *grid);
+
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
@@ -1094,6 +1131,14 @@ static const struct ispfe_stats_grid {
 	size_t clear;
 	u32 flag;
 	bool (*written)(const void *grid);
+	/*
+	 * How a result gets from the area into the buffer, when a straight
+	 * copy of the first @size bytes is not it.  The phase-detect block
+	 * writes a 0x60000-byte full-frame region before the windows a focus
+	 * loop reads, and publishes 2.8 KB out of 400.
+	 */
+	void (*decode)(const struct ispfe_device *ispfe, void *out,
+		       const void *grid);
 } ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
 	[ISPFE_STATS_GRID_AWB] = {
 		.output = ISPFE_PDMA_OUTPUT_AWB,
@@ -1145,6 +1190,23 @@ static const struct ispfe_stats_grid {
 		/* Named in this structure's own terms, as the flicker one is. */
 		.clear = offsetofend(struct exynos_ispfe_stats_motion,
 				     reserved1),
+	},
+	[ISPFE_STATS_GRID_PDAF] = {
+		.output = ISPFE_PDMA_OUTPUT_PDAF_STATS,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer, pdaf),
+		.size = sizeof(struct exynos_ispfe_stats_pdaf),
+		.flag = EXYNOS_ISPFE_STATS_PDAF,
+		.written = ispfe_stats_pdaf_written,
+		.decode = ispfe_stats_pdaf_decode,
+		/*
+		 * Only as far as the disparity count in the block's own
+		 * header, which the predicate tests before it reads anything
+		 * else -- so a frame the block did not write cannot pass on
+		 * the strength of the previous one's windows.  The area is
+		 * 400 KB and this runs before every frame; clearing the window
+		 * region as well would be a memset the size of the picture.
+		 */
+		.clear = ISPFE_PDAF_HEADER_DISPARITIES + sizeof(__u32),
 	},
 	[ISPFE_STATS_GRID_LSC] = {
 		.output = ISPFE_PDMA_OUTPUT_LSC,
@@ -1904,6 +1966,13 @@ struct ispfe_device {
 	bool pdma_program_override;
 	bool active_pdma_program_override;
 	/* Bring-up overrides for the measured opcode/length and head push. */
+	/*
+	 * Where the phase-detect block's correlation axis starts, read out of
+	 * the running recipe's own configuration rather than assumed: it is a
+	 * signed six-bit field and the captured value is -5, but nothing about
+	 * the interface promises that and a consumer indexes with it.
+	 */
+	s32 pdaf_disparity_start;
 	u32 pdma_cmd;
 	/*
 	 * Override the descriptor's program address. Zero selects the relocated
@@ -4641,6 +4710,118 @@ static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
  * a recipe this code has not seen -- and a zeroed weight map would meter
  * nothing at all.
  */
+/*
+ * The phase-detect block's disparity origin, out of the recipe about to run.
+ *
+ * `lmp/pdaf_stats_config` is a 200-byte inline burst whose second 64-bit word
+ * holds the block's scalars; `csr_pdaf_stats_disparity_range_start` is six
+ * signed bits at 16.  Both the field positions and the register are Lyric's;
+ * see the camera subsystem's reference/ispfe.md.
+ *
+ * A recipe without the block leaves this zero, which is harmless: the
+ * statistics it would describe are not published either.
+ */
+#define ISPFE_LMP_PDAF_STATS_CONFIG_REG		0x00040004
+#define ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS	0x08
+#define ISPFE_LMP_PDAF_RANGE_START_SHIFT	16
+#define ISPFE_LMP_PDAF_RANGE_START_BITS		6
+
+static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    void *out, const void *grid)
+{
+	struct exynos_ispfe_stats_pdaf *pdaf = out;
+	const u8 *area = grid;
+	const u8 *win = area + ISPFE_PDAF_WINDOW_REGION;
+	unsigned int k;
+
+	memset(pdaf, 0, sizeof(*pdaf));
+
+	pdaf->disparities = get_unaligned_le32(area + ISPFE_PDAF_HEADER_DISPARITIES);
+	pdaf->frame = get_unaligned_le32(area + ISPFE_PDAF_HEADER_FRAME);
+	pdaf->disparity_start = ispfe->pdaf_disparity_start;
+
+	/*
+	 * One window, and not because one is all there is.  The reader's own
+	 * accessors put window *m* at a stride of 0x3c00 while the header's
+	 * "bytes in use" for a single window implies 0x3c80; the two agree
+	 * only at window 0, and no capture configures a second one to tell
+	 * them apart.  So this publishes the window every recipe here asks
+	 * for, and a recipe that asks for more has to settle the stride
+	 * first -- which is what ISPFE_PDAF_WINDOW_STRIDE is named for and
+	 * why nothing multiplies by it yet.
+	 */
+	pdaf->windows = 1;
+
+	pdaf->window[0].tile_sum_left =
+		get_unaligned_le64(win + ISPFE_PDAF_TILE_SUM_LEFT);
+	pdaf->window[0].tile_sum_right =
+		get_unaligned_le64(win + ISPFE_PDAF_TILE_SUM_RIGHT);
+	pdaf->window[0].overflow =
+		get_unaligned_le64(win + ISPFE_PDAF_OVERFLOW);
+
+	for (k = 0; k < EXYNOS_ISPFE_PDAF_DISPARITIES; k++) {
+		pdaf->window[0].numerator[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_NUMERATOR + 8 * k);
+		pdaf->window[0].denominator_right[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_DENOM_RIGHT + 8 * k);
+		pdaf->window[0].denominator_left[k] =
+			get_unaligned_le64(win + ISPFE_PDAF_DENOM_LEFT + 8 * k);
+	}
+}
+
+/*
+ * Whether the block wrote this frame, tested on the published copy.
+ *
+ * The left denominator is a sum of squares over a window that does not move,
+ * so the hardware has to write the same value at every shift -- and it cannot
+ * be zero over a window with any light in it at all.  That is a stronger
+ * statement than "some byte is not zero", and it is free.
+ */
+static bool ispfe_stats_pdaf_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_pdaf *pdaf = grid;
+	unsigned int k;
+
+	if (pdaf->disparities != EXYNOS_ISPFE_PDAF_DISPARITIES)
+		return false;
+	if (pdaf->window[0].denominator_left[0] <= 0)
+		return false;
+	for (k = 1; k < EXYNOS_ISPFE_PDAF_DISPARITIES; k++)
+		if (pdaf->window[0].denominator_left[k] !=
+		    pdaf->window[0].denominator_left[0])
+			return false;
+
+	return true;
+}
+
+static void ispfe_pdaf_read_config(struct ispfe_device *ispfe)
+{
+	const struct ispfe_pdma_program *prog = ispfe->prog;
+	unsigned int i;
+
+	ispfe->pdaf_disparity_start = 0;
+
+	for (i = 0; i < prog->num_cmds; i++) {
+		const struct ispfe_pdma_cmd *cmd = &prog->cmds[i];
+		u32 field;
+		u64 word;
+
+		if (cmd->op != ISPFE_PDMA_INLINE_BURST ||
+		    cmd->reg != ISPFE_LMP_PDAF_STATS_CONFIG_REG ||
+		    !cmd->payload ||
+		    cmd->len < ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS + sizeof(u64))
+			continue;
+
+		word = get_unaligned_le64(cmd->payload +
+					  ISPFE_LMP_PDAF_STATS_CONFIG_SCALARS);
+		field = (word >> ISPFE_LMP_PDAF_RANGE_START_SHIFT) &
+			(BIT(ISPFE_LMP_PDAF_RANGE_START_BITS) - 1);
+		ispfe->pdaf_disparity_start =
+			sign_extend32(field, ISPFE_LMP_PDAF_RANGE_START_BITS - 1);
+		return;
+	}
+}
+
 static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
@@ -5604,6 +5785,7 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 		ret = ispfe_pdma_state_luts(ispfe);
 		if (ret)
 			return ret;
+		ispfe_pdaf_read_config(ispfe);
 	}
 
 	/*
@@ -9569,7 +9751,12 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		 * at all -- and a buffer with no frame behind it never reaches
 		 * this loop.
 		 */
-		memcpy((u8 *)out + desc->offset, area->grid[grid], desc->size);
+		if (desc->decode)
+			desc->decode(ispfe, (u8 *)out + desc->offset,
+				     area->grid[grid]);
+		else
+			memcpy((u8 *)out + desc->offset, area->grid[grid],
+			       desc->size);
 
 		if (!desc->written((u8 *)out + desc->offset))
 			continue;

@@ -124,9 +124,9 @@ static int lc898129_set_ctrl(struct v4l2_ctrl *ctrl)
 	 *
 	 * What it does not do is notice the module power-cycling underneath
 	 * it.  The part resets to its own position and this driver is not told,
-	 * so the cached value can be stale until something writes again -- an
-	 * autofocus loop writing every frame does, an application setting a
-	 * position once does not.
+	 * so the cached value is stale from that moment until something writes
+	 * again -- which is why the control is %V4L2_CTRL_FLAG_EXECUTE_ON_WRITE
+	 * and this runs even for a value the cache already holds.
 	 */
 	return lc898129_write(lc898129, LC898129_AF_TARGET,
 			      LC898129_AF_TARGET_SELECT | ctrl->val);
@@ -141,6 +141,7 @@ static const struct v4l2_subdev_ops lc898129_subdev_ops = { };
 static int lc898129_probe(struct i2c_client *client)
 {
 	struct lc898129 *lc898129;
+	struct v4l2_ctrl *ctrl;
 	int ret;
 
 	lc898129 = devm_kzalloc(&client->dev, sizeof(*lc898129), GFP_KERNEL);
@@ -152,10 +153,22 @@ static int lc898129_probe(struct i2c_client *client)
 	lc898129->sd.entity.function = MEDIA_ENT_F_LENS;
 
 	v4l2_ctrl_handler_init(&lc898129->ctrls, 1);
-	v4l2_ctrl_new_std(&lc898129->ctrls, &lc898129_ctrl_ops,
-			  V4L2_CID_FOCUS_ABSOLUTE, LC898129_FOCUS_MIN,
-			  LC898129_FOCUS_MAX, LC898129_FOCUS_STEP,
-			  LC898129_FOCUS_MIN);
+	ctrl = v4l2_ctrl_new_std(&lc898129->ctrls, &lc898129_ctrl_ops,
+				 V4L2_CID_FOCUS_ABSOLUTE, LC898129_FOCUS_MIN,
+				 LC898129_FOCUS_MAX, LC898129_FOCUS_STEP,
+				 LC898129_FOCUS_MIN);
+	/*
+	 * Every write reaches the lens, including one for the value the cache
+	 * already holds.  Without this the framework elides such a write, and
+	 * the cache is not a reading of the hardware: the part comes up at a
+	 * position of its own choosing and this driver is not told, so on the
+	 * main camera of this board the control reads 0 while the lens sits
+	 * near the other end of its travel.  The first thing a focus loop does
+	 * is put the lens somewhere known, and that is exactly the write the
+	 * elision would drop.
+	 */
+	if (ctrl)
+		ctrl->flags |= V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
 	if (lc898129->ctrls.error) {
 		ret = lc898129->ctrls.error;
 		goto err_free_ctrls;

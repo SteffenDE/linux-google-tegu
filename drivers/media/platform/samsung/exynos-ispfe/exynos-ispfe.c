@@ -460,6 +460,24 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
  * line of their own.
  */
 #define FC_PDAF_CTX(m)			(0x3b000 + (m) * 0x1000)
+/*
+ * The phase-detect path's bind bank is the one **past** the five bayer
+ * contexts', at the same 0x400 stride -- 0x29000, which the vendor session
+ * writes with FC_BIND_LOCH 0 and FC_BIND_ENABLE 1 beside the image context's
+ * own bind at 0x28c00, and clears at stream stop.  There is a third word in
+ * the bank at +0x08 that the same session writes zero to and the image bind
+ * never touches.
+ *
+ * Whether that is index 5 of one array shared with the bayer binds or index 0
+ * of a pdaf array of its own is **not settled**: both readings give 0x29000,
+ * and only a session using a pdaf bank other than 0 would tell them apart.
+ * Both available captures use bank 0.  Written as a continuation of the bayer
+ * array because that is what the addresses look like, and indexed so that it
+ * moves with %ISPFE_PD_FCCTX rather than silently staying on bank 5 if that
+ * ever changes.
+ */
+#define FC_PDAF_BIND(m)			FC_CTX_BIND(FC_NUM_CTX + (m))
+#define FC_BIND_PDAF_EXTRA		0x08
 
 #define FC_BIND_ENABLE			0x00
 #define FC_BIND_LOCH		0x04
@@ -478,6 +496,20 @@ static const u32 fc_ctx_ones[] = { 0x60, 0x64, 0x6c, 0x70 };
 #define FC_CTX_MSK			0x30c
 #define FC_CTX_MSK_ARM		0x000007f8
 #define FC_CTX_MSK_RUN		0x000007fc
+/*
+ * The phase-detect frame-controller bank takes neither of those.  The vendor
+ * session writes its mask once, with 0x3, and never writes its FC_CTX_CTRL at
+ * all -- so the bank is not armed and run the way a bayer context is.
+ */
+#define FC_PDAF_CTX_MSK_VAL	0x00000003
+/*
+ * And the phase-detect line-memory pool's mask is ten bits wide, not the
+ * bayer pool's thirty.  %LMP_INT_MSK_VAL is the bayer value and does not
+ * belong here.  The session unmasks everything but Context0RegisterUpdate
+ * while it configures, then everything once the channel is running.
+ */
+#define LMP_INT_MSK_PDAF_CONFIGURE	0x000003ef
+#define LMP_INT_MSK_PDAF_VAL		0x000003ff
 
 /*
  * Two frame-controller LMP-IDMA AXI common banks.  Lyric's register
@@ -5734,32 +5766,73 @@ static int ispfe_pd_channel(const struct ispfe_source *src)
  * session took.  Which channel a stream gets is an allocation rather than a
  * property of the camera, and this driver runs one stream at a time.
  *
- * **And it stops there, which is not what the vendor does.**  The session also
- * binds a phase-detect line-memory instance to this channel.  Doing that used
- * to stop the *picture* arriving -- the image channel latched EbufOverflow and
- * the line memory completed one frame in six thousand -- because the five
- * commands configuring that instance were dropped from the recipe, so the bind
+ * The line memory behind it runs too [HW 2026-08-31], which is what
+ * ispfe_pd_start() arms below.  Binding it used to stop the *picture*
+ * arriving -- the image channel latched EbufOverflow and the line memory
+ * completed one frame in six thousand -- and the reason was that the five
+ * commands behind lmp/pdaf_stats were dropped from the recipe, so the bind
  * handed the stream to a stage that could not process it.  They are in the
- * recipe now, which is what this commit does; giving the instance a frame is
- * the next one.
+ * recipe now.
  *
- * The write DMA is upstream of everything the line memory does either way,
- * which is the useful fact: the raw phase-detect stream can be had without
- * the statistics block that reduces it.
+ * The write DMA is still upstream of everything the line memory does, and
+ * that is worth keeping in view: the raw phase-detect stream can be had
+ * without the statistics block, and both are produced at once.
  */
 #define ISPFE_PD_LOCH		0
+/*
+ * The phase-detect frame-controller bank and line-memory instance the recipe
+ * configures.  Both are 0: the captured program writes fc/pdaf_cfg and
+ * fc/pdaf_ctx at 0x3b020 and 0x3b028, which is %FC_PDAF_CTX(0), and its
+ * lmp/pdaf_stats enable is that pool's first instance.
+ */
+#define ISPFE_PD_FCCTX		0
+#define ISPFE_PD_LMP		0
 static_assert(ISPFE_PD_LOCH < LOCH_PD_COUNT);
 
 static void ispfe_pd_start(struct ispfe_device *ispfe)
 {
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 	void __iomem *ctx = core + LOCH_PD(ISPFE_PD_LOCH);
+	void __iomem *bank = core + FC_PDAF_CTX(ISPFE_PD_FCCTX);
 	unsigned int i;
+
+	/*
+	 * The frame-controller bank and the line-memory instance behind it.
+	 * Without these the CSIS side runs on its own, which is a working raw
+	 * phase-detect stream and an empty statistics buffer, because nothing
+	 * ever hands the line memory a frame.
+	 *
+	 * Neither takes the image channel's values: the bank's mask is 0x3 and
+	 * its FC_CTX_CTRL is never written, and the instance's mask is ten bits
+	 * rather than thirty.  All three are what the vendor session writes.
+	 */
+	writel_relaxed(FC_PDAF_CTX_MSK_VAL, bank + FC_CTX_MSK);
+	writel_relaxed(LMP_INT_MSK_PDAF_CONFIGURE,
+		       core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
 
 	writel_relaxed(LOCH_ABORT_MSK_VAL, ctx + LOCH_ABORT_MSK);
 	writel_relaxed(LOCH_PROC_MSK_CONFIGURE, ctx + LOCH_PROC_MSK);
 	writel_relaxed(LOCH_ERR_MSK_VAL, ctx + LOCH_ERR_MSK);
 	writel_relaxed(LOCH_MUTE_MSK_VAL, ctx + LOCH_MUTE_MSK);
+
+	/*
+	 * Bound before the channel is started, which is where this driver puts
+	 * the image channel's bind.  **The order does not matter**, and that is
+	 * measured rather than assumed: the two vendor sessions disagree with
+	 * each other.  camera-pdma-main-raw-2026-08-28 binds at +0x29000 and
+	 * only then writes the phase-detect bit of LOCH_START;
+	 * camera-pdma-main-2026-08-28 starts the channel first.  Both work, so
+	 * nothing here is load-bearing and neither order is worth chasing if a
+	 * frame goes missing.
+	 *
+	 * Clearing this bind in ispfe_pd_stop() is also what closes the window
+	 * on the block's destinations: ispfe_stop() runs ispfe_fc_stop() before
+	 * anything releases a buffer, so by the time ispfe_buffers_free() runs
+	 * the line memory has no channel feeding it.
+	 */
+	writel_relaxed(ISPFE_PD_LOCH, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_LOCH);
+	writel_relaxed(1, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_ENABLE);
+	writel_relaxed(0, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_PDAF_EXTRA);
 
 	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
 	writel_relaxed(LOCH_PD_BIT(ISPFE_PD_LOCH), core + LOCH_START);
@@ -5783,6 +5856,8 @@ static void ispfe_pd_run(struct ispfe_device *ispfe)
 {
 	void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
 
+	writel_relaxed(LMP_INT_MSK_PDAF_VAL,
+		       core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
 	writel_relaxed(LOCH_PROC_MSK_PD,
 		       core + LOCH_PD(ISPFE_PD_LOCH) + LOCH_PROC_MSK);
 }
@@ -5807,6 +5882,11 @@ static void ispfe_pd_stop(struct ispfe_device *ispfe)
 	writel_relaxed(0, ctx + LOCH_PROC_MSK);
 	writel_relaxed(0, ctx + LOCH_ERR_MSK);
 	writel_relaxed(0, ctx + LOCH_MUTE_MSK);
+
+	/* And what ispfe_pd_start() took.  The session clears the bind too. */
+	writel_relaxed(0, core + LMP_PDAF(ISPFE_PD_LMP) + LMP_INT_MSK);
+	writel_relaxed(0, core + FC_PDAF_CTX(ISPFE_PD_FCCTX) + FC_CTX_MSK);
+	writel_relaxed(0, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_ENABLE);
 }
 
 /*
@@ -8226,6 +8306,21 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "lmp_seen     %#010x\n", READ_ONCE(ispfe->lmp_seen));
 	seq_printf(s, "pd_fc_seen   %#010x\n", READ_ONCE(ispfe->pd_fc_seen));
 	seq_printf(s, "pd_lmp_seen  %#010x\n", READ_ONCE(ispfe->pd_lmp_seen));
+	if (ispfe->streaming && ispfe->pd_channel >= 0) {
+		void __iomem *core = ispfe->base[ISPFE_WIN_CORE];
+
+		seq_printf(s, "pd_fc_msk    %#010x\n",
+			   readl_relaxed(core + FC_PDAF_CTX(ISPFE_PD_FCCTX) +
+					 FC_CTX_MSK));
+		seq_printf(s, "pd_lmp_msk   %#010x\n",
+			   readl_relaxed(core + LMP_PDAF(ISPFE_PD_LMP) +
+					 LMP_INT_MSK));
+		seq_printf(s, "pd_bind      %#010x loch %#010x\n",
+			   readl_relaxed(core + FC_PDAF_BIND(ISPFE_PD_FCCTX) +
+					 FC_BIND_ENABLE),
+			   readl_relaxed(core + FC_PDAF_BIND(ISPFE_PD_FCCTX) +
+					 FC_BIND_LOCH));
+	}
 	seq_printf(s, "frame_iova   %pad\n", &ispfe->frame_dma);
 	seq_printf(s, "spare_iova   %pad\n", &ispfe->spare_frame_dma);
 	seq_printf(s, "frame_size   %zu\n", ispfe->frame_size);

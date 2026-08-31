@@ -854,9 +854,12 @@ struct exynos_ispfe_stats_motion {
  * terms, is the phase: zero where the window is in focus, and signed by which
  * side of focus it is on.
  *
- * @denominator_left does not vary with *k* -- the left window does not move --
- * which is the cheapest check that a result is a result.  @numerator is signed
- * and can be negative at the ends of the range.
+ * @denominator_left is very nearly independent of *k*, and only very nearly:
+ * measured on the main camera it is bit-identical over the non-positive shifts
+ * and drifts down by about 0.003% over the positive ones, so whatever the
+ * block does to the left window at one end of the range, it is not nothing.
+ * Do not use it as an invariant.  @numerator is signed and can be negative at
+ * the ends of the range.
  */
 struct exynos_ispfe_stats_pdaf_window {
 	__s64 tile_sum_left;

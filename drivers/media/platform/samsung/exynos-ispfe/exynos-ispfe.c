@@ -760,6 +760,18 @@ struct ispfe_awb_snapshot_file {
 #define ISPFE_TNR_PYRAMID_SIZE		0x00468000
 
 /*
+ * The phase-detect statistics buffer, which is a derived size rather than a
+ * captured number copied across.  Lyric's own reader indexes a full-frame
+ * region of 0x60000 -- 24 rows of 32 columns, 0x200 apart -- and then nine
+ * windows of 0x3c00 each, which comes to 0x81c00, and to 0x82000 once a
+ * page-aligning allocator has it.  That is exactly the vendor session's
+ * allocation class for this buffer, so the arithmetic and the capture agree.
+ * The accessors it is read from are in the camera subsystem's
+ * reference/ispfe.md.
+ */
+#define ISPFE_PDAF_STATS_SIZE		532480
+
+/*
  * The working areas the front end writes back to, in the order the recipe's
  * ISPFE_BUF_OUTPUT() indices name them.  The sizes are the vendor session's
  * own allocation classes.  Outputs 0--9 are completion/statistics buffers.
@@ -768,11 +780,14 @@ struct ispfe_awb_snapshot_file {
  * which nothing on this driver's path reads, so they are named without a size:
  * no gate is stated for any of the three and the encoder writes a null address
  * for each.  Outputs 13 and 14 are the phase-detect write DMA's pair, and 14
- * is the only one of the fifteen this driver reads as a picture.
+ * is the only one of the seventeen this driver reads as a picture.  Outputs 15
+ * and 16 are the phase-detect *line memory's* pair -- a status queue and the
+ * statistics buffer the block reduces a frame into.
  *
  * All of them except the three tapouts are allocated for every stream,
  * whether or not the recipe it runs names them, which is what output 14's
- * 3.6 MB costs a camera that sends no phase-detect stream.
+ * 3.6 MB and output 16's half a megabyte cost a camera that sends no
+ * phase-detect stream.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -790,6 +805,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_TAPOUT(),
 	PDMA_OUTPUT(4096),
 	PDMA_IMAGE_OUTPUT(ISPFE_PD_STRIDE * ISPFE_PD_HEIGHT),
+	PDMA_OUTPUT(4096),
+	PDMA_OUTPUT(ISPFE_PDAF_STATS_SIZE),
 };
 
 /*
@@ -801,6 +818,17 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  */
 #define ISPFE_PDMA_OUTPUT_PD_CONFIG	13
 #define ISPFE_PDMA_OUTPUT_PD_IMAGE	14
+
+/*
+ * The phase-detect line memory's pair.  Its statistics block reduces a frame to
+ * a phase per window rather than the 3.6 MB output 14 carries, and writes the
+ * result through the batch record at %ISPFE_PDMA_OUTPUT_PDAF_STATS; the status
+ * queue beside it is a 4 KB completion area of the class every other one here
+ * uses.  %ISPFE_PDAF_STATS_SIZE, with the other allocation sizes, is where the
+ * statistics buffer's own size comes from.
+ */
+#define ISPFE_PDMA_OUTPUT_PDAF_QUEUE	15
+#define ISPFE_PDMA_OUTPUT_PDAF_STATS	16
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
@@ -1302,13 +1330,16 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 	 * Five of them are the *line-memory processor's* phase-detect
 	 * pipeline: a statistics block that reduces the stream to a phase per
 	 * window, a lookup table, a status queue and two batch records.  The
-	 * generator takes all five out.  That block's table is 576 bytes of
-	 * per-unit calibration and its output format is not decoded, so the
-	 * phase-detect line-memory instance stays at reset -- and a stage that
-	 * is enabled and unconfigured is what this hardware refuses.
+	 * recipe carries all five [HW 2026-08-31], and the block runs.  Its
+	 * table is the one thing that does not ship: 576 bytes of per-unit
+	 * calibration out of the module's own OTP, which the generator drops
+	 * and ispfe_pdaf_lut_unity() states instead.
 	 *
-	 * What is *not* taken out, since the phase-detect stream became worth
-	 * having, is the receiver's own half: a second CSIS write DMA inside
+	 * The recipe carried none of the five until the block's output format
+	 * was decoded, because a stage that is enabled and unconfigured is what
+	 * this hardware refuses -- which it demonstrated.
+	 *
+	 * Beside them is the receiver's own half: a second CSIS write DMA inside
 	 * logical channel +0x22000 with its own stride, format, config id and
 	 * two destinations, and the frame-controller context that drives it.
 	 * That writes the sensor's phase-detect readout to memory as it
@@ -3921,6 +3952,51 @@ static_assert(ISPFE_LMP_LINEARIZATION_LUT_BYTES == 0x410);
  * become an interface, which is why it is not one.
  */
 #define ISPFE_LMP_HISTOGRAM_LUT_REG	0x0006c8b8
+
+/*
+ * The phase-detect statistics block's shading table, which only the main
+ * camera's raw recipe carries.  It is 16 x 12 left and right gains as
+ * (gain * 256) in 11-bit fields, and in the vendor's session it is **per-unit
+ * calibration**: it comes out of that module's own OTP.  So the kernel has no
+ * business carrying one, the generator drops it, and this states unity --
+ * exactly the argument the Bayer shading grid gets.
+ *
+ * The packing is a 2 x 2 block of the grid per twelve bytes with the two
+ * planes interleaved, at bits 0, 11, 22, 33, 44, 66 and 77.  That is seven
+ * fields, not eight: the vendor's own encoder issues its bit-33 insert twice
+ * with two different sources and drops one of the eight gains.  Filling
+ * exactly the positions it writes leaves a table the same shape as the one
+ * the hardware is known to accept, differing from it only in the values --
+ * which is the point, since what a field means is decoded and what the
+ * unwritten bits do is not.
+ */
+#define ISPFE_LMP_PDAF_LUT_REG		0x00061d48
+#define ISPFE_LMP_PDAF_LUT_BYTES	0x240
+#define ISPFE_LMP_PDAF_LUT_GROUP	12
+#define ISPFE_LMP_PDAF_LUT_UNITY	256
+
+static void ispfe_pdaf_lut_unity(u8 *area)
+{
+	static const u8 field_bit[] = { 0, 11, 22, 33, 44, 66, 77 };
+	unsigned int group, i;
+	u64 lo = 0;
+	u32 hi = 0;
+
+	for (i = 0; i < ARRAY_SIZE(field_bit); i++) {
+		if (field_bit[i] < 64)
+			lo |= (u64)ISPFE_LMP_PDAF_LUT_UNITY << field_bit[i];
+		else
+			hi |= (u32)ISPFE_LMP_PDAF_LUT_UNITY << (field_bit[i] - 64);
+	}
+
+	for (group = 0; group < ISPFE_LMP_PDAF_LUT_BYTES /
+			ISPFE_LMP_PDAF_LUT_GROUP; group++) {
+		u8 *at = area + group * ISPFE_LMP_PDAF_LUT_GROUP;
+
+		put_unaligned_le64(lo, at);
+		put_unaligned_le32(hi, at + 8);
+	}
+}
 #define ISPFE_LMP_HISTOGRAM_WEIGHTS	0x400
 #define ISPFE_LMP_HISTOGRAM_WEIGHT_FLAT	0x80
 /*
@@ -4586,6 +4662,17 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 	lsc = ispfe_lsc_input(prog);
 	if (lsc >= 0 && !prog->inputs[lsc].data)
 		__set_bit(lsc, &stated);
+
+	/*
+	 * And the phase-detect shading table, for the one recipe that has one.
+	 * Absent is not an error here the way the two above are: only the main
+	 * camera's raw readout runs the block at all.
+	 */
+	if (!ispfe_lut_area(ispfe, ISPFE_LMP_PDAF_LUT_REG,
+			    ISPFE_LMP_PDAF_LUT_BYTES, &index, &area)) {
+		__set_bit(index, &stated);
+		ispfe_pdaf_lut_unity(area);
+	}
 
 	/*
 	 * And every empty input is one of those, so a recipe cannot declare a
@@ -5647,23 +5734,18 @@ static int ispfe_pd_channel(const struct ispfe_source *src)
  * session took.  Which channel a stream gets is an allocation rather than a
  * property of the camera, and this driver runs one stream at a time.
  *
- * **And it stops there, which is not what the vendor does** [HW 2026-08-31].
- * The capture also starts a phase-detect frame-controller context and binds a
- * phase-detect line-memory instance to this channel.  Replaying that stopped
- * the *picture* arriving: the image channel latched EbufOverflow, the line
- * memory completed one frame in six thousand, and v4l2-ctl waited for a buffer
- * that never came -- the signature of a line-memory chain that receives frames
- * and finishes none.  It is what that pool is for, and this driver does not
- * configure it: the five commands behind lmp/pdaf_stats are dropped from the
- * recipe, so binding an instance to a running context hands the stream to a
- * stage that cannot process it.
+ * **And it stops there, which is not what the vendor does.**  The session also
+ * binds a phase-detect line-memory instance to this channel.  Doing that used
+ * to stop the *picture* arriving -- the image channel latched EbufOverflow and
+ * the line memory completed one frame in six thousand -- because the five
+ * commands configuring that instance were dropped from the recipe, so the bind
+ * handed the stream to a stage that could not process it.  They are in the
+ * recipe now, which is what this commit does; giving the instance a frame is
+ * the next one.
  *
- * Without them -- no frame-controller context, no bind, nothing but the CSIS
- * core's own logical channel and the write DMA inside it -- both channels run
- * clean: core_err and pd_err zero, one line-memory event per frame, and the
- * phase-detect frame in memory.  So the write DMA is upstream of everything
- * the line memory does, which is the useful fact: the stream can be had
- * without the statistics block that reduces it.
+ * The write DMA is upstream of everything the line memory does either way,
+ * which is the useful fact: the raw phase-detect stream can be had without
+ * the statistics block that reduces it.
  */
 #define ISPFE_PD_LOCH		0
 static_assert(ISPFE_PD_LOCH < LOCH_PD_COUNT);
@@ -8243,20 +8325,49 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
  * it once and nothing retargets it -- so a read taken while a stream runs can
  * tear, and a read after it stops is the last frame the receiver wrote.
  */
-static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
-			     loff_t *ppos)
+static ssize_t ispfe_output_read(struct ispfe_device *ispfe, unsigned int out,
+				 char __user *buf, size_t count, loff_t *ppos)
 {
-	struct ispfe_device *ispfe = file->private_data;
+	if (out >= ARRAY_SIZE(ispfe_pdma_outputs))
+		return -EINVAL;
 
 	guard(mutex)(&ispfe->lock);
 
-	if (!ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu)
+	if (!ispfe->pdma_output[out].cpu)
 		return -ENODATA;
 
 	return simple_read_from_buffer(buf, count, ppos,
-			ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu,
-			ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PD_IMAGE].size);
+				       ispfe->pdma_output[out].cpu,
+				       ispfe_pdma_outputs[out].size);
 }
+
+static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
+			     loff_t *ppos)
+{
+	return ispfe_output_read(file->private_data, ISPFE_PDMA_OUTPUT_PD_IMAGE,
+				 buf, count, ppos);
+}
+
+/*
+ * The phase-detect *statistics*, out of the area the line memory's batch
+ * record was pointed at -- the block's reduction of the same frame the file
+ * above carries whole.  Same caveat: one shared destination every frame
+ * overwrites in place.
+ */
+static ssize_t ispfe_pdaf_read(struct file *file, char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	return ispfe_output_read(file->private_data,
+				 ISPFE_PDMA_OUTPUT_PDAF_STATS,
+				 buf, count, ppos);
+}
+
+static const struct file_operations ispfe_pdaf_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_pdaf_read,
+	.llseek = default_llseek,
+};
 
 static const struct file_operations ispfe_pd_fops = {
 	.owner = THIS_MODULE,
@@ -8581,6 +8692,7 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("pd", 0444, d, ispfe, &ispfe_pd_fops);
+	debugfs_create_file("pdaf", 0444, d, ispfe, &ispfe_pdaf_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
 	debugfs_create_file("blocks", 0644, d, ispfe, &ispfe_blocks_fops);
 	debugfs_create_file("lmp_shading", 0444, d, ispfe,

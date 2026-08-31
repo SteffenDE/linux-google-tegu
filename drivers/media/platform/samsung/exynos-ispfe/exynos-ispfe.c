@@ -1316,6 +1316,18 @@ struct ispfe_pdma_program {
 	 * needs a logical channel of its own, which ispfe_pd_start() gives it.
 	 */
 	bool pd_output;
+	/*
+	 * And whether it runs the *line memory* behind that channel -- the
+	 * statistics block that reduces the same stream to a phase per window.
+	 * The two are independent: the back-end recipe runs the block and not
+	 * the write DMA, because the block takes its input on the fly and
+	 * nothing reads a 3.6 MB phase frame while a picture is being taken.
+	 *
+	 * Either one needs the logical channel; only @pd_output may arm it,
+	 * because arming a write DMA the recipe never configured is what
+	 * latches wdma_config_miss.
+	 */
+	bool pd_stats;
 	bool backend_output;
 	bool patch_backend_output;
 	bool backend_recipe;
@@ -1399,6 +1411,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.blocks_bytes = ISPFE_PDMA_MAINRAW_BLOCKS_BYTES,
 		.raw_output = true,
 		.pd_output = true,
+		.pd_stats = true,
 	},
 	{
 		.cmds = ispfe_pdma_backend_recipe,
@@ -1428,6 +1441,7 @@ static const struct ispfe_pdma_program ispfe_pdma_programs[] = {
 		.width = 4000, .height = 3000, .stride = 8000,
 		.recipe_bytes = ISPFE_PDMA_MAINBE_RECIPE_BYTES,
 		.blocks_bytes = ISPFE_PDMA_MAINBE_BLOCKS_BYTES,
+		.pd_stats = true,
 		.backend_output = true,
 		.backend_recipe = true,
 		.lmp_wbg = &ispfe_lmp_wbg_mainbe,
@@ -4696,9 +4710,9 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 		__set_bit(lsc, &stated);
 
 	/*
-	 * And the phase-detect shading table, for the one recipe that has one.
-	 * Absent is not an error here the way the two above are: only the main
-	 * camera's raw readout runs the block at all.
+	 * And the phase-detect shading table, for the recipes that have one --
+	 * both of the main camera's since 2026-08-31.  Absent is not an error
+	 * here the way the two above are: no other camera runs the block.
 	 */
 	if (!ispfe_lut_area(ispfe, ISPFE_LMP_PDAF_LUT_REG,
 			    ISPFE_LMP_PDAF_LUT_BYTES, &index, &area)) {
@@ -5834,7 +5848,14 @@ static void ispfe_pd_start(struct ispfe_device *ispfe)
 	writel_relaxed(1, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_ENABLE);
 	writel_relaxed(0, core + FC_PDAF_BIND(ISPFE_PD_FCCTX) + FC_BIND_PDAF_EXTRA);
 
-	writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
+	/*
+	 * The arm belongs to this channel's write DMA, and a recipe that runs
+	 * only the line memory does not configure one -- arming it anyway is
+	 * what raises and latches wdma_config_miss, exactly as it does on the
+	 * image channel.
+	 */
+	if (ispfe->prog->pd_output)
+		writel_relaxed(LOCH_ARM_VAL, ctx + LOCH_ARM);
 	writel_relaxed(LOCH_PD_BIT(ISPFE_PD_LOCH), core + LOCH_START);
 
 	writel_relaxed(ispfe->active.mode_word0, ctx + LOCH_WORD0);
@@ -7105,7 +7126,8 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	 * frame: a channel aimed at a slot the link does not describe receives
 	 * nothing, and says so only by staying silent.
 	 */
-	if (ispfe->prog->pd_output && ispfe_pd_channel(&source) < 0) {
+	if ((ispfe->prog->pd_output || ispfe->prog->pd_stats) &&
+	    ispfe_pd_channel(&source) < 0) {
 		dev_err(ispfe->dev,
 			"PDMA recipe expects a phase-detect stream this camera does not send\n");
 		return -EINVAL;
@@ -7116,8 +7138,8 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	 * are four places, and testing four separate conditions would let one
 	 * of them enable a channel another had declined to configure.
 	 */
-	ispfe->pd_channel = ispfe->prog->pd_output ? ispfe_pd_channel(&source)
-						   : -1;
+	ispfe->pd_channel = (ispfe->prog->pd_output || ispfe->prog->pd_stats)
+			  ? ispfe_pd_channel(&source) : -1;
 	if (ispfe->prog->fixed_resources &&
 	    (source.loch != ispfe->prog->required_loch ||
 	     source.fcctx != ispfe->prog->required_fcctx ||

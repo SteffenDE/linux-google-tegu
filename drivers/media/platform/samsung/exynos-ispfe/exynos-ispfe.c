@@ -760,6 +760,18 @@ struct ispfe_awb_snapshot_file {
 #define ISPFE_TNR_PYRAMID_SIZE		0x00468000
 
 /*
+ * The phase-detect statistics buffer, which is a derived size rather than a
+ * captured number copied across.  Lyric's own reader indexes a full-frame
+ * region of 0x60000 -- 24 rows of 32 columns, 0x200 apart -- and then nine
+ * windows of 0x3c00 each, which comes to 0x81c00, and to 0x82000 once a
+ * page-aligning allocator has it.  That is exactly the vendor session's
+ * allocation class for this buffer, so the arithmetic and the capture agree.
+ * The accessors it is read from are in the camera subsystem's
+ * reference/ispfe.md.
+ */
+#define ISPFE_PDAF_STATS_SIZE		532480
+
+/*
  * The working areas the front end writes back to, in the order the recipe's
  * ISPFE_BUF_OUTPUT() indices name them.  The sizes are the vendor session's
  * own allocation classes.  Outputs 0--9 are completion/statistics buffers.
@@ -768,11 +780,14 @@ struct ispfe_awb_snapshot_file {
  * which nothing on this driver's path reads, so they are named without a size:
  * no gate is stated for any of the three and the encoder writes a null address
  * for each.  Outputs 13 and 14 are the phase-detect write DMA's pair, and 14
- * is the only one of the fifteen this driver reads as a picture.
+ * is the only one of the seventeen this driver reads as a picture.  Outputs 15
+ * and 16 are the phase-detect *line memory's* pair -- a status queue and the
+ * statistics buffer the block reduces a frame into.
  *
  * All of them except the three tapouts are allocated for every stream,
  * whether or not the recipe it runs names them, which is what output 14's
- * 3.6 MB costs a camera that sends no phase-detect stream.
+ * 3.6 MB and output 16's half a megabyte cost a camera that sends no
+ * phase-detect stream.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -790,6 +805,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_TAPOUT(),
 	PDMA_OUTPUT(4096),
 	PDMA_IMAGE_OUTPUT(ISPFE_PD_STRIDE * ISPFE_PD_HEIGHT),
+	PDMA_OUTPUT(4096),
+	PDMA_OUTPUT(ISPFE_PDAF_STATS_SIZE),
 };
 
 /*
@@ -801,6 +818,17 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  */
 #define ISPFE_PDMA_OUTPUT_PD_CONFIG	13
 #define ISPFE_PDMA_OUTPUT_PD_IMAGE	14
+
+/*
+ * The phase-detect line memory's pair.  Its statistics block reduces a frame to
+ * a phase per window rather than the 3.6 MB output 14 carries, and writes the
+ * result through the batch record at %ISPFE_PDMA_OUTPUT_PDAF_STATS; the status
+ * queue beside it is a 4 KB completion area of the class every other one here
+ * uses.  %ISPFE_PDAF_STATS_SIZE, with the other allocation sizes, is where the
+ * statistics buffer's own size comes from.
+ */
+#define ISPFE_PDMA_OUTPUT_PDAF_QUEUE	15
+#define ISPFE_PDMA_OUTPUT_PDAF_STATS	16
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
@@ -8207,6 +8235,10 @@ static int ispfe_status_show(struct seq_file *s, void *unused)
 		ispfe_seq_dirty(s, "pd_dirty",
 				ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu,
 				ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PD_IMAGE].size);
+	if (ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PDAF_STATS].cpu)
+		ispfe_seq_dirty(s, "pdaf_dirty",
+				ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PDAF_STATS].cpu,
+				ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PDAF_STATS].size);
 
 	return 0;
 }
@@ -8243,20 +8275,46 @@ static ssize_t ispfe_frame_read(struct file *file, char __user *buf,
  * it once and nothing retargets it -- so a read taken while a stream runs can
  * tear, and a read after it stops is the last frame the receiver wrote.
  */
-static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
-			     loff_t *ppos)
+static ssize_t ispfe_output_read(struct ispfe_device *ispfe, unsigned int out,
+				 char __user *buf, size_t count, loff_t *ppos)
 {
-	struct ispfe_device *ispfe = file->private_data;
-
 	guard(mutex)(&ispfe->lock);
 
-	if (!ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu)
+	if (!ispfe->pdma_output[out].cpu)
 		return -ENODATA;
 
 	return simple_read_from_buffer(buf, count, ppos,
-			ispfe->pdma_output[ISPFE_PDMA_OUTPUT_PD_IMAGE].cpu,
-			ispfe_pdma_outputs[ISPFE_PDMA_OUTPUT_PD_IMAGE].size);
+				       ispfe->pdma_output[out].cpu,
+				       ispfe_pdma_outputs[out].size);
 }
+
+static ssize_t ispfe_pd_read(struct file *file, char __user *buf, size_t count,
+			     loff_t *ppos)
+{
+	return ispfe_output_read(file->private_data, ISPFE_PDMA_OUTPUT_PD_IMAGE,
+				 buf, count, ppos);
+}
+
+/*
+ * The phase-detect *statistics*, out of the area the line memory's batch
+ * record was pointed at -- the block's reduction of the same frame the file
+ * above carries whole.  Same caveat: one shared destination every frame
+ * overwrites in place.
+ */
+static ssize_t ispfe_pdaf_read(struct file *file, char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	return ispfe_output_read(file->private_data,
+				 ISPFE_PDMA_OUTPUT_PDAF_STATS,
+				 buf, count, ppos);
+}
+
+static const struct file_operations ispfe_pdaf_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ispfe_pdaf_read,
+	.llseek = default_llseek,
+};
 
 static const struct file_operations ispfe_pd_fops = {
 	.owner = THIS_MODULE,
@@ -8581,6 +8639,7 @@ static void ispfe_debugfs_init(struct ispfe_device *ispfe)
 	debugfs_create_file("status", 0444, d, ispfe, &ispfe_status_fops);
 	debugfs_create_file("frame", 0444, d, ispfe, &ispfe_frame_fops);
 	debugfs_create_file("pd", 0444, d, ispfe, &ispfe_pd_fops);
+	debugfs_create_file("pdaf", 0444, d, ispfe, &ispfe_pdaf_fops);
 	debugfs_create_file("program", 0644, d, ispfe, &ispfe_program_fops);
 	debugfs_create_file("blocks", 0644, d, ispfe, &ispfe_blocks_fops);
 	debugfs_create_file("lmp_shading", 0444, d, ispfe,

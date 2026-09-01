@@ -698,6 +698,20 @@ struct ispfe_pdma_desc {
 #define ISPFE_LSC_SLOT_STRIDE		ALIGN(ISPFE_LSC_LUT_BYTES, PAGE_SIZE)
 #define ISPFE_LSC_AREA_BYTES		(PDMA_SLOTS * ISPFE_LSC_SLOT_STRIDE)
 
+/*
+ * The linear-RGB scaler's resampling filter, on the same terms and for the
+ * same reason: it is a table userspace supplies, so a frame must not be able
+ * to change one an earlier frame's program already points at.  Sixteen phases
+ * of four taps in each direction, which is the hardware's shape and the uAPI's.
+ */
+#define ISPFE_RGB_FILTER_TAPS		(EXYNOS_ISPFE_RGB_SCALER_DIRECTIONS * \
+					 EXYNOS_ISPFE_RGB_SCALER_PHASES * \
+					 EXYNOS_ISPFE_RGB_SCALER_TAPS)
+#define ISPFE_RGB_FILTER_BYTES		(ISPFE_RGB_FILTER_TAPS * 2)
+#define ISPFE_RGB_FILTER_SLOT_STRIDE	ALIGN(ISPFE_RGB_FILTER_BYTES, PAGE_SIZE)
+#define ISPFE_RGB_FILTER_AREA_BYTES	(PDMA_SLOTS * ISPFE_RGB_FILTER_SLOT_STRIDE)
+static_assert(ISPFE_RGB_FILTER_BYTES == 0x100);
+
 enum ispfe_backend_buffer_state {
 	ISPFE_BACKEND_BUFFER_IDLE,
 	ISPFE_BACKEND_BUFFER_PREPARING,
@@ -713,6 +727,32 @@ struct ispfe_backend_buffer {
 	unsigned int program_slot;
 	u64 retire_credit;
 };
+
+/*
+ * The rasters the linear-RGB branch spans, kept for the statistics buffer as
+ * well as for the encode: what a spatial algorithm needs from a thumbnail is
+ * which part of the picture each sample came from, and inferring that is
+ * exactly what made the motion metering map unusable.  Filled by
+ * ispfe_pdma_apply_rgb() out of the recipe's own downscaler command.
+ */
+struct ispfe_lmp_rgb_geometry {
+	/* The downscaler's input, which is the front end's own raster. */
+	u32 source_width;
+	u32 source_height;
+	/* And its output, which is what this branch scales from. */
+	u32 width;
+	u32 height;
+	bool known;
+};
+
+/*
+ * What an area holding a picture is filled with before the hardware is pointed
+ * at it, so that "nothing was written" is distinguishable from what a dark
+ * scene writes.  Moved up here from beside the register definitions because
+ * the statistics descriptors use it too: the linear-RGB thumbnail is a picture
+ * on a buffer of measurements.
+ */
+#define ISPFE_FRAME_POISON		0xa5
 
 /*
  * The working areas the front end writes back to.  The blocks it *reads* do not
@@ -804,22 +844,49 @@ struct ispfe_awb_snapshot_file {
 #define ISPFE_PDAF_STATS_SIZE		532480
 
 /*
+ * The linear-RGB thumbnail, which is a derived size as well: three planes of
+ * the 256 x 192 the stage's own constraint check bounds it to, one signed
+ * sixteen-bit sample each.  The plane offsets the batch record carries -- the
+ * two words a capture of this destination holds -- are the same arithmetic, so
+ * the allocation and the vendor's own record agree.
+ */
+#define ISPFE_THUMBNAIL_PLANE_BYTES	(EXYNOS_ISPFE_THUMBNAIL_COLUMNS * \
+					 EXYNOS_ISPFE_THUMBNAIL_ROWS * \
+					 sizeof(__s16))
+#define ISPFE_THUMBNAIL_BYTES		(ISPFE_THUMBNAIL_PLANE_BYTES * \
+					 EXYNOS_ISPFE_THUMBNAIL_COMPONENTS)
+static_assert(ISPFE_THUMBNAIL_PLANE_BYTES == 0x18000);
+static_assert(ISPFE_THUMBNAIL_BYTES == 0x48000);
+
+/*
+ * The last samples of the last plane, which is where a frame the branch did
+ * not write leaves the poison the area was armed with.  Four of them rather
+ * than one, so that a scene that happens to end on the poison value has to do
+ * it four times running.
+ */
+#define ISPFE_THUMBNAIL_SENTINEL_SAMPLES	4
+#define ISPFE_THUMBNAIL_SENTINEL_BYTES		\
+	(ISPFE_THUMBNAIL_SENTINEL_SAMPLES * sizeof(__s16))
+
+/*
  * The working areas the front end writes back to, in the order the recipe's
  * ISPFE_BUF_OUTPUT() indices name them.  The sizes are the vendor session's
  * own allocation classes.  Outputs 0--9 are completion/statistics buffers.
- * Outputs 10--12 are the LMP's processed-image destinations --
- * planar linear RGB, YUV420 ML output 0 and interleaved RGB888 ML output 2 --
- * which nothing on this driver's path reads, so they are named without a size:
- * no gate is stated for any of the three and the encoder writes a null address
- * for each.  Outputs 13 and 14 are the phase-detect write DMA's pair, and 14
- * is the only one of the seventeen this driver reads as a picture.  Outputs 15
- * and 16 are the phase-detect *line memory's* pair -- a status queue and the
+ * Outputs 10--12 are the LMP's processed-image destinations -- planar linear
+ * RGB, YUV420 ML output 0 and interleaved RGB888 ML output 2.  Output 10 is
+ * the small linear-RGB frame a back-end stream publishes on its statistics
+ * buffer, and its size is derived above rather than taken from a capture; the
+ * other two are read by nothing here, so they are named without a size, no
+ * gate is stated for either and the encoder writes a null address for each.
+ * Outputs 13 and 14 are the phase-detect write DMA's pair, and 14 is the only
+ * one of the seventeen this driver reads as a *raw* picture.  Outputs 15 and
+ * 16 are the phase-detect *line memory's* pair -- a status queue and the
  * statistics buffer the block reduces a frame into.
  *
- * All of them except the three tapouts are allocated for every stream,
- * whether or not the recipe it runs names them, which is what output 14's
- * 3.6 MB and output 16's half a megabyte cost a camera that sends no
- * phase-detect stream.
+ * All of them except the two tapouts are allocated for every stream, whether
+ * or not the recipe it runs names them, which is what output 14's 3.6 MB and
+ * output 16's half a megabyte cost a camera that sends no phase-detect stream
+ * -- and what output 10's 288 KiB costs a raw one, which gates it off.
  */
 static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(4096),
@@ -832,7 +899,7 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(12288),
 	PDMA_OUTPUT(299008),
-	PDMA_TAPOUT(),
+	PDMA_IMAGE_OUTPUT(ISPFE_THUMBNAIL_BYTES),
 	PDMA_TAPOUT(),
 	PDMA_TAPOUT(),
 	PDMA_OUTPUT(4096),
@@ -861,6 +928,15 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
  */
 #define ISPFE_PDMA_OUTPUT_PDAF_QUEUE	15
 #define ISPFE_PDMA_OUTPUT_PDAF_STATS	16
+
+/*
+ * The linear-RGB write DMA's destination: the one image destination of the
+ * three this driver runs.  It is a statistics area rather than a picture the
+ * user asked for -- it rotates per frame with the grids and is published on
+ * the metadata buffer -- but it is written by an image stage, so it is poisoned
+ * rather than zeroed like the frame buffers.
+ */
+#define ISPFE_PDMA_OUTPUT_RGB		10
 
 #define ISPFE_PDMA_OUTPUT_AWB		4
 #define ISPFE_PDMA_OUTPUT_AE		9
@@ -932,7 +1008,8 @@ static const struct ispfe_pdma_output ispfe_pdma_outputs[] = {
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI1	6
 #define ISPFE_STATS_GRID_HISTOGRAM_ROI2	7
 #define ISPFE_STATS_GRID_PDAF		8
-#define ISPFE_STATS_GRIDS		9
+#define ISPFE_STATS_GRID_THUMBNAIL	9
+#define ISPFE_STATS_GRIDS		10
 
 struct ispfe_stats_area {
 	struct list_head list;
@@ -941,6 +1018,16 @@ struct ispfe_stats_area {
 	dma_addr_t dma[ISPFE_STATS_GRIDS];
 	u64 timestamp;
 	u32 sequence;
+	/*
+	 * The linear-RGB branch's rasters, as the encode that armed this area
+	 * derived them.  Here rather than on the device for the same reason
+	 * @sequence is: an area outlives the moment it was armed, and the copy
+	 * out of it runs on a work item that can land after a second stream
+	 * has started.  Reading the device's copy there would describe this
+	 * area's picture with the next recipe's geometry -- plausible numbers,
+	 * a set flag, and every sample mapped to the wrong part of the frame.
+	 */
+	struct ispfe_lmp_rgb_geometry rgb_geometry;
 	/*
 	 * Which streaming session of the metadata node armed this area.  A
 	 * frame can retire after that session ended -- the front end is a
@@ -1084,8 +1171,12 @@ static bool ispfe_stats_motion_written(const void *grid)
 	return (size_t)motion->rows * stride <= sizeof(motion->luma);
 }
 
-/* Defined below; the phase-detect decode needs the recipe it is running. */
+/*
+ * Defined below; the phase-detect decode needs the recipe it is running, and
+ * the thumbnail's needs the area it is publishing.
+ */
 struct ispfe_device;
+struct ispfe_stats_area;
 
 /*
  * The phase-detect statistics block's result, which is the one this driver
@@ -1123,16 +1214,30 @@ struct ispfe_device;
  * decode reads the disparity origin out of the recipe that is running.
  */
 static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    const struct ispfe_stats_area *stats,
 				    void *out, const void *grid);
 static bool ispfe_stats_pdaf_written(const void *grid);
+
+/*
+ * And the thumbnail's pair, which are here for a second reason as well as that
+ * one: what the decode publishes as geometry is not in the bytes the hardware
+ * wrote, so it comes off the area those bytes were written into.
+ */
+static void ispfe_stats_thumbnail_decode(const struct ispfe_device *ispfe,
+					 const struct ispfe_stats_area *area,
+					 void *out, const void *grid);
+static bool ispfe_stats_thumbnail_written(const void *grid);
 
 static const struct ispfe_stats_grid {
 	unsigned int output;
 	size_t offset;
 	size_t size;
 	/*
-	 * How much of the area the driver clears before the frame is armed,
-	 * which has to cover whatever @written reads.
+	 * How much of the area the driver clears before the frame is armed.
+	 * That and @clear_at together have to cover whatever @written reads:
+	 * a measurement's metadata is at the front of its area and this
+	 * reaches it, while the thumbnail has no metadata and leaves this
+	 * zero, arming a sentinel at the far end with @clear_at instead.
 	 */
 	size_t clear;
 	/*
@@ -1144,6 +1249,27 @@ static const struct ispfe_stats_grid {
 	 */
 	size_t clear_at;
 	size_t clear_at_len;
+	/*
+	 * What those ranges are filled with.  Zero for a measurement, where
+	 * "the hardware wrote nothing" and "the hardware measured nothing" are
+	 * the same answer and the metadata a block writes says which.  Poison
+	 * for the one result that is a *picture*, because a dark scene writes
+	 * zeros itself -- the same distinction PDMA_IMAGE_OUTPUT() makes about
+	 * the shared allocations.
+	 */
+	u8 fill;
+	/*
+	 * How much of the area a copy reads, where that is not @size.  The two
+	 * differ only for the thumbnail, whose published structure carries the
+	 * geometry the driver fills in as well as the picture the hardware
+	 * writes, so it is larger than the area behind it.
+	 *
+	 * Only meaningful with a @decode, and asserted so: the plain path
+	 * copies @size bytes out of the area, and setting this without one
+	 * would relax the bound that makes that copy safe rather than
+	 * describing a narrower read.
+	 */
+	size_t reads;
 	u32 flag;
 	bool (*written)(const void *grid);
 	/*
@@ -1152,7 +1278,8 @@ static const struct ispfe_stats_grid {
 	 * writes a 384 KiB full-frame region before the windows a focus loop
 	 * reads, and publishes 2.8 KB out of 520 KiB.
 	 */
-	void (*decode)(const struct ispfe_device *ispfe, void *out,
+	void (*decode)(const struct ispfe_device *ispfe,
+		       const struct ispfe_stats_area *area, void *out,
 		       const void *grid);
 } ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
 	[ISPFE_STATS_GRID_AWB] = {
@@ -1257,6 +1384,28 @@ static const struct ispfe_stats_grid {
 		.flag = EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2,
 		.written = ispfe_stats_histogram_written,
 		.clear = sizeof(struct exynos_ispfe_stats_grid_header),
+	},
+	[ISPFE_STATS_GRID_THUMBNAIL] = {
+		.output = ISPFE_PDMA_OUTPUT_RGB,
+		.offset = offsetof(struct exynos_ispfe_stats_buffer,
+				   thumbnail),
+		.size = sizeof(struct exynos_ispfe_stats_thumbnail),
+		.reads = ISPFE_THUMBNAIL_BYTES,
+		.flag = EXYNOS_ISPFE_STATS_THUMBNAIL,
+		.written = ispfe_stats_thumbnail_written,
+		.decode = ispfe_stats_thumbnail_decode,
+		/*
+		 * Nothing at the front of the area, because there is no
+		 * metadata there: the write DMA starts at the first sample of
+		 * the first plane.  The sentinel is at the other end instead --
+		 * the last samples the third plane's interface produces -- so
+		 * what it says is that the branch ran this frame and reached
+		 * the end of it, rather than that it started.
+		 */
+		.clear_at = ISPFE_THUMBNAIL_BYTES -
+			    ISPFE_THUMBNAIL_SENTINEL_BYTES,
+		.clear_at_len = ISPFE_THUMBNAIL_SENTINEL_BYTES,
+		.fill = ISPFE_FRAME_POISON,
 	},
 };
 
@@ -1579,7 +1728,6 @@ static const struct ispfe_pdma_program *ispfe_program_for(u32 width, u32 height,
 
 	return NULL;
 }
-#define ISPFE_FRAME_POISON		0xa5
 
 /*
  * The ISPFE front end proper.  +0x50000 reads 0x1003aa in every capture taken
@@ -2101,6 +2249,25 @@ struct ispfe_device {
 	 */
 	u8 *lsc_unity;
 	int lsc_input;
+	int rgb_filter_input;
+	/*
+	 * The linear-RGB branch's rasters, as the last encode derived them
+	 * from the running recipe.  Every slot encodes the same recipe, so
+	 * every encode writes the same two rasters here; what reads them is
+	 * ispfe_stats_take(), which snapshots them into the area the frame's
+	 * statistics will be published from.  A copy-out reads that snapshot
+	 * and never this, because an area can outlive the stream that armed
+	 * it and this cannot.
+	 */
+	struct ispfe_lmp_rgb_geometry rgb_geometry;
+	/*
+	 * The live resampling filter for the linear-RGB scaler: an equal-weight
+	 * box until a parameters block replaces it, and swapped rather than
+	 * copied when one does.
+	 */
+	__s16 *rgb_filter;
+	void *rgb_filter_area;
+	dma_addr_t rgb_filter_dma;
 	/*
 	 * Byte offsets within a program of the frame destination's two address
 	 * halves, so a destination can be retargeted without searching the
@@ -3115,7 +3282,9 @@ static void ispfe_stats_area_put_locked(struct ispfe_device *ispfe,
 /*
  * Take an area for a slot that is about to be encoded, and clear the metadata
  * header of each grid in it so that a grid the hardware does not write this
- * frame reports no geometry rather than the last frame's.
+ * frame reports no geometry rather than the last frame's.  A grid holding a
+ * picture has no metadata header and is armed with poison at its far end
+ * instead; see the descriptors' @fill.
  *
  * Nothing is taken while the metadata node is not streaming: an ordinary
  * capture then keeps writing its statistics into the shared allocations, which
@@ -3142,6 +3311,18 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		}
 		list_del_init(&area->list);
 		area->session = ispfe->stats_session;
+		/*
+		 * And the branch's rasters, taken now rather than read at
+		 * copy-out.  The device's copy is the running recipe's --
+		 * every slot's encode derives the same one, and the stream
+		 * start that would change it has already run by the time any
+		 * area is taken, because the slots are encoded there.  What
+		 * this snapshot buys is the case that outlives the stream: an
+		 * area still waiting to be copied out when a second stream has
+		 * started would otherwise be published with that stream's
+		 * geometry.
+		 */
+		area->rgb_geometry = ispfe->rgb_geometry;
 		ispfe->stats_slot[slot] = area;
 	}
 
@@ -3196,9 +3377,12 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		if (WARN_ON_ONCE(clear > PAGE_SIZE))
 			clear = PAGE_SIZE;
 
-		memset(area->grid[grid], 0, clear);
-		dma_sync_single_for_device(ispfe->dev, area->dma[grid], clear,
-					   DMA_TO_DEVICE);
+		if (clear) {
+			memset(area->grid[grid], ispfe_stats_grids[grid].fill,
+			       clear);
+			dma_sync_single_for_device(ispfe->dev, area->dma[grid],
+						   clear, DMA_TO_DEVICE);
+		}
 
 		clear = ispfe_stats_grids[grid].clear_at_len;
 		if (!clear)
@@ -3214,7 +3398,8 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		if (WARN_ON_ONCE(off % PAGE_SIZE + clear > PAGE_SIZE))
 			continue;
 
-		memset((u8 *)area->grid[grid] + off, 0, clear);
+		memset((u8 *)area->grid[grid] + off,
+		       ispfe_stats_grids[grid].fill, clear);
 		dma_sync_single_for_device(ispfe->dev, area->dma[grid] + off,
 					   clear, DMA_TO_DEVICE);
 	}
@@ -3722,17 +3907,43 @@ static int ispfe_stats_grid_of_output(unsigned int index)
 }
 
 /*
- * Whether a recipe's destination is one this driver does not run, and so has
- * neither an allocation nor an enable.  Only the LMP image tapouts are gated
- * off; everything else a recipe names is always there.
+ * Whether this stream runs the linear-RGB branch -- the scaler and the write
+ * DMA that produce the thumbnail on the statistics buffer.
+ *
+ * Back-end recipes only, and that is a decision rather than a limitation.  The
+ * raw recipes carry the vendor's own configuration of that branch, including a
+ * coefficient bank the corpus says is a stale peek at a different output's,
+ * and they carry it for a destination they gate off -- so it has never been
+ * run and is not an oracle for what to run.  Turning the branch on there would
+ * mean stating those recipes' scaler as well, which is a second change with
+ * its own evidence to gather and no consumer asking for it: what reads the
+ * thumbnail is an IPA on the processed path.
+ *
+ * A staged program is a raw recipe by construction -- ispfe_pdma_staged_validate()
+ * refuses any other length -- so this also leaves that path exactly as it was.
+ */
+static bool ispfe_pdma_rgb_branch(const struct ispfe_device *ispfe)
+{
+	return ispfe->prog->backend_recipe;
+}
+
+/*
+ * Whether a recipe's destination is one this stream does not run, and so has
+ * no enable and no address.  Two of the three LMP image tapouts are gated off
+ * always; the linear-RGB one follows the branch above, so a raw stream leaves
+ * it exactly as it was before that branch existed -- null address, no gate --
+ * while a back-end stream writes it.
  */
 static bool ispfe_pdma_buffer_gated(const struct ispfe_device *ispfe, u8 buffer)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
 
-	return ISPFE_BUF_TO_KIND(buffer) == ISPFE_BUF_KIND_OUTPUT &&
-	       index < ARRAY_SIZE(ispfe_pdma_outputs) &&
-	       ispfe_pdma_outputs[index].tapout;
+	if (ISPFE_BUF_TO_KIND(buffer) != ISPFE_BUF_KIND_OUTPUT ||
+	    index >= ARRAY_SIZE(ispfe_pdma_outputs))
+		return false;
+	if (index == ISPFE_PDMA_OUTPUT_RGB)
+		return !ispfe_pdma_rgb_branch(ispfe);
+	return ispfe_pdma_outputs[index].tapout;
 }
 
 /*
@@ -3745,7 +3956,7 @@ static bool ispfe_pdma_buffer_gated(const struct ispfe_device *ispfe, u8 buffer)
 static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 				    dma_addr_t bayer, dma_addr_t backend,
 				    const struct ispfe_stats_area *stats,
-				    dma_addr_t lsc)
+				    dma_addr_t lsc, dma_addr_t filter)
 {
 	unsigned int index = ISPFE_BUF_TO_INDEX(buffer);
 	int grid;
@@ -3755,12 +3966,15 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 		return bayer;
 	case ISPFE_BUF_KIND_INPUT:
 		/*
-		 * The shading table is the one input a frame can carry its own
-		 * copy of; @lsc is this slot's, or zero for the paths that
-		 * keep the shared area.
+		 * The shading table and the linear-RGB scaler's filter are the
+		 * inputs a frame can carry its own copy of, because both come
+		 * from userspace; @lsc and @filter are this slot's, or zero
+		 * for the paths that keep the shared area.
 		 */
 		if (lsc && (int)index == ispfe->lsc_input)
 			return lsc;
+		if (filter && (int)index == ispfe->rgb_filter_input)
+			return filter;
 		if (index < ispfe->prog->num_inputs)
 			return ispfe->blocks_dma +
 			       ispfe->prog->inputs[index].area_offset;
@@ -3875,6 +4089,19 @@ static dma_addr_t ispfe_pdma_buffer(struct ispfe_device *ispfe, u8 buffer,
 #define ISPFE_LMP_OUTPUT_GATES_AT	0x20
 #define ISPFE_LMP_BATCH_IRQS_AT		0x24
 #define ISPFE_LMP_BATCH_CONFIG_MIN	0xc8
+
+/*
+ * And the two words of the 0x20-byte header the driver states: where the
+ * linear-RGB destination's second and third planes start inside its
+ * allocation.  The header holds eight words, a pair per image destination in
+ * the order the enable word takes them, and %ISPFE_LMP_TAPOUT_GATES names four
+ * of those destinations; the captured record leaves the fourth pair zero.  The
+ * six words this driver does not write belong to destinations it does not run,
+ * whose base addresses the encoder nulls, so an offset from one of them
+ * describes nothing and stays at the zero the blanked record already has.
+ */
+#define ISPFE_LMP_RGB_PLANE1_AT		0x00
+#define ISPFE_LMP_RGB_PLANE2_AT		0x04
 
 /*
  * What this driver runs: the six statistics taps the front end publishes.  The
@@ -4033,12 +4260,23 @@ static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
  * its own.  What the corpus holds there, for reading the register: `lmp/scaler`
  * takes only three values across all 54 programs -- 0x10, 0x50 and 0x70, one
  * per enabled output -- and `lmp/rgb_scaler` two, 0x02 and 0x06, differing in
- * `sw_binning_enable`.  See ispfe_pdma_apply_scalers().
+ * `sw_binning_enable`.  The first is ispfe_pdma_apply_scalers()'s to state and
+ * the second is ispfe_pdma_apply_rgb()'s, which builds both of those values
+ * from the raster rather than choosing between them.
  */
 #define ISPFE_LMP_SCALER_APPLIED	BIT(0)
 #define ISPFE_LMP_RGB_SCALER_APPLIED	BIT(1)
+#define ISPFE_LMP_RGB_TAPOUT_APPLIED	BIT(2)
+/*
+ * The three stages a back-end recipe must have handed to an apply function by
+ * the end of an encode: the image scaler, whose enables the driver clears so
+ * that the two coefficient tables it drops have no reader, and the linear-RGB
+ * scaler and write DMA, which the driver states from the raster.  The first is
+ * ispfe_pdma_apply_scalers()'s and the other two are ispfe_pdma_apply_rgb()'s.
+ */
 #define ISPFE_LMP_SCALERS_APPLIED	(ISPFE_LMP_SCALER_APPLIED | \
-					 ISPFE_LMP_RGB_SCALER_APPLIED)
+					 ISPFE_LMP_RGB_SCALER_APPLIED | \
+					 ISPFE_LMP_RGB_TAPOUT_APPLIED)
 
 /*
  * The interfaces of the same four image destinations %ISPFE_LMP_TAPOUT_GATES
@@ -4048,12 +4286,20 @@ static_assert(ISPFE_LMP_RGB_SCALER_CONFIG_REG0 == 0x00054b70);
  * are the same destinations, so the two lists are what make dropping one from
  * either a deliberate edit.
  *
+ * The RGB tapout's three are named on their own because a back-end stream runs
+ * that destination and puts them back; see ispfe_pdma_apply_active_ifs().
+ * They stay part of the withdrawn set, so the word a capture came with is
+ * still reduced to the same 27 bits whichever path is running, and restoring
+ * them is a statement rather than a hole in the check.
+ *
  * The CDAF word is not a run of three: `GetActiveDramInterfaces` ORs this one
  * constant behind that block's enable, bit 32 skipped, so it is transcribed
  * rather than built out of a first interface and a count.
  */
-#define ISPFE_LMP_TAPOUT_IFS		(GENMASK_ULL(4, 2) | \
+#define ISPFE_LMP_RGB_TAPOUT_IFS	GENMASK_ULL(4, 2)
+#define ISPFE_LMP_TAPOUT_IFS		(ISPFE_LMP_RGB_TAPOUT_IFS | \
 					 GENMASK_ULL(14, 6))
+static_assert(ISPFE_LMP_RGB_TAPOUT_IFS == 0x000000000000001cULL);
 static_assert(ISPFE_LMP_TAPOUT_IFS == 0x0000000000007fdcULL);
 #define ISPFE_LMP_CDAF_IFS		0x0000001effc00000ULL
 #define ISPFE_LMP_WITHDRAWN_IFS		(ISPFE_LMP_TAPOUT_IFS | \
@@ -4082,6 +4328,13 @@ static_assert(ISPFE_LMP_TAPOUT_IFS == 0x0000000000007fdcULL);
  */
 static_assert(ISPFE_LMP_CAPTURED_ACTIVE_IFS == 0x00002120003e90dcULL);
 static_assert(ISPFE_LMP_FIXED_ACTIVE_IFS == 0x00002120003e8000ULL);
+/*
+ * What the driver puts back for a stream that runs the linear-RGB branch is
+ * exactly what the vendor's own word carries for it, rather than three bits
+ * chosen here.
+ */
+static_assert((ISPFE_LMP_CAPTURED_ACTIVE_IFS & ISPFE_LMP_RGB_TAPOUT_IFS) ==
+	      ISPFE_LMP_RGB_TAPOUT_IFS);
 static_assert(!(ISPFE_LMP_ALIGNMENT_FORMATTER_IFS &
 		ISPFE_LMP_WITHDRAWN_IFS));
 
@@ -4094,6 +4347,7 @@ static_assert(!(ISPFE_LMP_ALIGNMENT_FORMATTER_IFS &
  */
 #define ISPFE_LMP_LUT_INSTANCE_STRIDE	0x3ae8
 #define ISPFE_LMP_LSC_LUT_REG		0x0006a02c
+#define ISPFE_LMP_RGB_SCALER_LUT_REG	0x00069d0c
 /*
  * The linearisation curve LMP reads through that same area, and it is an
  * exact identity: 129 knots of four unsigned Q15 channels in the R, Gr, Gb, B
@@ -4444,27 +4698,33 @@ static int ispfe_pdma_apply_backend_output(struct ispfe_device *ispfe,
 }
 
 /*
- * State both scaler stages off, which is the whole of what the recipe carries
- * for them.
+ * State the image scaler stage off, which is the whole of what the recipe
+ * carries for it.
  *
  * Not the same move as the gate word and the interface mask beside it.  Those
  * stop a destination being *written*; this stops the stage computing anything
  * for it, which is how Lyric itself turns an output off -- and, because the
  * builder emits a scaler's table only behind these bits, it is what lets the
- * recipe stop carrying 768 bytes of scaler and RGB-scaler coefficients.
+ * recipe stop carrying 512 bytes of scaler coefficients.
  *
  * This used to clear the input-scale bits out of a captured word and leave the
- * other sixteen registers of `lmp/scaler` and seven of `lmp/rgb_scaler`
- * replayed.  They were configuring a stage that had already been told it is
- * off, so the recipe stubs both commands to this one register and the driver
- * writes it: the payload arrives as four zero bytes and this is what says so
- * on purpose rather than by omission.  Everything past it keeps its reset
- * value, the same shape the five other stubbed blocks take.
+ * other sixteen registers of `lmp/scaler` replayed.  They were configuring a
+ * stage that had already been told it is off, so the recipe stubs the command
+ * to this one register and the driver writes it: the payload arrives as four
+ * zero bytes and this is what says so on purpose rather than by omission.
+ * Everything past it keeps its reset value, the same shape the four other
+ * stubbed blocks take.
  *
  * The two still have to move together.  A cleared enable whose table is still
  * in the program is a shape no capture holds, and so is the reverse; the recipe
- * drops exactly the tables whose stages are stated off here, and the encoder's
- * own completeness check below is what says both commands were present.
+ * drops exactly the tables whose stage is stated off here, and the encoder's
+ * own completeness check below is what says the command was present.
+ *
+ * The *RGB* scaler was this function's too until the linear-RGB branch was
+ * turned on.  It is ispfe_pdma_apply_rgb()'s now, and the two cannot both hold
+ * it: they demand opposite lengths for the same register, and this one runs
+ * second, so leaving the case here would clear the enable that one had just
+ * set.  What moved with it is the ISPFE_LMP_RGB_SCALER_APPLIED bookkeeping.
  *
  * Back-end recipe only.  The raw recipes still carry all three tables and both
  * stages in full, and the pairing is per recipe rather than per driver.
@@ -4473,24 +4733,24 @@ static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
 				    const struct ispfe_pdma_cmd *cmd,
 				    u8 *payload, unsigned int *applied)
 {
-	u32 flag;
-
 	if (!ispfe->prog->backend_recipe)
 		return 0;
-	if (cmd->reg == ISPFE_LMP_SCALER_CONFIG_REG0)
-		flag = ISPFE_LMP_SCALER_APPLIED;
-	else if (cmd->reg == ISPFE_LMP_RGB_SCALER_CONFIG_REG0)
-		flag = ISPFE_LMP_RGB_SCALER_APPLIED;
-	else
+	if (cmd->reg != ISPFE_LMP_SCALER_CONFIG_REG0)
 		return 0;
 	/*
 	 * Exactly the enable register and nothing after it: a recipe that went
-	 * back to carrying the rest of either block would be replaying tuning
-	 * for a stage this says is off, and the stage's coefficient tables are
+	 * back to carrying the rest of the block would be replaying tuning for
+	 * a stage this says is off, and the stage's coefficient tables are
 	 * dropped on the strength of that.
 	 */
-	if (cmd->len != sizeof(u32) || (*applied & flag))
+	if (cmd->len != sizeof(u32) ||
+	    (*applied & ISPFE_LMP_SCALER_APPLIED)) {
+		dev_err(ispfe->dev,
+			"PDMA image scaler command is %u bytes%s\n", cmd->len,
+			(*applied & ISPFE_LMP_SCALER_APPLIED) ?
+			" and a second one" : "");
 		return -EINVAL;
+	}
 
 	/*
 	 * The encoder has already memset a NULL payload to zero, so this write
@@ -4498,10 +4758,246 @@ static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
 	 * than left to that, and so a staged program cannot arrive with an
 	 * enable set.  What the function is really for is the two lines around
 	 * it -- the shape assertion above and the completeness bookkeeping
-	 * below, which is what pairs these stages with the dropped tables.
+	 * below, which is what pairs this stage with the dropped tables.
 	 */
 	put_unaligned_le32(0, payload);
-	*applied |= flag;
+	*applied |= ISPFE_LMP_SCALER_APPLIED;
+
+	return 0;
+}
+
+/*
+ * The linear-RGB branch: a scaler and a write DMA, stated from the raster
+ * rather than replayed.
+ *
+ * Every word of both is geometry, a literal or an address, which is what makes
+ * the branch shippable at all -- turning it on used to look like putting a
+ * couple of hundred captured words back in the kernel, and it is not.  Sixteen
+ * payload words between the two commands, and the recipe stores none of them.
+ * The one thing here that is neither is the scaler's resampling filter, which
+ * is a function of the ratio and arrives from userspace because deriving it
+ * needs floating point; see EXYNOS_ISPFE_PARAM_BLOCK_RGB_SCALER.
+ *
+ * The geometry comes from the DDS command, which every recipe writes before
+ * this one -- the encoder walks commands in order, so @geom carries it forward
+ * the way the other apply functions carry their counters.  A recipe that
+ * reordered them, or that has no DDS at all, is refused rather than silently
+ * encoded from zero; so is a second command of any of the three.
+ *
+ * Back-end recipes only, per ispfe_pdma_rgb_branch(): a raw recipe replays the
+ * vendor's own configuration of this branch for a destination it gates off,
+ * and this function does not touch it.
+ *
+ * What the block is handed:
+ *
+ *   - the DDS output, halved on each axis when it exceeds 1024 x 768, because
+ *     the stage bins by two before it scales and that threshold is the
+ *     hardware's own;
+ *   - no crop.  The vendor's programs sometimes take two pixels off each side
+ *     horizontally and this does not; it is policy, not description, and there
+ *     is nothing here for it to serve.  It is also the whole of the difference
+ *     between what this states and what the ultrawide capture holds, which is
+ *     why that recipe's header lists a crop word and a horizontal factor the
+ *     driver does not reproduce;
+ *   - 256 x 192 out, which is the largest this stage can emit -- its own
+ *     constraint check bounds it there and all 54 captured programs carry it;
+ *   - Q21 factors, floor(src / dst << 21), which reproduce every captured pair
+ *     once that crop is accounted for.
+ */
+/*
+ * The scaler factors, which two stages need: the one this driver states below
+ * and the geometry check that validates a staged program.  Q21, floored, and
+ * bounded by the field they go in.
+ */
+#define ISPFE_LMP_SCALER_FACTOR_MAX	GENMASK(23, 0)
+
+static u64 ispfe_pdma_scale_factor(u32 source, u32 destination)
+{
+	return div_u64((u64)source << 21, destination);
+}
+
+/* How far into the DDS payload its output geometry is. */
+#define ISPFE_LMP_DDS_CONFIG_MIN	0x0c
+
+#define ISPFE_LMP_RGB_TAPOUT_CONFIG_REG0	0x00054c94
+static_assert(ISPFE_LMP_RGB_TAPOUT_CONFIG_REG0 +
+	      ISPFE_LMP_INSTANCE_STRIDE == 0x0005632c);
+/*
+ * The DDS's back-end instance.  ISPFE_LMP_DDS_CONFIG_REG is the raw one, and
+ * ispfe_lmp_block_is() wants the low address of the pair -- handed the high one
+ * it matches neither recipe, which is a geometry silently taken as unknown
+ * rather than a build failure.
+ */
+#define ISPFE_LMP_DDS_CONFIG_REG0	(ISPFE_LMP_DDS_CONFIG_REG - \
+					 ISPFE_LMP_INSTANCE_STRIDE)
+static_assert(ISPFE_LMP_DDS_CONFIG_REG0 == 0x00054abc);
+#define ISPFE_LMP_RGB_BIN_MAX_WIDTH		1024
+#define ISPFE_LMP_RGB_BIN_MAX_HEIGHT		768
+#define ISPFE_LMP_RGB_SCALER_ENABLE		BIT(1)
+#define ISPFE_LMP_RGB_SCALER_BINNING		BIT(2)
+#define ISPFE_LMP_RGB_TAPOUT_ENABLE		BIT(1)
+#define ISPFE_LMP_RGB_SCALER_WORDS		8
+#define ISPFE_LMP_RGB_TAPOUT_WORDS		8
+
+/* The scaler's input, after the stage's own 2x pre-bin. */
+static void ispfe_lmp_rgb_scaler_source(const struct ispfe_lmp_rgb_geometry *geom,
+					u32 *width, u32 *height, bool *binning)
+{
+	*binning = geom->width > ISPFE_LMP_RGB_BIN_MAX_WIDTH ||
+		   geom->height > ISPFE_LMP_RGB_BIN_MAX_HEIGHT;
+	*width = *binning ? geom->width / 2 : geom->width;
+	*height = *binning ? geom->height / 2 : geom->height;
+}
+
+static int ispfe_pdma_apply_rgb(struct ispfe_device *ispfe,
+				const struct ispfe_pdma_cmd *cmd, u8 *payload,
+				struct ispfe_lmp_rgb_geometry *geom,
+				unsigned int *applied)
+{
+	u32 width, height;
+	u64 horizontal, vertical;
+	bool binning;
+
+	if (!ispfe_pdma_rgb_branch(ispfe))
+		return 0;
+
+	if (ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_DDS_CONFIG_REG0)) {
+		u32 flags, source, divisor;
+
+		if (cmd->len < ISPFE_LMP_DDS_CONFIG_MIN || geom->known) {
+			dev_err(ispfe->dev,
+				"PDMA recipe has %s downscaler command\n",
+				geom->known ? "a second" : "a short");
+			return -EINVAL;
+		}
+		/*
+		 * The one word of this payload the driver neither interprets
+		 * nor reproduces, and it is zero in all five captured
+		 * programs.  It is refused rather than ignored because what
+		 * the thumbnail publishes as @source_left and @source_top is
+		 * zero, on the strength of this stage reading the whole
+		 * raster: a program that set this could be cropping, and the
+		 * rectangle would be a claim rather than a description.
+		 */
+		if (get_unaligned_le32(payload + 4)) {
+			dev_err(ispfe->dev,
+				"PDMA downscaler word 1 is %#x, not zero\n",
+				get_unaligned_le32(payload + 4));
+			return -EINVAL;
+		}
+		flags = get_unaligned_le32(payload);
+		source = get_unaligned_le32(payload + 8);
+		divisor = 1 << (((flags >> 8) & 3) + 1);
+		geom->source_width = source & U16_MAX;
+		geom->source_height = source >> 16;
+		/*
+		 * The same three conditions the staged program's geometry
+		 * check makes, and for the same reason: a source the divisor
+		 * does not divide describes an output the hardware rounds
+		 * somewhere this arithmetic does not know about.
+		 */
+		if (!geom->source_width || !geom->source_height ||
+		    geom->source_width % divisor || geom->source_height % divisor) {
+			dev_err(ispfe->dev,
+				"PDMA downscaler source %ux%u does not divide by %u\n",
+				geom->source_width, geom->source_height,
+				divisor);
+			return -EINVAL;
+		}
+		geom->width = geom->source_width / divisor;
+		geom->height = geom->source_height / divisor;
+		geom->known = true;
+		return 0;
+	}
+
+	if (ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_RGB_SCALER_CONFIG_REG0)) {
+		if (cmd->len != ISPFE_LMP_RGB_SCALER_WORDS * sizeof(u32) ||
+		    !geom->known ||
+		    (*applied & ISPFE_LMP_RGB_SCALER_APPLIED)) {
+			dev_err(ispfe->dev,
+				"PDMA linear-RGB scaler command is %u bytes, geometry %sknown%s\n",
+				cmd->len, geom->known ? "" : "un",
+				(*applied & ISPFE_LMP_RGB_SCALER_APPLIED) ?
+				", and a second one" : "");
+			return -EINVAL;
+		}
+		ispfe_lmp_rgb_scaler_source(geom, &width, &height, &binning);
+		/*
+		 * Downscaling only, which is what this stage does: a source
+		 * narrower or shorter than the fixed output would ask it to
+		 * interpolate, and nothing here knows whether it can.  An odd
+		 * source that has to be binned is the staged check's condition
+		 * as well -- the pre-bin discards the odd column rather than
+		 * averaging it, so the factor would describe a raster the
+		 * hardware did not read.
+		 */
+		if (width < EXYNOS_ISPFE_THUMBNAIL_COLUMNS ||
+		    height < EXYNOS_ISPFE_THUMBNAIL_ROWS ||
+		    (binning && ((geom->width & 1) || (geom->height & 1)))) {
+			dev_err(ispfe->dev,
+				"PDMA linear-RGB scaler source %ux%u cannot reach %ux%u\n",
+				width, height, EXYNOS_ISPFE_THUMBNAIL_COLUMNS,
+				EXYNOS_ISPFE_THUMBNAIL_ROWS);
+			return -EINVAL;
+		}
+		horizontal = ispfe_pdma_scale_factor(width,
+						     EXYNOS_ISPFE_THUMBNAIL_COLUMNS);
+		vertical = ispfe_pdma_scale_factor(height,
+						   EXYNOS_ISPFE_THUMBNAIL_ROWS);
+		if (horizontal > ISPFE_LMP_SCALER_FACTOR_MAX ||
+		    vertical > ISPFE_LMP_SCALER_FACTOR_MAX) {
+			dev_err(ispfe->dev,
+				"PDMA linear-RGB scale factor %llu/%llu does not fit\n",
+				horizontal, vertical);
+			return -EINVAL;
+		}
+
+		/*
+		 * The whole payload is the driver's: the recipe emits this
+		 * command with none, so the memset restates what the encoder
+		 * already did rather than discarding anything.  It is what
+		 * leaves the crop at zero and the four unused words with it.
+		 */
+		memset(payload, 0, cmd->len);
+		put_unaligned_le32(ISPFE_LMP_RGB_SCALER_ENABLE |
+				   (binning ? ISPFE_LMP_RGB_SCALER_BINNING : 0),
+				   payload);
+		put_unaligned_le32(EXYNOS_ISPFE_THUMBNAIL_COLUMNS |
+				   EXYNOS_ISPFE_THUMBNAIL_ROWS << 16,
+				   payload + 4);
+		put_unaligned_le32(horizontal, payload + 8);
+		put_unaligned_le32(vertical, payload + 12);
+		put_unaligned_le32(width | height << 16, payload + 24);
+		*applied |= ISPFE_LMP_RGB_SCALER_APPLIED;
+		return 0;
+	}
+
+	if (ispfe_lmp_block_is(cmd->reg, ISPFE_LMP_RGB_TAPOUT_CONFIG_REG0)) {
+		if (cmd->len != ISPFE_LMP_RGB_TAPOUT_WORDS * sizeof(u32) ||
+		    !(*applied & ISPFE_LMP_RGB_SCALER_APPLIED) ||
+		    (*applied & ISPFE_LMP_RGB_TAPOUT_APPLIED)) {
+			dev_err(ispfe->dev,
+				"PDMA linear-RGB write DMA command is %u bytes%s%s\n",
+				cmd->len,
+				(*applied & ISPFE_LMP_RGB_SCALER_APPLIED) ?
+				"" : " and has no scaler before it",
+				(*applied & ISPFE_LMP_RGB_TAPOUT_APPLIED) ?
+				" and is a second one" : "");
+			return -EINVAL;
+		}
+		/*
+		 * Planar, which is what leaves the three components in three
+		 * planes the batch record gives offsets for, and a row stride
+		 * of one sample per column.  The three base addresses stay
+		 * zero: they arrive per frame in the batch record.
+		 */
+		memset(payload, 0, cmd->len);
+		put_unaligned_le32(ISPFE_LMP_RGB_TAPOUT_ENABLE, payload);
+		put_unaligned_le32(EXYNOS_ISPFE_THUMBNAIL_COLUMNS *
+				   sizeof(__s16), payload + 4);
+		*applied |= ISPFE_LMP_RGB_TAPOUT_APPLIED;
+		return 0;
+	}
 
 	return 0;
 }
@@ -4524,6 +5020,11 @@ static int ispfe_pdma_apply_scalers(struct ispfe_device *ispfe,
  * after they are taken out is checked against the one shape every captured
  * program carries, so a future capture that moved anything else is refused
  * rather than re-derived on an assumption about the other 27 bits.
+ *
+ * Then the linear-RGB tapout's three go back in for a stream that runs it.
+ * Restored after the check rather than exempted from it, so the remainder
+ * being tested is the same 27 bits on either path -- and restored from a
+ * constant the corpus pins, not from whatever the capture happened to carry.
  */
 static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 				       const struct ispfe_pdma_cmd *cmd,
@@ -4543,6 +5044,9 @@ static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
 		    ISPFE_LMP_ALIGNMENT_FORMATTER_IFS))
 		return -EINVAL;
 
+	if (ispfe_pdma_rgb_branch(ispfe))
+		ifs |= ISPFE_LMP_RGB_TAPOUT_IFS;
+
 	put_unaligned_le64(ifs, payload + ISPFE_LMP_ACTIVE_IFS_AT);
 	*applied = true;
 
@@ -4556,23 +5060,33 @@ static int ispfe_pdma_apply_active_ifs(struct ispfe_device *ispfe,
  * sixteen 0xa8-byte entries, each an enable word, an interrupt word and twenty
  * 64-bit destination addresses.  Every captured program has a batch size of
  * one, so entry 0 is the whole of it and the other fifteen are zero.  The
- * addresses are relocations, and the plane offsets belong to the linear RGB
- * frame and the three machine-learning outputs -- destinations this driver
- * does not run, whose base addresses the encoder nulls in the same pass, so an
- * offset from one of them describes nothing and is left at zero too.
+ * addresses are relocations, and the plane offsets are a pair per image
+ * destination: the linear-RGB frame's are stated below, because a back-end
+ * stream writes that destination, and the two machine-learning outputs' are
+ * left at zero because their base addresses the encoder nulls in the same
+ * pass, so an offset from one of them describes nothing.
  *
- * That leaves two words for this function, and the recipe therefore carries no
- * bytes at all for the record: the encoder blanks the whole 0xaa0, and what
- * reaches the hardware is these two words and the relocated addresses.
+ * That leaves four words for this function -- two in the header and two in the
+ * entry -- and the recipe therefore carries no bytes at all for the record:
+ * the encoder blanks the whole 0xaa0, and what reaches the hardware is these
+ * four words and the relocated addresses.
  *
- * The enable word is one bit per destination.  Three of the ones the vendor's
- * programs set are the image tapouts above -- four on the main camera, which
- * enables the second machine-learning output as well; leaving them on would
- * cost 5.1 MiB of coherent memory and about a megabyte of DMA writes per frame
- * for a picture with no consumer, so they are simply not in the word.  The
- * main camera's contrast-detect autofocus statistics go the same way and for
- * the same reason, which is why its generated header lists two captured
- * addresses the encoder nulls where the ultrawide's lists none.
+ * The enable word is one bit per destination.  Two of the ones the vendor's
+ * programs set are the machine-learning tapouts above -- three on the main
+ * camera, which enables the second one as well; leaving them on would cost
+ * 4.8 MiB of coherent memory and about a megabyte of DMA writes per frame for
+ * a picture with no consumer, so they are simply not in the word.  The main
+ * camera's contrast-detect autofocus statistics go the same way and for the
+ * same reason, which is why its generated header lists two captured addresses
+ * the encoder nulls where the ultrawide's lists none.
+ *
+ * The third image destination is the linear-RGB one, and a back-end stream
+ * does read it: it is 288 KiB a frame of small linear picture that the
+ * statistics buffer carries and an IPA tone-maps from.  So its bit goes in
+ * behind the same predicate that states its scaler, and the two plane offsets
+ * in the record's header go with it -- they are where the second and third
+ * components start, which is the same arithmetic the allocation is, and both
+ * reproduce the words the captures carry exactly.
  *
  * Stating the word rather than masking a replayed one moves a check earlier
  * rather than losing it.  The recipe generator lists every non-zero word of
@@ -4591,6 +5105,14 @@ static int ispfe_pdma_apply_batch(struct ispfe_device *ispfe,
 		return 0;
 	if (cmd->len < ISPFE_LMP_BATCH_CONFIG_MIN || *applied)
 		return -EINVAL;
+
+	if (ispfe_pdma_rgb_branch(ispfe)) {
+		gates |= ISPFE_LMP_GATE_RGB_OUTPUT;
+		put_unaligned_le32(ISPFE_THUMBNAIL_PLANE_BYTES,
+				   payload + ISPFE_LMP_RGB_PLANE1_AT);
+		put_unaligned_le32(2 * ISPFE_THUMBNAIL_PLANE_BYTES,
+				   payload + ISPFE_LMP_RGB_PLANE2_AT);
+	}
 
 	/*
 	 * The producer's two follow the one flag that already decides whether
@@ -4705,6 +5227,12 @@ static int ispfe_lsc_input(const struct ispfe_pdma_program *prog)
 			       ISPFE_LSC_LUT_BYTES);
 }
 
+static int ispfe_rgb_filter_input(const struct ispfe_pdma_program *prog)
+{
+	return ispfe_lut_input(prog, ISPFE_LMP_RGB_SCALER_LUT_REG,
+			       ISPFE_RGB_FILTER_BYTES);
+}
+
 /* One grid sample read back out of the tiled table, for the diagnostic. */
 static u16 ispfe_lsc_sample(const u8 *tiled, unsigned int row,
 			    unsigned int column, unsigned int channel)
@@ -4741,6 +5269,57 @@ static const u8 *ispfe_lsc_default(const struct ispfe_device *ispfe,
 	if (!prog->inputs[input].data)
 		return ispfe->lsc_unity;
 	return prog->inputs[input].data;
+}
+
+/*
+ * The filter a stream starts on, and what a disabled block asks for.
+ *
+ * An equal-weight box over the four taps, ignoring the phase.  Not nearest
+ * neighbour, which would be the obvious default and is not expressible: unity
+ * here is 32768 and a tap is signed sixteen bits, so no single tap can hold a
+ * whole phase's weight and every filter this block runs spreads it over at
+ * least two.  The vendor's own does, at every phase, because this stage only
+ * ever downscales.
+ *
+ * A box is the honest answer to not knowing the ratio.  It is soft where a
+ * fitted filter would be sharp, and it does not alias, which is the failure
+ * that would matter -- the same trade the shading grid's unity default makes,
+ * and for the same reason: a driver that has not been given a filter should
+ * look like it rather than carry a guess.
+ *
+ * It is also the one useful filter that is *integer* arithmetic.  The vendor's
+ * is a piecewise cubic in binary32 with a quantisation that rounds down and
+ * tops the residual up to unity, and a driver has no floating point -- which is
+ * the whole reason the real filter comes from userspace.
+ */
+static void ispfe_rgb_filter_box(__s16 *taps)
+{
+	unsigned int i;
+
+	for (i = 0; i < ISPFE_RGB_FILTER_TAPS; i++)
+		taps[i] = EXYNOS_ISPFE_RGB_SCALER_ONE /
+			  EXYNOS_ISPFE_RGB_SCALER_TAPS;
+}
+
+/*
+ * Whether userspace owns the filter for the recipe that is running, which is
+ * the same question as whether the recipe carries a bank of its own.
+ *
+ * The back-end recipes do not: their coefficient table is neutralised, the
+ * driver states it, and a parameters block is how a real filter gets there.
+ * The raw recipes do, for a stage whose destination they gate off -- so on
+ * that path a block would replace the vendor's bank with the driver's box for
+ * a picture nothing reads, and it would do so for the rest of the stream,
+ * because the swap below writes the device's own table rather than a shadow.
+ * Refusing it is not a limitation: there is nothing on that path for a filter
+ * to do.
+ */
+static bool ispfe_rgb_filter_is_ours(const struct ispfe_device *ispfe)
+{
+	const struct ispfe_pdma_program *prog = ispfe->prog;
+
+	return prog && ispfe->rgb_filter_input >= 0 &&
+	       !prog->inputs[ispfe->rgb_filter_input].data;
 }
 
 /*
@@ -4801,6 +5380,7 @@ static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
 #define ISPFE_LMP_PDAF_RANGE_START_BITS		6
 
 static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
+				    const struct ispfe_stats_area *stats,
 				    void *out, const void *grid)
 {
 	struct exynos_ispfe_stats_pdaf *pdaf = out;
@@ -4873,6 +5453,88 @@ static bool ispfe_stats_pdaf_written(const void *grid)
 	       pdaf->window[0].denominator_left[0] > 0;
 }
 
+/*
+ * The thumbnail: three planes of picture out of the area, and the geometry
+ * that says what part of the frame they cover.
+ *
+ * The geometry is the driver's rather than the hardware's -- nothing is
+ * written into this area but samples -- so it comes out of the recipe the
+ * encoder derived it from, and it is written only for a stream that actually
+ * runs the branch.  That is what makes @columns a usable test below: a raw
+ * stream gates this destination off, so it publishes zeroes and no flag rather
+ * than the last back-end stream's picture.
+ *
+ * @source_left and @source_top are zero because the branch takes no crop: the
+ * downscaler reads the whole raster and ispfe_pdma_apply_rgb() states the
+ * scaler's crop word clear, so what the thumbnail covers is the frame.  They
+ * are on the interface anyway because a future recipe that crops has to be
+ * able to say so, and because a consumer that has to ask is a consumer that
+ * will guess.
+ */
+static void ispfe_stats_thumbnail_decode(const struct ispfe_device *ispfe,
+					 const struct ispfe_stats_area *area,
+					 void *out, const void *grid)
+{
+	struct exynos_ispfe_stats_thumbnail *thumbnail = out;
+	const struct ispfe_lmp_rgb_geometry *geom = &area->rgb_geometry;
+	u32 width, height;
+	bool binning;
+
+	memset(thumbnail, 0,
+	       offsetof(struct exynos_ispfe_stats_thumbnail, samples));
+
+	if (!geom->known)
+		return;
+
+	ispfe_lmp_rgb_scaler_source(geom, &width, &height, &binning);
+
+	thumbnail->columns = EXYNOS_ISPFE_THUMBNAIL_COLUMNS;
+	thumbnail->rows = EXYNOS_ISPFE_THUMBNAIL_ROWS;
+	thumbnail->scale_width = width;
+	thumbnail->scale_height = height;
+	thumbnail->source_left = 0;
+	thumbnail->source_top = 0;
+	thumbnail->source_width = geom->source_width;
+	thumbnail->source_height = geom->source_height;
+
+	BUILD_BUG_ON(sizeof(thumbnail->samples) != ISPFE_THUMBNAIL_BYTES);
+	memcpy(thumbnail->samples, grid, sizeof(thumbnail->samples));
+}
+
+/*
+ * Whether the branch wrote this frame, tested on the published copy.
+ *
+ * Two things, and they answer different questions.  The geometry says this
+ * stream runs the branch at all, which the decode above only states when it
+ * does.  The sentinel says the write DMA reached the end of the third plane
+ * *this* frame: those samples were filled with poison before the frame was
+ * armed, and an area whose block did not run still holds it.
+ *
+ * Zero would not do for the second.  A statistics block that wrote nothing
+ * leaves a cleared header, and a cleared header is not a measurement; a
+ * picture that is dark writes zeros itself, and a zero sample is a sample.
+ * That is the same distinction PDMA_IMAGE_OUTPUT() makes about the frame
+ * buffers, and this is the same poison.
+ */
+static bool ispfe_stats_thumbnail_written(const void *grid)
+{
+	const struct exynos_ispfe_stats_thumbnail *thumbnail = grid;
+	const u8 *last = (const u8 *)thumbnail->samples +
+			 sizeof(thumbnail->samples) -
+			 ISPFE_THUMBNAIL_SENTINEL_BYTES;
+	size_t i;
+
+	if (thumbnail->columns != EXYNOS_ISPFE_THUMBNAIL_COLUMNS ||
+	    thumbnail->rows != EXYNOS_ISPFE_THUMBNAIL_ROWS)
+		return false;
+
+	for (i = 0; i < ISPFE_THUMBNAIL_SENTINEL_BYTES; i++)
+		if (last[i] != ISPFE_FRAME_POISON)
+			return true;
+
+	return false;
+}
+
 static void ispfe_pdaf_read_config(struct ispfe_device *ispfe)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
@@ -4908,6 +5570,7 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 	unsigned long stated = 0;
 	u8 *area;
 	int lsc;
+	int filter;
 	int ret;
 
 	if (prog->num_inputs > BITS_PER_LONG)
@@ -4954,6 +5617,17 @@ static int ispfe_pdma_state_luts(struct ispfe_device *ispfe)
 	lsc = ispfe_lsc_input(prog);
 	if (lsc >= 0 && !prog->inputs[lsc].data)
 		__set_bit(lsc, &stated);
+
+	/*
+	 * And the linear-RGB scaler's filter, for the same reason and by the
+	 * same route: the encode writes this slot's copy of whatever the
+	 * driver's live filter is.  Only a recipe that carries no bank of its
+	 * own is stated here; the raw recipes carry one, and keeping it is what
+	 * stops this change touching a path it has no business in.
+	 */
+	filter = ispfe_rgb_filter_input(prog);
+	if (filter >= 0 && !prog->inputs[filter].data)
+		__set_bit(filter, &stated);
 
 	/*
 	 * And the phase-detect shading table, for the recipes that have one --
@@ -5051,7 +5725,6 @@ static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
 	}
 }
 
-#define ISPFE_LMP_SCALER_FACTOR_MAX	GENMASK(23, 0)
 /*
  * The largest ML output 0 a staged program may declare, from the vendor's own
  * allocation class for that destination.  The driver does not run the LMP
@@ -5060,11 +5733,6 @@ static bool ispfe_pdma_geometry_byte(const struct ispfe_pdma_cmd *cmd,
  * a self-consistent one is the only kind worth accepting.
  */
 #define ISPFE_LMP_ML0_MAX_SIZE		0x00480000
-
-static u64 ispfe_pdma_scale_factor(u32 source, u32 destination)
-{
-	return div_u64((u64)source << 21, destination);
-}
 
 static bool ispfe_pdma_scale_factor_matches(const u8 *payload, size_t offset,
 					     u32 source, u32 destination)
@@ -5089,7 +5757,7 @@ static bool ispfe_pdma_scale_factor_matches(const u8 *payload, size_t offset,
  * length is the cheapest way to make that a refusal rather than an invariant
  * held somewhere else.
  */
-#define ISPFE_STAGED_DDS_MIN		0x0c
+#define ISPFE_STAGED_DDS_MIN		ISPFE_LMP_DDS_CONFIG_MIN
 #define ISPFE_STAGED_RGB_SCALER_MIN	0x1c
 #define ISPFE_STAGED_SCALER_MIN		0x44
 #define ISPFE_STAGED_FORMATTER_MIN	0x28
@@ -5152,7 +5820,8 @@ static int ispfe_pdma_staged_geometry_validate(const u8 *dds, const u8 *rgb,
 	/* The linear-RGB branch has one automatic 2x pre-bin stage. */
 	rgb_width = input_width;
 	rgb_height = input_height;
-	if (rgb_width > 1024 || rgb_height > 768) {
+	if (rgb_width > ISPFE_LMP_RGB_BIN_MAX_WIDTH ||
+	    rgb_height > ISPFE_LMP_RGB_BIN_MAX_HEIGHT) {
 		if (rgb_width & 1 || rgb_height & 1)
 			return -EINVAL;
 		rgb_width /= 2;
@@ -5321,12 +5990,14 @@ static int ispfe_pdma_staged_validate(struct ispfe_device *ispfe)
 static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			     dma_addr_t bayer, dma_addr_t backend,
 			     const struct ispfe_stats_area *stats,
-			     const u8 *shading)
+			     const u8 *shading, const __s16 *filter)
 {
 	const struct ispfe_pdma_program *prog = ispfe->prog;
 	const struct ispfe_pdma_reloc *reloc = prog->relocs;
 	const struct ispfe_pdma_reloc *last = prog->relocs + prog->num_relocs;
+	struct ispfe_lmp_rgb_geometry lmp_rgb = {};
 	dma_addr_t lsc = 0;
+	dma_addr_t rgb_filter = 0;
 	u32 bayer_lo = 0, bayer_hi = 0;
 	u32 awb_lo = 0, awb_hi = 0;
 	u32 backend_image_lo = 0, backend_image_hi = 0;
@@ -5361,6 +6032,21 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		memcpy((u8 *)ispfe->lsc + slot * ISPFE_LSC_SLOT_STRIDE,
 		       shading, ISPFE_LSC_LUT_BYTES);
 	}
+	/*
+	 * The scaler's filter, on the same terms and for the same reason --
+	 * and only where the recipe has no bank of its own.  A raw recipe
+	 * carries one for a stage whose destination it gates off, and its
+	 * burst is left pointing at the shared area exactly as it was, so
+	 * nothing about that path moves: not the bytes, not the address.
+	 */
+	if (filter && ispfe_rgb_filter_is_ours(ispfe) &&
+	    !ispfe->active_pdma_program_override) {
+		rgb_filter = ispfe->rgb_filter_dma +
+			     slot * ISPFE_RGB_FILTER_SLOT_STRIDE;
+		memcpy((u8 *)ispfe->rgb_filter_area +
+		       slot * ISPFE_RGB_FILTER_SLOT_STRIDE,
+		       filter, ISPFE_RGB_FILTER_BYTES);
+	}
 
 	if (ispfe_pdma_recipe_bytes(prog) != prog->recipe_bytes ||
 	    prog->recipe_bytes > PDMA_SLOT_STRIDE) {
@@ -5381,7 +6067,8 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			continue;
 		case ISPFE_PDMA_INDIRECT_BURST:
 			dma = ispfe_pdma_buffer(ispfe, cmd->buffer, bayer,
-						backend, stats, lsc);
+						backend, stats, lsc,
+						rgb_filter);
 			if (dma == DMA_MAPPING_ERROR)
 				return -EINVAL;
 			/*
@@ -5440,6 +6127,11 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 						 &lmp_histogram_applied);
 			if (ret)
 				return ret;
+			ret = ispfe_pdma_apply_rgb(ispfe, cmd, program + at,
+						   &lmp_rgb,
+						   &lmp_scalers_applied);
+			if (ret)
+				return ret;
 		}
 		ret = ispfe_pdma_apply_backend_output(ispfe, cmd, backend,
 						      program + at, at,
@@ -5489,7 +6181,7 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 			} else {
 				dma = ispfe_pdma_buffer(ispfe, reloc->buffer,
 							bayer, backend, stats,
-							lsc);
+							lsc, rgb_filter);
 				if (dma == DMA_MAPPING_ERROR)
 					return -EINVAL;
 			}
@@ -5573,16 +6265,21 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 		return -EINVAL;
 	}
 	/*
-	 * And both scaler stages, whose enables have to be cleared for the
-	 * tables this recipe no longer carries.  A recipe that had lost one of
-	 * these commands would otherwise ship a scaler still asking for a
-	 * coefficient table that is not in the program.
+	 * And the three stages ISPFE_LMP_SCALERS_APPLIED names.  The image
+	 * scaler's enables have to be cleared for the tables this recipe no
+	 * longer carries -- a recipe that had lost that command would ship a
+	 * scaler still asking for a coefficient table that is not in the
+	 * program -- and the linear-RGB pair have to be stated for the
+	 * destination the batch record now enables, or the branch would be
+	 * gated on with nothing configured behind it.
 	 */
 	if (ispfe->prog->backend_recipe &&
 	    lmp_scalers_applied != ISPFE_LMP_SCALERS_APPLIED) {
-		dev_err(ispfe->dev, "PDMA recipe is missing the %s scaler\n",
-			(lmp_scalers_applied & ISPFE_LMP_SCALER_APPLIED) ?
-			"RGB" : "image");
+		dev_err(ispfe->dev, "PDMA recipe is missing the %s\n",
+			!(lmp_scalers_applied & ISPFE_LMP_SCALER_APPLIED) ?
+			"image scaler" :
+			!(lmp_scalers_applied & ISPFE_LMP_RGB_SCALER_APPLIED) ?
+			"linear-RGB scaler" : "linear-RGB write DMA");
 		return -EINVAL;
 	}
 	if (ispfe->active_backend_side_output &&
@@ -5607,13 +6304,20 @@ static int ispfe_pdma_encode(struct ispfe_device *ispfe, unsigned int slot,
 	ispfe->backend_image_hi = backend_image_hi;
 	ispfe->backend_header_lo = backend_header_lo;
 	ispfe->backend_header_hi = backend_header_hi;
+	/*
+	 * The same argument covers this one, and it is what the statistics
+	 * buffer publishes as the thumbnail's geometry: the branch's rasters
+	 * come out of the recipe rather than out of the frame, so every slot's
+	 * encode derives the same two rasters.
+	 */
+	ispfe->rgb_geometry = lmp_rgb;
 
 	return 0;
 }
 
 static void ispfe_params_consume(struct ispfe_device *ispfe,
 				 struct ispfe_lmp_wbg_profile *wbg,
-				 const u8 **shading);
+				 const u8 **shading, const __s16 **filter);
 
 /*
  * Hand every finished frame to the back end.  This has no deadline of its own
@@ -5692,6 +6396,7 @@ static void ispfe_backend_queue_arm(struct ispfe_device *ispfe)
 		struct ispfe_backend_buffer *buf = NULL;
 		struct ispfe_lmp_wbg_profile wbg;
 		const u8 *shading = NULL;
+		const __s16 *filter = NULL;
 		unsigned int program_slot;
 		unsigned int i;
 		bool acquired = false;
@@ -5737,7 +6442,7 @@ static void ispfe_backend_queue_arm(struct ispfe_device *ispfe)
 			 * factors by them, and what it wants is the balance
 			 * *this* frame was taken through.
 			 */
-			ispfe_params_consume(ispfe, &wbg, &shading);
+			ispfe_params_consume(ispfe, &wbg, &shading, &filter);
 			buf->ticket.gains = (struct exynos_becore_input_gains) {
 				.red = wbg.red,
 				.green_red = wbg.green_red,
@@ -5747,7 +6452,7 @@ static void ispfe_backend_queue_arm(struct ispfe_device *ispfe)
 			ret = ispfe_pdma_encode(ispfe, program_slot,
 						ispfe->frame_dma,
 						buf->ticket.dma, stats,
-						shading);
+						shading, filter);
 			if (ret)
 				ispfe_stats_untake(ispfe, program_slot);
 		}
@@ -5830,6 +6535,8 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 
 	if (upper_32_bits(ispfe->blocks_dma + ISPFE_PDMA_MAX_BLOCKS_BYTES - 1) ||
 	    upper_32_bits(ispfe->lsc_dma + ISPFE_LSC_AREA_BYTES - 1) ||
+	    upper_32_bits(ispfe->rgb_filter_dma +
+			  ISPFE_RGB_FILTER_AREA_BYTES - 1) ||
 	    upper_32_bits(ispfe->programs_dma + PDMA_PROGRAMS_SIZE - 1) ||
 	    upper_32_bits(ispfe->frame_dma + ispfe->frame_size - 1) ||
 	    upper_32_bits(ispfe->spare_frame_dma + ispfe->frame_size - 1) ||
@@ -5884,7 +6591,8 @@ static int ispfe_pdma_program_prepare(struct ispfe_device *ispfe)
 					i == PDMA_DUMP_SLOT ?
 					ispfe->spare_frame_dma :
 					ispfe->frame_dma,
-					backend, NULL, ispfe->shading);
+					backend, NULL, ispfe->shading,
+					ispfe->rgb_filter);
 		if (ret)
 			return ret;
 	}
@@ -6792,7 +7500,8 @@ static void ispfe_stats_areas_free(struct ispfe_device *ispfe)
 
 /*
  * One allocation per grid per area, of the same size the shared allocation for
- * that output has: only the described part is ever copied out, but the writer
+ * that output has.  For a measurement only the described part is ever copied
+ * out, and for the thumbnail it is the whole area -- but either way the writer
  * is the hardware's and this driver does not get to decide where it stops.
  */
 static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
@@ -6809,8 +7518,13 @@ static int ispfe_stats_areas_alloc(struct ispfe_device *ispfe)
 		for (grid = 0; grid < ISPFE_STATS_GRIDS; grid++) {
 			unsigned int output = ispfe_stats_grids[grid].output;
 			size_t size = ispfe_pdma_outputs[output].size;
+			size_t reads = ispfe_stats_grids[grid].reads ?:
+				       ispfe_stats_grids[grid].size;
 
-			if (size < ispfe_stats_grids[grid].size ||
+			if (ispfe_stats_grids[grid].reads &&
+			    !ispfe_stats_grids[grid].decode)
+				return -EINVAL;
+			if (size < reads ||
 			    size < ispfe_stats_grids[grid].clear ||
 			    size_add(ispfe_stats_grids[grid].clear_at,
 				     ispfe_stats_grids[grid].clear_at_len) >
@@ -6921,6 +7635,11 @@ static void ispfe_buffers_free(struct ispfe_device *ispfe)
 				  ispfe->lsc, ispfe->lsc_dma);
 		ispfe->lsc = NULL;
 	}
+	if (ispfe->rgb_filter_area) {
+		dma_free_coherent(ispfe->dev, ISPFE_RGB_FILTER_AREA_BYTES,
+				  ispfe->rgb_filter_area, ispfe->rgb_filter_dma);
+		ispfe->rgb_filter_area = NULL;
+	}
 	if (ispfe->blocks) {
 		dma_free_coherent(ispfe->dev, ISPFE_PDMA_MAX_BLOCKS_BYTES,
 				  ispfe->blocks, ispfe->blocks_dma);
@@ -6972,6 +7691,7 @@ static bool ispfe_buffers_ready(struct ispfe_device *ispfe)
 {
 	if (!ispfe->frame || !ispfe->spare_frame || !ispfe->ring ||
 	    !ispfe->programs || !ispfe->blocks || !ispfe->lsc ||
+	    !ispfe->rgb_filter_area ||
 	    !ispfe->awb_spare || !ispfe->stats_areas[0].grid[0])
 		return false;
 	if (ispfe->active_backend_side_output && !ispfe->tnr_pyramid)
@@ -7043,6 +7763,14 @@ static int ispfe_buffers_alloc(struct ispfe_device *ispfe)
 	ispfe->lsc = dma_alloc_coherent(ispfe->dev, ISPFE_LSC_AREA_BYTES,
 					&ispfe->lsc_dma, GFP_KERNEL);
 	if (!ispfe->lsc) {
+		ispfe_buffers_free(ispfe);
+		return -ENOMEM;
+	}
+	ispfe->rgb_filter_area = dma_alloc_coherent(ispfe->dev,
+						    ISPFE_RGB_FILTER_AREA_BYTES,
+						    &ispfe->rgb_filter_dma,
+						    GFP_KERNEL);
+	if (!ispfe->rgb_filter_area) {
 		ispfe_buffers_free(ispfe);
 		return -ENOMEM;
 	}
@@ -7313,6 +8041,28 @@ ispfe_start(struct ispfe_device *ispfe, bool backend_consumer,
 	ispfe->lsc_input = ispfe_lsc_input(ispfe->prog);
 	if (ispfe->lsc_input == -EINVAL)
 		return -EINVAL;
+	/*
+	 * The scaler's filter is not per-recipe the way the shading grid is --
+	 * it depends on the ratio and nothing else -- but which input carries
+	 * it is, so it is resolved here with the rest.
+	 */
+	ispfe->rgb_filter_input = ispfe_rgb_filter_input(ispfe->prog);
+	if (ispfe->rgb_filter_input == -EINVAL)
+		return -EINVAL;
+	/*
+	 * And the branch's own rasters are the last encode's, so they are
+	 * cleared here rather than left over: a stream that does not run the
+	 * branch must publish no geometry, not the previous stream's.
+	 */
+	ispfe->rgb_geometry = (struct ispfe_lmp_rgb_geometry){};
+	/*
+	 * And the filter goes back to the driver's own, so that a stream never
+	 * begins on the last one's.  The box rather than anything the recipe
+	 * carries: a recipe with a bank of its own keeps that bank -- the
+	 * encode does not redirect its burst at all -- so what this holds is
+	 * only ever read on a path where the driver states the table.
+	 */
+	ispfe_rgb_filter_box(ispfe->rgb_filter);
 	if (ispfe->lsc_input >= 0) {
 		const u8 *table = ispfe_lsc_default(ispfe, ispfe->prog);
 
@@ -9230,6 +9980,7 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		const struct ispfe_stats_area *stats;
 		struct ispfe_buffer *buf;
 		const u8 *shading = NULL;
+		const __s16 *filter = NULL;
 		unsigned int slot;
 		dma_addr_t dma;
 		int ret;
@@ -9258,10 +10009,10 @@ static void ispfe_queue_fill(struct ispfe_device *ispfe)
 		 * that is never taken is a DQBUF that never returns -- and
 		 * userspace has no way to know which program a stream picked.
 		 */
-		ispfe_params_consume(ispfe, NULL, &shading);
+		ispfe_params_consume(ispfe, NULL, &shading, &filter);
 		ret = ispfe_pdma_encode(ispfe, slot, dma,
 					ispfe->backend_buffer.dma, stats,
-					shading);
+					shading, filter);
 		if (ret) {
 			scoped_guard(spinlock_irqsave, &ispfe->slock) {
 				ispfe_stats_untake_locked(ispfe, slot);
@@ -9851,7 +10602,7 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		 * this loop.
 		 */
 		if (desc->decode)
-			desc->decode(ispfe, (u8 *)out + desc->offset,
+			desc->decode(ispfe, area, (u8 *)out + desc->offset,
 				     area->grid[grid]);
 		else
 			memcpy((u8 *)out + desc->offset, area->grid[grid],
@@ -10202,12 +10953,16 @@ struct ispfe_params_buffer {
 	 * after a consume this holds whatever table the device had before.
 	 */
 	u8 *shading;
+	/* And this buffer's resampling filter, on the same terms. */
+	__s16 *filter;
 	bool has_wbg;
 	bool has_metering;
 	bool has_shading;
+	bool has_filter;
 	bool restore_default;
 	bool restore_metering_default;
 	bool restore_shading_default;
+	bool restore_filter_default;
 };
 
 static struct ispfe_params_buffer *
@@ -10226,6 +10981,9 @@ ispfe_params_block_info[] = {
 	},
 	[EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING] = {
 		.size = sizeof(struct exynos_ispfe_params_lens_shading),
+	},
+	[EXYNOS_ISPFE_PARAM_BLOCK_RGB_SCALER] = {
+		.size = sizeof(struct exynos_ispfe_params_rgb_scaler),
 	},
 };
 
@@ -10333,6 +11091,42 @@ ispfe_params_check_lens_shading(struct device *dev,
 						row, column, channel);
 					return -ERANGE;
 				}
+
+	return 0;
+}
+
+/*
+ * The one thing that makes a set of taps a filter: each phase has to sum to
+ * unity, or the picture's brightness moves with its sub-pixel position and what
+ * comes out is a stripe rather than a resampling.  Every one of the vendor's
+ * own 32 phases sums to exactly 32768.
+ *
+ * Nothing else is checked, and there is nothing else to check: the shape of a
+ * resampling kernel is the caller's to choose, and the ratio it is right for is
+ * one the driver reports rather than one it can verify a filter against.
+ */
+static int
+ispfe_params_check_rgb_scaler(struct device *dev,
+			      const struct exynos_ispfe_params_rgb_scaler *rgb)
+{
+	unsigned int direction, phase, tap;
+
+	for (direction = 0; direction < EXYNOS_ISPFE_RGB_SCALER_DIRECTIONS;
+	     direction++)
+		for (phase = 0; phase < EXYNOS_ISPFE_RGB_SCALER_PHASES;
+		     phase++) {
+			int sum = 0;
+
+			for (tap = 0; tap < EXYNOS_ISPFE_RGB_SCALER_TAPS; tap++)
+				sum += rgb->taps[direction][phase][tap];
+			if (sum != EXYNOS_ISPFE_RGB_SCALER_ONE) {
+				dev_dbg(dev,
+					"scaler filter direction %u phase %u sums to %d, not %d\n",
+					direction, phase, sum,
+					EXYNOS_ISPFE_RGB_SCALER_ONE);
+				return -EINVAL;
+			}
+		}
 
 	return 0;
 }
@@ -10450,6 +11244,30 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
 			buf->has_shading = true;
 			break;
 		}
+		case EXYNOS_ISPFE_PARAM_BLOCK_RGB_SCALER: {
+			const struct exynos_ispfe_params_rgb_scaler *rgb =
+				(const struct exynos_ispfe_params_rgb_scaler *)header;
+			int ret;
+
+			/*
+			 * Disabling asks for the driver's box back rather than
+			 * for the stage to stop: a scaler with no filter does
+			 * not resample, it writes nothing.
+			 */
+			if (header->flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) {
+				buf->restore_filter_default = true;
+				break;
+			}
+
+			ret = ispfe_params_check_rgb_scaler(ispfe->dev, rgb);
+			if (ret)
+				return ret;
+
+			memcpy(buf->filter, &rgb->taps[0][0][0],
+			       ISPFE_RGB_FILTER_BYTES);
+			buf->has_filter = true;
+			break;
+		}
 		default:
 			return -EINVAL;
 		}
@@ -10477,7 +11295,7 @@ static int ispfe_params_walk(struct ispfe_device *ispfe,
  */
 static void ispfe_params_consume(struct ispfe_device *ispfe,
 				 struct ispfe_lmp_wbg_profile *wbg,
-				 const u8 **shading)
+				 const u8 **shading, const __s16 **filter)
 {
 	struct ispfe_params_buffer *buf;
 
@@ -10526,6 +11344,22 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 		else if (buf->has_shading)
 			swap(ispfe->shading, buf->shading);
 
+		/*
+		 * The scaler's filter, swapped on the same terms -- but only
+		 * where the filter is userspace's to set.  A recipe that
+		 * carries its own bank keeps it, and that has to be decided
+		 * here rather than only at stream start: this writes the
+		 * device's table in place, so a block accepted once on the raw
+		 * path would replace the vendor's bank for the rest of the
+		 * stream.
+		 */
+		if (ispfe_rgb_filter_is_ours(ispfe)) {
+			if (buf->restore_filter_default)
+				ispfe_rgb_filter_box(ispfe->rgb_filter);
+			else if (buf->has_filter)
+				swap(ispfe->rgb_filter, buf->filter);
+		}
+
 		buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
@@ -10534,6 +11368,8 @@ static void ispfe_params_consume(struct ispfe_device *ispfe,
 		*wbg = ispfe->active_lmp_wbg;
 	if (shading)
 		*shading = ispfe->shading;
+	if (filter)
+		*filter = ispfe->rgb_filter;
 }
 
 static void ispfe_params_return_all(struct ispfe_device *ispfe,
@@ -10557,11 +11393,14 @@ static int ispfe_params_buf_init(struct vb2_buffer *vb)
 
 	buf->config = kvmalloc(ISPFE_PARAMS_BUFFER_SIZE, GFP_KERNEL);
 	buf->shading = kzalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
-	if (!buf->config || !buf->shading) {
+	buf->filter = kzalloc(ISPFE_RGB_FILTER_BYTES, GFP_KERNEL);
+	if (!buf->config || !buf->shading || !buf->filter) {
 		kvfree(buf->config);
 		buf->config = NULL;
 		kfree(buf->shading);
 		buf->shading = NULL;
+		kfree(buf->filter);
+		buf->filter = NULL;
 		return -ENOMEM;
 	}
 
@@ -10577,6 +11416,8 @@ static void ispfe_params_buf_cleanup(struct vb2_buffer *vb)
 	buf->config = NULL;
 	kfree(buf->shading);
 	buf->shading = NULL;
+	kfree(buf->filter);
+	buf->filter = NULL;
 }
 
 static int ispfe_params_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
@@ -10625,6 +11466,8 @@ static int ispfe_params_buf_prepare(struct vb2_buffer *vb)
 	buf->restore_metering_default = false;
 	buf->has_shading = false;
 	buf->restore_shading_default = false;
+	buf->has_filter = false;
+	buf->restore_filter_default = false;
 
 	/*
 	 * A buffer carrying no blocks changes nothing and has nothing in it to
@@ -11780,6 +12623,8 @@ static void ispfe_shading_release(void *data)
 
 	kfree(ispfe->shading);
 	ispfe->shading = NULL;
+	kfree(ispfe->rgb_filter);
+	ispfe->rgb_filter = NULL;
 }
 
 static int ispfe_probe(struct platform_device *pdev)
@@ -11806,11 +12651,15 @@ static int ispfe_probe(struct platform_device *pdev)
 	ispfe->shading = kzalloc(ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
 	ispfe->lsc_unity = devm_kmalloc(dev, ISPFE_LSC_LUT_BYTES, GFP_KERNEL);
 	ispfe->lsc_input = -ENOENT;
+	ispfe->rgb_filter = kzalloc(ISPFE_RGB_FILTER_BYTES, GFP_KERNEL);
+	ispfe->rgb_filter_input = -ENOENT;
 	if (!ispfe->pdma_program_staged || !ispfe->pdma_blocks_staged ||
-	    !ispfe->shading || !ispfe->lsc_unity) {
+	    !ispfe->shading || !ispfe->lsc_unity || !ispfe->rgb_filter) {
 		kfree(ispfe->shading);
+		kfree(ispfe->rgb_filter);
 		return -ENOMEM;
 	}
+	ispfe_rgb_filter_box(ispfe->rgb_filter);
 	ret = devm_add_action_or_reset(dev, ispfe_shading_release, ispfe);
 	if (ret)
 		return ret;

@@ -59,6 +59,11 @@ enum exynos_ispfe_stats_version {
  *
  * %EXYNOS_ISPFE_STATS_PDAF:
  *	The phase-detect correlation, in @pdaf
+ *
+ * %EXYNOS_ISPFE_STATS_THUMBNAIL:
+ *	A small linear-RGB image of the frame, in @thumbnail.  The one member
+ *	here that is a picture rather than a measurement, and the only one
+ *	whose flag being clear can mean the stream simply does not produce it.
  */
 #define EXYNOS_ISPFE_STATS_AWB			(1U << 0)
 #define EXYNOS_ISPFE_STATS_AE			(1U << 1)
@@ -69,6 +74,7 @@ enum exynos_ispfe_stats_version {
 #define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI1	(1U << 6)
 #define EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2	(1U << 7)
 #define EXYNOS_ISPFE_STATS_PDAF			(1U << 8)
+#define EXYNOS_ISPFE_STATS_THUMBNAIL		(1U << 9)
 
 /**
  * enum exynos_ispfe_params_block_type - Parameters block type
@@ -79,6 +85,8 @@ enum exynos_ispfe_stats_version {
  *	:c:type:`exynos_ispfe_params_metering`
  * @EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING: The lens shading gain grid,
  *	:c:type:`exynos_ispfe_params_lens_shading`
+ * @EXYNOS_ISPFE_PARAM_BLOCK_RGB_SCALER: The linear-RGB scaler's resampling
+ *	filter, :c:type:`exynos_ispfe_params_rgb_scaler`
  * @EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * The white balance gains are the one thing here that nothing about is knowable
@@ -94,6 +102,7 @@ enum exynos_ispfe_params_block_type {
 	EXYNOS_ISPFE_PARAM_BLOCK_WHITE_BALANCE = 0,
 	EXYNOS_ISPFE_PARAM_BLOCK_METERING,
 	EXYNOS_ISPFE_PARAM_BLOCK_LENS_SHADING,
+	EXYNOS_ISPFE_PARAM_BLOCK_RGB_SCALER,
 	EXYNOS_ISPFE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -350,6 +359,76 @@ struct exynos_ispfe_params_lens_shading {
 		   [EXYNOS_ISPFE_WB_GAINS];
 } __attribute__((aligned(8)));
 
+/*
+ * The linear-RGB scaler's filter: two directions of sixteen sub-pixel phases,
+ * four taps each.  The hardware's own shape, and the whole of what the block
+ * resamples with.
+ */
+#define EXYNOS_ISPFE_RGB_SCALER_DIRECTIONS	2
+#define EXYNOS_ISPFE_RGB_SCALER_PHASES		16
+#define EXYNOS_ISPFE_RGB_SCALER_TAPS		4
+
+/* The horizontal direction first, which is the order the hardware reads. */
+#define EXYNOS_ISPFE_RGB_SCALER_HORIZONTAL	0
+#define EXYNOS_ISPFE_RGB_SCALER_VERTICAL	1
+
+/*
+ * Q15: a phase's four taps must sum to exactly this.  It is not a scale so
+ * much as the block's definition of a filter -- taps summing to anything else
+ * change the picture's brightness with its sub-pixel position, which is a
+ * moving stripe rather than a resampling.
+ *
+ * Note that it does not fit a tap.  A tap is signed sixteen bits and this is
+ * 32768, so no single one of the four can carry a whole phase's weight, and
+ * nearest-neighbour is not a filter this block can be given.  Nothing here has
+ * wanted to: the stage only ever downscales, and the vendor's own filter
+ * spreads every phase across at least three taps.
+ */
+#define EXYNOS_ISPFE_RGB_SCALER_ONE		32768
+
+/**
+ * struct exynos_ispfe_params_rgb_scaler - The linear-RGB scaler's filter
+ *
+ * @header: The parameters block header
+ * @taps: One filter per direction, sixteen phases of four signed Q15 taps,
+ *	indexed ``[direction][phase][tap]``
+ *
+ * The front end scales its linear-RGB output down to a small image with this,
+ * and the filter is a function of the ratio it is scaling by -- not of the
+ * scene, the lens or the illuminant.  So it is not tuning, and the kernel would
+ * state it as it states the rest of that stage's geometry, except that the
+ * vendor's own derivation is binary32 throughout with a quantisation that
+ * rounds down and then tops the residual up to unity, where a last-bit
+ * difference in a divide moves a tap.  A driver has no floating point.  So the
+ * arithmetic runs where floating point is ordinary, and what crosses is the
+ * result.
+ *
+ * **Every phase's four taps must sum to %EXYNOS_ISPFE_RGB_SCALER_ONE**, and the
+ * driver refuses a block where any of the 32 does not.  That is the whole
+ * contract: a filter that does not sum to unity is not a filter, and it is what
+ * an arithmetic mistake upstream looks like.
+ *
+ * The **ratio** this filter has to match is not userspace's to choose -- the
+ * driver derives the scaler's source from the raster it is running and its
+ * output is fixed -- so a caller needs to be told what it is scaling by.  That
+ * geometry is reported alongside the image the stage produces, in
+ * :c:type:`exynos_ispfe_stats_thumbnail`.  A filter built for the wrong ratio
+ * is accepted, because nothing here can tell: it produces a soft or aliased
+ * picture rather than an error.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the filter
+ * to the driver's own, which is an equal-weight box over the four taps at every
+ * phase.  That is a real picture and a soft one, and it is what a stream that
+ * sends no filter gets -- the same trade the lens shading grid's unity default
+ * makes.
+ */
+struct exynos_ispfe_params_rgb_scaler {
+	struct v4l2_isp_params_block_header header;
+	__s16 taps[EXYNOS_ISPFE_RGB_SCALER_DIRECTIONS]
+		  [EXYNOS_ISPFE_RGB_SCALER_PHASES]
+		  [EXYNOS_ISPFE_RGB_SCALER_TAPS];
+} __attribute__((aligned(8)));
+
 /**
  * define EXYNOS_ISPFE_PARAMS_MAX_SIZE - Maximum parameters data size
  *
@@ -358,7 +437,8 @@ struct exynos_ispfe_params_lens_shading {
 #define EXYNOS_ISPFE_PARAMS_MAX_SIZE \
 	(sizeof(struct exynos_ispfe_params_white_balance) + \
 	 sizeof(struct exynos_ispfe_params_metering) + \
-	 sizeof(struct exynos_ispfe_params_lens_shading))
+	 sizeof(struct exynos_ispfe_params_lens_shading) + \
+	 sizeof(struct exynos_ispfe_params_rgb_scaler))
 
 /*
  * Both grids are the same shape: LMP meters 64 x 48 rectangular regions over
@@ -897,6 +977,89 @@ struct exynos_ispfe_stats_pdaf {
 	struct exynos_ispfe_stats_pdaf_window window[EXYNOS_ISPFE_PDAF_WINDOWS];
 };
 
+/*
+ * The small linear-RGB image the front end scales out of the picture, and the
+ * only thing here that is an image rather than a measurement.  Its size is the
+ * hardware's own maximum: `CheckScalerConstraints` bounds the stage's output to
+ * 256 x 192, two vendor functions write that literal, and all 54 captured
+ * programs carry it.
+ */
+#define EXYNOS_ISPFE_THUMBNAIL_COLUMNS		256
+#define EXYNOS_ISPFE_THUMBNAIL_ROWS		192
+#define EXYNOS_ISPFE_THUMBNAIL_COMPONENTS	3
+#define EXYNOS_ISPFE_THUMBNAIL_RED		0
+#define EXYNOS_ISPFE_THUMBNAIL_GREEN		1
+#define EXYNOS_ISPFE_THUMBNAIL_BLUE		2
+
+/**
+ * struct exynos_ispfe_stats_thumbnail - A small linear-RGB image of the frame
+ *
+ * @columns: Samples per row the stage produced
+ * @rows: Rows it produced
+ * @scale_width: The width the scaler took its input at, after binning and its
+ *	own crop
+ * @scale_height: The same vertically
+ * @source_left: Where @samples starts in the front end's own raster
+ * @source_top: The same vertically
+ * @source_width: How much of that raster @samples covers
+ * @source_height: The same vertically
+ * @reserved: Undefined
+ * @samples: Signed linear samples, planar, ``[component][row][column]``
+ *
+ * Every other member of :c:type:`exynos_ispfe_stats_buffer` reduces the frame
+ * to sums, counts or a distribution.  This is a picture of it, which is what an
+ * algorithm needs when the thing it has to decide varies across the frame.
+ *
+ * **It is linear**, and that is measured rather than assumed: the samples are
+ * the front end's own linear-RGB, taken before the global tone map and the
+ * output gamma, both of which this driver leaves switched off on the path that
+ * produces this.  Where the tap sits relative to the colour matrix is *not*
+ * established, so a consumer should not treat these as being in any particular
+ * colour space -- what they are good for is brightness and local contrast,
+ * which is what they are here for.  A consumer that wants a perceptual
+ * quantity applies its own curve.
+ *
+ * **@source_* is why this is usable and the motion metering map is not**
+ * [2026-09-01].  A spatial algorithm has to know which part of the picture each
+ * sample came from, and inferring it does not work: the motion map is metered
+ * over a window the driver does not publish, and reducing that to a scale
+ * factor from the pictures themselves gives a broad optimum that matches no
+ * candidate geometry.  These four are in the same raster the sensor's own crop
+ * is reported in, so the mapping onto the processed image is arithmetic rather
+ * than a guess.
+ *
+ * **@scale_width and @scale_height are the filter's ratio**, and are the other
+ * reason they are here: :c:type:`exynos_ispfe_params_rgb_scaler` carries a
+ * resampling filter that is a function of exactly ``@columns / @scale_width``
+ * and ``@rows / @scale_height``, and the driver chooses both sides of those.
+ * They are the scaler's own input, which is far smaller than @source_width:
+ * the front end's downscaler has already reduced the raster by two, four,
+ * eight or sixteen before this stage sees it, and the stage then bins by two
+ * again whenever what it is handed would exceed 1024 x 768.
+ *
+ * The samples are signed because the hardware's are, and a sample below the
+ * black level really does go negative.  Planes are contiguous and unpadded: a
+ * row is @columns samples and a plane is @rows of them.
+ *
+ * %EXYNOS_ISPFE_STATS_THUMBNAIL is what says a buffer holds one, as the
+ * corresponding flag does for every other member here.  Nothing else is: the
+ * geometry below is only meaningful once that bit is set.
+ */
+struct exynos_ispfe_stats_thumbnail {
+	__u32 columns;
+	__u32 rows;
+	__u32 scale_width;
+	__u32 scale_height;
+	__u32 source_left;
+	__u32 source_top;
+	__u32 source_width;
+	__u32 source_height;
+	__u32 reserved[8];
+	__s16 samples[EXYNOS_ISPFE_THUMBNAIL_COMPONENTS]
+		     [EXYNOS_ISPFE_THUMBNAIL_ROWS]
+		     [EXYNOS_ISPFE_THUMBNAIL_COLUMNS];
+};
+
 /**
  * struct exynos_ispfe_stats_buffer - ISPFE per-frame statistics
  *
@@ -920,6 +1083,8 @@ struct exynos_ispfe_stats_pdaf {
  *	%EXYNOS_ISPFE_STATS_HISTOGRAM_ROI2 is set
  * @pdaf: The phase-detect correlation, valid when %EXYNOS_ISPFE_STATS_PDAF is
  *	set
+ * @thumbnail: A small linear-RGB image of the frame, valid when
+ *	%EXYNOS_ISPFE_STATS_THUMBNAIL is set
  *
  * One buffer is one frame's statistics, and which frame is said three ways.
  * The buffer's ``sequence`` is that frame's number, which is what V4L2 says a
@@ -970,6 +1135,15 @@ struct exynos_ispfe_stats_buffer {
 	struct exynos_ispfe_stats_histogram histogram_roi1;
 	struct exynos_ispfe_stats_histogram histogram_roi2;
 	struct exynos_ispfe_stats_pdaf pdaf;
+	/*
+	 * An image, where everything above it is a measurement, and by far the
+	 * largest thing here -- it is 288 KiB of a buffer that was 1 MiB
+	 * without it.  It is on this buffer rather than a node of its own so
+	 * that it pairs with the measurements by construction: an algorithm
+	 * reading both is reading one frame, and a separate queue would have
+	 * to be correlated and could drop one half.
+	 */
+	struct exynos_ispfe_stats_thumbnail thumbnail;
 };
 
 #endif /* __UAPI_EXYNOS_ISPFE_CONFIG_H */

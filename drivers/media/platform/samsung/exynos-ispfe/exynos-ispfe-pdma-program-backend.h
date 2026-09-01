@@ -10,7 +10,7 @@
  * Source: buf-126-iova000000001d1d8000-fd423-size12288.bin
  * SHA-256: 275a47cfde9f7f6e12e618638a3d24e346d0ee12e35300a9f798dec23fe1e529
  * Capture: 0x17d0 bytes in 61 commands
- * Program: 0x13c4 bytes in 52 commands, 18 relocations
+ * Program: 0x1410 bytes in 53 commands, 18 relocations
  *
  * Blocks emitted blank: a NULL payload the encoder writes as
  * zeroes.  The hardware is written every register these blocks
@@ -34,8 +34,6 @@
  *   0x00054b2c  lmp/gtm  stub 0x4 bytes
  *   0x00054b34  lmp/gamma  stub 0x4 bytes
  *   0x00054b64  lmp/rgb_dg  stub 0x4 bytes
- *   0x00054b70  lmp/rgb_scaler  stub 0x4 bytes
- *   0x00054c94  lmp/rgb_tapout  stub 0x4 bytes
  *   0x00054b90  lmp/scaler  stub 0x4 bytes
  *   0x00054df4  lmp/lightness  stub 0x4 bytes
  *
@@ -46,6 +44,16 @@
  * is what the driver has to account for -- a capture that
  * changes one of them changes this list, so regenerating is the
  * check that the driver still states the right thing:
+ *   0x00054b70  lmp/rgb_scaler
+ *     +0x0000  0x00000006
+ *     +0x0004  0x00c00100
+ *     +0x0008  0x00414000
+ *     +0x000c  0x00410000
+ *     +0x0010  0x00020002
+ *     +0x0018  0x0186020e
+ *   0x00054c94  lmp/rgb_tapout
+ *     +0x0000  0x00000002
+ *     +0x0004  0x00000200
  *   0x00055140  lmp/batch_mode_bayer_config | lmp/batch_mode_bayer_config_offset
  *     +0x0000  0x00018000
  *     +0x0004  0x00030000
@@ -64,7 +72,6 @@
  *   0x000548a8  lmp/cdaf_stats
  *   0x00069e0c  lmp/gtm_lut
  *   0x00069558  lmp/gamma_lut | lmp/lut
- *   0x00069d0c  lmp/rgb_scaler_lut
  *   0x00069a0c  lmp/scaler_lut
  *   0x00069c0c  lmp/scaler_lut
  *   0x00054cb4  lmp/sparse_pd
@@ -76,6 +83,7 @@
  * contents are a calibration or a tuning, so they do not ship, and
  * what the driver writes instead is its own neutral default:
  *   0x0006a02c  lmp/lsc_lut  0x1ce0 bytes withheld
+ *   0x00069d0c  lmp/rgb_scaler_lut  0x100 bytes withheld
  *
  * Every comment below is still anchored to the capture -- a command's
  * offset and its number are the ones a decode of the vendor's own
@@ -92,8 +100,8 @@
 
 #include "exynos-ispfe-pdma.h"
 
-#define ISPFE_PDMA_BACKEND_RECIPE_BYTES		0x13c4
-#define ISPFE_PDMA_BACKEND_BLOCKS_BYTES		0x6000
+#define ISPFE_PDMA_BACKEND_RECIPE_BYTES		0x1410
+#define ISPFE_PDMA_BACKEND_BLOCKS_BYTES		0x7000
 
 /*
  * The blocks the program's indirect-burst records stream into the front
@@ -179,9 +187,13 @@ static const struct ispfe_pdma_input ispfe_pdma_backend_inputs[] = {
 	/* lmp/histogram_lut: stated by the driver, SHA-256 f991acb1e5897fe6 */
 	{ .area_offset = 0x03000, .data = NULL,
 	  .size = 0x0400 },
-	{ .area_offset = 0x04000, .data = ispfe_pdma_backend_input_1d1d3000,
+	/* lmp/rgb_scaler_lut: neutralised, the driver's own table replaces
+	 * the capture's, SHA-256 8f09461476f64915 */
+	{ .area_offset = 0x04000, .data = NULL,
+	  .size = 0x0100 },
+	{ .area_offset = 0x05000, .data = ispfe_pdma_backend_input_1d1d3000,
 	  .size = sizeof(ispfe_pdma_backend_input_1d1d3000) },
-	{ .area_offset = 0x05000, .data = ispfe_pdma_backend_input_1d1d2000,
+	{ .area_offset = 0x06000, .data = ispfe_pdma_backend_input_1d1d2000,
 	  .size = sizeof(ispfe_pdma_backend_input_1d1d2000) },
 };
 
@@ -545,10 +557,13 @@ static const struct ispfe_pdma_cmd ispfe_pdma_backend_recipe[] = {
 	  .payload = NULL, .len = 0x0004 },
 	/* 0x0076c  inline-burst, lmp/rgb_scaler */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054b70,
-	  .payload = NULL, .len = 0x0004 },
+	  .payload = NULL, .len = 0x0020 },
+	/* 0x00794  indirect-burst, lmp/rgb_scaler_lut */
+	{ .op = ISPFE_PDMA_INDIRECT_BURST, .reg = 0x00069d0c,
+	  .buffer = ISPFE_BUF_INPUT(3), .len = 0x0100 },
 	/* 0x007a8  inline-burst, lmp/rgb_tapout */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054c94,
-	  .payload = NULL, .len = 0x0004 },
+	  .payload = NULL, .len = 0x0020 },
 	/* 0x007d0  inline-burst, lmp/scaler */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054b90,
 	  .payload = NULL, .len = 0x0004 },
@@ -572,10 +587,10 @@ static const struct ispfe_pdma_cmd ispfe_pdma_backend_recipe[] = {
 	  .payload = ispfe_pdma_backend_payload_46, .len = sizeof(ispfe_pdma_backend_payload_46) },
 	/* 0x00b9c  indirect-burst, lmp/alignment_formatter_lut */
 	{ .op = ISPFE_PDMA_INDIRECT_BURST, .reg = 0x0006beb0,
-	  .buffer = ISPFE_BUF_INPUT(3), .len = 0x0104 },
+	  .buffer = ISPFE_BUF_INPUT(4), .len = 0x0104 },
 	/* 0x00bb0  indirect-burst, lmp/alignment_formatter_drc_lut */
 	{ .op = ISPFE_PDMA_INDIRECT_BURST, .reg = 0x0006bfb4,
-	  .buffer = ISPFE_BUF_INPUT(4), .len = 0x0104 },
+	  .buffer = ISPFE_BUF_INPUT(5), .len = 0x0104 },
 	/* 0x00bc4  inline-burst, lmp/bayer_downscale */
 	{ .op = ISPFE_PDMA_INLINE_BURST, .reg = 0x00054f04,
 	  .payload = ispfe_pdma_backend_payload_49, .len = sizeof(ispfe_pdma_backend_payload_49) },
@@ -632,52 +647,52 @@ static const struct ispfe_pdma_reloc ispfe_pdma_backend_relocs[] = {
 	{ .cmd = 18, .lo = 0x0034, .hi = 0x0038,
 	  .buffer = ISPFE_BUF_OUTPUT(2) },
 	/* 0x00054ecc */
-	{ .cmd = 37, .lo = 0x001c, .hi = ISPFE_PDMA_RELOC_NO_HIGH,
+	{ .cmd = 38, .lo = 0x001c, .hi = ISPFE_PDMA_RELOC_NO_HIGH,
 	  .buffer = ISPFE_BUF_TNR_PYRAMID },
 	/* 0x00054fc8 */
-	{ .cmd = 47, .lo = 0x0004, .hi = 0x0008,
+	{ .cmd = 48, .lo = 0x0004, .hi = 0x0008,
 	  .buffer = ISPFE_BUF_OUTPUT(3) },
 	/* 0x00055178  lmp/sw_awb_stats_base_address */
-	{ .cmd = 50, .lo = 0x0038, .hi = 0x003c,
+	{ .cmd = 51, .lo = 0x0038, .hi = 0x003c,
 	  .buffer = ISPFE_BUF_OUTPUT(4) },
 	/* 0x00055180  lmp/sw_lsc_stats_base_address */
-	{ .cmd = 50, .lo = 0x0040, .hi = 0x0044,
+	{ .cmd = 51, .lo = 0x0040, .hi = 0x0044,
 	  .buffer = ISPFE_BUF_OUTPUT(5) },
 	/* 0x00055188  lmp/sw_flicker_stats_base_address */
-	{ .cmd = 50, .lo = 0x0048, .hi = 0x004c,
+	{ .cmd = 51, .lo = 0x0048, .hi = 0x004c,
 	  .buffer = ISPFE_BUF_OUTPUT(1) },
 	/* 0x00055190  lmp/sw_histogram_roi_base_address */
-	{ .cmd = 50, .lo = 0x0050, .hi = 0x0054,
+	{ .cmd = 51, .lo = 0x0050, .hi = 0x0054,
 	  .buffer = ISPFE_BUF_OUTPUT(6) },
 	/* 0x00055198  lmp/sw_histogram_roi_base_address */
-	{ .cmd = 50, .lo = 0x0058, .hi = 0x005c,
+	{ .cmd = 51, .lo = 0x0058, .hi = 0x005c,
 	  .buffer = ISPFE_BUF_OUTPUT(7) },
 	/* 0x000551a0  lmp/sw_histogram_roi_base_address */
-	{ .cmd = 50, .lo = 0x0060, .hi = 0x0064,
+	{ .cmd = 51, .lo = 0x0060, .hi = 0x0064,
 	  .buffer = ISPFE_BUF_OUTPUT(8) },
 	/* 0x000551a8  lmp/sw_post_lsc_ae_stats_base_address */
-	{ .cmd = 50, .lo = 0x0068, .hi = 0x006c,
+	{ .cmd = 51, .lo = 0x0068, .hi = 0x006c,
 	  .buffer = ISPFE_BUF_OUTPUT(9) },
 	/* 0x000551b0  lmp/sw_motion_metering_base_address */
-	{ .cmd = 50, .lo = 0x0070, .hi = 0x0074,
+	{ .cmd = 51, .lo = 0x0070, .hi = 0x0074,
 	  .buffer = ISPFE_BUF_OUTPUT(2) },
 	/* 0x000551c0  lmp/sw_main_output_base_address */
-	{ .cmd = 50, .lo = 0x0080, .hi = 0x0084,
+	{ .cmd = 51, .lo = 0x0080, .hi = 0x0084,
 	  .buffer = ISPFE_BUF_BACKEND_IMAGE },
 	/* 0x000551c8  lmp/sw_main_output_header_base_address */
-	{ .cmd = 50, .lo = 0x0088, .hi = 0x008c,
+	{ .cmd = 51, .lo = 0x0088, .hi = 0x008c,
 	  .buffer = ISPFE_BUF_BACKEND_HEADER },
 	/* 0x000551e0  lmp/sw_rgb_output_base_address */
-	{ .cmd = 50, .lo = 0x00a0, .hi = 0x00a4,
+	{ .cmd = 51, .lo = 0x00a0, .hi = 0x00a4,
 	  .buffer = ISPFE_BUF_OUTPUT(10) },
 	/* 0x000551e8  lmp/sw_ml_output_base_address */
-	{ .cmd = 50, .lo = 0x00a8, .hi = 0x00ac,
+	{ .cmd = 51, .lo = 0x00a8, .hi = 0x00ac,
 	  .buffer = ISPFE_BUF_OUTPUT(11) },
 	/* 0x000551f8  lmp/sw_ml_output_base_address */
-	{ .cmd = 50, .lo = 0x00b8, .hi = 0x00bc,
+	{ .cmd = 51, .lo = 0x00b8, .hi = 0x00bc,
 	  .buffer = ISPFE_BUF_OUTPUT(12) },
 	/* 0x00055200  lmp/sw_tnr_output_base_address */
-	{ .cmd = 50, .lo = 0x00c0, .hi = 0x00c4,
+	{ .cmd = 51, .lo = 0x00c0, .hi = 0x00c4,
 	  .buffer = ISPFE_BUF_TNR_PYRAMID },
 };
 

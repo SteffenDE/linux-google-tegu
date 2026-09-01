@@ -154,6 +154,20 @@ struct exynos_becore_params_ltm_tone_adjust {
 	__u16 curve[EXYNOS_BECORE_LTM_TONE_ADJUST_POINTS];
 } __attribute__((aligned(8)));
 
+/*
+ * The affine grid the local tone mapper slices: a tone curve per region of the
+ * picture, sampled at %EXYNOS_BECORE_LTM_GRID_LEVELS points along the guide
+ * curve's output.  Its shape is the hardware's -- `GridDesc` offers 16 x 12,
+ * 32 x 24 and 64 x 48 and every captured program uses the middle one, which is
+ * also the only one the block's stride register describes.
+ */
+#define EXYNOS_BECORE_LTM_GRID_COLUMNS		32
+#define EXYNOS_BECORE_LTM_GRID_ROWS		24
+#define EXYNOS_BECORE_LTM_GRID_LEVELS		8
+#define EXYNOS_BECORE_LTM_GRID_POINTS \
+	(EXYNOS_BECORE_LTM_GRID_COLUMNS * EXYNOS_BECORE_LTM_GRID_ROWS * \
+	 EXYNOS_BECORE_LTM_GRID_LEVELS)
+
 /* 17 nodes per axis, indexed by RGB, each holding one (U, V) chroma pair. */
 #define EXYNOS_BECORE_CLUT_AXIS_NODES		17
 #define EXYNOS_BECORE_CLUT_NODES \

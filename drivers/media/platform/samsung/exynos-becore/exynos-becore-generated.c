@@ -2313,8 +2313,9 @@ static u32 becore_sharpen_kernel_sum(const struct becore_sharpen_kernel *kernel)
  * The local tone mapper's grid RDMA, by offset from YUVP's base.
  *
  * The vendor's numbers here are this driver's own allocation: 0x800 bytes a
- * row over 48 rows is the 96 KiB a 32 x 24 x 8 bilateral grid needs, and the
- * stride is the row. Deriving them from the allocation rather than replaying
+ * row over 48 rows is the 96 KiB the block reads, of which the 32 x 24 x 8
+ * grid is the first 1,024 bytes of each of the first 24 rows and the rest is
+ * padding, and the stride is the row. Deriving them from the allocation rather than replaying
  * them is what makes a DMA programmed to read past its own buffer impossible
  * to write by accident -- the address beside them is already relocated to
  * `becore->grid`, and this is the length that goes with it.
@@ -2334,7 +2335,7 @@ static int becore_yuvp_grid_dma_value(u32 offset, u32 *value)
 		*value = BECORE_LTM_GRID_ROW_BYTES;
 		return 0;
 	case 0x1c24:				/* ..._HEIGHT */
-		*value = BECORE_LTM_GRID_ROWS;
+		*value = BECORE_LTM_GRID_BUFFER_ROWS;
 		return 0;
 	}
 

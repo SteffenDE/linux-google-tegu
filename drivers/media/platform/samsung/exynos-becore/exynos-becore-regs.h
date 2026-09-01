@@ -760,19 +760,27 @@ static_assert((BECORE_YUVP_LTM_TONEADJ_LAST -
 #define BECORE_YUVP_LTM_UNITY_FIRST	(BECORE_YUVP_LTM_BASE + 0x4e0)
 #define BECORE_YUVP_LTM_UNITY_LAST	(BECORE_YUVP_LTM_BASE + 0x6d4)
 /*
- * The grid is a fixed 32 x 24 x 8 bilateral grid: 32 * 24 * 8 cells of eight
- * shorts is 49152, exactly the array YuvpLtmBlock::ConfigureWith carries. It
- * keeps that shape whatever the frame is, so its cells are square only on a
- * 4:3 one -- which is why the horizontal and vertical steps below come out
- * equal here and why this looked like one number for a while.
+ * The grid is a fixed 32 x 24 x 8 bilateral grid, one gain and one offset at
+ * each of its 6,144 points. It keeps that shape whatever the frame is, so its
+ * cells are square only on a 4:3 one -- which is why the horizontal and
+ * vertical steps below come out equal here and why this looked like one number
+ * for a while.
+ *
+ * The dimensions themselves are the uAPI's, because a parameters block carries
+ * one value at each grid point and there cannot be two statements of how many
+ * points there are. Where each one sits in memory is in exynos-becore-common.h.
+ *
+ * (An earlier note here read the array `YuvpLtmBlock::ConfigureWith` carries --
+ * 49,152 shorts -- as eight shorts per point. It is the whole 96 KiB
+ * allocation: 12,288 of those shorts are grid and the rest is padding, which
+ * is what every captured grid holds.)
  */
 #define BECORE_LTM_LUMA_Q12_R		1225
 #define BECORE_LTM_LUMA_Q12_G		2404
 #define BECORE_LTM_LUMA_Q12_B		467
-#define BECORE_LTM_SLCGRID_COLUMNS	32
-#define BECORE_LTM_SLCGRID_ROWS		24
-#define BECORE_LTM_SLCGRID_DEPTH	8
-#define BECORE_LTM_SLCGRID_CELL_SHORTS	8
+#define BECORE_LTM_SLCGRID_COLUMNS	EXYNOS_BECORE_LTM_GRID_COLUMNS
+#define BECORE_LTM_SLCGRID_ROWS		EXYNOS_BECORE_LTM_GRID_ROWS
+#define BECORE_LTM_SLCGRID_DEPTH	EXYNOS_BECORE_LTM_GRID_LEVELS
 #define BECORE_LTM_UNITY_Q8_PAIR	0x01000100
 /*
  * YUVP's inverse colour matrix: nine signed Q10 coefficients that read as

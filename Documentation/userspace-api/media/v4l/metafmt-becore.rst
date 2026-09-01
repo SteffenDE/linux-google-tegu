@@ -37,6 +37,24 @@ so a curve sent in the wrong one fits and is twice as steep; and the colour
 LUT's samples must fit ``EXYNOS_BECORE_CLUT_MAX`` with both ends of its grey
 axis neutral.
 
+The tone mapper's bilateral grid is checked only for range, and that is a
+statement about what the driver knows rather than about how much it trusts
+userspace. A curve's samples sit at inputs the driver states, so it can say that
+one goes backwards; the grid's levels sit wherever the guide curve puts them,
+and that curve comes from userspace too, so the same numbers are a sensible tone
+map under one curve and an inverted one under another. The two limits it does
+enforce have different reasons: ``EXYNOS_BECORE_LTM_GRID_SLOPE_MAX`` is where
+Q20 runs out of a 32-bit integer, while the hardware's exponent still has room
+above it, and ``EXYNOS_BECORE_LTM_GRID_BIAS_MAX`` is the last rung of the
+exponent ladder the bias has, past which no scaling makes it fit.
+
+One thing about the block is worth knowing before using it: the quantisation
+step is chosen from the largest magnitude anywhere in the grid, because the
+hardware carries one exponent for the whole of it. A single cell asking for a
+1000x gain therefore costs every other cell most of its precision, and unity
+would be written as 32 parts in 32768. Bounding what an algorithm asks for is
+what keeps the rest of the grid smooth.
+
 The sharpener is the exception and is deliberately not checked that way. Its
 values are fixed-point numbers in the hardware's own fields, and a value past
 the field it reaches **saturates** rather than being refused -- which is what

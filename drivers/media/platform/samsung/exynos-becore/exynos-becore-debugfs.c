@@ -139,7 +139,16 @@ static ssize_t becore_stage_write(struct becore_device *becore,
 
 	*staged_bytes += count;
 	*ppos += count;
-	if (generation && *staged_bytes == capacity)
+	/*
+	 * On every write that changed bytes, not only on the one that completes
+	 * the stage.  What reads this counter is asking whether the buffer is
+	 * still the one some other description was derived from, and a partial
+	 * stage has already made it not that -- so the answer has to be no from
+	 * the first byte.  Two gates refuse to *run* a partly staged buffer, so
+	 * bumping late was not reachable today; it was one relaxed check away
+	 * from being.
+	 */
+	if (generation)
 		(*generation)++;
 
 unlock:
@@ -284,6 +293,14 @@ static const struct file_operations becore_input_fops = {
 	.llseek = default_llseek,
 };
 
+/*
+ * Staging a grid here disowns the exponents a parameters block derived, and
+ * needs no code to do it: they are answerable only while the generation they
+ * were taken at is the buffer's, and becore_stage_write() bumps it under the
+ * same lock it copies under.  The block then reads this grid through the
+ * driver's own stated pair, which is the closest thing to a right answer for
+ * a grid handed over as bytes.
+ */
 static ssize_t becore_grid_write(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 {
@@ -761,6 +778,19 @@ static int becore_status_show(struct seq_file *s, void *unused)
 		   becore->grid.staged_bytes, becore->grid.size,
 		   becore->grid_generation,
 		   &becore->grid.dma);
+	if (becore->grid_exponent_generation &&
+	    becore->grid_exponent_generation == becore->grid_generation)
+		seq_printf(s,
+			   "grid exponents   slope 2^-%u, bias 2^-%u, from the grid in the buffer\n",
+			   becore->grid_slope_frac_bit,
+			   14 - becore->grid_bias_bit_adjust);
+	else
+		seq_puts(s,
+			 "grid exponents   driver-stated; no parameters grid is installed\n");
+	if (becore->grid_neutral_generation)
+		seq_printf(s,
+			   "grid neutralise  asked at generation %u\n",
+			   becore->grid_neutral_generation);
 	seq_printf(s, "output           %zu active/%zu completed/%zu allocated bytes, iova %pad\n",
 		   becore->active_output_size, becore->completed_output_size,
 		   becore->output.size,

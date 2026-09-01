@@ -701,7 +701,36 @@ struct becore_device {
 	u32 gtnr_encoded_generation;
 	u32 mcsc_recipe_generation;
 	u32 mcsc_encoded_generation;
+	/*
+	 * The tone mapper's grid, and two things that are only true of one
+	 * version of it.  Every write that changes a byte of the buffer bumps
+	 * @grid_generation, which is what makes both of them self-invalidating: a stale answer
+	 * here is a tone map read at the wrong scale, and there are three
+	 * writers -- a parameters block, the neutral generator, and the
+	 * debugfs staging file -- so a flag each writer had to remember to
+	 * clear would eventually be forgotten by one of them.
+	 *
+	 * @grid_slope_frac_bit and @grid_bias_bit_adjust are the exponents the
+	 * block must read the buffer through, derived in
+	 * becore_ltm_grid_write() from the grid it was handed.  They are the
+	 * answer becore_params_value() gives only while
+	 * @grid_exponent_generation still names the grid in the buffer;
+	 * otherwise the driver's own stated pair stands.  Zero is never a
+	 * match, so the all-zero state a fresh device has does not read as one.
+	 *
+	 * @grid_neutral_generation is a neutralisation asked for and not yet
+	 * done -- see becore_params_stop_streaming(), which cannot do it where
+	 * the request arrives -- and it names the generation it was asked
+	 * about, so a grid written in between supersedes it rather than being
+	 * overwritten by it.  Zero is no request; no writer produces zero.  It
+	 * is recorded only for a grid a parameters block wrote, because a grid
+	 * staged through debugfs is not that interface's to withdraw.
+	 */
 	u32 grid_generation;
+	u32 grid_exponent_generation;
+	u32 grid_neutral_generation;
+	u32 grid_slope_frac_bit;
+	u32 grid_bias_bit_adjust;
 	u32 run_generation;
 	u32 completed_generation;
 	u32 video_sequence;
@@ -835,6 +864,9 @@ struct becore_cmdq_shape;
 /* exynos-becore-params.c */
 int becore_params_init(struct becore_device *becore);
 void becore_params_work(struct work_struct *work);
+int becore_ltm_grid_generate(struct becore_device *becore);
+int becore_ltm_grid_write(struct becore_device *becore, const __s32 *slope,
+			  const __s32 *bias);
 void becore_params_consume(struct becore_device *becore);
 int becore_params_value(const struct becore_device *becore, u32 reg, u32 *value);
 int __must_check becore_params_check_yuvnr(struct device *dev,

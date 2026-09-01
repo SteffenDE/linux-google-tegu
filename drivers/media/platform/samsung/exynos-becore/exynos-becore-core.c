@@ -1652,8 +1652,13 @@ becore_ltm_grid_point(const struct becore_dma_buffer *grid, u32 row, u32 column,
  * zero bias, the curve has nothing to modulate. The two are written by
  * different code and coupled only by that fact, so anything that makes this
  * grid non-neutral makes the ramp a live tone curve in the same breath.
+ *
+ * It bumps the generation like every other writer, which is what retires a
+ * parameters block's exponents: a grid and the two registers that say how to
+ * read it are one description, and leaving half of a userspace one behind
+ * would scale this one.
  */
-static int becore_ltm_grid_generate(struct becore_device *becore)
+int becore_ltm_grid_generate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *grid = &becore->grid;
 	u32 row, column, level, slot;
@@ -1683,7 +1688,115 @@ static int becore_ltm_grid_generate(struct becore_device *becore)
 			}
 
 	grid->staged_bytes = grid->size;
-	becore->grid_generation = 1;
+	becore->grid_generation++;
+
+	return 0;
+}
+
+/*
+ * How the block is told to read the grid, from the grid itself.
+ *
+ * The two registers are exponents: the block reads each gain as a fraction of
+ * 2 ** frac_bit and each offset as one of 2 ** (14 - bias_adjust), so the
+ * largest of each has to pick the exponent that lets it fill its 16-bit field.
+ * `TranslateLtm` raises the largest to at least 1.0 first, which is what keeps
+ * a grid at or below unity on the 14 and 0 the neutral one uses, and then
+ * takes the exponent from its integer part. Written here as the shift it is
+ * rather than as the vendor's count-leading-zeros expression: the two agree
+ * over every integer either can be handed, and one of them says why.
+ *
+ * That integer is reached by *rounding*, which is not a detail. The vendor's
+ * `(int)` is an `fcvtas`, and so is the one below that scales each value -- and
+ * an exponent chosen by truncation where the value rounds is off by one rung at
+ * the top of every binade, exactly where it cannot afford to be. A grid whose
+ * largest gain is 1.9999695 would take the exponent for 1.0, and its largest
+ * cell would encode to 32768: the most negative value the field holds, where
+ * the largest positive one was asked for. 392 values of that gain do it.
+ *
+ * The largest is taken by *magnitude* where the vendor takes it signed. A grid
+ * whose most negative gain is larger than its most positive one is not
+ * something the corpus contains, and following the vendor there would encode
+ * it into an overflow rather than into a wrong picture.
+ */
+static u32 becore_ltm_grid_whole(u32 largest)
+{
+	return max(DIV_ROUND_CLOSEST(largest, EXYNOS_BECORE_LTM_GRID_ONE), 1U);
+}
+
+static u32 becore_ltm_grid_slope_frac_bit(u32 largest)
+{
+	return clamp_t(int, 14 - (int)ilog2(becore_ltm_grid_whole(largest)),
+		       1, 14);
+}
+
+static u32 becore_ltm_grid_bias_bit_adjust(u32 largest)
+{
+	return min(ilog2(becore_ltm_grid_whole(largest)), 3U);
+}
+
+/* Q20 to the block's own scale, rounded to nearest and away from zero. */
+static s16 becore_ltm_grid_quantise(s32 value, u32 fractional_bits)
+{
+	s64 scaled = (s64)value * (1 << fractional_bits);
+	s64 half = EXYNOS_BECORE_LTM_GRID_ONE / 2;
+
+	return div_s64(scaled + (scaled < 0 ? -half : half),
+		       EXYNOS_BECORE_LTM_GRID_ONE);
+}
+
+/*
+ * A grid from userspace, in the buffer the hardware reads.
+ *
+ * Safe to write in place because the back end runs one frame at a time and
+ * this is called from the same path that encodes that frame's program: the
+ * previous frame has completed and the next has not been armed.
+ */
+int becore_ltm_grid_write(struct becore_device *becore, const __s32 *slope,
+			  const __s32 *bias)
+{
+	struct becore_dma_buffer *grid = &becore->grid;
+	u32 largest_slope = EXYNOS_BECORE_LTM_GRID_ONE;
+	u32 largest_bias = 0;
+	u32 frac_bit, bit_adjust;
+	unsigned int i;
+
+	if (!becore_ltm_grid_fits(grid))
+		return -EINVAL;
+
+	for (i = 0; i < EXYNOS_BECORE_LTM_GRID_POINTS; i++) {
+		largest_slope = max_t(u32, largest_slope, abs(slope[i]));
+		largest_bias = max_t(u32, largest_bias, abs(bias[i]));
+	}
+	frac_bit = becore_ltm_grid_slope_frac_bit(largest_slope);
+	bit_adjust = becore_ltm_grid_bias_bit_adjust(largest_bias);
+
+	memset(grid->cpu, 0, grid->size);
+	/* One pass in the uAPI's own index order, which is what it states. */
+	for (i = 0; i < EXYNOS_BECORE_LTM_GRID_POINTS; i++) {
+		u32 level = i % EXYNOS_BECORE_LTM_GRID_LEVELS;
+		u32 cell = i / EXYNOS_BECORE_LTM_GRID_LEVELS;
+		struct becore_ltm_gain_offset_group *group;
+		u32 slot;
+
+		group = becore_ltm_grid_point(grid,
+					      cell / EXYNOS_BECORE_LTM_GRID_COLUMNS,
+					      cell % EXYNOS_BECORE_LTM_GRID_COLUMNS,
+					      level, &slot);
+		if (!group)
+			return -EINVAL;
+
+		group->gain[slot] =
+			cpu_to_le16(becore_ltm_grid_quantise(slope[i], frac_bit));
+		group->offset[slot] =
+			cpu_to_le16(becore_ltm_grid_quantise(bias[i],
+							     14 - bit_adjust));
+	}
+
+	grid->staged_bytes = grid->size;
+	becore->grid_generation++;
+	becore->grid_slope_frac_bit = frac_bit;
+	becore->grid_bias_bit_adjust = bit_adjust;
+	becore->grid_exponent_generation = becore->grid_generation;
 
 	return 0;
 }

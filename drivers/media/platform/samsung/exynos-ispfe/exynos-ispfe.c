@@ -1029,6 +1029,16 @@ struct ispfe_stats_area {
 	 */
 	struct ispfe_lmp_rgb_geometry rgb_geometry;
 	/*
+	 * And the phase-detect block's disparity origin, for the same reason:
+	 * it is the running recipe's, ispfe_pdaf_read_config() rewrites it at
+	 * every stream start, and a copy-out that lands after a second stream
+	 * has started would otherwise publish this area's correlation curve
+	 * against the next recipe's shift axis.  The two main-camera recipes
+	 * agree at -5 and every other recipe has none, so what this closes is
+	 * a camera change with statistics still in flight.
+	 */
+	s32 pdaf_disparity_start;
+	/*
 	 * Which streaming session of the metadata node armed this area.  A
 	 * frame can retire after that session ended -- the front end is a
 	 * different queue and keeps going -- and its statistics belong to the
@@ -1172,10 +1182,12 @@ static bool ispfe_stats_motion_written(const void *grid)
 }
 
 /*
- * Defined below; the phase-detect decode needs the recipe it is running, and
- * the thumbnail's needs the area it is publishing.
+ * Defined below.  A decode is given the area and nothing else: everything it
+ * needs that the hardware did not write is snapshotted onto the area when the
+ * frame is armed, because an area outlives the stream that armed it and the
+ * device's own copy has moved on by the time a copy-out runs.  Not being
+ * handed the device is what makes that structural rather than a rule.
  */
-struct ispfe_device;
 struct ispfe_stats_area;
 
 /*
@@ -1213,8 +1225,7 @@ struct ispfe_stats_area;
  * Defined with the rest of the phase-detect handling, below @ispfe_device: the
  * decode reads the disparity origin out of the recipe that is running.
  */
-static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
-				    const struct ispfe_stats_area *stats,
+static void ispfe_stats_pdaf_decode(const struct ispfe_stats_area *stats,
 				    void *out, const void *grid);
 static bool ispfe_stats_pdaf_written(const void *grid);
 
@@ -1223,8 +1234,7 @@ static bool ispfe_stats_pdaf_written(const void *grid);
  * one: what the decode publishes as geometry is not in the bytes the hardware
  * wrote, so it comes off the area those bytes were written into.
  */
-static void ispfe_stats_thumbnail_decode(const struct ispfe_device *ispfe,
-					 const struct ispfe_stats_area *area,
+static void ispfe_stats_thumbnail_decode(const struct ispfe_stats_area *area,
 					 void *out, const void *grid);
 static bool ispfe_stats_thumbnail_written(const void *grid);
 
@@ -1278,8 +1288,7 @@ static const struct ispfe_stats_grid {
 	 * writes a 384 KiB full-frame region before the windows a focus loop
 	 * reads, and publishes 2.8 KB out of 520 KiB.
 	 */
-	void (*decode)(const struct ispfe_device *ispfe,
-		       const struct ispfe_stats_area *area, void *out,
+	void (*decode)(const struct ispfe_stats_area *area, void *out,
 		       const void *grid);
 } ispfe_stats_grids[ISPFE_STATS_GRIDS] = {
 	[ISPFE_STATS_GRID_AWB] = {
@@ -3323,6 +3332,7 @@ static struct ispfe_stats_area *ispfe_stats_take(struct ispfe_device *ispfe,
 		 * geometry.
 		 */
 		area->rgb_geometry = ispfe->rgb_geometry;
+		area->pdaf_disparity_start = ispfe->pdaf_disparity_start;
 		ispfe->stats_slot[slot] = area;
 	}
 
@@ -5379,8 +5389,7 @@ static int ispfe_lut_area(struct ispfe_device *ispfe, u32 reg, u32 bytes,
 #define ISPFE_LMP_PDAF_RANGE_START_SHIFT	16
 #define ISPFE_LMP_PDAF_RANGE_START_BITS		6
 
-static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
-				    const struct ispfe_stats_area *stats,
+static void ispfe_stats_pdaf_decode(const struct ispfe_stats_area *stats,
 				    void *out, const void *grid)
 {
 	struct exynos_ispfe_stats_pdaf *pdaf = out;
@@ -5392,7 +5401,7 @@ static void ispfe_stats_pdaf_decode(const struct ispfe_device *ispfe,
 
 	pdaf->disparities = get_unaligned_le32(area + ISPFE_PDAF_HEADER_DISPARITIES);
 	pdaf->frame = get_unaligned_le32(area + ISPFE_PDAF_HEADER_FRAME);
-	pdaf->disparity_start = ispfe->pdaf_disparity_start;
+	pdaf->disparity_start = stats->pdaf_disparity_start;
 
 	/*
 	 * One window, and not because one is all there is.  The reader's own
@@ -5471,8 +5480,7 @@ static bool ispfe_stats_pdaf_written(const void *grid)
  * able to say so, and because a consumer that has to ask is a consumer that
  * will guess.
  */
-static void ispfe_stats_thumbnail_decode(const struct ispfe_device *ispfe,
-					 const struct ispfe_stats_area *area,
+static void ispfe_stats_thumbnail_decode(const struct ispfe_stats_area *area,
 					 void *out, const void *grid)
 {
 	struct exynos_ispfe_stats_thumbnail *thumbnail = out;
@@ -10602,7 +10610,7 @@ static void ispfe_stats_publish(struct ispfe_device *ispfe,
 		 * this loop.
 		 */
 		if (desc->decode)
-			desc->decode(ispfe, area, (u8 *)out + desc->offset,
+			desc->decode(area, (u8 *)out + desc->offset,
 				     area->grid[grid]);
 		else
 			memcpy((u8 *)out + desc->offset, area->grid[grid],

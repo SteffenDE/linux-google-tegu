@@ -32,6 +32,8 @@
  *	:c:type:`exynos_becore_params_dmsc`
  * @EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST: The local tone mapper's tone
  *	adjustment curve, :c:type:`exynos_becore_params_ltm_tone_adjust`
+ * @EXYNOS_BECORE_PARAM_BLOCK_LTM_GRID: The local tone mapper's bilateral grid,
+ *	:c:type:`exynos_becore_params_ltm_grid`
  * @EXYNOS_BECORE_PARAM_BLOCK_SENTINEL: Not a block type; the number of them
  *
  * None of these is anything the kernel could know: the matrix is white
@@ -54,6 +56,7 @@ enum exynos_becore_params_block_type {
 	EXYNOS_BECORE_PARAM_BLOCK_BYR_DNS,
 	EXYNOS_BECORE_PARAM_BLOCK_DMSC,
 	EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST,
+	EXYNOS_BECORE_PARAM_BLOCK_LTM_GRID,
 	EXYNOS_BECORE_PARAM_BLOCK_SENTINEL,
 };
 
@@ -167,6 +170,85 @@ struct exynos_becore_params_ltm_tone_adjust {
 #define EXYNOS_BECORE_LTM_GRID_POINTS \
 	(EXYNOS_BECORE_LTM_GRID_COLUMNS * EXYNOS_BECORE_LTM_GRID_ROWS * \
 	 EXYNOS_BECORE_LTM_GRID_LEVELS)
+
+/*
+ * Q20: 1048576 is unity gain, and the same scale carries the bias.
+ *
+ * A scale of this block's own, where every other block here is in the
+ * hardware's.  The hardware's own scale for these two numbers is *chosen per
+ * grid* -- `trans_slope_frac_bit` and `trans_bias_bit_adjust` normalise the
+ * largest of each so it fills its 16-bit field -- so a fixed-point format
+ * cannot both be the hardware's and be a stable ABI.  The driver picks those
+ * two registers from the grid it is handed, which is the only way they can
+ * never disagree with it.
+ */
+#define EXYNOS_BECORE_LTM_GRID_ONE		(1 << 20)
+
+/*
+ * How far each of the two may go, and the two limits have different reasons.
+ *
+ * The slope's is this scale in this type: Q20 in a __s32 stops just short of
+ * 2048, and the hardware's exponent still has room above it.  The bias's is the
+ * hardware's own: its exponent ladder has four rungs and the last of them
+ * leaves eleven fractional bits, so a bias of 16 no longer fits the 16-bit
+ * field however it is written.  Both are stated rather than left to overflow,
+ * because a value past either is an arithmetic mistake in userspace and not a
+ * tone curve.
+ */
+#define EXYNOS_BECORE_LTM_GRID_SLOPE_MAX	(2047 * EXYNOS_BECORE_LTM_GRID_ONE)
+#define EXYNOS_BECORE_LTM_GRID_BIAS_MAX		(15 * EXYNOS_BECORE_LTM_GRID_ONE)
+
+/**
+ * struct exynos_becore_params_ltm_grid - The local tone mapper's bilateral grid
+ *
+ * @header: The parameters block header
+ * @slope: The multiplier at each grid point, Q20, indexed
+ *	``(row * %EXYNOS_BECORE_LTM_GRID_COLUMNS + column) *
+ *	%EXYNOS_BECORE_LTM_GRID_LEVELS + level``
+ * @bias: The value added after it at the same point, on the same scale and in
+ *	the same order
+ *
+ * The block's other input, and the one that makes it *local*: where
+ * :c:type:`exynos_becore_params_ltm_curve` and
+ * :c:type:`exynos_becore_params_ltm_tone_adjust` are one curve each for the
+ * whole frame, this is one affine transform per region of the picture and per
+ * level of brightness within that region.  The hardware interpolates it in all
+ * three axes and applies ``slope * v + bias`` to the pixel it sliced at.
+ *
+ * The two spatial axes span the picture; @level is indexed by the *guide
+ * curve's output*, not by the pixel value directly, so where the levels sit in
+ * brightness is decided by the guide curve sent beside this grid.  The two are
+ * one description and the driver does not reconcile them: a caller that sends
+ * a grid built for one guide curve and then changes the curve gets a tone map
+ * stretched along its brightness axis, with nothing to report it.
+ *
+ * The hardware carries **one quantisation step for the whole grid**, and the
+ * driver picks it from the largest magnitude in the block it is handed.  So a
+ * single point asking for a very large gain costs every other point most of its
+ * precision: with one gain at 1023, unity is written as 32 parts in 32768 and a
+ * smooth grid comes back quantised into steps.  Ask for what the picture needs.
+ *
+ * Unity slope and zero bias everywhere is the identity, and it is what the
+ * driver writes when no block has arrived -- which is also what makes the two
+ * curves inert, because a guide curve modulates this grid and has nothing to
+ * modulate when every cell is the identity.
+ *
+ * The shape of the curve each cell describes is **not** checked, only that
+ * each number is inside %EXYNOS_BECORE_LTM_GRID_SLOPE_MAX or
+ * %EXYNOS_BECORE_LTM_GRID_BIAS_MAX.  A decreasing curve is
+ * refused for the two global curves because there the driver knows where every
+ * sample sits; here it does not, because the guide curve decides that and
+ * userspace owns it too.
+ *
+ * Disabling this block (%V4L2_ISP_PARAMS_FL_BLOCK_DISABLE) returns the grid to
+ * the identity, which switches the local half of tone mapping off and leaves
+ * the global half running.
+ */
+struct exynos_becore_params_ltm_grid {
+	struct v4l2_isp_params_block_header header;
+	__s32 slope[EXYNOS_BECORE_LTM_GRID_POINTS];
+	__s32 bias[EXYNOS_BECORE_LTM_GRID_POINTS];
+} __attribute__((aligned(8)));
 
 /* 17 nodes per axis, indexed by RGB, each holding one (U, V) chroma pair. */
 #define EXYNOS_BECORE_CLUT_AXIS_NODES		17
@@ -1395,6 +1477,7 @@ struct exynos_becore_params_dmsc {
 	 sizeof(struct exynos_becore_params_yuvnr) + \
 	 sizeof(struct exynos_becore_params_byr_dns) + \
 	 sizeof(struct exynos_becore_params_dmsc) + \
-	 sizeof(struct exynos_becore_params_ltm_tone_adjust))
+	 sizeof(struct exynos_becore_params_ltm_tone_adjust) + \
+	 sizeof(struct exynos_becore_params_ltm_grid))
 
 #endif /* __UAPI_EXYNOS_BECORE_CONFIG_H */

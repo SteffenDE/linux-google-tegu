@@ -51,9 +51,14 @@
  * That is a derivation and not a replay, and the captures show why it has to
  * be: 401 of the 426 hold 14, and the other 25 are frames whose grid ran past
  * unity gain. A driver that copied one program's word would be wrong the
- * moment its grid stopped being neutral -- which is the thing to remember if
- * a parameters block ever carries a grid: these two are constants only for as
- * long as the grid beside them is, and nothing couples them automatically.
+ * moment its grid stopped being neutral.
+ *
+ * These two are therefore the values for *this* driver's own grid, and they
+ * are what the block reads only while that is the grid in the buffer. A
+ * parameters block carrying one derives its own pair in
+ * becore_ltm_grid_write() and answers for these registers through
+ * becore_params_value(), which is what couples them; before that block
+ * existed, nothing did.
  */
 #define BECORE_LTM_TRANS_SLOPE_FRAC_BIT	14
 #define BECORE_LTM_TRANS_BIAS_BIT_ADJUST 0

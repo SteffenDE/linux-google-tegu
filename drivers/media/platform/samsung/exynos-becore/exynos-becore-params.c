@@ -1232,6 +1232,25 @@ int becore_params_value(const struct becore_device *becore,
 		return 0;
 	}
 	/*
+	 * The two exponents the block reads the grid through.  They are not
+	 * values userspace sent -- they are derived from the grid it sent, in
+	 * becore_ltm_grid_write() -- and they are not parameters state either,
+	 * because they describe the buffer rather than the block: what makes
+	 * them answerable is that the grid in it is still the one they came
+	 * from, and every writer of that buffer bumps the generation.
+	 */
+	if (becore->grid_exponent_generation &&
+	    becore->grid_exponent_generation == becore->grid_generation) {
+		if (reg == BECORE_YUVP_LTM_SLOPE_FRAC_REG) {
+			*value = becore->grid_slope_frac_bit;
+			return 0;
+		}
+		if (reg == BECORE_YUVP_LTM_BIAS_ADJUST_REG) {
+			*value = becore->grid_bias_bit_adjust;
+			return 0;
+		}
+	}
+	/*
 	 * No range test in front of this one: the table it walks is the only
 	 * statement of where those registers are, and a second copy of their
 	 * extent here would be a copy to keep in step.
@@ -1346,6 +1365,9 @@ becore_params_block_info[] = {
 	[EXYNOS_BECORE_PARAM_BLOCK_LTM_TONE_ADJUST] = {
 		.size = sizeof(struct exynos_becore_params_ltm_tone_adjust),
 	},
+	[EXYNOS_BECORE_PARAM_BLOCK_LTM_GRID] = {
+		.size = sizeof(struct exynos_becore_params_ltm_grid),
+	},
 };
 
 static_assert(ARRAY_SIZE(becore_params_block_info) ==
@@ -1426,6 +1448,45 @@ becore_params_check_ltm_tone_adjust(struct device *dev,
 		if (i && ltm->curve[i] < ltm->curve[i - 1]) {
 			dev_dbg(dev, "tone adjustment decreases at point %u\n",
 				i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * The grid's shape is not checked and the two global curves' is, and the
+ * difference is what the driver knows rather than how much it trusts
+ * userspace.  A curve's samples sit at inputs the driver states, so it can say
+ * that one goes backwards; a grid's levels sit wherever the guide curve puts
+ * them, and the guide curve is userspace's too, so the same sequence of
+ * numbers is a sensible tone map under one curve and an inverted one under
+ * another.
+ *
+ * What is left to check is the range, and that is a real check rather than a
+ * formality: past these the block's own exponent cannot express the value at
+ * all, so the encoding would silently wrap a highlight into a shadow.
+ */
+static int
+becore_params_check_ltm_grid(struct device *dev,
+			     const struct exynos_becore_params_ltm_grid *ltm)
+{
+	unsigned int i;
+
+	/*
+	 * In s64, because abs(INT_MIN) is INT_MIN: compared as an s32 the most
+	 * negative gain userspace can name passes a test that refuses every
+	 * value just inside it, and then picks the coarsest quantisation step
+	 * there is for the whole grid.
+	 */
+	for (i = 0; i < EXYNOS_BECORE_LTM_GRID_POINTS; i++) {
+		if (abs((s64)ltm->slope[i]) > EXYNOS_BECORE_LTM_GRID_SLOPE_MAX) {
+			dev_dbg(dev, "tone mapping slope %u is out of range\n", i);
+			return -EINVAL;
+		}
+		if (abs((s64)ltm->bias[i]) > EXYNOS_BECORE_LTM_GRID_BIAS_MAX) {
+			dev_dbg(dev, "tone mapping bias %u is out of range\n", i);
 			return -EINVAL;
 		}
 	}
@@ -1655,6 +1716,36 @@ static int becore_params_walk(struct becore_device *becore,
 			becore->params.ltm_tone_adjust_valid = true;
 			break;
 		}
+		case EXYNOS_BECORE_PARAM_BLOCK_LTM_GRID: {
+			const struct exynos_becore_params_ltm_grid *ltm =
+				(const void *)header;
+
+			/*
+			 * Disabling returns the grid to the identity, which is
+			 * what becore_ltm_grid_generate() writes and what
+			 * clears the two exponents with it.
+			 */
+			if (disable) {
+				if (apply)
+					becore_ltm_grid_generate(becore);
+				break;
+			}
+			ret = becore_params_check_ltm_grid(becore->dev, ltm);
+			if (ret)
+				return ret;
+			if (!apply)
+				break;
+			/*
+			 * Straight into the buffer the hardware reads: it is
+			 * 96 KiB and a shadow copy of it would be a second one
+			 * for no reader.
+			 */
+			ret = becore_ltm_grid_write(becore, ltm->slope,
+						    ltm->bias);
+			if (ret)
+				return ret;
+			break;
+		}
 		case EXYNOS_BECORE_PARAM_BLOCK_CLUT: {
 			const struct exynos_becore_params_clut *clut =
 				(const void *)header;
@@ -1859,6 +1950,23 @@ void becore_params_consume(struct becore_device *becore)
 {
 	struct becore_params_buffer *buf;
 
+	/*
+	 * Before this frame's buffer rather than after it: a buffer carrying a
+	 * grid must not have the neutral one written over it.
+	 */
+	if (becore->grid_neutral_generation) {
+		/*
+		 * Only if nothing has replaced that grid since the request:
+		 * a block installed between the two -- which the work item
+		 * can do while nothing is streaming -- is this frame's grid,
+		 * and neutralising it would run the session on the identity
+		 * having told userspace its buffer was applied.
+		 */
+		if (becore->grid_neutral_generation != becore->grid_generation ||
+		    !becore_ltm_grid_generate(becore))
+			becore->grid_neutral_generation = 0;
+	}
+
 	spin_lock_irq(&becore->queue_lock);
 	buf = list_first_entry_or_null(&becore->queued_params,
 				       struct becore_params_buffer, list);
@@ -2041,6 +2149,36 @@ static void becore_params_stop_streaming(struct vb2_queue *q)
 	mutex_lock(&becore->lock);
 	becore_params_return_all(becore, VB2_BUF_STATE_ERROR);
 	memset(&becore->params, 0, sizeof(becore->params));
+	/*
+	 * The tone mapper's grid is the one piece of this state that is not in
+	 * this state: it lives in the buffer the hardware reads, so forgetting
+	 * it is not the same as clearing it.  Left alone, the next stream would
+	 * start with this one's grid in that buffer and with the two exponents
+	 * back at what the identity needs -- a tone map read at the wrong scale,
+	 * on a session that sent no grid at all.
+	 *
+	 * Asked for rather than done here.  This queue has a lock of its own,
+	 * and becore->lock is dropped for the length of a frame, so a STREAMOFF
+	 * on this node can land while YUVP is reading that buffer -- which is
+	 * the state every other writer of it refuses in.  becore_params_consume()
+	 * runs at the one point where writing it is safe, and it runs before
+	 * every frame, so the next frame gets the identity and no frame sees a
+	 * torn grid.  The generation is recorded rather than a flag, so that a
+	 * grid written before that frame supersedes the request instead of
+	 * being erased by it.
+	 *
+	 * And only a grid *this* interface put there is owed anything.  A grid
+	 * staged through debugfs is not this queue's to withdraw: recording the
+	 * request unconditionally would have any STREAMON/STREAMOFF pair that
+	 * sent no grid at all -- which is what v4l2-compliance does -- replace
+	 * a staged one with the identity at the next run, silently, and
+	 * invisibly in the encoded program, because the exponents fall back to
+	 * the driver's stated pair either way.  What says the grid came from
+	 * here is that its exponents are still the ones derived with it.
+	 */
+	if (becore->grid_exponent_generation &&
+	    becore->grid_exponent_generation == becore->grid_generation)
+		becore->grid_neutral_generation = becore->grid_generation;
 	mutex_unlock(&becore->lock);
 	cancel_work_sync(&becore->params_work);
 }

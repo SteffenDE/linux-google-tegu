@@ -199,10 +199,20 @@ static_assert(BECORE_YUVP_CLUT_HEADER < BECORE_YUVP_HEADER_COUNT);
  * The register block and the 96 KiB buffer are two halves of one thing, and
  * nothing else in this driver says so: state it where both are in scope, so a
  * future edit to either has to answer for the other.
+ *
+ * Three relations and not one product, because the buffer is not full: a
+ * column carries the block's levels and nothing else, a row's columns fit
+ * inside the stride the block is programmed with, and the rows fit the
+ * allocation. What is left over is padding, which every captured grid leaves
+ * zero -- so an equality against BECORE_GRID_SIZE would be asserting the size
+ * of the padding, which is not a property anything here relies on.
  */
-static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_SLCGRID_ROWS *
-	      BECORE_LTM_SLCGRID_DEPTH * BECORE_LTM_SLCGRID_CELL_SHORTS *
-	      sizeof(__le16) == BECORE_GRID_SIZE);
+static_assert(BECORE_LTM_GRID_COLUMN_BYTES ==
+	      BECORE_LTM_SLCGRID_DEPTH * 2 * sizeof(__le16));
+static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_GRID_COLUMN_BYTES <=
+	      BECORE_LTM_GRID_ROW_BYTES);
+static_assert(BECORE_LTM_SLCGRID_ROWS * BECORE_LTM_GRID_ROW_BYTES <=
+	      BECORE_GRID_SIZE);
 
 #define BECORE_MCSC_INPUT_VOTF_STALL_LINES	GENMASK_U32(29, 16)
 
@@ -1595,9 +1605,50 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 	return 0;
 }
 
+/* Whether this driver's grid shape fits the buffer the block reads it from. */
+static bool becore_ltm_grid_fits(const struct becore_dma_buffer *grid)
+{
+	static_assert(BECORE_LTM_GRID_COLUMN_BYTES *
+		      EXYNOS_BECORE_LTM_GRID_COLUMNS <=
+		      BECORE_LTM_GRID_ROW_BYTES);
+	static_assert(EXYNOS_BECORE_LTM_GRID_ROWS <= BECORE_LTM_GRID_BUFFER_ROWS);
+	static_assert(EXYNOS_BECORE_LTM_GRID_LEVELS %
+		      BECORE_LTM_GRID_GROUP_LEVELS == 0);
+
+	return grid->cpu && grid->size == BECORE_GRID_SIZE;
+}
+
+/*
+ * Where one grid point's gain and offset live, or NULL if the shape the driver
+ * was built with does not fit the buffer the hardware was given.
+ *
+ * One function rather than the same arithmetic in two places, because the
+ * neutral grid below and the one a parameters block brings have to land on
+ * exactly the same bytes: if they ever disagreed, disabling the block would
+ * not restore what enabling it replaced.
+ */
+static struct becore_ltm_gain_offset_group *
+becore_ltm_grid_point(const struct becore_dma_buffer *grid, u32 row, u32 column,
+		      u32 level, u32 *slot)
+{
+	struct becore_ltm_grid_column *at;
+
+	if (!becore_ltm_grid_fits(grid) ||
+	    row >= EXYNOS_BECORE_LTM_GRID_ROWS ||
+	    column >= EXYNOS_BECORE_LTM_GRID_COLUMNS ||
+	    level >= EXYNOS_BECORE_LTM_GRID_LEVELS)
+		return NULL;
+
+	at = grid->cpu + row * BECORE_LTM_GRID_ROW_BYTES +
+	     column * BECORE_LTM_GRID_COLUMN_BYTES;
+	*slot = level % BECORE_LTM_GRID_GROUP_LEVELS;
+
+	return &at->groups[level / BECORE_LTM_GRID_GROUP_LEVELS];
+}
+
 /*
  * The neutral grid, and the reason the guide curve's identity ramp above is a
- * measured no-op rather than a hopeful one: with every cell at unity gain and
+ * measured no-op rather than a hopeful one: with every point at unity gain and
  * zero bias, the curve has nothing to modulate. The two are written by
  * different code and coupled only by that fact, so anything that makes this
  * grid non-neutral makes the ramp a live tone curve in the same breath.
@@ -1605,40 +1656,31 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 static int becore_ltm_grid_generate(struct becore_device *becore)
 {
 	struct becore_dma_buffer *grid = &becore->grid;
-	u32 row, column, group, channel;
+	u32 row, column, level, slot;
 
-	static_assert(sizeof(struct becore_ltm_grid_cell) ==
-		      BECORE_LTM_GRID_CELL_BYTES);
-	if (!grid->cpu || grid->size != BECORE_GRID_SIZE ||
-	    BECORE_LTM_GRID_WIDTH_CELLS * BECORE_LTM_GRID_CELL_BYTES >
-		BECORE_LTM_GRID_ROW_BYTES ||
-	    BECORE_LTM_GRID_HEIGHT_CELLS > BECORE_LTM_GRID_ROWS)
+	if (!becore_ltm_grid_fits(grid))
 		return -EINVAL;
 
 	/*
-	 * Lyric's LTM translator stores four Q14 gains followed by four signed
-	 * offsets in each 16-byte group.  Unity gains and zero offsets provide a
-	 * neutral policy surface; inactive cells and physical-row padding stay 0.
+	 * Unity gains and zero offsets provide a neutral policy surface;
+	 * the padding beyond each row's columns, and the rows past the grid's
+	 * own height, stay zero.
 	 */
 	memset(grid->cpu, 0, grid->size);
-	for (row = 0; row < BECORE_LTM_GRID_HEIGHT_CELLS; row++) {
-		u8 *row_base = (u8 *)grid->cpu +
-			       row * BECORE_LTM_GRID_ROW_BYTES;
+	for (row = 0; row < EXYNOS_BECORE_LTM_GRID_ROWS; row++)
+		for (column = 0; column < EXYNOS_BECORE_LTM_GRID_COLUMNS;
+		     column++)
+			for (level = 0; level < EXYNOS_BECORE_LTM_GRID_LEVELS;
+			     level++) {
+				struct becore_ltm_gain_offset_group *group =
+					becore_ltm_grid_point(grid, row, column,
+							      level, &slot);
 
-		for (column = 0; column < BECORE_LTM_GRID_WIDTH_CELLS;
-		     column++) {
-			struct becore_ltm_grid_cell *cell =
-				(void *)(row_base +
-					 column * BECORE_LTM_GRID_CELL_BYTES);
-
-			for (group = 0; group < ARRAY_SIZE(cell->groups); group++)
-				for (channel = 0;
-				     channel < ARRAY_SIZE(cell->groups[group].gain);
-				     channel++)
-					cell->groups[group].gain[channel] =
-						cpu_to_le16(BECORE_LTM_UNITY_Q14);
-		}
-	}
+				if (!group)
+					return -EINVAL;
+				group->gain[slot] =
+					cpu_to_le16(BECORE_LTM_UNITY_Q14);
+			}
 
 	grid->staged_bytes = grid->size;
 	becore->grid_generation = 1;

@@ -45,15 +45,32 @@
 #define BECORE_OVERRIDE_MAX		32
 #define BECORE_OVERRIDE_TEXT_MAX	1024
 
-/* Fixed neutral LTM policy for the proven 4000x3000 processing profile. */
+/*
+ * Where each of the tone mapper's grid points lives in its DMA buffer.
+ *
+ * The buffer is 48 rows of %BECORE_LTM_GRID_ROW_BYTES, which is what the
+ * block's stride register says and what its allocation is, and only the first
+ * %EXYNOS_BECORE_LTM_GRID_ROWS of them carry anything.  Inside one of those
+ * rows sit the grid's *other two* axes: %EXYNOS_BECORE_LTM_GRID_COLUMNS
+ * columns of %BECORE_LTM_GRID_COLUMN_BYTES, each holding that column's
+ * %EXYNOS_BECORE_LTM_GRID_LEVELS levels in groups of four -- four gains and
+ * then four offsets to a sixteen-byte group, which is the shape
+ * `TranslateBilateralGrid` writes.  So 1,024 of each row's 2,048 bytes are
+ * grid and the rest is padding, as are rows 24 to 47.
+ *
+ * Column-major over the levels rather than level-major over the columns, and
+ * that is measured: reshaped the other way the 27 distinct grids of the
+ * captured corpus vary fifteen times as fast across a row as they do down one,
+ * which is not a picture.  Reshaped this way the two agree to within a quarter
+ * -- 0.0123 against 0.0156 mean normalised neighbour difference -- and the
+ * level axis is the one that moves, at 0.2014, which is what a tone curve does.
+ */
 #define BECORE_LTM_GRID_ROW_BYTES	0x800
-#define BECORE_LTM_GRID_ROWS		48
-#define BECORE_LTM_GRID_CELL_BYTES	0x100
-#define BECORE_LTM_GRID_WIDTH_CELLS	4
-#define BECORE_LTM_GRID_HEIGHT_CELLS	24
+#define BECORE_LTM_GRID_BUFFER_ROWS	48
+#define BECORE_LTM_GRID_GROUP_LEVELS	4
 #define BECORE_LTM_UNITY_Q14		BIT(14)
 #define BECORE_GRID_SIZE			(BECORE_LTM_GRID_ROW_BYTES * \
-					 BECORE_LTM_GRID_ROWS)
+					 BECORE_LTM_GRID_BUFFER_ROWS)
 
 enum becore_block_id {
 	BECORE_RGBP,
@@ -283,18 +300,19 @@ struct becore_dma_buffer {
 };
 
 struct becore_ltm_gain_offset_group {
-	__le16 gain[4];
-	__le16 offset[4];
+	__le16 gain[BECORE_LTM_GRID_GROUP_LEVELS];
+	__le16 offset[BECORE_LTM_GRID_GROUP_LEVELS];
 };
 
-#define BECORE_LTM_GRID_GROUPS_PER_CELL \
-	(BECORE_LTM_GRID_CELL_BYTES / \
-	 sizeof(struct becore_ltm_gain_offset_group))
+#define BECORE_LTM_GRID_GROUPS_PER_COLUMN \
+	(EXYNOS_BECORE_LTM_GRID_LEVELS / BECORE_LTM_GRID_GROUP_LEVELS)
 
-struct becore_ltm_grid_cell {
+struct becore_ltm_grid_column {
 	struct becore_ltm_gain_offset_group
-		groups[BECORE_LTM_GRID_GROUPS_PER_CELL];
+		groups[BECORE_LTM_GRID_GROUPS_PER_COLUMN];
 };
+
+#define BECORE_LTM_GRID_COLUMN_BYTES	sizeof(struct becore_ltm_grid_column)
 
 enum becore_input_slot_state {
 	BECORE_INPUT_FREE,

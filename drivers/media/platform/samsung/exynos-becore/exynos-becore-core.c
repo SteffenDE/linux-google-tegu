@@ -200,12 +200,13 @@ static_assert(BECORE_YUVP_CLUT_HEADER < BECORE_YUVP_HEADER_COUNT);
  * nothing else in this driver says so: state it where both are in scope, so a
  * future edit to either has to answer for the other.
  *
- * Three relations and not one product, because the buffer is not full: a
- * column carries the block's levels and nothing else, a row's columns fit
- * inside the stride the block is programmed with, and the rows fit the
- * allocation. What is left over is padding, which every captured grid leaves
- * zero -- so an equality against BECORE_GRID_SIZE would be asserting the size
- * of the padding, which is not a property anything here relies on.
+ * The five relations below describe the tile rather than pretending the
+ * buffer is a linear grid: logical rows divide into twelve-row groups and
+ * three phases, columns divide into groups of four, every byte group fits in
+ * one physical-row stride, and all row phases fit in the allocation.  What is
+ * left over is padding, which every captured grid leaves zero -- so an
+ * equality against BECORE_GRID_SIZE would be asserting the size of the
+ * padding, which is not a property anything here relies on.
  */
 static_assert(BECORE_LTM_SLCGRID_ROWS %
 	      BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP == 0);

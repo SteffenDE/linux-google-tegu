@@ -207,12 +207,19 @@ static_assert(BECORE_YUVP_CLUT_HEADER < BECORE_YUVP_HEADER_COUNT);
  * zero -- so an equality against BECORE_GRID_SIZE would be asserting the size
  * of the padding, which is not a property anything here relies on.
  */
-static_assert(BECORE_LTM_GRID_COLUMN_BYTES ==
-	      BECORE_LTM_SLCGRID_DEPTH * 2 * sizeof(__le16));
-static_assert(BECORE_LTM_SLCGRID_COLUMNS * BECORE_LTM_GRID_COLUMN_BYTES <=
-	      BECORE_LTM_GRID_ROW_BYTES);
-static_assert(BECORE_LTM_SLCGRID_ROWS * BECORE_LTM_GRID_ROW_BYTES <=
-	      BECORE_GRID_SIZE);
+static_assert(BECORE_LTM_SLCGRID_ROWS %
+	      BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP == 0);
+static_assert(BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP /
+	      BECORE_LTM_GRID_ROW_PHASES == BECORE_LTM_GRID_GROUP_LEVELS);
+static_assert(BECORE_LTM_SLCGRID_COLUMNS %
+	      BECORE_LTM_GRID_TILE_COLUMNS == 0);
+static_assert(BECORE_LTM_GRID_TILE_COLUMNS * BECORE_LTM_SLCGRID_DEPTH *
+	      (BECORE_LTM_SLCGRID_ROWS /
+	       BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP) *
+	      BECORE_LTM_GRID_GROUP_BYTES <= BECORE_LTM_GRID_ROW_BYTES);
+static_assert(BECORE_LTM_GRID_ROW_PHASES *
+	      (BECORE_LTM_SLCGRID_COLUMNS /
+	       BECORE_LTM_GRID_TILE_COLUMNS) <= BECORE_LTM_GRID_BUFFER_ROWS);
 
 #define BECORE_MCSC_INPUT_VOTF_STALL_LINES	GENMASK_U32(29, 16)
 
@@ -1608,12 +1615,10 @@ static int becore_alloc_dma_buffer(struct becore_device *becore,
 /* Whether this driver's grid shape fits the buffer the block reads it from. */
 static bool becore_ltm_grid_fits(const struct becore_dma_buffer *grid)
 {
-	static_assert(BECORE_LTM_GRID_COLUMN_BYTES *
-		      EXYNOS_BECORE_LTM_GRID_COLUMNS <=
-		      BECORE_LTM_GRID_ROW_BYTES);
-	static_assert(EXYNOS_BECORE_LTM_GRID_ROWS <= BECORE_LTM_GRID_BUFFER_ROWS);
-	static_assert(EXYNOS_BECORE_LTM_GRID_LEVELS %
-		      BECORE_LTM_GRID_GROUP_LEVELS == 0);
+	static_assert(EXYNOS_BECORE_LTM_GRID_ROWS %
+		      BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP == 0);
+	static_assert(EXYNOS_BECORE_LTM_GRID_COLUMNS %
+		      BECORE_LTM_GRID_TILE_COLUMNS == 0);
 
 	return grid->cpu && grid->size == BECORE_GRID_SIZE;
 }
@@ -1631,7 +1636,8 @@ static struct becore_ltm_gain_offset_group *
 becore_ltm_grid_point(const struct becore_dma_buffer *grid, u32 row, u32 column,
 		      u32 level, u32 *slot)
 {
-	struct becore_ltm_grid_column *at;
+	struct becore_ltm_gain_offset_group *at;
+	u32 physical_row, group;
 
 	if (!becore_ltm_grid_fits(grid) ||
 	    row >= EXYNOS_BECORE_LTM_GRID_ROWS ||
@@ -1639,11 +1645,22 @@ becore_ltm_grid_point(const struct becore_dma_buffer *grid, u32 row, u32 column,
 	    level >= EXYNOS_BECORE_LTM_GRID_LEVELS)
 		return NULL;
 
-	at = grid->cpu + row * BECORE_LTM_GRID_ROW_BYTES +
-	     column * BECORE_LTM_GRID_COLUMN_BYTES;
-	*slot = level % BECORE_LTM_GRID_GROUP_LEVELS;
+	physical_row = row % BECORE_LTM_GRID_ROW_PHASES *
+		       (EXYNOS_BECORE_LTM_GRID_COLUMNS /
+			BECORE_LTM_GRID_TILE_COLUMNS) +
+		       column / BECORE_LTM_GRID_TILE_COLUMNS;
+	group = column % BECORE_LTM_GRID_TILE_COLUMNS *
+		EXYNOS_BECORE_LTM_GRID_LEVELS *
+		(EXYNOS_BECORE_LTM_GRID_ROWS /
+		 BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP) +
+		level * (EXYNOS_BECORE_LTM_GRID_ROWS /
+			 BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP) +
+		row / BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP;
+	*slot = row % BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP /
+		BECORE_LTM_GRID_ROW_PHASES;
+	at = grid->cpu + physical_row * BECORE_LTM_GRID_ROW_BYTES;
 
-	return &at->groups[level / BECORE_LTM_GRID_GROUP_LEVELS];
+	return &at[group];
 }
 
 /*

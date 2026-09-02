@@ -48,26 +48,30 @@
 /*
  * Where each of the tone mapper's grid points lives in its DMA buffer.
  *
- * The buffer is 48 rows of %BECORE_LTM_GRID_ROW_BYTES, which is what the
- * block's stride register says and what its allocation is, and only the first
- * %EXYNOS_BECORE_LTM_GRID_ROWS of them carry anything.  Inside one of those
- * rows sit the grid's *other two* axes: %EXYNOS_BECORE_LTM_GRID_COLUMNS
- * columns of %BECORE_LTM_GRID_COLUMN_BYTES, each holding that column's
- * %EXYNOS_BECORE_LTM_GRID_LEVELS levels in groups of four -- four gains and
- * then four offsets to a sixteen-byte group, which is the shape
- * `TranslateBilateralGrid` writes.  So 1,024 of each row's 2,048 bytes are
- * grid and the rest is padding, as are rows 24 to 47.
+ * The buffer is 48 rows of %BECORE_LTM_GRID_ROW_BYTES, but the first 24 are
+ * hardware tiles rather than the grid's 24 logical rows.  Each physical row
+ * carries four adjacent columns, all eight levels and eight logical rows: four
+ * gains followed by four offsets in each sixteen-byte group.  The logical
+ * rows are split into three phases and two groups of four lanes.
  *
- * Column-major over the levels rather than level-major over the columns, and
- * that is measured: reshaped the other way the 27 distinct grids of the
- * captured corpus vary fifteen times as fast across a row as they do down one,
- * which is not a picture.  Reshaped this way the two agree to within a quarter
- * -- 0.0123 against 0.0156 mean normalised neighbour difference -- and the
- * level axis is the one that moves, at 0.2014, which is what a tone curve does.
+ * For logical (row, column, level), the exact vendor mapping is:
+ *
+ *   physical row = (row % 3) * 8 + column / 4
+ *   group        = (column % 4) * 16 + level * 2 + row / 12
+ *   lane         = (row % 12) / 3
+ *
+ * This is measured against three pointer-associated node/driver pairs: after
+ * this inverse swizzle all 6,144 slopes reproduce the fp16 node output bit for
+ * bit and biases differ only by the quantizer's integer truncation.  Reading a
+ * physical row as one logical row preserves the histogram but invents a tone
+ * curve by moving spatial variation onto the level axis.
  */
 #define BECORE_LTM_GRID_ROW_BYTES	0x800
 #define BECORE_LTM_GRID_BUFFER_ROWS	48
 #define BECORE_LTM_GRID_GROUP_LEVELS	4
+#define BECORE_LTM_GRID_ROW_PHASES	3
+#define BECORE_LTM_GRID_TILE_COLUMNS	4
+#define BECORE_LTM_GRID_LOGICAL_ROWS_PER_GROUP	12
 #define BECORE_LTM_UNITY_Q14		BIT(14)
 #define BECORE_GRID_SIZE			(BECORE_LTM_GRID_ROW_BYTES * \
 					 BECORE_LTM_GRID_BUFFER_ROWS)
@@ -304,15 +308,8 @@ struct becore_ltm_gain_offset_group {
 	__le16 offset[BECORE_LTM_GRID_GROUP_LEVELS];
 };
 
-#define BECORE_LTM_GRID_GROUPS_PER_COLUMN \
-	(EXYNOS_BECORE_LTM_GRID_LEVELS / BECORE_LTM_GRID_GROUP_LEVELS)
-
-struct becore_ltm_grid_column {
-	struct becore_ltm_gain_offset_group
-		groups[BECORE_LTM_GRID_GROUPS_PER_COLUMN];
-};
-
-#define BECORE_LTM_GRID_COLUMN_BYTES	sizeof(struct becore_ltm_grid_column)
+#define BECORE_LTM_GRID_GROUP_BYTES \
+	sizeof(struct becore_ltm_gain_offset_group)
 
 enum becore_input_slot_state {
 	BECORE_INPUT_FREE,

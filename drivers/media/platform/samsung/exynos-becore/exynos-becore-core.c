@@ -1728,10 +1728,9 @@ int becore_ltm_grid_generate(struct becore_device *becore)
  * below 2.0 still encodes below 32768 with fourteen fractional bits, while
  * 2.0 itself advances to the next exponent.
  *
- * The largest is taken by *magnitude* where the vendor takes it signed. A grid
- * whose most negative gain is larger than its most positive one is not
- * something the corpus contains, and following the vendor there would encode
- * it into an overflow rather than into a wrong picture.
+ * Both paths take the largest magnitude: Lyric clears each float's sign bit
+ * before its maximum reduction, and the Q20 interface does the equivalent
+ * with abs() below.
  */
 static u32 becore_ltm_grid_whole(u32 largest)
 {

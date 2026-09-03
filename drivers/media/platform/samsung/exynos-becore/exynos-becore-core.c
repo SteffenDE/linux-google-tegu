@@ -1723,13 +1723,10 @@ int becore_ltm_grid_generate(struct becore_device *becore)
  * rather than as the vendor's count-leading-zeros expression: the two agree
  * over every integer either can be handed, and one of them says why.
  *
- * That integer is reached by *rounding*, which is not a detail. The vendor's
- * `(int)` is an `fcvtas`, and so is the one below that scales each value -- and
- * an exponent chosen by truncation where the value rounds is off by one rung at
- * the top of every binade, exactly where it cannot afford to be. A grid whose
- * largest gain is 1.9999695 would take the exponent for 1.0, and its largest
- * cell would encode to 32768: the most negative value the field holds, where
- * the largest positive one was asked for. 392 values of that gain do it.
+ * The exponent path converts the largest value with `fcvtzu`, so its integer
+ * part is truncated.  That remains safe at the top of a binade: any value
+ * below 2.0 still encodes below 32768 with fourteen fractional bits, while
+ * 2.0 itself advances to the next exponent.
  *
  * The largest is taken by *magnitude* where the vendor takes it signed. A grid
  * whose most negative gain is larger than its most positive one is not
@@ -1738,7 +1735,7 @@ int becore_ltm_grid_generate(struct becore_device *becore)
  */
 static u32 becore_ltm_grid_whole(u32 largest)
 {
-	return max(DIV_ROUND_CLOSEST(largest, EXYNOS_BECORE_LTM_GRID_ONE), 1U);
+	return max(largest / EXYNOS_BECORE_LTM_GRID_ONE, 1U);
 }
 
 static u32 becore_ltm_grid_slope_frac_bit(u32 largest)
@@ -1752,14 +1749,17 @@ static u32 becore_ltm_grid_bias_bit_adjust(u32 largest)
 	return min(ilog2(becore_ltm_grid_whole(largest)), 3U);
 }
 
-/* Q20 to the block's own scale, rounded to nearest and away from zero. */
+/*
+ * Q20 to the block's own scale.  Lyric's active fp16 SIMD writer multiplies
+ * then uses `fcvtzs`, truncating toward zero.  Its generic scalar fallback
+ * uses a different conversion, but the SIMD path reproduced three captured
+ * 96 KiB buffers byte for byte.
+ */
 static s16 becore_ltm_grid_quantise(s32 value, u32 fractional_bits)
 {
 	s64 scaled = (s64)value * (1 << fractional_bits);
-	s64 half = EXYNOS_BECORE_LTM_GRID_ONE / 2;
 
-	return div_s64(scaled + (scaled < 0 ? -half : half),
-		       EXYNOS_BECORE_LTM_GRID_ONE);
+	return div_s64(scaled, EXYNOS_BECORE_LTM_GRID_ONE);
 }
 
 /*

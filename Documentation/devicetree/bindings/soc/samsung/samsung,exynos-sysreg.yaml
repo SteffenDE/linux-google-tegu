@@ -24,6 +24,7 @@ properties:
               - google,zumapro-disp-sysreg
               - google,zumapro-hsi1-sysreg
               - google,zumapro-hsi2-sysreg
+              - google,zumapro-mfc-sysreg
               - google,zumapro-peric0-sysreg
               - google,zumapro-peric1-sysreg
               - samsung,exynos2200-cmgp-sysreg

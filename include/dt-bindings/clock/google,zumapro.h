@@ -84,6 +84,11 @@
 #define CLK_GOUT_CMU_HSI1_PCIE			61
 #define CLK_DOUT_CMU_HSI1_PCIE			62
 
+/* CMU_TOP MFC feed */
+#define CLK_MOUT_CMU_MFC_MFC			63
+#define CLK_GOUT_CMU_MFC_MFC			64
+#define CLK_DOUT_CMU_MFC_MFC			65
+
 /*
  * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
  * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
@@ -290,5 +295,11 @@
 #define CLK_MOUT_MISC_NOC_USER			1
 #define CLK_DOUT_MISC_NOCP			2
 #define CLK_GOUT_MISC_MCT_PCLK			3
+
+/* CMU_MFC */
+#define CLK_MOUT_MFC_MFC_USER			1
+#define CLK_DOUT_MFC_NOCP				2
+#define CLK_GOUT_MFC_MFC_ACLK			3
+#define CLK_GOUT_MFC_SYSREG_PCLK			4
 
 #endif /* _DT_BINDINGS_CLOCK_GOOGLE_ZUMAPRO_H */

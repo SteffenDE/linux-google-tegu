@@ -44,6 +44,7 @@ properties:
       - google,zumapro-cmu-hsi1
       - google,zumapro-cmu-hsi2
       - google,zumapro-cmu-misc
+      - google,zumapro-cmu-mfc
       - google,zumapro-cmu-peric0
       - google,zumapro-cmu-peric1
 
@@ -77,6 +78,24 @@ required:
   - reg
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          const: google,zumapro-cmu-mfc
+    then:
+      properties:
+        clocks:
+          items:
+            - description: External reference clock
+            - description: MFC bus clock (from CMU_TOP)
+        clock-names:
+          items:
+            - const: oscclk
+            - const: bus
+      required:
+        - power-domains
+        - samsung,sysreg
+
   - if:
       properties:
         compatible:

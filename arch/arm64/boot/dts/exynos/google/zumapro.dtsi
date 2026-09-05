@@ -1131,6 +1131,19 @@
 			samsung,pmmu0-default-stream = <0x138>;
 			samsung,pmmu1-default-stream = <0x138>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_mfc>;
+			status = "disabled";
+		};
+
+		/* MFC's stage-2 protection unit shares the SysMMU clock domain. */
+		s2mpu_mfc: access-controller@1a4a0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1a4a0000 0x10000>;
+			clocks = <&cmu_mfc CLK_GOUT_MFC_SYSMMU_S0_CLK>;
+			clock-names = "bus";
+			interrupts = <GIC_SPI 520 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_mfc>;
+			#access-controller-cells = <0>;
 			status = "disabled";
 		};
 

@@ -7,6 +7,15 @@ menuconfig SOC_SAMSUNG
 
 if SOC_SAMSUNG
 
+config GOOGLE_S2MPU
+	tristate "Google Tensor Stage-2 Memory Protection Unit"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on PM && PM_GENERIC_DOMAINS && OF
+	help
+	  Restore host DMA access through Tensor S2MPUs after power-domain
+	  transitions. This supports systems without a hypervisor managing
+	  protected DMA domains; the master's IOMMU handles DMA translations.
+
 # There is no need to enable these drivers for ARMv8
 config EXYNOS_ASV_ARM
 	bool "Exynos ASV ARMv7-specific driver extensions" if COMPILE_TEST

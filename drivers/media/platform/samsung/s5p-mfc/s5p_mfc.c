@@ -1219,6 +1219,8 @@ static int s5p_mfc_configure_common_memory(struct s5p_mfc_dev *mfc_dev)
 {
 	struct device *dev = &mfc_dev->plat_dev->dev;
 	unsigned long mem_size = SZ_4M;
+	u64 coherent_mask = dev->coherent_dma_mask;
+	int ret;
 
 	if (IS_ENABLED(CONFIG_DMA_CMA) || exynos_is_iommu_available(dev))
 		mem_size = SZ_8M;
@@ -1230,8 +1232,25 @@ static int s5p_mfc_configure_common_memory(struct s5p_mfc_dev *mfc_dev)
 	if (!mfc_dev->mem_bitmap)
 		return -ENOMEM;
 
+	/*
+	 * Zumapro firmware must precede every codec buffer in device address
+	 * space. Allocate this pool below 256 MiB, then restore the full mask
+	 * for frame buffers. Buffer validation also enforces the lower bound;
+	 * it must not depend on the IOMMU allocator returning high addresses.
+	 * No queues or other DMA allocations are active during probe.
+	 */
+	if (IS_MFCV16_PLUS(mfc_dev)) {
+		ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(28));
+		if (ret) {
+			bitmap_free(mfc_dev->mem_bitmap);
+			return ret;
+		}
+	}
+
 	mfc_dev->mem_virt = dma_alloc_coherent(dev, mem_size,
 					       &mfc_dev->mem_base, GFP_KERNEL);
+	if (IS_MFCV16_PLUS(mfc_dev))
+		dma_set_coherent_mask(dev, coherent_mask);
 	if (!mfc_dev->mem_virt) {
 		bitmap_free(mfc_dev->mem_bitmap);
 		dev_err(dev, "failed to preallocate %ld MiB for the firmware and context buffers\n",
@@ -1321,6 +1340,12 @@ static int s5p_mfc_probe(struct platform_device *pdev)
 	if (!dev->variant) {
 		dev_err(&pdev->dev, "Failed to get device MFC hardware variant information\n");
 		return -ENOENT;
+	}
+
+	if (IS_MFCV16_PLUS(dev)) {
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+		if (ret)
+			return ret;
 	}
 
 	dev->regs_base = devm_platform_ioremap_resource(pdev, 0);
@@ -1750,4 +1775,3 @@ module_platform_driver(s5p_mfc_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kamil Debski <k.debski@samsung.com>");
 MODULE_DESCRIPTION("Samsung S5P Multi Format Codec V4L2 driver");
-

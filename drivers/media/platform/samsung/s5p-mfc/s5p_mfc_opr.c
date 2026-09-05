@@ -85,6 +85,14 @@ int s5p_mfc_alloc_generic_buf(struct s5p_mfc_dev *dev, unsigned int mem_ctx,
 	if (!b->virt)
 		goto no_mem;
 
+	if (!s5p_mfc_dma_addr_valid(dev, b->dma)) {
+		mfc_err("Buffer %pad is below the firmware allocation\n", &b->dma);
+		dma_free_coherent(mem_dev, b->size, b->virt, b->dma);
+		b->virt = NULL;
+		b->dma = 0;
+		return -ENOMEM;
+	}
+
 	mfc_debug(3, "Allocated addr %p %pad\n", b->virt, &b->dma);
 	return 0;
 no_mem:

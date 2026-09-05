@@ -11,6 +11,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #include <dt-bindings/clock/google,zumapro.h>
 
@@ -18,7 +19,7 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI1_PCIE + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_MFC_MFC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI9_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
@@ -28,6 +29,7 @@
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
 #define CLKS_NR_MISC		(CLK_GOUT_MISC_MCT_PCLK + 1)
+#define CLKS_NR_MFC		(CLK_GOUT_MFC_SYSREG_PCLK + 1)
 
 /*
  * Gate "debug" register window offset. In automatic clock mode the framework
@@ -100,8 +102,14 @@
 #define CLK_CON_GAT_GATE_CLKCMU_DPUB_NOC	0x207c
 #define CLK_CON_GAT_GATE_CLKCMU_DPUF0_NOC	0x2080
 #define CLK_CON_GAT_GATE_CLKCMU_DPUF1_NOC	0x2084
+#define CLK_CON_MUX_MUX_CLKCMU_MFC_MFC	0x10c4
+#define CLK_CON_DIV_CLKCMU_MFC_MFC		0x18bc
+#define CLK_CON_GAT_GATE_CLKCMU_MFC_MFC	0x20ec
 
 static const unsigned long top_clk_regs[] __initconst = {
+	CLK_CON_MUX_MUX_CLKCMU_MFC_MFC,
+	CLK_CON_DIV_CLKCMU_MFC_MFC,
+	CLK_CON_GAT_GATE_CLKCMU_MFC_MFC,
 	CLK_CON_CMU_TOP_CONTROLLER_OPTION,
 	CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM,
 	CLK_CON_MUX_MUX_CLKCMU_DPUB_NOC,
@@ -216,8 +224,16 @@ PNAME(mout_cmu_misc_noc_p) = {
 	"fout_shared0_d4", "fout_shared2_d2",
 	"fout_shared3_d2", "fout_spare_pll",
 };
+PNAME(mout_cmu_mfc_mfc_p) = {
+	"fout_shared0_d3", "fout_shared3_d1",
+	"fout_shared1_d3", "fout_shared0_d4",
+	"fout_shared1_d4", "fout_shared2_d2",
+	"fout_spare_pll", "oscclk",
+};
 
 static const struct samsung_mux_clock top_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_CMU_MFC_MFC, "mout_cmu_mfc_mfc", mout_cmu_mfc_mfc_p,
+	    CLK_CON_MUX_MUX_CLKCMU_MFC_MFC, 0, 3),
 	MUX(CLK_MOUT_CMU_DPUB_DSIM, "mout_cmu_dpub_dsim",
 	    mout_cmu_dpub_dsim_p, CLK_CON_MUX_MUX_CLKCMU_DPUB_DSIM, 0, 1),
 	MUX(CLK_MOUT_CMU_DPUB_NOC, "mout_cmu_dpub_noc",
@@ -257,6 +273,8 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 };
 
 static const struct samsung_gate_clock top_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CMU_MFC_MFC, "gout_cmu_mfc_mfc", "mout_cmu_mfc_mfc",
+	     CLK_CON_GAT_GATE_CLKCMU_MFC_MFC, 21, 0, 0),
 	/*
 	 * CMU_TOP runs in automatic (HWACG) clock mode, like gs101 and the
 	 * downstream Zuma kernel: clk_enable()/clk_disable() are nops and the
@@ -328,6 +346,8 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 };
 
 static const struct samsung_div_clock top_div_clks[] __initconst = {
+	DIV(CLK_DOUT_CMU_MFC_MFC, "dout_cmu_mfc_mfc", "gout_cmu_mfc_mfc",
+	    CLK_CON_DIV_CLKCMU_MFC_MFC, 0, 4),
 	DIV(CLK_DOUT_CMU_DPUB_DSIM, "dout_cmu_dpub_dsim",
 	    "gout_cmu_dpub_dsim", CLK_CON_DIV_CLKCMU_DPUB_DSIM, 0, 4),
 	DIV(CLK_DOUT_CMU_DPUB_NOC, "dout_cmu_dpub_noc",
@@ -1533,6 +1553,96 @@ static const struct samsung_cmu_info dpuf1_cmu_info __initconst = {
 	.clk_name	= "bus",
 };
 
+/* ---- CMU_MFC ------------------------------------------------------------ */
+
+/* MFC uses the same automatic gate and Q-channel interface as CMU_TOP. */
+#define PLL_CON0_MUX_CLKCMU_MFC_MFC_USER	0x0600
+#define MFC_CMU_MFC_CONTROLLER_OPTION	0x0800
+#define CLK_CON_DIV_DIV_CLK_MFC_NOCP	0x1800
+#define CLK_CON_GAT_GOUT_MFC_ACLK		0x2030
+#define CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK	0x206c
+
+static const unsigned long mfc_clk_regs[] __initconst = {
+	CLK_CON_DIV_DIV_CLK_MFC_NOCP,
+	PLL_CON0_MUX_CLKCMU_MFC_MFC_USER,
+	CLK_CON_GAT_GOUT_MFC_ACLK,
+	CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK,
+	/* Q-channel state is lost when the MFC power domain turns off. */
+	0x300c, /* D_TZPC */
+	0x3010, /* GPC */
+	0x3014, /* LH_AXI_SI_D0 */
+	0x3018, /* LH_AXI_SI_D1 */
+	0x301c, /* CMU */
+	0x3020, /* MFC */
+	0x3024, /* PPMU_D0 */
+	0x3028, /* PPMU_D1 */
+	0x302c, /* RSTNSYNC_NOCD_SW_RESET */
+	0x3034, /* SLH_AXI_MI_P */
+	0x3038, /* SSMT_D0 */
+	0x303c, /* SSMT_D1 */
+	0x3040, /* SYSMMU_S0 */
+	0x3044, /* SYSMMU_PMMU0 */
+	0x3048, /* SYSMMU_PMMU1 */
+	0x304c, /* SYSREG */
+	MFC_CMU_MFC_CONTROLLER_OPTION,
+};
+
+static const unsigned long mfc_sysreg_clk_regs[] __initconst = {
+	ZUMAPRO_DRCG_EN_OFFSET,
+	0x0108, /* MEMCLK */
+};
+
+static const struct samsung_clk_reg_dump mfc_suspend_regs[] = {
+	/*
+	 * Keep the global automatic-mode bits installed by CMU initialisation,
+	 * but clear bit 24 to allow CMU reset during domain power-down. The
+	 * saved active value is restored after power-up. The CMU owns this
+	 * register; the power-domain node needs only its PMU resource.
+	 */
+	{ MFC_CMU_MFC_CONTROLLER_OPTION, 0xf0000000 },
+};
+
+PNAME(mout_mfc_mfc_user_p) = { "oscclk", "dout_cmu_mfc_mfc" };
+
+static const struct samsung_mux_clock mfc_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MFC_MFC_USER, "mout_mfc_mfc_user", mout_mfc_mfc_user_p,
+	    PLL_CON0_MUX_CLKCMU_MFC_MFC_USER, 4, 1),
+};
+
+static const struct samsung_div_clock mfc_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MFC_NOCP, "dout_mfc_nocp", "mout_mfc_mfc_user",
+	    CLK_CON_DIV_DIV_CLK_MFC_NOCP, 0, 3),
+};
+
+static const struct samsung_gate_clock mfc_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MFC_MFC_ACLK, "gout_mfc_mfc_aclk", "mout_mfc_mfc_user",
+	     CLK_CON_GAT_GOUT_MFC_ACLK, 21, 0, 0),
+	GATE(CLK_GOUT_MFC_SYSREG_PCLK, "gout_mfc_sysreg_pclk", "dout_mfc_nocp",
+	     CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK, 21, 0, 0),
+};
+
+static const struct samsung_cmu_info mfc_cmu_info __initconst = {
+	.mux_clks	= mfc_mux_clks,
+	.nr_mux_clks	= ARRAY_SIZE(mfc_mux_clks),
+	.div_clks	= mfc_div_clks,
+	.nr_div_clks	= ARRAY_SIZE(mfc_div_clks),
+	.gate_clks	= mfc_gate_clks,
+	.nr_gate_clks	= ARRAY_SIZE(mfc_gate_clks),
+	.nr_clk_ids	= CLKS_NR_MFC,
+	.clk_regs	= mfc_clk_regs,
+	.nr_clk_regs	= ARRAY_SIZE(mfc_clk_regs),
+	.sysreg_clk_regs = mfc_sysreg_clk_regs,
+	.nr_sysreg_clk_regs = ARRAY_SIZE(mfc_sysreg_clk_regs),
+	.suspend_regs	= mfc_suspend_regs,
+	.nr_suspend_regs = ARRAY_SIZE(mfc_suspend_regs),
+	.clk_name	= "bus",
+	.auto_clock_gate = true,
+	.gate_dbg_offset = ZUMAPRO_GATE_DBG_OFFSET,
+	.option_offset	= MFC_CMU_MFC_CONTROLLER_OPTION,
+	.drcg_offset	= ZUMAPRO_DRCG_EN_OFFSET,
+	.memclk_offset	= 0x0108,
+};
+
 /* ---- platform_driver ---------------------------------------------------- */
 
 static int __init zumapro_cmu_probe(struct platform_device *pdev)
@@ -1584,8 +1694,43 @@ static struct platform_driver zumapro_cmu_driver __refdata = {
 	.probe = zumapro_cmu_probe,
 };
 
+static int __init zumapro_cmu_pm_probe(struct platform_device *pdev)
+{
+	return exynos_arm64_register_cmu_pm(pdev, true);
+}
+
+static const struct of_device_id zumapro_cmu_pm_of_match[] = {
+	{ .compatible = "google,zumapro-cmu-mfc", .data = &mfc_cmu_info },
+	{ }
+};
+
+static const struct dev_pm_ops zumapro_cmu_pm_ops = {
+	SET_RUNTIME_PM_OPS(exynos_arm64_cmu_suspend, exynos_arm64_cmu_resume, NULL)
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+};
+
+static struct platform_driver zumapro_cmu_pm_driver __refdata = {
+	.driver = {
+		.name = "zumapro-cmu-pm",
+		.of_match_table = zumapro_cmu_pm_of_match,
+		.suppress_bind_attrs = true,
+		.pm = &zumapro_cmu_pm_ops,
+	},
+	.probe = zumapro_cmu_pm_probe,
+};
+
 static int __init zumapro_cmu_init(void)
 {
-	return platform_driver_register(&zumapro_cmu_driver);
+	int ret;
+
+	ret = platform_driver_register(&zumapro_cmu_driver);
+	if (ret)
+		return ret;
+
+	ret = platform_driver_register(&zumapro_cmu_pm_driver);
+	if (ret)
+		platform_driver_unregister(&zumapro_cmu_driver);
+
+	return ret;
 }
 core_initcall(zumapro_cmu_init);

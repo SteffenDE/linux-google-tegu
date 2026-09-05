@@ -18,6 +18,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_iommu.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -1049,6 +1050,7 @@ static const struct iommu_ops samsung_sysmmu_v9_ops = {
 	.probe_device = samsung_sysmmu_v9_probe_device,
 	.release_device = samsung_sysmmu_v9_release_device,
 	.device_group = samsung_sysmmu_v9_device_group,
+	.get_resv_regions = of_iommu_get_resv_regions,
 	.of_xlate = samsung_sysmmu_v9_of_xlate,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev = samsung_sysmmu_v9_attach_dev,

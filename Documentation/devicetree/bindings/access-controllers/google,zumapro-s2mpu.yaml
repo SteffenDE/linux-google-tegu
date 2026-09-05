@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/access-controllers/google,zumapro-s2mpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Google Tensor G4 Stage-2 Memory Protection Unit
+
+maintainers:
+  - Steffen Deusch <steffen@deusch.me>
+
+description:
+  The S2MPU checks physical memory accesses from a DMA master and its stage-1
+  IOMMU. Its protection state is lost when the containing power domain turns
+  off. Consumers reference the whole controller through access-controllers.
+
+properties:
+  compatible:
+    const: google,zumapro-s2mpu
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: bus
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  "#access-controller-cells":
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - interrupts
+  - power-domains
+  - "#access-controller-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    access-controller@1a4a0000 {
+        compatible = "google,zumapro-s2mpu";
+        reg = <0x1a4a0000 0x10000>;
+        clocks = <&cmu_mfc 5>;
+        clock-names = "bus";
+        interrupts = <GIC_SPI 520 IRQ_TYPE_LEVEL_HIGH>;
+        power-domains = <&pd_mfc>;
+        #access-controller-cells = <0>;
+    };

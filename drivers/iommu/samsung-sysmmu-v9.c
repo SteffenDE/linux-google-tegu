@@ -955,20 +955,23 @@ static struct iommu_group *samsung_sysmmu_v9_device_group(struct device *dev)
 	struct list_head *list;
 
 	np = of_parse_phandle(dev->of_node, "samsung,iommu-group", 0);
-	if (!np)
-		return generic_device_group(dev);
+	if (np) {
+		pdev = of_find_device_by_node(np);
+		of_node_put(np);
+		if (!pdev)
+			return ERR_PTR(-EPROBE_DEFER);
 
-	pdev = of_find_device_by_node(np);
-	of_node_put(np);
-	if (!pdev)
-		return ERR_PTR(-EPROBE_DEFER);
+		group = platform_get_drvdata(pdev);
+		platform_device_put(pdev);
+		if (!group)
+			return ERR_PTR(-EPROBE_DEFER);
 
-	group = platform_get_drvdata(pdev);
-	platform_device_put(pdev);
-	if (!group)
-		return ERR_PTR(-EPROBE_DEFER);
-
-	group = iommu_group_ref_get(group);
+		group = iommu_group_ref_get(group);
+	} else {
+		group = generic_device_group(dev);
+		if (IS_ERR(group))
+			return group;
+	}
 
 	mutex_lock(&group_data_lock);
 	if (iommu_group_get_iommudata(group)) {

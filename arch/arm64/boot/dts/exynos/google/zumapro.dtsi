@@ -1134,6 +1134,18 @@
 			status = "disabled";
 		};
 
+		mfc: codec@1a4d0000 {
+			compatible = "google,zumapro-mfc";
+			reg = <0x1a4d0000 0x10000>;
+			interrupts = <GIC_SPI 515 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_mfc CLK_GOUT_MFC_MFC_ACLK>;
+			clock-names = "mfc";
+			power-domains = <&pd_mfc>;
+			iommus = <&sysmmu_mfc>;
+			status = "disabled";
+		};
+
+
 		/*
 		 * Source: downstream sysmmu_dpuf0/sysmmu_dpuf1 in
 		 * zumapro-sysmmu.dtsi and research/dumped.dts:882-916.  These

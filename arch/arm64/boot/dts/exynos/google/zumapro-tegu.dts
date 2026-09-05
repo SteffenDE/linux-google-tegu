@@ -143,6 +143,18 @@
 		ranges;
 
 		/*
+		 * Leave one 1 MiB firmware slot below 256 MiB. All later MFC
+		 * DMA allocations must be above firmware and end within its
+		 * 0xf0000000-byte RISC window. This reserves device addresses
+		 * only; the DMA allocator supplies the backing pages.
+		 */
+		mfc_firmware_iova: mfc-firmware-iova {
+			iommu-addresses = <&mfc 0x00000000 0x0ff00000>,
+					  <&mfc 0xfff00000 0x00100000>;
+		};
+
+
+		/*
 		 * Source: ABL fastboot-boot log from 2026-05-24 shows ABL
 		 * appends pkvm_guest_firmware@8b000000 before Linux starts.
 		 * Keep the downstream range visible here, but do not compile it
@@ -1833,4 +1845,26 @@
 			pinctrl-0 = <&wlan_host_wake>;
 		};
 	};
+};
+
+/* MFC firmware bring-up uses the board's standard IOVA reservation. */
+&pd_mfc {
+	status = "okay";
+};
+
+&cmu_mfc {
+	status = "okay";
+};
+
+&sysreg_mfc {
+	status = "okay";
+};
+
+&sysmmu_mfc {
+	status = "okay";
+};
+
+&mfc {
+	memory-region = <&mfc_firmware_iova>;
+	status = "okay";
 };

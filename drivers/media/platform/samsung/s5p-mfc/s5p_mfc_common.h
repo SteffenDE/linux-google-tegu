@@ -19,7 +19,7 @@
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
 #include "regs-mfc.h"
-#include "regs-mfc-v12.h"
+#include "regs-mfc-v16.h"
 
 #define S5P_MFC_NAME		"s5p-mfc"
 
@@ -790,6 +790,7 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 #define IS_MFCV8_PLUS(dev)	((dev)->variant->version >= 0x80)
 #define IS_MFCV10_PLUS(dev)	((dev)->variant->version >= 0xA0)
 #define IS_MFCV12(dev)		((dev)->variant->version >= 0xC0)
+#define IS_MFCV16_PLUS(dev)	((dev)->variant->version >= MFC_VERSION_V16)
 #define FW_HAS_E_MIN_SCRATCH_BUF(dev) (IS_MFCV10_PLUS(dev))
 
 #define MFC_V5_BIT	BIT(0)

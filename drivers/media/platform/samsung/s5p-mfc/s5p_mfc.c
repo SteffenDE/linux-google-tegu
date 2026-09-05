@@ -179,9 +179,18 @@ static void s5p_mfc_watchdog_worker(struct work_struct *work)
 	 * This is necessary as they may load and unload firmware.
 	 */
 	mutex_locked = mutex_trylock(&dev->mfc_mutex);
-	if (!mutex_locked)
+	if (!mutex_locked) {
 		mfc_err("Error: some instance may be closing/opening\n");
+		if (IS_MFCV16_PLUS(dev))
+			return;
+	}
 	spin_lock_irqsave(&dev->irqlock, flags);
+
+	/* Stop DMA before returning timed-out buffers to userspace. */
+	if (IS_MFCV16_PLUS(dev) && s5p_mfc_reset(dev)) {
+		spin_unlock_irqrestore(&dev->irqlock, flags);
+		goto unlock;
+	}
 
 	s5p_mfc_clock_off(dev);
 
@@ -199,7 +208,9 @@ static void s5p_mfc_watchdog_worker(struct work_struct *work)
 	spin_unlock_irqrestore(&dev->irqlock, flags);
 
 	/* De-init MFC */
-	s5p_mfc_deinit_hw(dev);
+	ret = s5p_mfc_deinit_hw(dev);
+	if (ret)
+		goto unlock;
 
 	/*
 	 * Double check if there is at least one instance running.

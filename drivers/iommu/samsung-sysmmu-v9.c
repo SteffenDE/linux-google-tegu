@@ -1295,12 +1295,51 @@ static irqreturn_t samsung_sysmmu_v9_irq_thread(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static int samsung_sysmmu_v9_link_access_controller(struct device *dev)
+{
+	struct of_phandle_args args;
+	struct platform_device *supplier;
+	struct device_link *link;
+	int ret;
+
+	if (!of_property_present(dev->of_node, "access-controllers"))
+		return 0;
+
+	ret = of_parse_phandle_with_args(dev->of_node, "access-controllers",
+					 "#access-controller-cells", 0, &args);
+	if (ret)
+		return ret;
+
+	supplier = of_find_device_by_node(args.np);
+	of_node_put(args.np);
+	if (!supplier)
+		return -EPROBE_DEFER;
+
+	device_lock(&supplier->dev);
+	if (!device_is_bound(&supplier->dev)) {
+		device_unlock(&supplier->dev);
+		platform_device_put(supplier);
+		return -EPROBE_DEFER;
+	}
+
+	/* Also establish PM ordering when inferred firmware links are disabled. */
+	link = device_link_add(dev, &supplier->dev,
+			       DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
+	device_unlock(&supplier->dev);
+	platform_device_put(supplier);
+	return link ? 0 : -EINVAL;
+}
+
 static int samsung_sysmmu_v9_probe(struct platform_device *pdev)
 {
 	struct samsung_sysmmu_v9_drvdata *data;
 	struct device *dev = &pdev->dev;
 	int irq;
 	int ret;
+
+	ret = samsung_sysmmu_v9_link_access_controller(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to link access controller\n");
 
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)

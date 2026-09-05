@@ -38,6 +38,10 @@ properties:
     items:
       - const: gate
 
+  access-controllers:
+    maxItems: 1
+    description: Stage-2 protection unit covering this IOMMU's memory accesses.
+
   samsung,qos:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Downstream QoS priority programmed by the v9 driver.

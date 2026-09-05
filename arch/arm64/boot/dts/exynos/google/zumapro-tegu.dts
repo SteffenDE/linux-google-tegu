@@ -1864,6 +1864,10 @@
 	status = "okay";
 };
 
+&s2mpu_mfc {
+	status = "okay";
+};
+
 &mfc {
 	memory-region = <&mfc_firmware_iova>;
 	status = "okay";

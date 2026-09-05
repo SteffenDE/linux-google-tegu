@@ -85,14 +85,14 @@ static const struct s5p_mfc_fmt formats[] = {
 		.codec_mode	= S5P_MFC_CODEC_MPEG4_ENC,
 		.type		= MFC_FMT_ENC,
 		.num_planes	= 1,
-		.versions	= MFC_V5PLUS_BITS,
+		.versions	= MFC_V5PLUS_BITS | MFC_V16_BIT,
 	},
 	{
 		.fourcc		= V4L2_PIX_FMT_H263,
 		.codec_mode	= S5P_MFC_CODEC_H263_ENC,
 		.type		= MFC_FMT_ENC,
 		.num_planes	= 1,
-		.versions	= MFC_V5PLUS_BITS,
+		.versions	= MFC_V5PLUS_BITS | MFC_V16_BIT,
 	},
 	{
 		.fourcc		= V4L2_PIX_FMT_VP8,
@@ -1189,7 +1189,8 @@ static int enc_post_seq_start(struct s5p_mfc_ctx *ctx)
 	if (p->seq_hdr_mode == V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE &&
 	    !(IS_MFCV16_PLUS(dev) &&
 	      (ctx->codec_mode == S5P_MFC_CODEC_VP8_ENC ||
-	       ctx->codec_mode == S5P_MFC_CODEC_VP9_ENC))) {
+	       ctx->codec_mode == S5P_MFC_CODEC_VP9_ENC ||
+	       ctx->codec_mode == S5P_MFC_CODEC_H263_ENC))) {
 		if (!list_empty(&ctx->dst_queue)) {
 			dst_mb = list_entry(ctx->dst_queue.next,
 					struct s5p_mfc_buf, list);
@@ -1514,7 +1515,7 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
-static void s5p_mfc_enc_update_vpx_controls(struct s5p_mfc_ctx *ctx)
+static void s5p_mfc_enc_update_controls(struct s5p_mfc_ctx *ctx)
 {
 	static const u32 qp_ids[] = {
 		V4L2_CID_MPEG_VIDEO_VPX_MIN_QP,
@@ -1523,6 +1524,9 @@ static void s5p_mfc_enc_update_vpx_controls(struct s5p_mfc_ctx *ctx)
 		V4L2_CID_MPEG_VIDEO_VPX_P_FRAME_QP,
 	};
 	bool vp9 = ctx->codec_mode == S5P_MFC_CODEC_VP9_ENC;
+	bool bframes = ctx->codec_mode == S5P_MFC_CODEC_H264_ENC ||
+		       ctx->codec_mode == S5P_MFC_CODEC_HEVC_ENC ||
+		       ctx->codec_mode == S5P_MFC_CODEC_MPEG4_ENC;
 	struct v4l2_ctrl *ctrl;
 	int i, max = vp9 ? 255 : 127;
 
@@ -1532,7 +1536,7 @@ static void s5p_mfc_enc_update_vpx_controls(struct s5p_mfc_ctx *ctx)
 				       i == 1 ? max : i == 0 ? 0 : 10);
 	}
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_handler, V4L2_CID_MPEG_VIDEO_B_FRAMES);
-	v4l2_ctrl_modify_range(ctrl, 0, vp9 ? 0 : 2, 1, 0);
+	v4l2_ctrl_modify_range(ctrl, 0, bframes ? 2 : 0, 1, 0);
 }
 
 static int vidioc_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
@@ -1556,7 +1560,7 @@ static int vidioc_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		ctx->state = MFCINST_INIT;
 		ctx->codec_mode = ctx->dst_fmt->codec_mode;
 		if (IS_MFCV16_PLUS(dev))
-			s5p_mfc_enc_update_vpx_controls(ctx);
+			s5p_mfc_enc_update_controls(ctx);
 		ctx->enc_dst_buf_size =	pix_fmt_mp->plane_fmt[0].sizeimage;
 		pix_fmt_mp->plane_fmt[0].bytesperline = 0;
 		ctx->dst_bufs_cnt = 0;

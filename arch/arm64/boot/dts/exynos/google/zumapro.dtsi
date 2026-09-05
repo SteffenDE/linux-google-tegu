@@ -1119,6 +1119,8 @@
 		sysmmu_mfc: iommu@1a470000 {
 			compatible = "samsung,sysmmu-v9";
 			reg = <0x1a470000 0x10000>;
+			clocks = <&cmu_mfc CLK_GOUT_MFC_SYSMMU_S0_CLK>;
+			clock-names = "gate";
 			interrupts = <GIC_SPI 518 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 519 IRQ_TYPE_LEVEL_HIGH 0>;
 			power-domains = <&pd_mfc>;

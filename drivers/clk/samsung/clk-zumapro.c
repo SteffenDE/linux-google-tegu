@@ -29,7 +29,7 @@
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
 #define CLKS_NR_MISC		(CLK_GOUT_MISC_MCT_PCLK + 1)
-#define CLKS_NR_MFC		(CLK_GOUT_MFC_SYSREG_PCLK + 1)
+#define CLKS_NR_MFC		(CLK_GOUT_MFC_SYSMMU_S0_CLK + 1)
 
 /*
  * Gate "debug" register window offset. In automatic clock mode the framework
@@ -1560,12 +1560,14 @@ static const struct samsung_cmu_info dpuf1_cmu_info __initconst = {
 #define MFC_CMU_MFC_CONTROLLER_OPTION	0x0800
 #define CLK_CON_DIV_DIV_CLK_MFC_NOCP	0x1800
 #define CLK_CON_GAT_GOUT_MFC_ACLK		0x2030
+#define CLK_CON_GAT_CLK_MFC_SYSMMU_S0	0x2014
 #define CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK	0x206c
 
 static const unsigned long mfc_clk_regs[] __initconst = {
 	CLK_CON_DIV_DIV_CLK_MFC_NOCP,
 	PLL_CON0_MUX_CLKCMU_MFC_MFC_USER,
 	CLK_CON_GAT_GOUT_MFC_ACLK,
+	CLK_CON_GAT_CLK_MFC_SYSMMU_S0,
 	CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK,
 	/* Q-channel state is lost when the MFC power domain turns off. */
 	0x300c, /* D_TZPC */
@@ -1619,6 +1621,8 @@ static const struct samsung_gate_clock mfc_gate_clks[] __initconst = {
 	     CLK_CON_GAT_GOUT_MFC_ACLK, 21, 0, 0),
 	GATE(CLK_GOUT_MFC_SYSREG_PCLK, "gout_mfc_sysreg_pclk", "dout_mfc_nocp",
 	     CLK_CON_GAT_GOUT_MFC_SYSREG_PCLK, 21, 0, 0),
+	GATE(CLK_GOUT_MFC_SYSMMU_S0_CLK, "gout_mfc_sysmmu_s0_clk",
+	     "mout_mfc_mfc_user", CLK_CON_GAT_CLK_MFC_SYSMMU_S0, 21, 0, 0),
 };
 
 static const struct samsung_cmu_info mfc_cmu_info __initconst = {

@@ -918,6 +918,17 @@
 		status = "disabled";
 	};
 
+	/* MFC PMU configuration/status and secure TZPC save/restore identifier. */
+	pd_mfc: power-domain@15462080 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462080 0x20>;
+		reg-names = "pmu";
+		samsung,secure-pd-id = <0x1a410204>;
+		#power-domain-cells = <0>;
+		label = "MFC";
+		status = "disabled";
+	};
+
 	/*
 	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
 	 * Downstream leaves its exynos-pd node disabled (the domain is never
@@ -1079,6 +1090,45 @@
 				 <&cmu_top CLK_DOUT_CMU_DPUF1_NOC>;
 			clock-names = "oscclk", "bus";
 			power-domains = <&pd_dpuf1>;
+			status = "disabled";
+		};
+
+		cmu_mfc: clock-controller@1a400000 {
+			compatible = "google,zumapro-cmu-mfc";
+			reg = <0x1a400000 0x10000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_MFC_MFC>;
+			clock-names = "oscclk", "bus";
+			power-domains = <&pd_mfc>;
+			samsung,sysreg = <&sysreg_mfc>;
+			status = "disabled";
+		};
+
+		/*
+		 * CMU_MFC accesses this only while the domain is active. A clock
+		 * reference here would pin the runtime-PM clock provider on.
+		 */
+		sysreg_mfc: syscon@1a420000 {
+			compatible = "google,zumapro-mfc-sysreg", "syscon";
+			reg = <0x1a420000 0x1000>;
+			status = "disabled";
+		};
+
+		/* One SysMMU with two PMMUs, both using stream configuration 0x138. */
+		sysmmu_mfc: iommu@1a470000 {
+			compatible = "samsung,sysmmu-v9";
+			reg = <0x1a470000 0x10000>;
+			interrupts = <GIC_SPI 518 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 519 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_mfc>;
+			samsung,qos = <15>;
+			samsung,secure-irq;
+			samsung,secure-base = <0x1a480000>;
+			samsung,port-name = "MFC";
+			samsung,pmmu0-default-stream = <0x138>;
+			samsung,pmmu1-default-stream = <0x138>;
+			#iommu-cells = <0>;
 			status = "disabled";
 		};
 

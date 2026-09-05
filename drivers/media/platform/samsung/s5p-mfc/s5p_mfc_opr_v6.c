@@ -1414,6 +1414,8 @@ static int s5p_mfc_set_enc_params_mpeg4(struct s5p_mfc_ctx *ctx)
 
 	/* pictype : number of B */
 	reg = readl(mfc_regs->e_gop_config);
+	if (IS_MFCV16_PLUS(dev))
+		reg |= BIT(19); /* GOP size counts pictures, including B frames. */
 	reg &= ~(0x3 << 16);
 	reg |= ((p->num_b_frame & 0x3) << 16);
 	writel(reg, mfc_regs->e_gop_config);
@@ -1445,6 +1447,8 @@ static int s5p_mfc_set_enc_params_mpeg4(struct s5p_mfc_ctx *ctx)
 	/** min QP */
 	reg |= p_mpeg4->rc_min_qp & 0x3F;
 	writel(reg, mfc_regs->e_rc_qp_bound);
+	if (IS_MFCV16_PLUS(dev))
+		mfc_write(dev, reg | (reg << 16), S5P_FIMV_E_RC_QP_BOUND_PB_V16);
 
 	/* other QPs */
 	writel(0x0, mfc_regs->e_fixed_picture_qp);
@@ -1457,7 +1461,8 @@ static int s5p_mfc_set_enc_params_mpeg4(struct s5p_mfc_ctx *ctx)
 	}
 
 	/* frame rate */
-	if (p->rc_frame && p->rc_framerate_num && p->rc_framerate_denom) {
+	if ((p->rc_frame || IS_MFCV16_PLUS(dev)) &&
+	    p->rc_framerate_num && p->rc_framerate_denom) {
 		reg = 0;
 		reg |= ((p->rc_framerate_num & 0xFFFF) << 16);
 		reg |= p->rc_framerate_denom & 0xFFFF;
@@ -1494,11 +1499,9 @@ static int s5p_mfc_set_enc_params_h263(struct s5p_mfc_ctx *ctx)
 
 	s5p_mfc_set_enc_params(ctx);
 
-	/* profile & level */
-	reg = 0;
-	/** profile */
-	reg |= (0x1 << 4);
-	writel(reg, mfc_regs->e_picture_profile);
+	/* v16 supports only baseline profile, level 70, without a selector. */
+	if (!IS_MFCV16_PLUS(dev))
+		writel(BIT(4), mfc_regs->e_picture_profile);
 
 	/* rate control config. */
 	reg = readl(mfc_regs->e_rc_config);
@@ -1519,6 +1522,8 @@ static int s5p_mfc_set_enc_params_h263(struct s5p_mfc_ctx *ctx)
 	/** min QP */
 	reg |= p_h263->rc_min_qp & 0x3F;
 	writel(reg, mfc_regs->e_rc_qp_bound);
+	if (IS_MFCV16_PLUS(dev))
+		mfc_write(dev, reg, S5P_FIMV_E_RC_QP_BOUND_PB_V16);
 
 	/* other QPs */
 	writel(0x0, mfc_regs->e_fixed_picture_qp);
@@ -1531,7 +1536,8 @@ static int s5p_mfc_set_enc_params_h263(struct s5p_mfc_ctx *ctx)
 	}
 
 	/* frame rate */
-	if (p->rc_frame && p->rc_framerate_num && p->rc_framerate_denom) {
+	if ((p->rc_frame || IS_MFCV16_PLUS(dev)) &&
+	    p->rc_framerate_num && p->rc_framerate_denom) {
 		reg = 0;
 		reg |= ((p->rc_framerate_num & 0xFFFF) << 16);
 		reg |= p->rc_framerate_denom & 0xFFFF;

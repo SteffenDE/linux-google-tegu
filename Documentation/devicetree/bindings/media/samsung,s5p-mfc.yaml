@@ -18,6 +18,7 @@ properties:
   compatible:
     oneOf:
       - enum:
+          - google,zumapro-mfc            # Google Tensor G4
           - samsung,exynos5433-mfc        # Exynos5433
           - samsung,mfc-v5                # Exynos4
           - samsung,mfc-v6                # Exynos5
@@ -71,6 +72,33 @@ required:
 additionalProperties: false
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: google,zumapro-mfc
+    then:
+      properties:
+        clocks:
+          maxItems: 1
+        clock-names:
+          items:
+            - const: mfc
+        iommus:
+          maxItems: 1
+        iommu-names: false
+        memory-region:
+          maxItems: 1
+          description:
+            IOVA reservation excluding addresses below the firmware allocation.
+            Firmware occupies the last 1 MiB below 256 MiB; all codec buffers
+            must have higher device addresses. The reservation has no physical
+            backing and uses iommu-addresses to exclude the lower 255 MiB.
+      required:
+        - iommus
+        - power-domains
+        - memory-region
+
   - if:
       properties:
         compatible:

@@ -610,6 +610,9 @@ struct s5p_mfc_codec_ops {
  * @luma_size:		size of a luma plane
  * @chroma_size:	size of a chroma plane
  * @mv_size:		size of a motion vectors buffer
+ * @luma_dpb_min:	the firmware's minimum luma DPB plane size, read at
+ *			SEQ_DONE on v16
+ * @chroma_dpb_min:	the firmware's minimum chroma DPB plane size
  * @consumed_stream:	number of bytes that have been used so far from the
  *			decoding buffer
  * @dpb_flush_flag:	flag used to indicate that a DPB buffers are being
@@ -714,6 +717,8 @@ struct s5p_mfc_ctx {
 	int chroma_size;
 	int chroma_size_1;
 	int mv_size;
+	unsigned int luma_dpb_min;
+	unsigned int chroma_dpb_min;
 
 	unsigned long consumed_stream;
 
@@ -870,5 +875,23 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 					MFC_V12_BIT)
 
 #define MFC_V10PLUS_BITS	(MFC_V10_BIT | MFC_V12_BIT)
+
+/* DMA addresses of a raw frame's planes; a single buffer holds them all. */
+static inline void s5p_mfc_raw_plane_addrs(const struct s5p_mfc_ctx *ctx,
+					   const struct s5p_mfc_fmt *fmt,
+					   struct vb2_buffer *vb,
+					   unsigned long *y, unsigned long *c,
+					   unsigned long *c1)
+{
+	*y = vb2_dma_contig_plane_dma_addr(vb, 0);
+	*c1 = 0;
+	if (fmt->num_planes == 1) {
+		*c = *y + ctx->luma_size;
+		return;
+	}
+	*c = vb2_dma_contig_plane_dma_addr(vb, 1);
+	if (fmt->num_planes == 3)
+		*c1 = vb2_dma_contig_plane_dma_addr(vb, 2);
+}
 
 #endif /* S5P_MFC_COMMON_H_ */

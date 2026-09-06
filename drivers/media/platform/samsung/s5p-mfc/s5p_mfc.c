@@ -455,10 +455,15 @@ static void s5p_mfc_handle_frame_new(struct s5p_mfc_ctx *ctx, unsigned int err)
 			else
 				dst_buf->b->field =
 							V4L2_FIELD_INTERLACED;
-			vb2_set_plane_payload(&dst_buf->b->vb2_buf, 0,
-						ctx->luma_size);
-			vb2_set_plane_payload(&dst_buf->b->vb2_buf, 1,
-						ctx->chroma_size);
+			if (dst_buf->b->vb2_buf.num_planes == 1) {
+				vb2_set_plane_payload(&dst_buf->b->vb2_buf, 0,
+						      ctx->luma_size + ctx->chroma_size);
+			} else {
+				vb2_set_plane_payload(&dst_buf->b->vb2_buf, 0,
+						      ctx->luma_size);
+				vb2_set_plane_payload(&dst_buf->b->vb2_buf, 1,
+						      ctx->chroma_size);
+			}
 			clear_bit(dst_buf->b->vb2_buf.index,
 							&ctx->dec_dst_flag);
 

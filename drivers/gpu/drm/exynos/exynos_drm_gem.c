@@ -27,10 +27,24 @@ static int exynos_drm_gem_mmap(struct drm_gem_object *obj, struct vm_area_struct
 static int exynos_drm_alloc_buf(struct exynos_drm_gem *exynos_gem, bool kvmap)
 {
 	struct drm_device *dev = exynos_gem->base.dev;
+	struct device *dma_dev = drm_dev_dma_dev(dev);
 	unsigned long attr = 0;
 
+	/*
+	 * Until a scanout block registers its device through
+	 * exynos_drm_register_dma(), the core hands back the exynos-drm
+	 * platform device.  An allocation from it succeeds (it carries a
+	 * 32-bit DMA mask) but yields memory no display DMA can reach
+	 * through its IOMMU, so refuse rather than scan out garbage.
+	 */
+	if (dma_dev == dev->dev) {
+		DRM_DEV_ERROR(dev->dev,
+			      "cannot allocate GEM buffer without DMA device\n");
+		return -ENODEV;
+	}
+
 	if (exynos_gem->dma_addr) {
-		DRM_DEV_DEBUG_KMS(drm_dev_dma_dev(dev), "already allocated.\n");
+		DRM_DEV_DEBUG_KMS(dma_dev, "already allocated.\n");
 		return 0;
 	}
 
@@ -55,18 +69,18 @@ static int exynos_drm_alloc_buf(struct exynos_drm_gem *exynos_gem, bool kvmap)
 		attr |= DMA_ATTR_NO_KERNEL_MAPPING;
 
 	exynos_gem->dma_attrs = attr;
-	exynos_gem->cookie = dma_alloc_attrs(drm_dev_dma_dev(dev), exynos_gem->base.size,
+	exynos_gem->cookie = dma_alloc_attrs(dma_dev, exynos_gem->base.size,
 					     &exynos_gem->dma_addr, GFP_KERNEL,
 					     exynos_gem->dma_attrs);
 	if (!exynos_gem->cookie) {
-		DRM_DEV_ERROR(drm_dev_dma_dev(dev), "failed to allocate buffer.\n");
+		DRM_DEV_ERROR(dma_dev, "failed to allocate buffer.\n");
 		return -ENOMEM;
 	}
 
 	if (kvmap)
 		exynos_gem->kvaddr = exynos_gem->cookie;
 
-	DRM_DEV_DEBUG_KMS(drm_dev_dma_dev(dev), "dma_addr(%pad), size(0x%zx)\n",
+	DRM_DEV_DEBUG_KMS(dma_dev, "dma_addr(%pad), size(0x%zx)\n",
 			  &exynos_gem->dma_addr, exynos_gem->base.size);
 	return 0;
 }

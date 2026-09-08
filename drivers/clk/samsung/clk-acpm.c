@@ -25,6 +25,7 @@ struct acpm_clk {
 
 struct acpm_clk_variant {
 	const char *name;
+	unsigned long flags;
 };
 
 struct acpm_clk_driver_data {
@@ -74,8 +75,8 @@ static const struct acpm_clk_driver_data acpm_clk_gs101 = {
  * match the firmware enum exactly.
  */
 static const struct acpm_clk_variant zumapro_acpm_clks[] = {
-	ACPM_CLK("mif"),	/* 0 */
-	ACPM_CLK("int"),	/* 1 */
+	{ .name = "mif", .flags = CLK_GET_RATE_NOCACHE },	/* 0 */
+	{ .name = "int", .flags = CLK_GET_RATE_NOCACHE },	/* 1 */
 	ACPM_CLK("cpucl0"),	/* 2 */
 	ACPM_CLK("cpucl1"),	/* 3 */
 	ACPM_CLK("cpucl2"),	/* 4 */
@@ -87,7 +88,7 @@ static const struct acpm_clk_variant zumapro_acpm_clks[] = {
 	ACPM_CLK("intcam"),	/* 10 */
 	ACPM_CLK("tnr"),	/* 11 */
 	ACPM_CLK("cam"),	/* 12 */
-	ACPM_CLK("mfc"),	/* 13 */
+	{ .name = "mfc", .flags = CLK_GET_RATE_NOCACHE },	/* 13 */
 };
 
 static const struct acpm_clk_driver_data acpm_clk_zumapro = {
@@ -139,12 +140,13 @@ static const struct clk_ops acpm_clk_ops = {
 };
 
 static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
-			     const char *name)
+			     const struct acpm_clk_variant *variant)
 {
 	struct clk_init_data init = {};
 
-	init.name = name;
+	init.name = variant->name;
 	init.ops = &acpm_clk_ops;
+	init.flags = variant->flags;
 	aclk->hw.init = &init;
 
 	return devm_clk_hw_register(dev, &aclk->hw);
@@ -199,7 +201,7 @@ static int acpm_clk_probe(struct platform_device *pdev)
 
 		hws[i] = &aclk->hw;
 
-		err = acpm_clk_register(dev, aclk, data->clks[i].name);
+		err = acpm_clk_register(dev, aclk, &data->clks[i]);
 		if (err)
 			return dev_err_probe(dev, err,
 					     "Failed to register clock\n");

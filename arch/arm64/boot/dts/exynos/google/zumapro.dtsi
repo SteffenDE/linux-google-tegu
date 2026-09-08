@@ -9,6 +9,7 @@
 #include <dt-bindings/clock/google,zumapro-acpm.h>
 #include <dt-bindings/clock/google,zumapro.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/google,zumapro.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/thermal/thermal.h>
@@ -1167,6 +1168,9 @@
 			clocks = <&cmu_mfc CLK_GOUT_MFC_MFC_ACLK>,
 				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MFC>;
 			clock-names = "mfc", "sclk_mfc";
+			interconnects = <&bts ZUMAPRO_BTS_MASTER_MFC
+					 &bts ZUMAPRO_BTS_SLAVE_MIF>;
+			interconnect-names = "memory";
 			power-domains = <&pd_mfc>;
 			iommus = <&sysmmu_mfc>;
 			status = "disabled";

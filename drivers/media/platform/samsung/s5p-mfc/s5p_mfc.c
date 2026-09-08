@@ -485,6 +485,11 @@ static void s5p_mfc_handle_frame(struct s5p_mfc_ctx *ctx,
 	struct s5p_mfc_buf *src_buf;
 	unsigned int res_change;
 
+	if (IS_MFCV16_PLUS(dev) &&
+	    FIELD_GET(S5P_FIMV_D_NUM_TILES_MASK_V16,
+		      mfc_read(dev, S5P_FIMV_D_DECODED_STATUS_V16)) >= 4)
+		WRITE_ONCE(ctx->qos.tiled, true);
+
 	if (IS_MFCV16_PLUS(dev) && ctx->codec_mode == S5P_MFC_CODEC_VP9_DEC &&
 	    (s5p_mfc_hw_call(dev->mfc_ops, get_dspl_status, dev) &
 	     S5P_FIMV_D_STATUS_INTER_RES_CHANGE_V16)) {
@@ -684,6 +689,12 @@ static void s5p_mfc_handle_seq_done(struct s5p_mfc_ctx *ctx,
 		ctx->img_height = height;
 		/* Valid only now; S_FMT recomputes the layout from these. */
 		if (IS_MFCV16_PLUS(dev)) {
+			WRITE_ONCE(ctx->qos.tiled, false);
+			WRITE_ONCE(ctx->qos.mbaff,
+				   (ctx->codec_mode == S5P_MFC_CODEC_H264_DEC ||
+				    ctx->codec_mode == S5P_MFC_CODEC_H264_MVC_DEC) &&
+				   (mfc_read(dev, S5P_FIMV_D_H264_INFO_V16) &
+				    S5P_FIMV_D_MBAFF_V16));
 			ctx->luma_dpb_min = mfc_read(dev,
 					S5P_FIMV_D_MIN_LUMA_DPB_SIZE_V6);
 			ctx->chroma_dpb_min = mfc_read(dev,
@@ -1186,6 +1197,7 @@ static int s5p_mfc_release(struct file *file)
 			mfc_debug(2, "Has to free instance\n");
 			s5p_mfc_close_mfc_inst(dev, ctx);
 		}
+		s5p_mfc_qos_release(ctx);
 		s5p_mfc_release_ctx_slot(ctx);
 		list_del(&ctx->node);
 		dev->num_inst--;
@@ -1778,9 +1790,13 @@ static int s5p_mfc_suspend(struct device *dev)
 static int s5p_mfc_resume(struct device *dev)
 {
 	struct s5p_mfc_dev *m_dev = dev_get_drvdata(dev);
+	int ret;
 
 	if (m_dev->num_inst == 0)
 		return 0;
+	ret = s5p_mfc_qos_restore(m_dev);
+	if (ret)
+		return ret;
 	return s5p_mfc_wakeup(m_dev);
 }
 #endif

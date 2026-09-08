@@ -1164,8 +1164,9 @@
 			compatible = "google,zumapro-mfc";
 			reg = <0x1a4d0000 0x10000>;
 			interrupts = <GIC_SPI 515 IRQ_TYPE_LEVEL_HIGH 0>;
-			clocks = <&cmu_mfc CLK_GOUT_MFC_MFC_ACLK>;
-			clock-names = "mfc";
+			clocks = <&cmu_mfc CLK_GOUT_MFC_MFC_ACLK>,
+				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MFC>;
+			clock-names = "mfc", "sclk_mfc";
 			power-domains = <&pd_mfc>;
 			iommus = <&sysmmu_mfc>;
 			status = "disabled";

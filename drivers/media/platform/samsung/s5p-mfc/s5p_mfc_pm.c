@@ -42,6 +42,13 @@ int s5p_mfc_init_pm(struct s5p_mfc_dev *dev)
 	if (dev->variant->use_clock_gating)
 		pm->clock_gate = pm->clocks[0];
 
+	if (IS_MFCV16_PLUS(dev)) {
+		pm->rate_clock = devm_clk_get_optional(pm->device, "sclk_mfc");
+		if (IS_ERR(pm->rate_clock))
+			return dev_err_probe(pm->device, PTR_ERR(pm->rate_clock),
+					     "cannot get MFC DVFS clock\n");
+	}
+
 	pm_runtime_enable(pm->device);
 	return 0;
 }

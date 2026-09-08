@@ -139,9 +139,86 @@ static const struct exynos_bts_profile zumapro_mfc_uhd = {
 	.qurgent_th_w = 0xff,
 };
 
+static const struct exynos_bts_profile zumapro_dpu_default = {
+	.rmo = 0x60,
+	.wmo = 0x20,
+	.arqos = 0x8,
+	.awqos = 0x8,
+	.qurgent_th_r = 0x20,
+	.qurgent_th_w = 0x20,
+	.qurgent = true,
+};
+
+static const struct exynos_bts_profile zumapro_dpu_camera = {
+	.rmo = 0x30,
+	.wmo = 0x20,
+	.arqos = 0x8,
+	.awqos = 0x8,
+	.qurgent_th_r = 0x20,
+	.qurgent_th_w = 0x20,
+	.qurgent = true,
+};
+
+static const struct exynos_bts_profile zumapro_ispfe0_default = {
+	.rmo = 0x26,
+	.wmo = 0x40,
+	.arqos = 0xc,
+	.awqos = 0xc,
+	.qurgent_th_r = 0x20,
+	.qurgent_th_w = 0x20,
+	.qurgent = true,
+};
+
+static const struct exynos_bts_profile zumapro_ispfe12_default = {
+	.rmo = 0xffff,
+	.wmo = 0x40,
+	.arqos = 0xc,
+	.awqos = 0xc,
+	.qurgent_th_r = 0x20,
+	.qurgent_th_w = 0x20,
+	.qurgent = true,
+};
+
+static const struct exynos_bts_profile zumapro_ispfe3_default = {
+	.rmo = 0xffff,
+	.wmo = 0x8,
+	.arqos = 0xc,
+	.awqos = 0xc,
+	.qurgent_th_r = 0x20,
+	.qurgent_th_w = 0x20,
+	.qurgent = true,
+};
+
+static const struct exynos_bts_profile zumapro_g2d_default = {
+	.rmo = 0x18,
+	.wmo = 0x14,
+	.arqos = 0x4,
+	.awqos = 0x4,
+	.qurgent_th_r = 0xff,
+	.qurgent_th_w = 0xff,
+};
+
+static const struct exynos_bts_profile zumapro_g2d_camera = {
+	.rmo = 0x8,
+	.wmo = 0x8,
+	.arqos = 0x4,
+	.awqos = 0x4,
+	.qurgent_th_r = 0xff,
+	.qurgent_th_w = 0xff,
+};
+
 static const struct exynos_bts_block_data zumapro_blocks[] = {
 	{ "mfc0", &zumapro_mfc_default },
 	{ "mfc1", &zumapro_mfc_default },
+	{ "dpu0", &zumapro_dpu_default },
+	{ "dpu1", &zumapro_dpu_default },
+	{ "ispfe0", &zumapro_ispfe0_default },
+	{ "ispfe1", &zumapro_ispfe12_default },
+	{ "ispfe2", &zumapro_ispfe12_default },
+	{ "ispfe3", &zumapro_ispfe3_default },
+	{ "g2d0", &zumapro_g2d_default },
+	{ "g2d1", &zumapro_g2d_default },
+	{ "g2d2", &zumapro_g2d_default },
 };
 
 static const struct exynos_bts_override zumapro_mfc_uhd_overrides[] = {
@@ -168,7 +245,37 @@ static const struct exynos_bts_policy zumapro_mfc_policies[] = {
 	},
 };
 
+/* The global camera scenario takes priority over the MFC UHD scenario. */
+static const struct exynos_bts_override zumapro_camera_overrides[] = {
+	{ 0, &zumapro_mfc_default },
+	{ 1, &zumapro_mfc_default },
+	{ 2, &zumapro_dpu_camera },
+	{ 3, &zumapro_dpu_camera },
+	{ 8, &zumapro_g2d_camera },
+	{ 9, &zumapro_g2d_camera },
+	{ 10, &zumapro_g2d_camera },
+};
+
+static const struct exynos_bts_policy zumapro_camera_policies[] = {
+	{
+		.priority = 7,
+		.overrides = zumapro_camera_overrides,
+		.num_overrides = ARRAY_SIZE(zumapro_camera_overrides),
+	},
+};
+
 static const struct exynos_bts_master_data zumapro_masters[] = {
+	{
+		.id = ZUMAPRO_BTS_MASTER_ISPFE,
+		.name = "ispfe",
+		.bus_width = 32,
+		.realtime = true,
+		/* Separate graph-wide DPM floors measured with ISPFE active. */
+		.mif_floor = 1000000,
+		.int_floor = 200000,
+		.policies = zumapro_camera_policies,
+		.num_policies = ARRAY_SIZE(zumapro_camera_policies),
+	},
 	{
 		.id = ZUMAPRO_BTS_MASTER_MFC,
 		.name = "mfc",

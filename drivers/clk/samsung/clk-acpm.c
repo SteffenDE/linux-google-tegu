@@ -87,6 +87,7 @@ static const struct acpm_clk_variant zumapro_acpm_clks[] = {
 	ACPM_CLK("intcam"),	/* 10 */
 	ACPM_CLK("tnr"),	/* 11 */
 	ACPM_CLK("cam"),	/* 12 */
+	ACPM_CLK("mfc"),	/* 13 */
 };
 
 static const struct acpm_clk_driver_data acpm_clk_zumapro = {

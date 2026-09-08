@@ -1146,11 +1146,21 @@
 			clock-names = "oscclk";
 		};
 
-		/* MFC NoC QoS ports, from the downstream Zuma BTS description. */
+		/* NoC QoS ports, from the downstream Zuma BTS description. */
 		bts: interconnect@26c48380 {
 			compatible = "google,zumapro-bts";
-			reg = <0x26c48380 0x80>, <0x26c48400 0x80>;
-			reg-names = "mfc0", "mfc1";
+			reg = <0x26c48380 0x80>, <0x26c48400 0x80>,
+			      <0x26c48000 0x80>,
+			      <0x26c48080 0x80>,
+			      <0x26c48180 0x80>,
+			      <0x26c48200 0x80>,
+			      <0x26c48280 0x80>,
+			      <0x26c48300 0x80>,
+			      <0x27048200 0x80>,
+			      <0x27048280 0x80>,
+			      <0x27048300 0x80>;
+			reg-names = "mfc0", "mfc1", "dpu0", "dpu1", "ispfe0",
+				    "ispfe1", "ispfe2", "ispfe3", "g2d0", "g2d1", "g2d2";
 			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MIF>,
 				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INT>;
 			clock-names = "mif", "int";

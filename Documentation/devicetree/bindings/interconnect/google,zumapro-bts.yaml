@@ -15,7 +15,7 @@ description: |
   bandwidth into minimum MIF and INT ACPM DVFS rates.
 
   The register resources describe the BTS blocks managed by this provider.
-  Initially these are the two MFC memory ports. Client bandwidth and workload
+  These cover the MFC, ISPFE, DPU and G2D ports. Client bandwidth and workload
   tags select per-master clock floors and outstanding-transaction profiles.
 
 properties:
@@ -26,11 +26,29 @@ properties:
     items:
       - description: MFC channel 0 BTS registers
       - description: MFC channel 1 BTS registers
+      - description: DPU channel 0 BTS registers
+      - description: DPU channel 1 BTS registers
+      - description: ISPFE channel 0 BTS registers
+      - description: ISPFE channel 1 BTS registers
+      - description: ISPFE channel 2 BTS registers
+      - description: ISPFE channel 3 BTS registers
+      - description: G2D channel 0 BTS registers
+      - description: G2D channel 1 BTS registers
+      - description: G2D channel 2 BTS registers
 
   reg-names:
     items:
       - const: mfc0
       - const: mfc1
+      - const: dpu0
+      - const: dpu1
+      - const: ispfe0
+      - const: ispfe1
+      - const: ispfe2
+      - const: ispfe3
+      - const: g2d0
+      - const: g2d1
+      - const: g2d2
 
   clocks:
     items:
@@ -61,8 +79,18 @@ examples:
 
     interconnect@26c48380 {
         compatible = "google,zumapro-bts";
-        reg = <0x26c48380 0x80>, <0x26c48400 0x80>;
-        reg-names = "mfc0", "mfc1";
+        reg = <0x26c48380 0x80>, <0x26c48400 0x80>,
+              <0x26c48000 0x80>,
+              <0x26c48080 0x80>,
+              <0x26c48180 0x80>,
+              <0x26c48200 0x80>,
+              <0x26c48280 0x80>,
+              <0x26c48300 0x80>,
+              <0x27048200 0x80>,
+              <0x27048280 0x80>,
+              <0x27048300 0x80>;
+        reg-names = "mfc0", "mfc1", "dpu0", "dpu1", "ispfe0",
+                    "ispfe1", "ispfe2", "ispfe3", "g2d0", "g2d1", "g2d2";
         clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MIF>,
                  <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INT>;
         clock-names = "mif", "int";

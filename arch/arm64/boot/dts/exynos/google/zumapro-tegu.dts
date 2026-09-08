@@ -1848,6 +1848,10 @@
 };
 
 /* MFC firmware bring-up uses the board's standard IOVA reservation. */
+&bts {
+	status = "okay";
+};
+
 &pd_mfc {
 	status = "okay";
 };

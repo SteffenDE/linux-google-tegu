@@ -989,6 +989,18 @@
 			clock-names = "oscclk";
 		};
 
+		/* MFC NoC QoS ports, from the downstream Zuma BTS description. */
+		bts: interconnect@26c48380 {
+			compatible = "google,zumapro-bts";
+			reg = <0x26c48380 0x80>, <0x26c48400 0x80>;
+			reg-names = "mfc0", "mfc1";
+			clocks = <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_MIF>,
+				 <&acpm_ipc ZUMAPRO_CLK_ACPM_DVFS_INT>;
+			clock-names = "mif", "int";
+			#interconnect-cells = <1>;
+			status = "disabled";
+		};
+
 		/*
 		 * CMU_MISC clocks the Multi-Core Timer (MCT).  Modelled only far
 		 * enough to gate the MCT register-access pclk; the NOC USER mux

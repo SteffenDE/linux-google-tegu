@@ -936,6 +936,59 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The domains the bootloader leaves powered and nothing in this tree
+	 * drives: the 2D engine, the camera back end, the two ML blocks, the
+	 * compression engine and the always-on compute block.  Each names its
+	 * CMU and SYSREG so the domain driver can save and restore them around
+	 * a power cycle with the vendor's list; with no consumer genpd powers
+	 * them off at late init, as the vendor kernel has them when unused.
+	 * PMU offsets, CMU bases and secure ids are the vendor DT's
+	 * (research/dumped.dts pd-*@1546xxxx: need_smc, cmu_id).  The camera
+	 * branch describes its domains with dedicated compatibles and extra
+	 * windows; those nodes supersede these there.
+	 */
+	pd_g2d: power-domain@15461e80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461e80 0x20>,
+		      <0x0 0x1a800000 0x10000>,
+		      <0x0 0x1a820000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1a810204>;
+		#power-domain-cells = <0>;
+		label = "G2D";
+	};
+	pd_gdc: power-domain@15461f00 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461f00 0x20>,
+		      <0x0 0x1d400000 0x10000>,
+		      <0x0 0x1d420000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1d410204>;
+		#power-domain-cells = <0>;
+		label = "GDC";
+	};
+	pd_gse: power-domain@15461f80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15461f80 0x20>,
+		      <0x0 0x1d800000 0x10000>,
+		      <0x0 0x1d820000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1d810204>;
+		#power-domain-cells = <0>;
+		label = "GSE";
+	};
+	pd_mcsc: power-domain@15462000 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462000 0x20>,
+		      <0x0 0x1d000000 0x10000>,
+		      <0x0 0x1d020000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1d010204>;
+		#power-domain-cells = <0>;
+		label = "MCSC";
+	};
+
 	/* MFC PMU configuration/status and secure TZPC save/restore identifier. */
 	pd_mfc: power-domain@15462080 {
 		compatible = "google,zumapro-pd";
@@ -947,6 +1000,108 @@
 		#power-domain-cells = <0>;
 		label = "MFC";
 		status = "disabled";
+	};
+
+	pd_rgbp: power-domain@15462100 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462100 0x20>,
+		      <0x0 0x1c400000 0x10000>,
+		      <0x0 0x1c420000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1c410204>;
+		#power-domain-cells = <0>;
+		label = "RGBP";
+	};
+	pd_tnr: power-domain@15462180 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462180 0x20>,
+		      <0x0 0x1cc00000 0x10000>,
+		      <0x0 0x1cc20000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1cc10204>;
+		#power-domain-cells = <0>;
+		label = "TNR";
+	};
+	pd_yuvp: power-domain@15462200 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462200 0x20>,
+		      <0x0 0x1c800000 0x10000>,
+		      <0x0 0x1c820000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1c810204>;
+		#power-domain-cells = <0>;
+		label = "YUVP";
+	};
+	/*
+	 * BLK_AOC hosts the always-on compute block, which is running (its
+	 * firmware is booted by userspace) and whose driver is not yet a
+	 * consumer of this domain, so it stays pinned: with no consumer genpd
+	 * would power it off at late init.  The vendor's table has no save
+	 * list for it; the AoC firmware owns CMU_AOC.
+	 */
+	pd_aoc: power-domain@15462280 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462280 0x20>,
+		      <0x0 0x19000000 0x10000>;
+		reg-names = "pmu", "cmu";
+		samsung,secure-pd-id = <0x19010204>;
+		samsung,always-on;
+		#power-domain-cells = <0>;
+		label = "AOC";
+	};
+	/*
+	 * AUR is the one block whose SYSREG is at cmu + 0x40000; every other
+	 * one is at + 0x20000.
+	 */
+	pd_aur: power-domain@15462300 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462300 0x20>,
+		      <0x0 0x20a00000 0x10000>,
+		      <0x0 0x20a40000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x20a10204>;
+		#power-domain-cells = <0>;
+		label = "AUR";
+	};
+	pd_bw: power-domain@15462380 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462380 0x20>,
+		      <0x0 0x1a600000 0x10000>,
+		      <0x0 0x1a620000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1a610204>;
+		#power-domain-cells = <0>;
+		label = "BW";
+	};
+	pd_eh: power-domain@15462400 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462400 0x20>,
+		      <0x0 0x16c00000 0x10000>,
+		      <0x0 0x16c20000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x16c10204>;
+		#power-domain-cells = <0>;
+		label = "EH";
+	};
+	pd_ispfe: power-domain@15462480 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462480 0x20>,
+		      <0x0 0x1c000000 0x10000>,
+		      <0x0 0x1c020000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1c010204>;
+		#power-domain-cells = <0>;
+		label = "ISPFE";
+	};
+	pd_tpu: power-domain@15462500 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462500 0x20>,
+		      <0x0 0x1a300000 0x10000>,
+		      <0x0 0x1a320000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x1a310204>;
+		#power-domain-cells = <0>;
+		label = "TPU";
 	};
 
 	/*

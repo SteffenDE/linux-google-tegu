@@ -1587,6 +1587,50 @@ static void zumapro_pcie_remove(struct platform_device *pdev)
 	phy_exit(zp->phy);
 }
 
+/*
+ * System suspend.  Park the modem link and gate the controller's clocks before
+ * firmware quiesces the interconnect.  Downstream reaches the same link state
+ * from the endpoint side, where the CP parks the link itself.  HSI1 remains
+ * outside AP genpd power-off ownership.
+ *
+ * The link is normally already parked: the modem driver takes it down when
+ * the CP drops CP2AP_WAKEUP, and refuses to suspend while the CP still
+ * wants it.  Park whatever is left here, with the same sequence, so a
+ * system suspend cannot leave a trained link driving the interconnect.
+ *
+ * Nothing is trained back in resume: the CP asks for the link with
+ * CP2AP_WAKEUP and the modem driver answers, exactly as it does after a
+ * runtime park.  The other channel (WiFi, in HSI2) is handled separately.
+ */
+static int zumapro_pcie_suspend_noirq(struct device *dev)
+{
+	struct zumapro_pcie *zp = dev_get_drvdata(dev);
+
+	if (!zp->cp_pwr)
+		return 0;
+
+	if (zumapro_pcie_modem_link_active(dev))
+		zumapro_pcie_modem_link_down(dev, false);
+
+	clk_bulk_disable_unprepare(zp->num_clks, zp->clks);
+
+	return 0;
+}
+
+static int zumapro_pcie_resume_noirq(struct device *dev)
+{
+	struct zumapro_pcie *zp = dev_get_drvdata(dev);
+
+	if (!zp->cp_pwr)
+		return 0;
+
+	return clk_bulk_prepare_enable(zp->num_clks, zp->clks);
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(zumapro_pcie_pm_ops,
+			       zumapro_pcie_suspend_noirq,
+			       zumapro_pcie_resume_noirq);
+
 static const struct of_device_id zumapro_pcie_of_match[] = {
 	{ .compatible = "google,zumapro-pcie" },
 	{ },
@@ -1600,6 +1644,7 @@ static struct platform_driver zumapro_pcie_driver = {
 		.name			= "zumapro-pcie",
 		.of_match_table		= zumapro_pcie_of_match,
 		.suppress_bind_attrs	= true,
+		.pm			= pm_sleep_ptr(&zumapro_pcie_pm_ops),
 	},
 };
 module_platform_driver(zumapro_pcie_driver);

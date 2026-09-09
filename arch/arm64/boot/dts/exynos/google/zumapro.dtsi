@@ -1604,6 +1604,25 @@
 		};
 
 		/*
+		 * The GPU's stage-2 protection unit.  Source: downstream
+		 * s2mpu_s0_g3d@1ee70000 in research/dumped.dts:5383-5389 (reg,
+		 * interrupt 354, pd-g3d).  It sits in the G3D top-level domain and
+		 * resets to blocking when that domain powers off, so the GPU links
+		 * to it through access-controllers and the driver reopens it at
+		 * every runtime resume, which is what the vendor kernel does on
+		 * every G3D power-on.  No clock: CMU_G3D has no clock provider, its
+		 * state is restored by the power domain itself.
+		 */
+		s2mpu_g3d: access-controller@1ee70000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1ee70000 0x10000>;
+			interrupts = <GIC_SPI 354 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_g3d>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
 		 * GPU: Mali-G715 (Valhall CSF, arch 11.2, product tTUx), driven by
 		 * mainline panthor.  Register base, interrupts and power domains are
 		 * the downstream mali@1F000000 node.  Disabled here; enabled per
@@ -1637,6 +1656,7 @@
 			operating-points-v2 = <&gpu_opp_table>;
 			power-domains = <&pd_g3d>, <&pd_embedded_g3d>;
 			power-domain-names = "top", "cores";
+			access-controllers = <&s2mpu_g3d>;
 			status = "disabled";
 
 			/*

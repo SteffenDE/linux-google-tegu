@@ -891,9 +891,14 @@
 
 	/*
 	 * Display PM domains.  Source: downstream zumapro-pm-domains.dtsi and
-	 * research/dumped.dts:2721-2754.  Keep disabled until the display clock,
-	 * SysMMU, DSIM, and DECON drivers can consume them together; enabling
-	 * these too early could hand genpd control of the bootloader splash path.
+	 * research/dumped.dts:2721-2754.  They follow their consumers now: the
+	 * DECON reaches DPUF0 and DPUF1 through its two System MMUs' runtime-PM
+	 * device links and the DPPs through the DECON's own reference, so the
+	 * pair goes down when the display blanks and comes back before it is
+	 * driven again; DPUB holds the DSIM and the display CMU and goes down
+	 * only across a system suspend, where the DRM master disables every
+	 * CRTC first.  The domain driver saves and restores the vendor's CMU
+	 * and SYSREG lists around each transition.
 	 */
 	pd_dpub: power-domain@15461d00 {
 		compatible = "google,zumapro-pd";
@@ -902,7 +907,6 @@
 		      <0x0 0x19420000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19410204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "DPUB";
 		status = "disabled";
@@ -915,7 +919,6 @@
 		      <0x0 0x19820000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19810204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		power-domains = <&pd_dpub>;
 		label = "DPUF0";
@@ -929,7 +932,6 @@
 		      <0x0 0x19c20000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19c10204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		power-domains = <&pd_dpub>;
 		label = "DPUF1";

@@ -858,12 +858,13 @@
 	 * in CMU_G3D, and sets EMBEDDED_G3D_OUT (+0x20 in its PMU block)
 	 * before the cores come up, which is why both nodes map CMU_G3D.
 	 *
-	 * Both are samsung,always-on.  On silicon the bootloader hands the GPU
-	 * over fully powered (both PMU status regs 0x15461a84/0x15461c84 read 1)
-	 * and the domains are adopted in that state, as the display splash
-	 * pipeline is.  The vendor off/on sequences are implemented in the
-	 * domain driver; the pins come off one domain at a time as each
-	 * sequence is validated on hardware.
+	 * The bootloader hands the GPU over fully powered (both PMU status
+	 * regs 0x15461a84/0x15461c84 read 1) and the domains are adopted in
+	 * that state, as the display splash pipeline is.  The cores follow the
+	 * GPU's runtime PM through its device links; the top level stays
+	 * samsung,always-on until its own off/on sequence has been seen to work
+	 * on hardware, and until the S2MPU in the block is reopened on every
+	 * power-on the way the vendor kernel does it.
 	 */
 	pd_g3d: power-domain@15461a80 {
 		compatible = "google,zumapro-pd";
@@ -883,7 +884,6 @@
 		      <0x0 0x1ee00000 0x10000>;
 		reg-names = "pmu", "cmu";
 		power-domains = <&pd_g3d>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "G3D_CORES";
 	};

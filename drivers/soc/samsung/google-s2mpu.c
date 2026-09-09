@@ -97,9 +97,14 @@ static void google_s2mpu_remove(struct platform_device *pdev)
 	pm_runtime_set_suspended(dev);
 }
 
+/*
+ * Late, like the System MMU that links to this device: the device list then
+ * closes the S2MPU after the MMU at suspend and reopens it before the MMU at
+ * resume, the order the runtime path produces through the link.
+ */
 static const struct dev_pm_ops google_s2mpu_pm_ops = {
 	RUNTIME_PM_OPS(google_s2mpu_runtime_suspend, google_s2mpu_runtime_resume, NULL)
-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 };
 
 static const struct of_device_id google_s2mpu_of_match[] = {

@@ -840,26 +840,37 @@
 	};
 
 	/*
+	 * Power domains.  Each node names the domain's PMU configuration/status
+	 * pair and the CMU inside the domain, whose controller option the
+	 * power-off sequence writes before the domain goes down (downstream's
+	 * pmucal *_off tables: CONTROLLER_OPTION bit 24 cleared, then
+	 * CONFIGURATION = 0).  A CMU that has a clock provider saves and
+	 * restores its own registers across the transition; CMU_G3D has none,
+	 * so pd_g3d also names its SYSREG and the domain driver carries the
+	 * vendor save list for both.
+	 *
 	 * GPU (Mali-G715 / Tensor G4 "G3D") PM domains.  Source: downstream
 	 * research/dumped_uart.dts:2699-2719 and the Phase-0 power-on trace
 	 * (docs/subsystems/gpu/reference/gpu-power-trace-results.md).  Two domains: pd_g3d (top, the
 	 * EL3-protected PMU register -> secure SMC path) and pd_embedded_g3d
-	 * (the shader cores, a child of pd_g3d).
+	 * (the shader cores, a child of pd_g3d).  The cores' power sequence
+	 * parks and re-enables PLL_G3D/PLL_G3D_L2 and forces the GPU Q-channel
+	 * in CMU_G3D, and sets EMBEDDED_G3D_OUT (+0x20 in its PMU block)
+	 * before the cores come up, which is why both nodes map CMU_G3D.
 	 *
 	 * Both are samsung,always-on.  On silicon the bootloader hands the GPU
-	 * over fully powered (both PMU status regs 0x15461a84/0x15461c84 read 1),
-	 * and the mainline power-OFF sequence times out on the cores domain (the
-	 * CMU handshake the downstream pmucal performs around the transition is
-	 * not yet replicated here), so genpd_power_off_unused cannot gate them.
-	 * For first light we adopt the live, powered state (as the display splash
-	 * pipeline does) instead of exercising an unproven off->on cycle; real
-	 * runtime-PM power-cycling can drop always-on once the off-sequence works.
+	 * over fully powered (both PMU status regs 0x15461a84/0x15461c84 read 1)
+	 * and the domains are adopted in that state, as the display splash
+	 * pipeline is.  The vendor off/on sequences are implemented in the
+	 * domain driver; the pins come off one domain at a time as each
+	 * sequence is validated on hardware.
 	 */
 	pd_g3d: power-domain@15461a80 {
 		compatible = "google,zumapro-pd";
 		reg = <0x0 0x15461a80 0x20>,
-		      <0x0 0x1ee00800 0x4>;
-		reg-names = "pmu", "cmu";
+		      <0x0 0x1ee00000 0x10000>,
+		      <0x0 0x1ee20000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x1ee10204>;
 		samsung,always-on;
 		#power-domain-cells = <0>;
@@ -868,8 +879,9 @@
 
 	pd_embedded_g3d: power-domain@15461c80 {
 		compatible = "google,zumapro-pd";
-		reg = <0x0 0x15461c80 0x20>;
-		reg-names = "pmu";
+		reg = <0x0 0x15461c80 0x40>,
+		      <0x0 0x1ee00000 0x10000>;
+		reg-names = "pmu", "cmu";
 		power-domains = <&pd_g3d>;
 		samsung,always-on;
 		#power-domain-cells = <0>;
@@ -885,7 +897,7 @@
 	pd_dpub: power-domain@15461d00 {
 		compatible = "google,zumapro-pd";
 		reg = <0x0 0x15461d00 0x20>,
-		      <0x0 0x19400800 0x4>;
+		      <0x0 0x19400000 0x10000>;
 		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x19410204>;
 		samsung,always-on;
@@ -897,7 +909,7 @@
 	pd_dpuf0: power-domain@15461d80 {
 		compatible = "google,zumapro-pd";
 		reg = <0x0 0x15461d80 0x20>,
-		      <0x0 0x19800800 0x4>;
+		      <0x0 0x19800000 0x8000>;
 		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x19810204>;
 		samsung,always-on;
@@ -910,7 +922,7 @@
 	pd_dpuf1: power-domain@15461e00 {
 		compatible = "google,zumapro-pd";
 		reg = <0x0 0x15461e00 0x20>,
-		      <0x0 0x19c00800 0x4>;
+		      <0x0 0x19c00000 0x8000>;
 		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x19c10204>;
 		samsung,always-on;
@@ -923,8 +935,9 @@
 	/* MFC PMU configuration/status and secure TZPC save/restore identifier. */
 	pd_mfc: power-domain@15462080 {
 		compatible = "google,zumapro-pd";
-		reg = <0x0 0x15462080 0x20>;
-		reg-names = "pmu";
+		reg = <0x0 0x15462080 0x20>,
+		      <0x0 0x1a400000 0x10000>;
+		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x1a410204>;
 		#power-domain-cells = <0>;
 		label = "MFC";
@@ -945,7 +958,7 @@
 	pd_hsi1: power-domain@15462b00 {
 		compatible = "google,zumapro-pd";
 		reg = <0x0 0x15462b00 0x20>,
-		      <0x0 0x12000800 0x4>;
+		      <0x0 0x12000000 0x10000>;
 		reg-names = "pmu", "cmu";
 		samsung,secure-pd-id = <0x12010204>;
 		samsung,always-on;

@@ -40,13 +40,23 @@ properties:
 
   reg:
     minItems: 1
-    maxItems: 2
+    items:
+      - description: The domain's configuration and status registers in the PMU
+      - description: |
+          The register block of the clock controller (CMU) inside the domain.
+          The power sequence writes its controller option before the domain
+          goes down and, for a domain whose CMU has no clock provider, saves
+          and restores its clock state around the transition.
+      - description: |
+          The register block of the system registers (SYSREG) inside the
+          domain, saved and restored with the CMU.
 
   reg-names:
     minItems: 1
     items:
       - const: pmu
       - const: cmu
+      - const: sysreg
 
   clocks:
     deprecated: true
@@ -105,7 +115,7 @@ examples:
   - |
     display_pd: power-domain@15461d00 {
         compatible = "google,zumapro-pd";
-        reg = <0x15461d00 0x20>, <0x19400800 0x4>;
+        reg = <0x15461d00 0x20>, <0x19400000 0x10000>;
         reg-names = "pmu", "cmu";
         samsung,secure-pd-id = <0x19410204>;
         samsung,always-on;

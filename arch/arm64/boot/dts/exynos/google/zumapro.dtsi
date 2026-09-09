@@ -412,9 +412,11 @@
 
 		/*
 		 * Throttle temps are downstream's (throttle 90 C, and a 115 C
-		 * critical backstop matching the CPU zones).  The sensor reads
-		 * live at all times because pd_g3d is samsung,always-on, so
-		 * there is no collapsed-domain reading to guard against.
+		 * critical backstop matching the CPU zones).  The sensor sits
+		 * in pd_g3d, which powers off whenever the GPU is idle; the
+		 * ACPM TMU read is a mailbox call whose failure disables the
+		 * zone rather than tripping it, and what the firmware reports
+		 * for an unpowered block is not yet measured (TRACE NEEDED).
 		 *
 		 * sustainable-power is the measured full-tilt figure, matching
 		 * the top of the OPP table's own measured power (glmark2 pinned
@@ -860,11 +862,11 @@
 	 *
 	 * The bootloader hands the GPU over fully powered (both PMU status
 	 * regs 0x15461a84/0x15461c84 read 1) and the domains are adopted in
-	 * that state, as the display splash pipeline is.  The cores follow the
-	 * GPU's runtime PM through its device links; the top level stays
-	 * samsung,always-on until its own off/on sequence has been seen to work
-	 * on hardware, and until the S2MPU in the block is reopened on every
-	 * power-on the way the vendor kernel does it.
+	 * that state, as the display splash pipeline is.  Both follow the GPU's
+	 * runtime PM through its device links: the cores' sequence was seen to
+	 * work first, then the top level's, whose power-off also loses the
+	 * S2MPU's state, which the GPU's link to s2mpu_g3d has reopened before
+	 * the GPU runs.
 	 */
 	pd_g3d: power-domain@15461a80 {
 		compatible = "google,zumapro-pd";
@@ -873,7 +875,6 @@
 		      <0x0 0x1ee20000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x1ee10204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "G3D";
 	};

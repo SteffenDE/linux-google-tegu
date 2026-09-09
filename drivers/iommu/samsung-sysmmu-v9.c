@@ -1460,9 +1460,19 @@ static int __maybe_unused samsung_sysmmu_v9_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * A System MMU that is active when the system sleeps loses its state when
+ * genpd removes power from its domain in the noirq phase and has to be
+ * re-enabled before the master it serves resumes.  Late system-sleep
+ * callbacks do that through the runtime hooks, in the same phase downstream
+ * uses for it; they also order the MMU after its CMU, which is earlier in
+ * the device list, and before the master, which links to the MMU.
+ */
 static const struct dev_pm_ops samsung_sysmmu_v9_pm_ops = {
 	SET_RUNTIME_PM_OPS(samsung_sysmmu_v9_runtime_suspend,
 			   samsung_sysmmu_v9_runtime_resume, NULL)
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+				     pm_runtime_force_resume)
 };
 
 static const struct of_device_id samsung_sysmmu_v9_of_match[] = {

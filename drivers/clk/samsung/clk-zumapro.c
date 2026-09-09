@@ -1668,23 +1668,11 @@ static const struct of_device_id zumapro_cmu_of_match[] = {
 		.compatible = "google,zumapro-cmu-peric1",
 		.data = &peric1_cmu_info,
 	}, {
-		.compatible = "google,zumapro-cmu-hsi1",
-		.data = &hsi1_cmu_info,
-	}, {
 		.compatible = "google,zumapro-cmu-hsi2",
 		.data = &hsi2_cmu_info,
 	}, {
 		.compatible = "google,zumapro-cmu-hsi0",
 		.data = &hsi0_cmu_info,
-	}, {
-		.compatible = "google,zumapro-cmu-dpub",
-		.data = &dpub_cmu_info,
-	}, {
-		.compatible = "google,zumapro-cmu-dpuf0",
-		.data = &dpuf0_cmu_info,
-	}, {
-		.compatible = "google,zumapro-cmu-dpuf1",
-		.data = &dpuf1_cmu_info,
 	}, {
 	},
 };
@@ -1705,6 +1693,10 @@ static int __init zumapro_cmu_pm_probe(struct platform_device *pdev)
 
 static const struct of_device_id zumapro_cmu_pm_of_match[] = {
 	{ .compatible = "google,zumapro-cmu-mfc", .data = &mfc_cmu_info },
+	{ .compatible = "google,zumapro-cmu-hsi1", .data = &hsi1_cmu_info },
+	{ .compatible = "google,zumapro-cmu-dpub", .data = &dpub_cmu_info },
+	{ .compatible = "google,zumapro-cmu-dpuf0", .data = &dpuf0_cmu_info },
+	{ .compatible = "google,zumapro-cmu-dpuf1", .data = &dpuf1_cmu_info },
 	{ }
 };
 

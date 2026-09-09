@@ -3146,6 +3146,17 @@
 			reg = <0x15460000 0x10000>;
 
 			/*
+			 * The PMU interrupt generator that routes the boot core's
+			 * wake on the deep-sleep (SYS_SLEEP) entry path.  Base is
+			 * PMU + 0x10000 -- the gs101 layout, and the address the
+			 * downstream pmucal SYS_SLEEP sequence programs
+			 * GRP*_INTR_BID at (0x15470xxx).  Unlike PMU_ALIVE this
+			 * region is not EL3-secured, so a plain mmio syscon works;
+			 * exynos-pmu builds a raw-spinlock mmio regmap over it.
+			 */
+			google,pmu-intr-gen-syscon = <&pmu_intr_gen>;
+
+			/*
 			 * Where the bootloader takes the reboot mode from after
 			 * a *warm* reset, same node and offset as gs101.  A cold
 			 * reset clears this register, and then the bootloader
@@ -3176,6 +3187,17 @@
 				mode-shutdown-thermal = <0x51>;
 				mode-shutdown-thermal-battery = <0x51>;
 			};
+		};
+
+		/*
+		 * PMU interrupt generator (non-secure mmio).  Referenced by the
+		 * PMU node's google,pmu-intr-gen-syscon; carries the GRP*_INTR_BID
+		 * wake-routing registers that the SYS_SLEEP enter sequence
+		 * programs.  Source: research/tracing/downstream-sys-sleep-decoded.md.
+		 */
+		pmu_intr_gen: syscon@15470000 {
+			compatible = "google,zumapro-pmu-intr-gen", "syscon";
+			reg = <0x15470000 0x10000>;
 		};
 
 		/*

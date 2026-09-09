@@ -72,9 +72,10 @@ static int google_s2mpu_probe(struct platform_device *pdev)
 	if (IS_ERR(s2mpu->base))
 		return PTR_ERR(s2mpu->base);
 
-	s2mpu->clk = devm_clk_get(dev, "bus");
+	/* Absent where the power domain, not a clock provider, restores the CMU */
+	s2mpu->clk = devm_clk_get_optional(dev, "bus");
 	if (IS_ERR(s2mpu->clk))
-		return dev_err_probe(dev, PTR_ERR(s2mpu->clk), "missing bus clock\n");
+		return dev_err_probe(dev, PTR_ERR(s2mpu->clk), "bus clock\n");
 
 	platform_set_drvdata(pdev, s2mpu);
 	pm_runtime_enable(dev);

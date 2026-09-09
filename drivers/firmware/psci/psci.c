@@ -12,6 +12,7 @@
 #include <linux/debugfs.h>
 #include <linux/errno.h>
 #include <linux/linkage.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/printk.h>
@@ -537,11 +538,43 @@ static int psci_system_suspend(unsigned long unused)
 	return psci_to_linux_errno(err);
 }
 
+/*
+ * DIAGNOSTIC, to be removed.  On Google Tensor the firmware owns the
+ * suspend-to-RAM power-down, and when the machine stays dark there is no way
+ * from outside to tell "the SoC was never brought back" from "it came back and
+ * the kernel hung somewhere in resume".  Every later marker is useless for
+ * that: the console UART, the interrupt controller and the clock tree are all
+ * restored after this point, so a print or a reset from a resume callback
+ * cannot run unless most of the resume path already worked.
+ *
+ * This runs before any syscore or driver resume -- only the low-level CPU
+ * state restore inside cpu_suspend() precedes it.  Panicking here writes the
+ * log to pstore, so the next boot answers the question with evidence.  The
+ * suspend finisher's return value goes in the message: 0 means the machine
+ * really suspended and came back, an error means the firmware refused the call
+ * and nothing ever powered down.
+ *
+ * Requires panic= and reboot=w on the command line.  Without a panic timeout
+ * the machine stops here and only a power cycle recovers it, and a power cycle
+ * is a cold reset, which clears the memory pstore lives in -- destroying the
+ * very record this exists to leave behind.
+ */
+static bool psci_suspend_probe_panic;
+core_param(psci_suspend_probe_panic, psci_suspend_probe_panic, bool, 0644);
+
 static int psci_system_suspend_enter(suspend_state_t state)
 {
+	int ret;
+
 	pm_set_resume_via_firmware();
 
-	return cpu_suspend(0, psci_system_suspend);
+	ret = cpu_suspend(0, psci_system_suspend);
+
+	if (psci_suspend_probe_panic)
+		panic("psci: suspend probe: resumed from SYSTEM_SUSPEND, cpu_suspend returned %d\n",
+		      ret);
+
+	return ret;
 }
 
 static int psci_system_suspend_begin(suspend_state_t state)

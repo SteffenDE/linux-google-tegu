@@ -2285,6 +2285,34 @@ static void samsung_dsim_zumapro_request_hs_clock(struct samsung_dsim *dsi)
 	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
 }
 
+/*
+ * Downstream's teardown for a BLK_DPU that is about to lose power stops
+ * requesting the HS byte clock and waits for the clock lane to reach stop
+ * state before anything else comes down; the link is switched to the
+ * oscillator, the PHY powered off and the DSIM reset only after that.  A
+ * lane still in HS when the domain goes is what the power-down handshake
+ * would then wait for.
+ */
+static void samsung_dsim_zumapro_stop_hs_clock(struct samsung_dsim *dsi)
+{
+	int timeout = 200;
+	u32 reg;
+
+	reg = samsung_dsim_read(dsi, DSIM_CLKCTRL_REG);
+	reg &= ~BIT(dsi->driver_data->tx_req_hsclk_bit);
+	samsung_dsim_write(dsi, DSIM_CLKCTRL_REG, reg);
+
+	do {
+		reg = samsung_dsim_read(dsi, DSIM_DPHY_STATUS_REG);
+		if (reg & DSIM_STOP_STATE_CLK)
+			return;
+
+		udelay(10);
+	} while (--timeout);
+
+	dev_warn(dsi->dev, "clock lane did not reach stop state\n");
+}
+
 static void samsung_dsim_disable_irq(struct samsung_dsim *dsi)
 {
 	if (dsi->te_gpio)
@@ -3021,6 +3049,7 @@ static int samsung_dsim_suspend(struct device *dev)
 		dsi->state &= ~DSIM_STATE_INITIALIZED;
 
 		if (driver_data->uses_external_dphy_pll) {
+			samsung_dsim_zumapro_stop_hs_clock(dsi);
 			samsung_dsim_zumapro_select_word_clock(dsi, false);
 			phy_power_off(dsi->phy);
 			phy_exit(dsi->phy);
@@ -3028,6 +3057,14 @@ static int samsung_dsim_suspend(struct device *dev)
 
 		samsung_dsim_disable_clock(dsi);
 		samsung_dsim_disable_irq(dsi);
+
+		/*
+		 * Leave the block in reset, as downstream's stop sequence
+		 * ends: its power domain may be taken away next, and the
+		 * bring-up after that starts from reset values anyway.
+		 */
+		if (driver_data->uses_external_dphy_pll)
+			samsung_dsim_reset(dsi);
 	}
 
 	dsi->state &= ~DSIM_STATE_CMD_LPM;

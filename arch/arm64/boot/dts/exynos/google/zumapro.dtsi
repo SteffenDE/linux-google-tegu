@@ -1105,6 +1105,31 @@
 	};
 
 	/*
+	 * BLK_HSI0 hosts USB (the DWC3 wrapper and core, the USB32DRD combo
+	 * PHY, the eUSB2 PHY, their S2MPU) and three USIs (the touch SPI, the
+	 * GNSS SPI, the amplifier I2C).  The vendor kernel has the domain owned
+	 * by the DWC3 wrapper's runtime PM and off whenever no cable is in; it
+	 * never sleeps with a gadget enumerated.  Here every consumer is named
+	 * and none of them has runtime PM, so genpd keeps the domain on while
+	 * the system runs and powers it off in suspend_noirq once they have
+	 * all suspended, restoring CMU_HSI0 and SYSREG_HSI0 from the vendor's
+	 * list on the way back; the USIs rewrite their mode words in
+	 * resume_noirq and the USB stack re-initialises from cold as it
+	 * already does after every suspend.  PMU offset, secure id and CMU base
+	 * are the vendor DT's (research/dumped.dts:2914-2924).
+	 */
+	pd_hsi0: power-domain@15462a80 {
+		compatible = "google,zumapro-pd";
+		reg = <0x0 0x15462a80 0x20>,
+		      <0x0 0x11000000 0x10000>,
+		      <0x0 0x11020000 0x1000>;
+		reg-names = "pmu", "cmu", "sysreg";
+		samsung,secure-pd-id = <0x11010204>;
+		#power-domain-cells = <0>;
+		label = "HSI0";
+	};
+
+	/*
 	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
 	 * Downstream leaves its exynos-pd node disabled (the domain is never
 	 * kernel-managed there, and ACPM has a dedicated SYS_SLEEP_HSI1ON
@@ -1233,6 +1258,7 @@
 		cmu_hsi0: clock-controller@11000000 {
 			compatible = "google,zumapro-cmu-hsi0";
 			reg = <0x11000000 0x10000>;
+			power-domains = <&pd_hsi0>;
 			#clock-cells = <1>;
 			clocks = <&ext_24_5m>,
 				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>,
@@ -1762,6 +1788,22 @@
 					};
 				};
 			};
+		};
+
+		/*
+		 * USB's stage-2 protection unit, in BLK_HSI0.  Source: downstream
+		 * s2mpu_s0_hsi0@11070000 (research/dumped.dts:5407-5412, interrupt
+		 * 395).  Like the GPU's it resets to blocking when its domain powers
+		 * off, so the DWC3 core links to it through access-controllers and
+		 * google-s2mpu reopens it before the controller resumes.
+		 */
+		s2mpu_hsi0: access-controller@11070000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x11070000 0x10000>;
+			interrupts = <GIC_SPI 395 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_hsi0>;
+			#access-controller-cells = <0>;
+			status = "disabled";
 		};
 
 		/*
@@ -2483,6 +2525,7 @@
 			phy-names = "hs";
 
 			samsung,pmu-syscon = <&pmu_system_controller>;
+			power-domains = <&pd_hsi0>;
 
 			status = "okay";
 		};
@@ -2505,6 +2548,7 @@
 				 <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>,
 				 <&cmu_hsi0 CLK_DOUT_HSI0_EUSB>;
 			clock-names = "ref", "bus", "ctrl";
+			power-domains = <&pd_hsi0>;
 
 			/* Placeholder rails until s2mpg14/15 PMIC support lands. */
 			vdd-supply = <&reg_placeholder>;
@@ -2531,6 +2575,7 @@
 				 <&cmu_hsi0 CLK_DOUT_HSI0_USB>,
 				 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>;
 			clock-names = "aclk", "sclk", "bus";
+			power-domains = <&pd_hsi0>;
 
 			/* Placeholder rails until s2mpg14/15 PMIC support lands. */
 			vdd33-supply = <&reg_placeholder>;
@@ -2556,6 +2601,9 @@
 
 				clocks = <&cmu_hsi0 CLK_DOUT_HSI0_USB>;
 				clock-names = "ref";
+
+				power-domains = <&pd_hsi0>;
+				access-controllers = <&s2mpu_hsi0>;
 
 				interrupts = <GIC_SPI 402 IRQ_TYPE_LEVEL_HIGH 0>;
 
@@ -2595,8 +2643,11 @@
 		 * fallback, so the downstream pdma1 (PL330) does not need to
 		 * be brought up for first touch bring-up.
 		 *
-		 * No power-domains: BLK_HSI0 is kept on by the bootloader for
-		 * the (always-live) USB block, like the other HSI0 nodes.
+		 * In pd_hsi0 with the rest of BLK_HSI0: the domain stays on while
+		 * the system runs (no consumer has runtime PM) and powers off
+		 * across a system suspend; the USI's mode word in SYSREG_HSI0 is
+		 * not in the vendor's save list, the driver rewrites it in
+		 * resume_noirq.
 		 */
 		usi2_hsi0: usi@111d00c0 {
 			compatible = "google,gs101-usi", "samsung,exynos850-usi";
@@ -2608,6 +2659,7 @@
 				 <&cmu_hsi0 CLK_GOUT_HSI0_USI2_USI_CLK>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_hsi0 0x101c>;
+			power-domains = <&pd_hsi0>;
 			status = "disabled";
 
 			spi_20: spi@111d0000 {
@@ -2641,6 +2693,7 @@
 				 <&cmu_hsi0 CLK_GOUT_HSI0_USI3_USI_CLK>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_hsi0 0x1020>;
+			power-domains = <&pd_hsi0>;
 			status = "disabled";
 
 			spi_21: spi@111e0000 {
@@ -2674,6 +2727,7 @@
 				 <&cmu_hsi0 CLK_GOUT_HSI0_USI4_USI_CLK>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_hsi0 0x1024>;
+			power-domains = <&pd_hsi0>;
 			status = "disabled";
 
 			hsi2c_19: i2c@111f0000 {

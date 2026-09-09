@@ -1097,17 +1097,24 @@
 };
 
 /*
- * GPU first light.  The bootloader hands the GPU over powered and the G3D
- * domains are samsung,always-on (see zumapro.dtsi), so panthor adopts the
- * live power state and reads the ACPM idle clocks (core/G3DL2 160 MHz,
- * stacks/G3D 150 MHz).  Requires the CSF firmware staged in the rootfs at
+ * GPU.  The bootloader hands it over powered; panthor adopts that state and
+ * reads the ACPM idle clocks (core/G3DL2 160 MHz, stacks/G3D 150 MHz), and
+ * the G3D domains follow its runtime PM from then on.  Requires the CSF
+ * firmware staged in the rootfs at
  * /lib/firmware/arm/mali/arch11.8/mali_csffw.bin -- without it panthor
  * probes but bails at firmware load.  The "google,zumapro-mali" compatible
  * makes panthor program the zumapro L2 slice (ASN) hash before L2 power-up;
  * without it the GPU's DRAM accesses (including its own MMU page-table walks)
  * decode to the wrong channel and bus-fault, and the MCU never boots.
+ *
+ * The S2MPU in the GPU's block resets to blocking with the domain; the GPU
+ * links to it and will not probe without it.
  */
 &gpu {
+	status = "okay";
+};
+
+&s2mpu_g3d {
 	status = "okay";
 };
 

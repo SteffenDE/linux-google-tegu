@@ -951,12 +951,13 @@
 
 	/*
 	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
-	 * Downstream leaves its exynos-pd node disabled (the domain is never
-	 * kernel-managed there, and ACPM has a dedicated SYS_SLEEP_HSI1ON
-	 * suspend mode for when the modem link stays up), so model it
-	 * always-on: if the bootloader hands the domain over powered this is
-	 * a no-op, and if not, genpd powers it up before the CMU_HSI1/PCIe
-	 * probes touch the block.  PMU offset and secure ID are from
+	 * Downstream leaves its exynos-pd node disabled: there the domain is
+	 * never kernel-managed, and the firmware's SYS_SLEEP sequence powers
+	 * it down itself once the CP has parked its link.  Zuma defines no
+	 * sleep mode that keeps HSI1 powered, so the domain follows its
+	 * consumers here and goes down across a system suspend, with the
+	 * root complex parking the link first.  PMU offset and secure ID are
+	 * from
 	 * research/dumped.dts:2927-2936 (pd-hsi1@15462B00: need_smc
 	 * 0x12010204, cmu_id 0x12000000).
 	 */
@@ -967,7 +968,6 @@
 		      <0x0 0x12020000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x12010204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "HSI1";
 	};

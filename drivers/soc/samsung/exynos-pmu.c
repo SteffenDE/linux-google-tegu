@@ -747,6 +747,22 @@ static void zumapro_sys_sleep_arm(void)
 			   GS101_GRP2_INTR_BID_ENABLE, BIT(0), BIT(0));
 
 	/*
+	 * DIAGNOSTIC.  CLUSTER0_CPU0_INT_EN bit 3 is known not to latch on
+	 * either kernel, so the assumption that the other two steps of the
+	 * enter sequence do latch is worth checking rather than inheriting:
+	 * this one is what routes the wake back to the boot core, and nothing
+	 * has ever read it back.
+	 */
+	{
+		unsigned int grp2 = 0;
+
+		regmap_read(pmu_context->pmuintrgen,
+			    GS101_GRP2_INTR_BID_ENABLE, &grp2);
+		pr_info("zumapro: suspend: GRP2_INTR_BID_ENABLE reads 0x%x after arming bit 0\n",
+			grp2);
+	}
+
+	/*
 	 * Clear-pending is "read the pending register, write what was pending
 	 * into the clear register", so it writes 0 when nothing is pending.
 	 * The capture in downstream-sys-sleep-decoded.md shows a literal 1 here

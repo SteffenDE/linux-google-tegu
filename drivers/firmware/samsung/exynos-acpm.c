@@ -31,6 +31,8 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
+#include <linux/soc/samsung/tegu-pmtrace.h>
+
 #include "exynos-acpm.h"
 #include "exynos-acpm-dvfs.h"
 #include "exynos-acpm-pmic.h"
@@ -503,6 +505,17 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
 				 xfer->txd, xfer->txcnt);
 
+		/*
+		 * Recorded here rather than on entry: the sequence number is
+		 * stamped into txd[0] by acpm_prepare_xfer() just above, and
+		 * this is the payload as it goes to the firmware.
+		 */
+		tegu_pmt_acpm(TEGU_PMT_ACPM_TX, TEGU_PMT_ACPM_TX_D,
+			      xfer->acpm_chan_id,
+			      FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]),
+			      xfer->txd, xfer->txcnt * sizeof(*xfer->txd),
+			      1 | (xfer->rxcnt ? 2 : 0));
+
 		/* Advance TX front. */
 		writel(idx, achan->tx.front);
 
@@ -513,7 +526,19 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		mbox_client_txdone(achan->chan, 0);
 	}
 
-	return acpm_wait_for_message_response(achan, xfer);
+	ret = acpm_wait_for_message_response(achan, xfer);
+
+	/*
+	 * One record for the reply as the caller sees it, whichever way it was
+	 * dequeued -- natively, or saved by another thread and copied back.
+	 */
+	if (!ret && xfer->rxcnt)
+		tegu_pmt_acpm(TEGU_PMT_ACPM_RX, TEGU_PMT_ACPM_RX_D,
+			      xfer->acpm_chan_id,
+			      FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->rxd[0]),
+			      xfer->rxd, xfer->rxcnt * sizeof(*xfer->rxd), 1);
+
+	return ret;
 }
 
 /**

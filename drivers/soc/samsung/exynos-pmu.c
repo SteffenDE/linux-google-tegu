@@ -25,6 +25,7 @@
 
 #include <linux/soc/samsung/exynos-regs-pmu.h>
 #include <linux/soc/samsung/exynos-pmu.h>
+#include <linux/soc/samsung/tegu-pmtrace.h>
 
 #include "exynos-pmu.h"
 
@@ -33,6 +34,8 @@ struct exynos_pmu_context {
 	const struct exynos_pmu_data *pmu_data;
 	struct regmap *pmureg;
 	struct regmap *pmuintrgen;
+	/* Its physical base, so trace records carry absolute addresses. */
+	phys_addr_t pmuintrgen_pa;
 	/*
 	 * Serialization lock for CPU hot plug and cpuidle ACPM hint
 	 * programming. Also protects in_cpuhp, sys_insuspend & sys_inreboot
@@ -479,6 +482,7 @@ static int setup_pmu_intr_gen(struct device *dev)
 	if (!virt_addr)
 		return -ENOMEM;
 
+	pmu_context->pmuintrgen_pa = intrgen_res.start;
 	pmu_context->pmuintrgen = devm_regmap_init_mmio(dev, virt_addr,
 							&regmap_pmu_intr);
 	if (IS_ERR(pmu_context->pmuintrgen)) {
@@ -743,8 +747,14 @@ static void zumapro_sys_sleep_arm(void)
 	if (!pmu_context->pmuintrgen)
 		return;
 
+	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_SYS_ENTER | 8, 0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 0, 3, 0, 0, 0, 0);
+
 	regmap_update_bits(pmu_context->pmuintrgen,
 			   GS101_GRP2_INTR_BID_ENABLE, BIT(0), BIT(0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
+		    pmu_context->pmuintrgen_pa + GS101_GRP2_INTR_BID_ENABLE,
+		    BIT(0), 0, 0, 0, 0);
 
 	/*
 	 * DIAGNOSTIC.  CLUSTER0_CPU0_INT_EN bit 3 is known not to latch on
@@ -773,6 +783,9 @@ static void zumapro_sys_sleep_arm(void)
 	regmap_read(pmu_context->pmuintrgen, GS101_GRP1_INTR_BID_UPEND, &reg);
 	regmap_write(pmu_context->pmuintrgen, GS101_GRP1_INTR_BID_CLEAR,
 		     reg & BIT(0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
+		    pmu_context->pmuintrgen_pa + GS101_GRP1_INTR_BID_CLEAR,
+		    reg & BIT(0), 0, 0, 0, 0);
 
 	/*
 	 * A plain read-modify-write, not regmap_update_bits(): for PMU_ALIVE
@@ -843,7 +856,14 @@ static int zumapro_sys_sleep_suspend(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return 0;
 
+	tegu_pmt_set_phase(TEGU_PMT_P_SYSCORE_SUSPEND);
+	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 0, 0, zumapro_sleep_hint,
+		    0, 0, 0);
+
 	zumapro_sys_sleep_arm();
+
+	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 1, 0, 0, 0, 0, 0);
+	tegu_pmt_set_phase(TEGU_PMT_P_ARMED);
 	return 0;
 }
 
@@ -852,7 +872,13 @@ static void zumapro_sys_sleep_resume(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return;
 
+	tegu_pmt_set_phase(TEGU_PMT_P_SYSCORE_RESUME);
+	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 2, 0, 0, 0, 0, 0);
+
 	zumapro_sys_sleep_disarm();
+
+	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 3, 0, 0, 0, 0, 0);
+	tegu_pmt_set_phase(TEGU_PMT_P_RESUMED);
 }
 
 static const struct syscore_ops zumapro_sys_sleep_syscore_ops = {
@@ -942,10 +968,22 @@ static void zumapro_program_lpm_durations(struct device *dev)
 {
 	int i, ret;
 
+	/*
+	 * Bracketed for the trace as its own sequence.  Downstream carries
+	 * these seven inside pmucal_lpm_init[] at indices 86..92; we run them
+	 * before the rest of the table rather than in the middle of it, which
+	 * the record will show.
+	 */
+	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 3,
+		    ARRAY_SIZE(zumapro_lpm_durations), 0, 0, 0, 0);
+
 	for (i = 0; i < ARRAY_SIZE(zumapro_lpm_durations); i++) {
 		u32 mask = zumapro_lpm_durations[i].mask;
 		u32 val = zumapro_lpm_durations[i].val;
 		unsigned int rb = 0;
+
+		tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, i));
 
 		/*
 		 * A masked entry is a read-modify-write of those bits and a
@@ -974,6 +1012,10 @@ static void zumapro_program_lpm_durations(struct device *dev)
 			dev_info(dev, "%s settle duration=0x%x\n",
 				 zumapro_lpm_durations[i].name, val);
 	}
+
+	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END, 3,
+		    ARRAY_SIZE(zumapro_lpm_durations), 0, 0, 0, 0);
 }
 
 /*
@@ -1109,9 +1151,19 @@ static void zumapro_program_lpm_init(struct device *dev)
 	void __iomem *va = NULL;
 	u32 mapped = 0;
 
+	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 0,
+		    ARRAY_SIZE(zumapro_lpm_init), 0, 0, 0, 0);
+
 	for (i = 0; i < ARRAY_SIZE(zumapro_lpm_init); i++) {
 		const struct zumapro_lpm_init_step *st = &zumapro_lpm_init[i];
 		u32 reg;
+
+		tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, i));
+		tegu_pmt_ev(TEGU_PMT_F_SEQ_STEP, TEGU_PMT_SEQ_STEP,
+			    (u64)st->base + st->offset,
+			    st->mask == ~0u ? 1 : 3, st->mask, st->val,
+			    st->cond_offset, st->cond_val);
 
 		if (st->cond_offset) {
 			unsigned int cond = 0;
@@ -1141,16 +1193,24 @@ static void zumapro_program_lpm_init(struct device *dev)
 
 		if (st->mask == ~0u) {
 			writel(st->val, va + st->offset);
+			reg = st->val;
 		} else {
 			reg = readl(va + st->offset);
 			reg = (reg & ~st->mask) | (st->val & st->mask);
 			writel(reg, va + st->offset);
 		}
+		/* The composed value, which is what downstream records too. */
+		tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
+			    (u64)st->base + st->offset, reg, 0, 0, 0, 0);
 		applied++;
 	}
 
 	if (va)
 		iounmap(va);
+
+	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
+	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END, 0,
+		    ARRAY_SIZE(zumapro_lpm_init), applied, skipped, 0, 0);
 
 	dev_info(dev, "lpm-init: %u of %u boot-time writes applied, %u skipped\n",
 		 applied, (unsigned int)ARRAY_SIZE(zumapro_lpm_init), skipped);

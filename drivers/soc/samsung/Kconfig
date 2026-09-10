@@ -84,4 +84,22 @@ config SAMSUNG_PM_CHECK_CHUNKSIZE
 config EXYNOS_REGULATOR_COUPLER
 	bool "Exynos SoC Regulator Coupler" if COMPILE_TEST
 	depends on ARCH_EXYNOS || COMPILE_TEST
+
+config TEGU_PMTRACE
+	bool "Bounded binary recorder for Tensor suspend-path operations"
+	depends on EXYNOS_PMU
+	depends on DEBUG_FS
+	help
+	  Record the secure-register writes, PMU/CAL sequence steps, ACPM
+	  messages and suspend/resume boundaries this kernel issues, into two
+	  static ring buffers exported through debugfs.
+
+	  The downstream vendor kernel carries the same recorder with the same
+	  record layout, so the two dumps decode with one tool and diff
+	  directly.  This exists to answer which operations each kernel issues
+	  that the other does not, on a SoC whose suspend-to-RAM returns on one
+	  and not the other.
+
+	  Diagnostic only.  Say N unless you are chasing that.
+
 endif

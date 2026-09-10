@@ -546,6 +546,15 @@
 	status = "okay";
 };
 
+/* Reopened on every DPUF domain power-on, before its System MMU resumes. */
+&s2mpu_dpuf0 {
+	status = "okay";
+};
+
+&s2mpu_dpuf1 {
+	status = "okay";
+};
+
 &sysmmu_dpuf0 {
 	status = "okay";
 };

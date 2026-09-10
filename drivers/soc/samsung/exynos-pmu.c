@@ -12,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mfd/core.h>
+#include <linux/moduleparam.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -234,6 +235,22 @@ EXPORT_SYMBOL_GPL(exynos_get_pmu_regmap_by_phandle);
 #define CPU_INFORM_CPD		2
 #define CPU_INFORM_SICD		3
 #define CPU_INFORM_SLEEP	4
+#define CPU_INFORM_SLEEP_SLCMON	5
+
+/*
+ * DIAGNOSTIC.  Which firmware sleep mode the boot core asks for.  On zuma the
+ * three deep modes -- SYS_SLEEP, SYS_SLEEP_SLCMON and SYS_STOP -- share one
+ * identical three-register enter sequence and one wake mask, so the hint in
+ * this word is the whole of the AP-side difference between them.  That makes
+ * it the cheapest discriminator available while "echo mem" takes the SoC down
+ * and nothing brings it back: if the machine returns from SLCMON but not from
+ * SLEEP, the fault is in what SLEEP additionally powers down, and the two
+ * pmucal_lpm_list[] entries name it.
+ *
+ * Settable at runtime through /sys/module/kernel/parameters/.
+ */
+static unsigned int zumapro_sleep_hint = CPU_INFORM_SLEEP;
+core_param(zumapro_sleep_hint, zumapro_sleep_hint, uint, 0644);
 
 /* PMU_INFORM0 value telling EL3/TF-A that Linux may use the C2 idle state. */
 #define PMU_ALLOWED_C2		1
@@ -712,7 +729,10 @@ static void zumapro_sys_sleep_arm(void)
 	 * "powered down" acknowledgement into the same word as it takes each
 	 * core down.  Rewriting them here would clobber that.
 	 */
-	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(0), CPU_INFORM_SLEEP);
+	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(0),
+		     zumapro_sleep_hint);
+	pr_info("zumapro: suspend: boot-core sleep hint %u\n",
+		zumapro_sleep_hint);
 
 	/*
 	 * Without the interrupt generator the wake cannot be routed back, so

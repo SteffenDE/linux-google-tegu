@@ -38,6 +38,14 @@
 #define HCI_RXPRDT_ENTRY_SIZE	0x04
 #define HCI_1US_TO_CNT_VAL	0x0C
 #define CNT_VAL_1US_MASK	0x3FF
+#define HCI_INVALID_UPIU_CTRL	0x10
+#define HCI_INVALID_UPIU_BADDR	0x14
+#define HCI_INVALID_UPIU_UBADDR	0x18
+#define HCI_INVALID_UTMR_OFFSET_ADDR	0x1C
+#define HCI_INVALID_UTR_OFFSET_ADDR	0x20
+#define HCI_INVALID_DIN_OFFSET_ADDR	0x24
+#define HCI_VENDOR_SPECIFIC_IS	0x38
+#define HCI_VENDOR_SPECIFIC_IE	0x3C
 #define HCI_UTRL_NEXUS_TYPE	0x40
 #define HCI_UTMRL_NEXUS_TYPE	0x44
 #define HCI_SW_RST		0x50
@@ -2317,6 +2325,59 @@ static int gs101_ufs_pre_pwr_change(struct exynos_ufs *ufs,
 	return 0;
 }
 
+/*
+ * The forty standard UFSHCI registers the core dumps cannot say why an AXI
+ * master access failed, so a SYSTEM_BUS_FATAL_ERROR arrives with every UniPro
+ * error register clean and nothing to read.  What names it lives in the vendor
+ * window: HCI_VENDOR_SPECIFIC_IS, and the five HCI_INVALID_* registers that
+ * latch the offending descriptor or data address.  Dump the window whenever
+ * the core dumps its own, which is the error handler's path.
+ */
+static const struct {
+	const char *name;
+	u32 offset;
+} exynos_ufs_vs_hci_regs[] = {
+	{ "VENDOR_SPECIFIC_IS",	HCI_VENDOR_SPECIFIC_IS },
+	{ "VENDOR_SPECIFIC_IE",	HCI_VENDOR_SPECIFIC_IE },
+	{ "INVALID_UPIU_CTRL",	HCI_INVALID_UPIU_CTRL },
+	{ "INVALID_UPIU_BADDR",	HCI_INVALID_UPIU_BADDR },
+	{ "INVALID_UPIU_UBADDR", HCI_INVALID_UPIU_UBADDR },
+	{ "INVALID_UTMR_OFFSET", HCI_INVALID_UTMR_OFFSET_ADDR },
+	{ "INVALID_UTR_OFFSET",	HCI_INVALID_UTR_OFFSET_ADDR },
+	{ "INVALID_DIN_OFFSET",	HCI_INVALID_DIN_OFFSET_ADDR },
+	{ "ERR_EN_PA_LAYER",	HCI_ERR_EN_PA_LAYER },
+	{ "ERR_EN_DL_LAYER",	HCI_ERR_EN_DL_LAYER },
+	{ "ERR_EN_N_LAYER",	HCI_ERR_EN_N_LAYER },
+	{ "ERR_EN_T_LAYER",	HCI_ERR_EN_T_LAYER },
+	{ "ERR_EN_DME_LAYER",	HCI_ERR_EN_DME_LAYER },
+	{ "TXPRDT_ENTRY_SIZE",	HCI_TXPRDT_ENTRY_SIZE },
+	{ "RXPRDT_ENTRY_SIZE",	HCI_RXPRDT_ENTRY_SIZE },
+	{ "UTRL_NEXUS_TYPE",	HCI_UTRL_NEXUS_TYPE },
+	{ "UTMRL_NEXUS_TYPE",	HCI_UTMRL_NEXUS_TYPE },
+	{ "SW_RST",		HCI_SW_RST },
+	{ "DATA_REORDER",	HCI_DATA_REORDER },
+	{ "UNIPRO_APB_CLK_CTRL", HCI_UNIPRO_APB_CLK_CTRL },
+	{ "AXIDMA_RWDATA_BURST_LEN", HCI_AXIDMA_RWDATA_BURST_LEN },
+	{ "GPIO_OUT",		HCI_GPIO_OUT },
+	{ "CLKSTOP_CTRL",	HCI_CLKSTOP_CTRL },
+	{ "MISC",		HCI_MISC },
+};
+
+static void exynos_ufs_dump_vs_hci(struct ufs_hba *hba)
+{
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	unsigned int i;
+
+	if (!ufs || !ufs->reg_hci)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(exynos_ufs_vs_hci_regs); i++)
+		dev_err(hba->dev, "vs_hci %-24s (0x%03x): 0x%08x\n",
+			exynos_ufs_vs_hci_regs[i].name,
+			exynos_ufs_vs_hci_regs[i].offset,
+			hci_readl(ufs, exynos_ufs_vs_hci_regs[i].offset));
+}
+
 static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
 	.name				= "exynos_ufs",
 	.init				= exynos_ufs_init,
@@ -2332,6 +2393,7 @@ static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
 	.suspend			= exynos_ufs_suspend,
 	.resume				= exynos_ufs_resume,
 	.fill_crypto_prdt		= exynos_ufs_fmp_fill_prdt,
+	.dbg_register_dump		= exynos_ufs_dump_vs_hci,
 };
 
 static struct ufs_hba_variant_ops ufs_hba_exynosauto_vh_ops = {

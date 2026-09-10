@@ -827,20 +827,16 @@ static int acpm_flexpmu_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(acpm_flexpmu);
 
-static int acpm_mif_always_on_get(void *data, u64 *val)
-{
-	*val = flexpmu_rd(FLEXPMU_DID_MIF_ALWAYS_ON, 0xc);
-	return 0;
-}
-
-static int acpm_mif_always_on_set(void *data, u64 val)
-{
-	writel((u32)!!val,
-	       acpm_flexpmu_dbg + FLEXPMU_LINE * FLEXPMU_DID_MIF_ALWAYS_ON + 0xc);
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(acpm_mif_always_on_fops, acpm_mif_always_on_get,
-			 acpm_mif_always_on_set, "%llu\n");
+/*
+ * No write path here, deliberately.  This buffer is readable from the kernel's
+ * ioremap of APM SRAM but **not writable**: a writel() to it raises an
+ * asynchronous SError that panics the machine [2026-09-10, HW], the same way a
+ * /dev/mem read of the SRAM's low pages does from userspace.  Downstream sets
+ * mif_always_on here with a plain __raw_writel(), so the AP's write access to
+ * this window is gated by something mainline does not set up -- worth finding,
+ * because it is the only control the firmware exposes over the MIF transition,
+ * but it is not available today and must not be attempted from here.
+ */
 
 static void acpm_flexpmu_init(struct acpm_info *acpm, size_t sram_size)
 {
@@ -859,8 +855,6 @@ static void acpm_flexpmu_init(struct acpm_info *acpm, size_t sram_size)
 
 	dir = debugfs_create_dir("acpm_flexpmu", NULL);
 	debugfs_create_file("counters", 0444, dir, NULL, &acpm_flexpmu_fops);
-	debugfs_create_file("mif_always_on", 0644, dir, NULL,
-			    &acpm_mif_always_on_fops);
 }
 
 static int acpm_probe(struct platform_device *pdev)

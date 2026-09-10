@@ -1879,6 +1879,11 @@
 	status = "okay";
 };
 
+/* USB DMA passes the HSI0 S2MPU, which resets to blocking with the domain. */
+&s2mpu_hsi0 {
+	status = "okay";
+};
+
 &mfc {
 	memory-region = <&mfc_firmware_iova>;
 	status = "okay";

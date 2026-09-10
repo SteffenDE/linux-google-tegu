@@ -891,9 +891,14 @@
 
 	/*
 	 * Display PM domains.  Source: downstream zumapro-pm-domains.dtsi and
-	 * research/dumped.dts:2721-2754.  Keep disabled until the display clock,
-	 * SysMMU, DSIM, and DECON drivers can consume them together; enabling
-	 * these too early could hand genpd control of the bootloader splash path.
+	 * research/dumped.dts:2721-2754.  They follow their consumers now: the
+	 * DECON reaches DPUF0 and DPUF1 through its two System MMUs' runtime-PM
+	 * device links and the DPPs through the DECON's own reference, so the
+	 * pair goes down when the display blanks and comes back before it is
+	 * driven again; DPUB holds the DSIM and the display CMU and goes down
+	 * only across a system suspend, where the DRM master disables every
+	 * CRTC first.  The domain driver saves and restores the vendor's CMU
+	 * and SYSREG lists around each transition.
 	 */
 	pd_dpub: power-domain@15461d00 {
 		compatible = "google,zumapro-pd";
@@ -902,7 +907,6 @@
 		      <0x0 0x19420000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19410204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		label = "DPUB";
 		status = "disabled";
@@ -915,7 +919,6 @@
 		      <0x0 0x19820000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19810204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		power-domains = <&pd_dpub>;
 		label = "DPUF0";
@@ -929,7 +932,6 @@
 		      <0x0 0x19c20000 0x1000>;
 		reg-names = "pmu", "cmu", "sysreg";
 		samsung,secure-pd-id = <0x19c10204>;
-		samsung,always-on;
 		#power-domain-cells = <0>;
 		power-domains = <&pd_dpub>;
 		label = "DPUF1";
@@ -1378,6 +1380,41 @@
 
 
 		/*
+		 * The DPU fetch blocks' stage-2 protection units.  Source:
+		 * downstream s2mpu_s0_dpuf0@19870000 and s2mpu_s0_dpuf1@19c70000
+		 * in research/dumped.dts:5351-5365 (reg, interrupts 279 and 306,
+		 * pd-dpuf0/pd-dpuf1).  Each resets to blocking when its domain
+		 * powers off -- stage-1 page-table walks included -- so the
+		 * block's System MMU links to it and google-s2mpu reopens it
+		 * before the MMU resumes, exactly as MFC's and the GPU's do.
+		 * Without the link the DECON comes back from a domain cycle
+		 * unable to walk its own page tables and the panel stays dark.
+		 *
+		 * No clock, like the GPU's: the power domain restores CMU_DPUF0
+		 * and CMU_DPUF1 around the transition, and both units answer
+		 * their version register with only the domain powered.  Taking
+		 * the SysMMU_S0 gate here would also mean gating it under a live
+		 * bootloader scanout at probe.
+		 */
+		s2mpu_dpuf0: access-controller@19870000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x19870000 0x10000>;
+			interrupts = <GIC_SPI 279 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_dpuf0>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		s2mpu_dpuf1: access-controller@19c70000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x19c70000 0x10000>;
+			interrupts = <GIC_SPI 306 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_dpuf1>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
 		 * Source: downstream sysmmu_dpuf0/sysmmu_dpuf1 in
 		 * zumapro-sysmmu.dtsi and research/dumped.dts:882-916.  These
 		 * are Samsung System MMU v9 blocks, not compatible with the
@@ -1391,6 +1428,7 @@
 			interrupts = <GIC_SPI 277 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 278 IRQ_TYPE_LEVEL_HIGH 0>;
 			power-domains = <&pd_dpuf0>;
+			access-controllers = <&s2mpu_dpuf0>;
 			samsung,qos = <15>;
 			samsung,secure-irq;
 			samsung,secure-base = <0x19850000>;
@@ -1481,6 +1519,7 @@
 			interrupts = <GIC_SPI 304 IRQ_TYPE_LEVEL_HIGH 0>,
 				     <GIC_SPI 305 IRQ_TYPE_LEVEL_HIGH 0>;
 			power-domains = <&pd_dpuf1>;
+			access-controllers = <&s2mpu_dpuf1>;
 			samsung,qos = <15>;
 			samsung,secure-irq;
 			samsung,secure-base = <0x19c50000>;

@@ -767,6 +767,27 @@ static void zumapro_sys_sleep_arm(void)
 	 */
 	regmap_read(pmu_context->pmureg, cl0_int_en, &reg);
 	regmap_write(pmu_context->pmureg, cl0_int_en, reg | BIT(3));
+
+	/*
+	 * DIAGNOSTIC.  A 2026-06-19 capture of downstream entering this mode
+	 * shows CLUSTER0_CPU0_INT_EN going to 0x281d, i.e. a pre-existing
+	 * 0x2815 with bit 3 added -- five other routes to CPU0 already enabled
+	 * that mainline may never have set.  This is a read-modify-write, so if
+	 * our starting value differs the result differs, and the capture cannot
+	 * settle that: only this register can.  Print what we found, what we
+	 * wrote, and what stuck.  Likewise GRP1_INTR_BID_UPEND, which decides
+	 * whether the clear-pending step has anything to clear -- the capture
+	 * shows a literal 1 written there.
+	 */
+	{
+		unsigned int before = reg, after = 0, upend = 0;
+
+		regmap_read(pmu_context->pmureg, cl0_int_en, &after);
+		regmap_read(pmu_context->pmuintrgen,
+			    GS101_GRP1_INTR_BID_UPEND, &upend);
+		pr_info("zumapro: suspend: CLUSTER0_CPU0_INT_EN 0x%x -> wrote 0x%x -> reads 0x%x, GRP1_UPEND 0x%x\n",
+			before, before | BIT(3), after, upend);
+	}
 }
 
 static void zumapro_sys_sleep_disarm(void)

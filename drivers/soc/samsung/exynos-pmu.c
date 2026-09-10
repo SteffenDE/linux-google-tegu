@@ -1066,12 +1066,27 @@ static int exynos_cpupm_suspend_noirq(struct device *dev)
 	zumapro_in_sys_sleep = pm_suspend_target_state == PM_SUSPEND_MEM;
 
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
-		unsigned int v = 0xdead;
+		unsigned int top = 0xdead, w2 = 0xdead;
+		unsigned int em[3] = { 0xdead, 0xdead, 0xdead };
+		int i;
 
 		zumapro_set_wakeup_mask(true);
-		regmap_read(pmu_context->pmureg, GS101_TOP_INT_EN, &v);
-		pr_info("zumapro: suspend: %s wakeup mask armed, TOP_INT_EN(0x3944)=0x%x\n",
-			zumapro_in_sys_sleep ? "sleep" : "idle", v);
+		regmap_read(pmu_context->pmureg, GS101_TOP_INT_EN, &top);
+		regmap_read(pmu_context->pmureg, GS101_WAKEUP2_INT_EN, &w2);
+		for (i = 0; i < 3; i++)
+			regmap_read(pmu_context->pmureg,
+				    GS101_EINT_WAKEUP_MASK + i * 4, &em[i]);
+		/*
+		 * DIAGNOSTIC.  Suspend-to-RAM powers the GIC down, so these
+		 * five registers are the whole wake path: an interrupt that is
+		 * merely enabled in Linux reaches nothing.  Printing them at
+		 * the moment they are armed is the only way to tell "the
+		 * firmware never brought the SoC back" from "nothing was ever
+		 * allowed to ask it to".  Needs no_console_suspend to be seen.
+		 */
+		pr_info("zumapro: suspend: %s wakeup mask armed, TOP_INT_EN(0x3944)=0x%x WAKEUP2_INT_EN(0x3964)=0x%x EINT_WAKEUP_MASK(0x3a80)=0x%x/0x%x/0x%x\n",
+			zumapro_in_sys_sleep ? "sleep" : "idle", top, w2,
+			em[0], em[1], em[2]);
 	}
 
 	return 0;
@@ -1080,9 +1095,15 @@ static int exynos_cpupm_suspend_noirq(struct device *dev)
 static int exynos_cpupm_resume_noirq(struct device *dev)
 {
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
+		unsigned int st = 0xdead, st2 = 0xdead;
+
+		/* DIAGNOSTIC: which aggregate the PMU latched as the wake. */
+		regmap_read(pmu_context->pmureg, GS101_WAKEUP_STAT, &st);
+		regmap_read(pmu_context->pmureg, 0x3970, &st2);
 		zumapro_set_wakeup_mask(false);
-		pr_info("zumapro: resume: CPU_INFORM hints c2=%u sicd=%u fails=%u\n",
-			zumapro_dbg_c2, zumapro_dbg_sicd, zumapro_dbg_fail);
+		pr_info("zumapro: resume: WAKEUP_STAT(0x3950)=0x%x WAKEUP2_STAT(0x3970)=0x%x CPU_INFORM hints c2=%u sicd=%u fails=%u\n",
+			st, st2, zumapro_dbg_c2, zumapro_dbg_sicd,
+			zumapro_dbg_fail);
 	}
 
 	raw_spin_lock(&pmu_context->cpupm_lock);

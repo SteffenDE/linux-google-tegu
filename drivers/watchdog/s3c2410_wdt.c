@@ -885,10 +885,38 @@ static void s3c2410wdt_shutdown(struct platform_device *dev)
 	s3c2410wdt_stop(&wdt->wdt_device);
 }
 
+/*
+ * DIAGNOSTIC, to be removed with the rest of the suspend-to-RAM probe.
+ *
+ * Suspend-to-RAM on this SoC goes down and never returns, and nothing
+ * available can say whether the AP is ever powered back up: the console is
+ * gone, the diagnostic panic can stall before its reboot, ACPM's own counters
+ * cannot be read after a run that does not return, and the debug-core UART is
+ * refused on production firmware.
+ *
+ * Leaving this watchdog armed across the suspend answers exactly that, and
+ * nothing else.  The counter sits in the AP's own power domain, so it stops
+ * when the AP does and resumes when the AP does: if the SoC brings the AP
+ * back, the watchdog expires shortly afterwards and resets the machine, which
+ * is observable from outside without the AP having to execute anything useful.
+ * If the AP is never powered up, the watchdog never counts and nothing
+ * happens -- the same silence as today, but now that silence means something.
+ *
+ * Off by default: a machine that resumes normally would be reset by this.
+ */
+static bool s3c2410wdt_keep_armed_in_suspend;
+core_param(s3c2410wdt_keep_armed_in_suspend, s3c2410wdt_keep_armed_in_suspend,
+	   bool, 0644);
+
 static int s3c2410wdt_suspend(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+
+	if (s3c2410wdt_keep_armed_in_suspend) {
+		dev_info(dev, "left armed across suspend (diagnostic)\n");
+		return 0;
+	}
 
 	/* Save watchdog state, and turn it off. */
 	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
@@ -906,6 +934,9 @@ static int s3c2410wdt_suspend(struct device *dev)
 
 static int s3c2410wdt_resume(struct device *dev)
 {
+	if (s3c2410wdt_keep_armed_in_suspend)
+		return 0;
+
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
 

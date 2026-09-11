@@ -191,6 +191,7 @@ struct exynos_ufs_drv_data {
 	int (*post_pwr_change)(struct exynos_ufs *ufs,
 			       const struct ufs_pa_layer_attr *pwr);
 	int (*pre_hce_enable)(struct exynos_ufs *ufs);
+	void (*post_host_reset)(struct exynos_ufs *ufs);
 	int (*post_hce_enable)(struct exynos_ufs *ufs);
 	int (*suspend)(struct exynos_ufs *ufs);
 	int (*resume)(struct exynos_ufs *ufs);
@@ -252,6 +253,7 @@ struct exynos_ufs {
 #define EXYNOS_UFS_OPT_TIMER_TICK_USES_MCLK	BIT(11)
 #define EXYNOS_UFS_OPT_RESTORE_MPHY_APBCLK	BIT(12)
 #define EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL	BIT(13)
+#define EXYNOS_UFS_OPT_MANUAL_HCI_CLK_CTRL	BIT(14)
 };
 
 #define for_each_ufs_rx_lane(ufs, i) \

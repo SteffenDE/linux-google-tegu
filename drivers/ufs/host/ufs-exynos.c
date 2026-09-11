@@ -73,6 +73,8 @@
 #define UNIPRO_PCLK_CTRL_EN	BIT(6)
 #define UNIPRO_MCLK_CTRL_EN	BIT(5)
 #define MPHY_APBCLK_CTRL_EN	BIT(10)
+#define REFCLKOUT_CTRL_EN	BIT(11)
+#define UFSP_DRCG_EN		BIT(8)
 #define HCI_CORECLK_CTRL_EN	BIT(4)
 #define CLK_CTRL_EN_MASK	(REFCLK_CTRL_EN |\
 				 UNIPRO_PCLK_CTRL_EN |\
@@ -166,6 +168,8 @@ enum {
 #define UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER0	0x78B8
 #define UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER1	0x78BC
 #define UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER2	0x78C0
+#define UNIPRO_PA_DBG_OPTION_SUITE1		0x39a8
+#define UNIPRO_PA_DBG_OPTION_SUITE2		0x39b4
 
 /*
  * UFS Protector registers
@@ -1317,6 +1321,43 @@ static void exynos_ufs_early_hci_setup(struct exynos_ufs *ufs)
 		   HCI_AXIDMA_RWDATA_BURST_LEN);
 }
 
+static void zumapro_ufs_post_host_reset(struct exynos_ufs *ufs)
+{
+	const struct exynos_ufs_uic_attr *attr = ufs->drv_data->uic_attr;
+	u32 val;
+
+	/* Re-establish host state after every reset, including link retries. */
+	exynos_ufs_disable_auto_ctrl_hcc(ufs);
+	exynos_ufs_early_hci_setup(ufs);
+
+	val = hci_readl(ufs, HCI_IOP_ACG_DISABLE);
+	hci_writel(ufs, val & ~HCI_IOP_ACG_DISABLE_EN, HCI_IOP_ACG_DISABLE);
+
+	/* Preserve PHY context across link-startup failure, before HCE. */
+	unipro_writel(ufs, attr->pa_dbg_opt_suite1_val,
+		      UNIPRO_PA_DBG_OPTION_SUITE1);
+	unipro_writel(ufs, attr->pa_dbg_opt_suite2_val,
+		      UNIPRO_PA_DBG_OPTION_SUITE2);
+}
+
+static int zumapro_ufs_post_hce_enable(struct exynos_ufs *ufs)
+{
+	u32 val;
+
+	/* Enable the internal clock controls before accessing the PCS. */
+	val = hci_readl(ufs, HCI_MISC);
+	val |= UFSP_DRCG_EN | MPHY_APBCLK_CTRL_EN | REFCLKOUT_CTRL_EN |
+	       REFCLK_CTRL_EN | UNIPRO_PCLK_CTRL_EN | UNIPRO_MCLK_CTRL_EN;
+	hci_writel(ufs, val, HCI_MISC);
+
+	val = hci_readl(ufs, HCI_CLKSTOP_CTRL);
+	val &= ~(REFCLKOUT_STOP | REFCLK_STOP | UNIPRO_MCLK_STOP |
+		 UNIPRO_PCLK_STOP);
+	hci_writel(ufs, val, HCI_CLKSTOP_CTRL);
+
+	return 0;
+}
+
 static int exynos_ufs_post_link(struct ufs_hba *hba)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
@@ -1874,14 +1915,17 @@ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
 		 * Host reset clears this state, so restore it here while the
 		 * clock rates are valid.
 		 */
-		if (ufs->opts & EXYNOS_UFS_OPT_EARLY_HCI_SETUP)
+		if (ufs->drv_data->post_host_reset)
+			ufs->drv_data->post_host_reset(ufs);
+		else if (ufs->opts & EXYNOS_UFS_OPT_EARLY_HCI_SETUP)
 			exynos_ufs_early_hci_setup(ufs);
 
 		exynos_ufs_dev_hw_reset(hba);
 		break;
 	case POST_CHANGE:
 		exynos_ufs_calc_pwm_clk_div(ufs);
-		if (!(ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL))
+		if (!(ufs->opts & (EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL |
+				   EXYNOS_UFS_OPT_MANUAL_HCI_CLK_CTRL)))
 			exynos_ufs_enable_auto_ctrl_hcc(ufs);
 
 		if (ufs->drv_data->post_hce_enable)
@@ -2238,6 +2282,12 @@ static int zumapro_ufs_pre_link(struct exynos_ufs *ufs)
 	struct ufs_hba *hba = ufs->hba;
 	int i;
 	u32 tx_line_reset_period, rx_line_reset_period;
+	u32 val;
+
+	/* Keep M-PHY APB and UniPro MCLK running for every PCS/PMA CAL pass. */
+	val = hci_readl(ufs, HCI_MISC);
+	val &= ~(MPHY_APBCLK_CTRL_EN | UNIPRO_MCLK_CTRL_EN);
+	hci_writel(ufs, val, HCI_MISC);
 
 	rx_line_reset_period = (RX_LINE_RESET_TIME * ufs->mclk_rate)
 				/ NSEC_PER_MSEC;
@@ -2552,13 +2602,15 @@ static const struct exynos_ufs_drv_data zumapro_ufs_drvs = {
 	.opts			= EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR |
 				  EXYNOS_UFS_OPT_UFSPR_SECURE |
 				  EXYNOS_UFS_OPT_TIMER_TICK_SELECT |
-				  EXYNOS_UFS_OPT_EARLY_HCI_SETUP |
+				  EXYNOS_UFS_OPT_MANUAL_HCI_CLK_CTRL |
 				  EXYNOS_UFS_OPT_PRE_LINK_GET_LANES |
 				  EXYNOS_UFS_OPT_TIMER_TICK_USES_MCLK |
 				  EXYNOS_UFS_OPT_RESTORE_MPHY_APBCLK |
 				  EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL,
 	.iocc_mask		= UFS_GS101_SHARABLE,
 	.drv_init		= zumapro_ufs_drv_init,
+	.post_host_reset	= zumapro_ufs_post_host_reset,
+	.post_hce_enable	= zumapro_ufs_post_hce_enable,
 	.pre_link		= zumapro_ufs_pre_link,
 	.post_link		= gs101_ufs_post_link,
 	.pre_pwr_change		= gs101_ufs_pre_pwr_change,

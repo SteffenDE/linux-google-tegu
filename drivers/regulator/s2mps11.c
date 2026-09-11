@@ -2487,22 +2487,34 @@ static void s2mpg14_15_debug_restore(struct device *dev)
 	for (i = 0; i < s2mps11->rdev_num; i++) {
 		struct regulator_dev *rdev = s2mps11->rdev[i];
 		const struct regulator_desc *desc = rdev->desc;
-		bool changed = false;
+		struct regmap *regmap = rdev_get_regmap(rdev);
+		unsigned int raw;
 		int ret;
 
 		if (!test_bit(i, s2mps11->debug_suspend_valid))
 			continue;
 
-		ret = regmap_update_bits_check(rdev_get_regmap(rdev),
-					       desc->enable_reg,
-					       desc->enable_mask,
-					       s2mps11->debug_suspend_enable[i],
-					       &changed);
-		if (ret || changed)
+		ret = regmap_read(regmap, desc->enable_reg, &raw);
+		if (ret) {
 			dev_info(dev,
-				 "REGRESTORE rail=%s reg=%#x mask=%#02x value=%#02x changed=%u err=%d\n",
+				 "REGRESTORE rail=%s reg=%#x mask=%#02x value=%#02x read_err=%d\n",
 				 desc->name, desc->enable_reg, desc->enable_mask,
-				 s2mps11->debug_suspend_enable[i], changed, ret);
+				 s2mps11->debug_suspend_enable[i], ret);
+			continue;
+		}
+
+		if ((raw & desc->enable_mask) ==
+		    s2mps11->debug_suspend_enable[i])
+			continue;
+
+		ret = regmap_update_bits(regmap, desc->enable_reg,
+					 desc->enable_mask,
+					 s2mps11->debug_suspend_enable[i]);
+		dev_info(dev,
+			 "REGRESTORE rail=%s reg=%#x mask=%#02x before=%#02x value=%#02x err=%d\n",
+			 desc->name, desc->enable_reg, desc->enable_mask,
+			 raw & desc->enable_mask,
+			 s2mps11->debug_suspend_enable[i], ret);
 	}
 
 	dev_info(dev, "REGRESTORE_END\n");

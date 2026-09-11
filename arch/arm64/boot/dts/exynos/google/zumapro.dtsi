@@ -1133,12 +1133,11 @@
 
 	/*
 	 * BLK_HSI1 hosts the modem's PCIe CH0 root complex (Gen3 x2).
-	 * Downstream leaves its exynos-pd node disabled (the domain is never
-	 * kernel-managed there, and ACPM has a dedicated SYS_SLEEP_HSI1ON
-	 * suspend mode for when the modem link stays up), so model it
-	 * always-on: if the bootloader hands the domain over powered this is
-	 * a no-op, and if not, genpd powers it up before the CMU_HSI1/PCIe
-	 * probes touch the block.  PMU offset and secure ID are from
+	 * Downstream leaves its exynos-pd node disabled, so the AP does not
+	 * power the domain off before entering firmware.  Doing that from
+	 * Linux prevents both s2idle and SYS_SLEEP from returning on tegu.
+	 * Keep the domain on from genpd's perspective; the PCIe consumer still
+	 * parks the modem link before suspend.  PMU offset and secure ID are from
 	 * research/dumped.dts:2927-2936 (pd-hsi1@15462B00: need_smc
 	 * 0x12010204, cmu_id 0x12000000).
 	 */

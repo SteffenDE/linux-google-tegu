@@ -1739,6 +1739,15 @@
 	};
 };
 
+/*
+ * DEBUG: downstream leaves pd-hsi1 disabled (dumped.dts:2927).
+ * Keep Linux from powering HSI1 off or issuing its secure save; the
+ * PCIe consumer still parks the modem link before firmware SYS_SLEEP.
+ */
+&pd_hsi1 {
+	samsung,always-on;
+};
+
 &pcie0_phy {
 	status = "okay";
 };

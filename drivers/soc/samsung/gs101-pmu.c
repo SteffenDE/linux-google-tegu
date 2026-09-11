@@ -9,7 +9,6 @@
 #include <linux/array_size.h>
 #include <linux/soc/samsung/exynos-pmu.h>
 #include <linux/soc/samsung/exynos-regs-pmu.h>
-#include <linux/soc/samsung/tegu-pmtrace.h>
 #include <linux/regmap.h>
 
 #include "exynos-pmu.h"
@@ -368,9 +367,6 @@ int tensor_sec_reg_write(void *context, unsigned int reg, unsigned int val)
 	arm_smccc_smc(TENSOR_SMC_PMU_SEC_REG, pmu_base + reg,
 		      TENSOR_PMUREG_WRITE, val, 0, 0, 0, 0, &res);
 
-	tegu_pmt_ev(TEGU_PMT_F_SEC, TEGU_PMT_SEC_WRITE, pmu_base + reg,
-		    val, (u32)res.a0, 0, 0, 0);
-
 	/* returns -EINVAL if access isn't allowed or 0 */
 	if (res.a0)
 		pr_warn("%s(): reg 0x%x val 0x%x SMC failed: %d\n", __func__,
@@ -388,9 +384,6 @@ static int tensor_sec_reg_rmw(void *context, unsigned int reg,
 
 	arm_smccc_smc(TENSOR_SMC_PMU_SEC_REG, pmu_base + reg,
 		      TENSOR_PMUREG_RMW, mask, val, 0, 0, 0, &res);
-
-	tegu_pmt_ev(TEGU_PMT_F_SEC, TEGU_PMT_SEC_RMW, pmu_base + reg,
-		    mask, val, (u32)res.a0, 0, 0);
 
 	/* returns -EINVAL if access isn't allowed or 0 */
 	if (res.a0)

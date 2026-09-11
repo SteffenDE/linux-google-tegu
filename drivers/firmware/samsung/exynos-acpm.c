@@ -5,8 +5,6 @@
  * Copyright 2024 Linaro Ltd.
  */
 
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
@@ -30,8 +28,6 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/types.h>
-
-#include <linux/soc/samsung/tegu-pmtrace.h>
 
 #include "exynos-acpm.h"
 #include "exynos-acpm-dvfs.h"
@@ -505,17 +501,6 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
 				 xfer->txd, xfer->txcnt);
 
-		/*
-		 * Recorded here rather than on entry: the sequence number is
-		 * stamped into txd[0] by acpm_prepare_xfer() just above, and
-		 * this is the payload as it goes to the firmware.
-		 */
-		tegu_pmt_acpm(TEGU_PMT_ACPM_TX, TEGU_PMT_ACPM_TX_D,
-			      xfer->acpm_chan_id,
-			      FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]),
-			      xfer->txd, xfer->txcnt * sizeof(*xfer->txd),
-			      1 | (xfer->rxcnt ? 2 : 0));
-
 		/* Advance TX front. */
 		writel(idx, achan->tx.front);
 
@@ -526,19 +511,7 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		mbox_client_txdone(achan->chan, 0);
 	}
 
-	ret = acpm_wait_for_message_response(achan, xfer);
-
-	/*
-	 * One record for the reply as the caller sees it, whichever way it was
-	 * dequeued -- natively, or saved by another thread and copied back.
-	 */
-	if (!ret && xfer->rxcnt)
-		tegu_pmt_acpm(TEGU_PMT_ACPM_RX, TEGU_PMT_ACPM_RX_D,
-			      xfer->acpm_chan_id,
-			      FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->rxd[0]),
-			      xfer->rxd, xfer->rxcnt * sizeof(*xfer->rxd), 1);
-
-	return ret;
+	return acpm_wait_for_message_response(achan, xfer);
 }
 
 /**
@@ -725,163 +698,6 @@ static const struct acpm_ops exynos_acpm_driver_ops = {
 	},
 };
 
-/*
- * DIAGNOSTIC: ACPM's FLEXPMU_DBG buffer.
- *
- * ACPM keeps a table of named buffers in its SRAM.  FLEXPMU_DBG is the one
- * that carries the firmware's own view of the low-power state machine: how
- * many times the SoC and MIF have actually gone down, which power mode it last
- * entered, and a writable "keep MIF up" override.  That is the only remaining
- * window into the firmware while "echo mem" takes the SoC down and nothing
- * brings it back -- the debug-core UART is refused on production firmware, the
- * ACPM log is only dumped after an APM watchdog reset, and userspace cannot
- * read this SRAM at all (a /dev/mem mapping of it raises an SError; the
- * kernel's own ioremap is fine).
- *
- * Reaching it means walking ACPM's plugin table, which is what downstream's
- * acpm_get_buffer() does.  Deliberately a walk rather than a scan for the name:
- * every offset dereferenced here is one ACPM itself published, and the low part
- * of this SRAM is not readable.  Layouts are the CONFIG_GS_ACPM_MODULE ones
- * from the vendor's fw_header/common.h, where every pointer is a u32 offset
- * from the SRAM base.
- */
-#define ACPM_FW_PLUGINS			0x00	/* in the initdata struct */
-#define ACPM_FW_NUM_PLUGINS		0x04
-#define ACPM_PLUGIN_STRIDE		48
-#define ACPM_PLUGIN_OPS			12
-#define ACPM_OPS_BUILD_VERSION		16
-#define ACPM_OPS_MAJOR			64
-#define ACPM_OPS_BUFFERS		68
-#define ACPM_BUF_SIZE			0
-#define ACPM_BUF_ADDRESS		4
-#define ACPM_BUF_NEXT			8
-#define ACPM_BUF_NAME			12
-#define ACPM_BUILD_INFO_MAJOR_BUFFERS	1
-#define ACPM_MAX_PLUGINS		64	/* sanity bound, not a hardware limit */
-
-/* FLEXPMU_DBG is a table of 16-byte lines, payload at +8 and +12 */
-#define FLEXPMU_LINE			16
-#define FLEXPMU_DID_SOC_COUNT		16
-#define FLEXPMU_DID_MIF_COUNT		17
-#define FLEXPMU_DID_MIF_ALWAYS_ON	21
-#define FLEXPMU_DID_AP_COUNT_SLEEP	22
-#define FLEXPMU_DID_MIF_COUNT_SLEEP	23
-#define FLEXPMU_DID_AP_COUNT_SICD	24
-#define FLEXPMU_DID_MIF_COUNT_SICD	25
-#define FLEXPMU_DID_CUR_PMD		26
-
-static void __iomem *acpm_flexpmu_dbg;
-static u32 acpm_flexpmu_dbg_size;
-
-static void __iomem *acpm_find_named_buffer(struct acpm_info *acpm,
-					    size_t sram_size,
-					    const char *name, u32 *size)
-{
-	u32 plugins, num_plugins, i;
-
-	plugins = readl(acpm->sram_base + ACPM_GS101_INITDATA_BASE +
-			ACPM_FW_PLUGINS);
-	num_plugins = readl(acpm->sram_base + ACPM_GS101_INITDATA_BASE +
-			    ACPM_FW_NUM_PLUGINS);
-
-	if (!plugins || plugins >= sram_size || num_plugins > ACPM_MAX_PLUGINS)
-		return NULL;
-
-	for (i = 0; i < num_plugins; i++) {
-		u32 off = plugins + i * ACPM_PLUGIN_STRIDE;
-		u32 ops, next;
-
-		if (off + ACPM_PLUGIN_STRIDE > sram_size)
-			return NULL;
-
-		ops = readl(acpm->sram_base + off + ACPM_PLUGIN_OPS);
-		if (!ops || ops + ACPM_OPS_BUFFERS + 4 > sram_size)
-			continue;
-
-		/* Old firmware put a longer string here and has no buffers. */
-		if (readb(acpm->sram_base + ops + ACPM_OPS_BUILD_VERSION + 47))
-			continue;
-		if (readb(acpm->sram_base + ops + ACPM_OPS_MAJOR) <
-		    ACPM_BUILD_INFO_MAJOR_BUFFERS)
-			continue;
-
-		next = readl(acpm->sram_base + ops + ACPM_OPS_BUFFERS);
-		while (next && next + ACPM_BUF_NAME + 12 <= sram_size) {
-			char found[13] = {};
-			int c;
-
-			for (c = 0; c < 12; c++)
-				found[c] = readb(acpm->sram_base + next +
-						 ACPM_BUF_NAME + c);
-
-			if (!strncmp(found, name, 12)) {
-				u32 addr = readl(acpm->sram_base + next +
-						 ACPM_BUF_ADDRESS);
-
-				*size = readl(acpm->sram_base + next +
-					      ACPM_BUF_SIZE);
-				if (!addr || addr >= sram_size)
-					return NULL;
-				return acpm->sram_base + addr;
-			}
-			next = readl(acpm->sram_base + next + ACPM_BUF_NEXT);
-		}
-	}
-
-	return NULL;
-}
-
-static u32 flexpmu_rd(int did, int off)
-{
-	return readl(acpm_flexpmu_dbg + FLEXPMU_LINE * did + off);
-}
-
-static int acpm_flexpmu_show(struct seq_file *s, void *unused)
-{
-	seq_printf(s, "buffer size      %u\n", acpm_flexpmu_dbg_size);
-	seq_printf(s, "cur_pmd          %u\n", flexpmu_rd(FLEXPMU_DID_CUR_PMD, 0xc));
-	seq_printf(s, "mif_always_on    %u\n", flexpmu_rd(FLEXPMU_DID_MIF_ALWAYS_ON, 0xc));
-	seq_printf(s, "soc_count        %u\n", flexpmu_rd(FLEXPMU_DID_SOC_COUNT, 0xc));
-	seq_printf(s, "mif_count        %u\n", flexpmu_rd(FLEXPMU_DID_MIF_COUNT, 0xc));
-	seq_printf(s, "ap_count_sleep   %u\n", flexpmu_rd(FLEXPMU_DID_AP_COUNT_SLEEP, 0xc));
-	seq_printf(s, "mif_count_sleep  %u\n", flexpmu_rd(FLEXPMU_DID_MIF_COUNT_SLEEP, 0xc));
-	seq_printf(s, "ap_count_sicd    %u\n", flexpmu_rd(FLEXPMU_DID_AP_COUNT_SICD, 0xc));
-	seq_printf(s, "mif_count_sicd   %u\n", flexpmu_rd(FLEXPMU_DID_MIF_COUNT_SICD, 0xc));
-	seq_printf(s, "early_wakeup     %u\n", flexpmu_rd(FLEXPMU_DID_AP_COUNT_SLEEP, 0x8));
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(acpm_flexpmu);
-
-/*
- * No write path here, deliberately.  This buffer is readable from the kernel's
- * ioremap of APM SRAM but **not writable**: a writel() to it raises an
- * asynchronous SError that panics the machine [2026-09-10, HW], the same way a
- * /dev/mem read of the SRAM's low pages does from userspace.  Downstream sets
- * mif_always_on here with a plain __raw_writel(), so the AP's write access to
- * this window is gated by something mainline does not set up -- worth finding,
- * because it is the only control the firmware exposes over the MIF transition,
- * but it is not available today and must not be attempted from here.
- */
-
-static void acpm_flexpmu_init(struct acpm_info *acpm, size_t sram_size)
-{
-	struct dentry *dir;
-
-	acpm_flexpmu_dbg = acpm_find_named_buffer(acpm, sram_size,
-						  "FLEXPMU_DBG",
-						  &acpm_flexpmu_dbg_size);
-	if (!acpm_flexpmu_dbg) {
-		dev_info(acpm->dev, "no FLEXPMU_DBG buffer in ACPM SRAM\n");
-		return;
-	}
-
-	dev_info(acpm->dev, "FLEXPMU_DBG at sram+0x%tx, %u bytes\n",
-		 acpm_flexpmu_dbg - acpm->sram_base, acpm_flexpmu_dbg_size);
-
-	dir = debugfs_create_dir("acpm_flexpmu", NULL);
-	debugfs_create_file("counters", 0444, dir, NULL, &acpm_flexpmu_fops);
-}
-
 static int acpm_probe(struct platform_device *pdev)
 {
 	const struct acpm_match_data *match_data;
@@ -921,8 +737,6 @@ static int acpm_probe(struct platform_device *pdev)
 	ret = acpm_channels_init(acpm);
 	if (ret)
 		return ret;
-
-	acpm_flexpmu_init(acpm, size);
 
 	acpm->handle.ops = &exynos_acpm_driver_ops;
 

@@ -9,11 +9,10 @@
 #include <linux/bitmap.h>
 #include <linux/cpuhotplug.h>
 #include <linux/cpu_pm.h>
+#include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mfd/core.h>
-#include <linux/io.h>
-#include <linux/moduleparam.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -25,7 +24,6 @@
 
 #include <linux/soc/samsung/exynos-regs-pmu.h>
 #include <linux/soc/samsung/exynos-pmu.h>
-#include <linux/soc/samsung/tegu-pmtrace.h>
 
 #include "exynos-pmu.h"
 
@@ -34,8 +32,6 @@ struct exynos_pmu_context {
 	const struct exynos_pmu_data *pmu_data;
 	struct regmap *pmureg;
 	struct regmap *pmuintrgen;
-	/* Its physical base, so trace records carry absolute addresses. */
-	phys_addr_t pmuintrgen_pa;
 	/*
 	 * Serialization lock for CPU hot plug and cpuidle ACPM hint
 	 * programming. Also protects in_cpuhp, sys_insuspend & sys_inreboot
@@ -239,22 +235,6 @@ EXPORT_SYMBOL_GPL(exynos_get_pmu_regmap_by_phandle);
 #define CPU_INFORM_CPD		2
 #define CPU_INFORM_SICD		3
 #define CPU_INFORM_SLEEP	4
-#define CPU_INFORM_SLEEP_SLCMON	5
-
-/*
- * DIAGNOSTIC.  Which firmware sleep mode the boot core asks for.  On zuma the
- * three deep modes -- SYS_SLEEP, SYS_SLEEP_SLCMON and SYS_STOP -- share one
- * identical three-register enter sequence and one wake mask, so the hint in
- * this word is the whole of the AP-side difference between them.  That makes
- * it the cheapest discriminator available while "echo mem" takes the SoC down
- * and nothing brings it back: if the machine returns from SLCMON but not from
- * SLEEP, the fault is in what SLEEP additionally powers down, and the two
- * pmucal_lpm_list[] entries name it.
- *
- * Settable at runtime through /sys/module/kernel/parameters/.
- */
-static unsigned int zumapro_sleep_hint = CPU_INFORM_SLEEP;
-core_param(zumapro_sleep_hint, zumapro_sleep_hint, uint, 0644);
 
 /* PMU_INFORM0 value telling EL3/TF-A that Linux may use the C2 idle state. */
 #define PMU_ALLOWED_C2		1
@@ -482,7 +462,6 @@ static int setup_pmu_intr_gen(struct device *dev)
 	if (!virt_addr)
 		return -ENOMEM;
 
-	pmu_context->pmuintrgen_pa = intrgen_res.start;
 	pmu_context->pmuintrgen = devm_regmap_init_mmio(dev, virt_addr,
 							&regmap_pmu_intr);
 	if (IS_ERR(pmu_context->pmuintrgen)) {
@@ -734,10 +713,7 @@ static void zumapro_sys_sleep_arm(void)
 	 * "powered down" acknowledgement into the same word as it takes each
 	 * core down.  Rewriting them here would clobber that.
 	 */
-	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(0),
-		     zumapro_sleep_hint);
-	pr_info("zumapro: suspend: boot-core sleep hint %u\n",
-		zumapro_sleep_hint);
+	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(0), CPU_INFORM_SLEEP);
 
 	/*
 	 * Without the interrupt generator the wake cannot be routed back, so
@@ -747,30 +723,8 @@ static void zumapro_sys_sleep_arm(void)
 	if (!pmu_context->pmuintrgen)
 		return;
 
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_SYS_ENTER | 8, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 0, 3, 0, 0, 0, 0);
-
 	regmap_update_bits(pmu_context->pmuintrgen,
 			   GS101_GRP2_INTR_BID_ENABLE, BIT(0), BIT(0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
-		    pmu_context->pmuintrgen_pa + GS101_GRP2_INTR_BID_ENABLE,
-		    BIT(0), 0, 0, 0, 0);
-
-	/*
-	 * DIAGNOSTIC.  CLUSTER0_CPU0_INT_EN bit 3 is known not to latch on
-	 * either kernel, so the assumption that the other two steps of the
-	 * enter sequence do latch is worth checking rather than inheriting:
-	 * this one is what routes the wake back to the boot core, and nothing
-	 * has ever read it back.
-	 */
-	{
-		unsigned int grp2 = 0;
-
-		regmap_read(pmu_context->pmuintrgen,
-			    GS101_GRP2_INTR_BID_ENABLE, &grp2);
-		pr_info("zumapro: suspend: GRP2_INTR_BID_ENABLE reads 0x%x after arming bit 0\n",
-			grp2);
-	}
 
 	/*
 	 * Clear-pending is "read the pending register, write what was pending
@@ -783,9 +737,6 @@ static void zumapro_sys_sleep_arm(void)
 	regmap_read(pmu_context->pmuintrgen, GS101_GRP1_INTR_BID_UPEND, &reg);
 	regmap_write(pmu_context->pmuintrgen, GS101_GRP1_INTR_BID_CLEAR,
 		     reg & BIT(0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
-		    pmu_context->pmuintrgen_pa + GS101_GRP1_INTR_BID_CLEAR,
-		    reg & BIT(0), 0, 0, 0, 0);
 
 	/*
 	 * A plain read-modify-write, not regmap_update_bits(): for PMU_ALIVE
@@ -797,27 +748,6 @@ static void zumapro_sys_sleep_arm(void)
 	 */
 	regmap_read(pmu_context->pmureg, cl0_int_en, &reg);
 	regmap_write(pmu_context->pmureg, cl0_int_en, reg | BIT(3));
-
-	/*
-	 * DIAGNOSTIC.  A 2026-06-19 capture of downstream entering this mode
-	 * shows CLUSTER0_CPU0_INT_EN going to 0x281d, i.e. a pre-existing
-	 * 0x2815 with bit 3 added -- five other routes to CPU0 already enabled
-	 * that mainline may never have set.  This is a read-modify-write, so if
-	 * our starting value differs the result differs, and the capture cannot
-	 * settle that: only this register can.  Print what we found, what we
-	 * wrote, and what stuck.  Likewise GRP1_INTR_BID_UPEND, which decides
-	 * whether the clear-pending step has anything to clear -- the capture
-	 * shows a literal 1 written there.
-	 */
-	{
-		unsigned int before = reg, after = 0, upend = 0;
-
-		regmap_read(pmu_context->pmureg, cl0_int_en, &after);
-		regmap_read(pmu_context->pmuintrgen,
-			    GS101_GRP1_INTR_BID_UPEND, &upend);
-		pr_info("zumapro: suspend: CLUSTER0_CPU0_INT_EN 0x%x -> wrote 0x%x -> reads 0x%x, GRP1_UPEND 0x%x\n",
-			before, (unsigned int)(before | BIT(3)), after, upend);
-	}
 }
 
 static void zumapro_sys_sleep_disarm(void)
@@ -856,14 +786,7 @@ static int zumapro_sys_sleep_suspend(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return 0;
 
-	tegu_pmt_set_phase(TEGU_PMT_P_SYSCORE_SUSPEND);
-	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 0, 0, zumapro_sleep_hint,
-		    0, 0, 0);
-
 	zumapro_sys_sleep_arm();
-
-	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 1, 0, 0, 0, 0, 0);
-	tegu_pmt_set_phase(TEGU_PMT_P_ARMED);
 	return 0;
 }
 
@@ -872,13 +795,7 @@ static void zumapro_sys_sleep_resume(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return;
 
-	tegu_pmt_set_phase(TEGU_PMT_P_SYSCORE_RESUME);
-	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 2, 0, 0, 0, 0, 0);
-
 	zumapro_sys_sleep_disarm();
-
-	tegu_pmt_ev(TEGU_PMT_F_PM, TEGU_PMT_PM, 3, 0, 0, 0, 0, 0);
-	tegu_pmt_set_phase(TEGU_PMT_P_RESUMED);
 }
 
 static const struct syscore_ops zumapro_sys_sleep_syscore_ops = {
@@ -968,22 +885,10 @@ static void zumapro_program_lpm_durations(struct device *dev)
 {
 	int i, ret;
 
-	/*
-	 * Bracketed for the trace as its own sequence.  Downstream carries
-	 * these seven inside pmucal_lpm_init[] at indices 86..92; we run them
-	 * before the rest of the table rather than in the middle of it, which
-	 * the record will show.
-	 */
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 3,
-		    ARRAY_SIZE(zumapro_lpm_durations), 0, 0, 0, 0);
-
 	for (i = 0; i < ARRAY_SIZE(zumapro_lpm_durations); i++) {
 		u32 mask = zumapro_lpm_durations[i].mask;
 		u32 val = zumapro_lpm_durations[i].val;
 		unsigned int rb = 0;
-
-		tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, i));
 
 		/*
 		 * A masked entry is a read-modify-write of those bits and a
@@ -1012,10 +917,6 @@ static void zumapro_program_lpm_durations(struct device *dev)
 			dev_info(dev, "%s settle duration=0x%x\n",
 				 zumapro_lpm_durations[i].name, val);
 	}
-
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END, 3,
-		    ARRAY_SIZE(zumapro_lpm_durations), 0, 0, 0, 0);
 }
 
 /*
@@ -1151,19 +1052,9 @@ static void zumapro_program_lpm_init(struct device *dev)
 	void __iomem *va = NULL;
 	u32 mapped = 0;
 
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, 0,
-		    ARRAY_SIZE(zumapro_lpm_init), 0, 0, 0, 0);
-
 	for (i = 0; i < ARRAY_SIZE(zumapro_lpm_init); i++) {
 		const struct zumapro_lpm_init_step *st = &zumapro_lpm_init[i];
 		u32 reg;
-
-		tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, i));
-		tegu_pmt_ev(TEGU_PMT_F_SEQ_STEP, TEGU_PMT_SEQ_STEP,
-			    (u64)st->base + st->offset,
-			    st->mask == ~0u ? 1 : 3, st->mask, st->val,
-			    st->cond_offset, st->cond_val);
 
 		if (st->cond_offset) {
 			unsigned int cond = 0;
@@ -1193,26 +1084,18 @@ static void zumapro_program_lpm_init(struct device *dev)
 
 		if (st->mask == ~0u) {
 			writel(st->val, va + st->offset);
-			reg = st->val;
 		} else {
 			reg = readl(va + st->offset);
 			reg = (reg & ~st->mask) | (st->val & st->mask);
 			writel(reg, va + st->offset);
 		}
-		/* The composed value, which is what downstream records too. */
-		tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
-			    (u64)st->base + st->offset, reg, 0, 0, 0, 0);
 		applied++;
 	}
 
 	if (va)
 		iounmap(va);
 
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(TEGU_PMT_SEQ_LPM_INIT, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END, 0,
-		    ARRAY_SIZE(zumapro_lpm_init), applied, skipped, 0, 0);
-
-	dev_info(dev, "lpm-init: %u of %u boot-time writes applied, %u skipped\n",
+	dev_dbg(dev, "lpm-init: %u of %u boot-time writes applied, %u skipped\n",
 		 applied, (unsigned int)ARRAY_SIZE(zumapro_lpm_init), skipped);
 }
 
@@ -1365,27 +1248,7 @@ static int exynos_cpupm_suspend_noirq(struct device *dev)
 	zumapro_in_sys_sleep = pm_suspend_target_state == PM_SUSPEND_MEM;
 
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
-		unsigned int top = 0xdead, w2 = 0xdead;
-		unsigned int em[3] = { 0xdead, 0xdead, 0xdead };
-		int i;
-
 		zumapro_set_wakeup_mask(true);
-		regmap_read(pmu_context->pmureg, GS101_TOP_INT_EN, &top);
-		regmap_read(pmu_context->pmureg, GS101_WAKEUP2_INT_EN, &w2);
-		for (i = 0; i < 3; i++)
-			regmap_read(pmu_context->pmureg,
-				    GS101_EINT_WAKEUP_MASK + i * 4, &em[i]);
-		/*
-		 * DIAGNOSTIC.  Suspend-to-RAM powers the GIC down, so these
-		 * five registers are the whole wake path: an interrupt that is
-		 * merely enabled in Linux reaches nothing.  Printing them at
-		 * the moment they are armed is the only way to tell "the
-		 * firmware never brought the SoC back" from "nothing was ever
-		 * allowed to ask it to".  Needs no_console_suspend to be seen.
-		 */
-		pr_info("zumapro: suspend: %s wakeup mask armed, TOP_INT_EN(0x3944)=0x%x WAKEUP2_INT_EN(0x3964)=0x%x EINT_WAKEUP_MASK(0x3a80)=0x%x/0x%x/0x%x\n",
-			zumapro_in_sys_sleep ? "sleep" : "idle", top, w2,
-			em[0], em[1], em[2]);
 	}
 
 	return 0;
@@ -1394,15 +1257,9 @@ static int exynos_cpupm_suspend_noirq(struct device *dev)
 static int exynos_cpupm_resume_noirq(struct device *dev)
 {
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
-		unsigned int st = 0xdead, st2 = 0xdead;
-
-		/* DIAGNOSTIC: which aggregate the PMU latched as the wake. */
-		regmap_read(pmu_context->pmureg, GS101_WAKEUP_STAT, &st);
-		regmap_read(pmu_context->pmureg, 0x3970, &st2);
 		zumapro_set_wakeup_mask(false);
-		pr_info("zumapro: resume: WAKEUP_STAT(0x3950)=0x%x WAKEUP2_STAT(0x3970)=0x%x CPU_INFORM hints c2=%u sicd=%u fails=%u\n",
-			st, st2, zumapro_dbg_c2, zumapro_dbg_sicd,
-			zumapro_dbg_fail);
+		pr_debug("zumapro: resume: CPU_INFORM hints c2=%u sicd=%u fails=%u\n",
+			zumapro_dbg_c2, zumapro_dbg_sicd, zumapro_dbg_fail);
 	}
 
 	raw_spin_lock(&pmu_context->cpupm_lock);

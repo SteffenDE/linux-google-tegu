@@ -16,7 +16,6 @@
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <linux/soc/samsung/tegu-pmtrace.h>
 #include <linux/pm_domain.h>
 #include <linux/delay.h>
 #include <linux/of.h>
@@ -47,8 +46,6 @@ struct exynos_pm_domain {
 	/* Only with vendor power sequences */
 	void __iomem *windows[EXYNOS_PD_NR_WINDOWS];
 	resource_size_t window_size[EXYNOS_PD_NR_WINDOWS];
-	/* Physical bases, so trace records carry absolute addresses. */
-	phys_addr_t window_pa[EXYNOS_PD_NR_WINDOWS];
 	const struct exynos_pd_sequences *seq;
 	/* One slot per step of seq->save; only the save steps are used */
 	u32 *saved;
@@ -157,13 +154,9 @@ static int exynos_pd_step_write(struct exynos_pm_domain *pd,
 		value = (readl(addr) & ~step->mask) | (value & step->mask);
 
 	if (step->window == EXYNOS_PD_PMU)
-		/* Recorded by the secure regmap, with its SMC status. */
 		return exynos_pd_write_pmu(pd, step->offset, value);
 
 	writel(value, addr);
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_MMIO_WRITE,
-		    pd->window_pa[step->window] + step->offset,
-		    value, 0, 0, 0, 0);
 	return 0;
 }
 
@@ -199,31 +192,12 @@ static int exynos_pd_run_sequence(struct exynos_pm_domain *pd, const char *what,
 				  const struct exynos_pd_step *seq,
 				  unsigned int nr_steps, enum exynos_pd_pass pass)
 {
-	/*
-	 * Label the trace the way the downstream recorder does, so the two
-	 * records read alike: the pass picks handle/save/restore, and the low
-	 * half of the context is the step index within the sequence.
-	 */
-	u32 label = pass == EXYNOS_PD_PASS_SAVE ? TEGU_PMT_SEQ_LOCAL_OFF :
-						  TEGU_PMT_SEQ_LOCAL_ON;
-	u64 kindarg = pass == EXYNOS_PD_PASS_SAVE ? 1 :
-		      pass == EXYNOS_PD_PASS_RESTORE ? 2 : 0;
-	u32 ctx = tegu_pmt_get_ctx();
 	bool skip = false;
 	unsigned int i;
 	int ret = 0;
 
-	tegu_pmt_set_ctx(TEGU_PMT_CTX(label, 0));
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_BEGIN, kindarg,
-		    nr_steps, 0, 0, 0, 0);
-
 	for (i = 0; i < nr_steps; i++) {
 		const struct exynos_pd_step *step = &seq[i];
-
-		tegu_pmt_set_ctx(TEGU_PMT_CTX(label, i));
-		tegu_pmt_ev(TEGU_PMT_F_SEQ_STEP, TEGU_PMT_SEQ_STEP,
-			    pd->window_pa[step->window] + step->offset,
-			    step->op, step->mask, step->value, 0, 0);
 
 		if (pass == EXYNOS_PD_PASS_SAVE) {
 			if (step->op == EXYNOS_PD_OP_SAVE)
@@ -263,16 +237,9 @@ static int exynos_pd_run_sequence(struct exynos_pm_domain *pd, const char *what,
 		if (ret) {
 			pr_err("Power domain %s: %s sequence failed at step %u: %d\n",
 			       pd->pd.name, what, i, ret);
-			tegu_pmt_set_ctx(ctx);
-			tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END,
-				    kindarg, nr_steps, (u32)ret, 0, 0, 0);
 			return ret;
 		}
 	}
-
-	tegu_pmt_set_ctx(ctx);
-	tegu_pmt_ev(TEGU_PMT_F_PMUCAL, TEGU_PMT_SEQ_END, kindarg,
-		    nr_steps, 0, 0, 0, 0);
 
 	return 0;
 }
@@ -495,7 +462,6 @@ static int exynos_pd_init_sequences(struct platform_device *pdev,
 		if (!pd->windows[i])
 			return -ENOMEM;
 		pd->window_size[i] = resource_size(res);
-		pd->window_pa[i] = res->start;
 	}
 
 	ret = exynos_pd_check_sequence(pd, "on", pd->seq->on, pd->seq->nr_on);
@@ -549,7 +515,6 @@ static int exynos_pd_probe(struct platform_device *pdev)
 	pd->base_addr = res->start;
 	pd->windows[EXYNOS_PD_PMU] = pd->base;
 	pd->window_size[EXYNOS_PD_PMU] = resource_size(res);
-	pd->window_pa[EXYNOS_PD_PMU] = res->start;
 
 	of_property_read_u32(np, "samsung,secure-pd-id", &pd->secure_pwr_id);
 

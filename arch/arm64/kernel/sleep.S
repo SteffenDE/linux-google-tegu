@@ -99,35 +99,6 @@ SYM_FUNC_END(__cpu_suspend_enter)
 
 	.pushsection ".idmap.text", "a"
 SYM_CODE_START(cpu_resume)
-#ifdef CONFIG_ARM64_RESUME_ENTRY_RESET_PROBE
-	/*
-	 * DIAGNOSTIC, to be removed with the rest of the suspend-to-RAM probe.
-	 *
-	 * This is the first instruction the AP executes after the firmware
-	 * brings it back: EL3 jumps here with the MMU off, before
-	 * init_kernel_el(), before __cpu_setup(), before any DRAM access, and
-	 * long before a console exists.  Reset the machine from here and the
-	 * reboot itself is the signal -- it needs no memory, no restored clock
-	 * tree and no working console, which is what every earlier probe
-	 * needed and could not get.
-	 *
-	 * The existing PSCI probe panics after cpu_suspend() has already
-	 * restored the MMU, the stack and the CPU state, and panic() can then
-	 * stall in its own console flush; the watchdog cannot report either,
-	 * because its block loses its enable bit when it loses power.  Neither
-	 * can tell "the AP was never powered up" from "the AP came back and
-	 * could not say so".  This can.
-	 *
-	 * Unconditional on purpose: a flag would have to be read from memory
-	 * that may not have survived, which is the very thing in question.
-	 * That makes this a one-shot diagnostic build, and it needs
-	 * cpuidle.off=1, since idle states return through here too.
-	 */
-	mov	w0, #0x0009			// PSCI SYSTEM_RESET
-	movk	w0, #0x8400, lsl #16
-	smc	#0
-	b	.
-#endif
 	mov	x0, xzr
 	bl	init_kernel_el
 	mov	x19, x0			// preserve boot mode

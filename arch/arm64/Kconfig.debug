@@ -21,19 +21,3 @@ config ARM64_RELOC_TEST
 	tristate "Relocation testing module"
 
 source "drivers/hwtracing/coresight/Kconfig"
-
-config ARM64_RESUME_ENTRY_RESET_PROBE
-	bool "DIAGNOSTIC: reset the machine at the suspend resume entry point"
-	help
-	  Reset the machine from the first instruction of cpu_resume, before
-	  the MMU, the stack or any DRAM access.  The reboot is then the only
-	  signal needed to prove the firmware brought the AP back, on a machine
-	  where suspend-to-RAM goes down and never returns and every later
-	  probe depends on state that may not have survived.
-
-	  This makes suspend-to-RAM and every power-down idle state reset the
-	  machine, so a kernel built with it is good for one measurement and
-	  nothing else.  Boot it with cpuidle.off=1 so the resume entry is
-	  reached only by suspend-to-RAM.
-
-	  If unsure, say N.

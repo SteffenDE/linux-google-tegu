@@ -26,7 +26,9 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 
 #include "exynos-acpm.h"
@@ -899,11 +901,80 @@ static const struct of_device_id acpm_match[] = {
 };
 MODULE_DEVICE_TABLE(of, acpm_match);
 
+/*
+ * DEBUG: Zuma gs-devfreq's AP-running flags, without its frequency policy.
+ * Channel 1, devfreq IDs MIF=0/INT=1, DATA_INIT=5, RELEASE=2.
+ * Word 3 is a subcommand here, not the usual DVFS timestamp.
+ */
+static int acpm_debug_dvfs_release(struct device *dev, u32 id, bool running)
+{
+	struct acpm_info *acpm = dev_get_drvdata(dev);
+	u32 cmd[4] = { id, running, 5, 2 };
+	struct acpm_xfer xfer;
+	int ret;
+
+	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), 1, true);
+	ret = acpm_do_xfer(&acpm->handle, &xfer);
+	if (ret)
+		dev_err(dev, "DEBUG: DVFS %u RELEASE(%u) failed: %d\n",
+			id, running, ret);
+
+	return ret;
+}
+
+static bool acpm_debug_dvfs_deep(struct device *dev)
+{
+	return of_device_is_compatible(dev->of_node, "google,zumapro-acpm-ipc") &&
+		pm_suspend_target_state == PM_SUSPEND_MEM;
+}
+
+static int acpm_debug_resume_early(struct device *dev)
+{
+	int id, ret, err = 0;
+
+	if (!acpm_debug_dvfs_deep(dev))
+		return 0;
+
+	/* Restore both flags, even if one reply fails. */
+	for (id = 0; id < 2; id++) {
+		ret = acpm_debug_dvfs_release(dev, id, true);
+		if (ret && !err)
+			err = ret;
+	}
+
+	return err;
+}
+
+static int acpm_debug_suspend_late(struct device *dev)
+{
+	int id, ret;
+
+	if (!acpm_debug_dvfs_deep(dev))
+		return 0;
+
+	/* Working downstream trace sends INT, then MIF, before noirq. */
+	for (id = 1; id >= 0; id--) {
+		ret = acpm_debug_dvfs_release(dev, id, false);
+		if (ret) {
+			/* A timed-out request may still have reached firmware. */
+			acpm_debug_resume_early(dev);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops acpm_debug_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(acpm_debug_suspend_late, acpm_debug_resume_early)
+};
+
 static struct platform_driver acpm_driver = {
 	.probe	= acpm_probe,
 	.driver	= {
 		.name = "exynos-acpm-protocol",
 		.of_match_table	= acpm_match,
+		.pm = pm_sleep_ptr(&acpm_debug_pm_ops),
 	},
 };
 module_platform_driver(acpm_driver);

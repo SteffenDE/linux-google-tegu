@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
+#include <linux/pm.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
@@ -50,6 +51,8 @@ struct s2mps11_info {
 	 * the suspend mode was enabled.
 	 */
 	DECLARE_BITMAP(suspend_state, S2MPS_REGULATOR_MAX);
+	struct regulator_dev *rdev[S2MPS_REGULATOR_MAX];
+	unsigned int rdev_num;
 };
 
 #define to_s2mpg10_regulator_desc(x) container_of((x), struct s2mpg10_regulator_desc, desc)
@@ -2418,6 +2421,64 @@ static int s2mps11_handle_ext_control(struct s2mps11_info *s2mps11,
 	return ret;
 }
 
+static void s2mpg14_15_debug_dump(struct device *dev, const char *phase)
+{
+	struct s2mps11_info *s2mps11 = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (s2mps11->dev_type != S2MPG14 && s2mps11->dev_type != S2MPG15)
+		return;
+
+	dev_info(dev, "REGSNAP_BEGIN phase=%s rails=%u\n",
+		 phase, s2mps11->rdev_num);
+
+	for (i = 0; i < s2mps11->rdev_num; i++) {
+		struct regulator_dev *rdev = s2mps11->rdev[i];
+		const struct regulator_desc *desc = rdev->desc;
+		struct regmap *regmap = rdev_get_regmap(rdev);
+		unsigned int enable_raw = 0, vsel_raw = 0;
+		unsigned int enable_field = 0, selector = 0;
+		int enable_ret, vsel_ret, uV = -EINVAL;
+
+		enable_ret = regmap_read(regmap, desc->enable_reg, &enable_raw);
+		vsel_ret = regmap_read(regmap, desc->vsel_reg, &vsel_raw);
+		if (!enable_ret)
+			enable_field = (enable_raw & desc->enable_mask) >>
+				       __ffs(desc->enable_mask);
+		if (!vsel_ret) {
+			selector = (vsel_raw & desc->vsel_mask) >>
+				   __ffs(desc->vsel_mask);
+			if (desc->ops->list_voltage)
+				uV = desc->ops->list_voltage(rdev, selector);
+		}
+
+		dev_info(dev,
+			 "REGSNAP phase=%s rail=%s en_reg=%#x en_raw=%#02x en_mask=%#02x en_field=%u en_err=%d vsel_reg=%#x vsel_raw=%#02x vsel_mask=%#02x selector=%u programmed_uV=%d vsel_err=%d\n",
+			 phase, desc->name, desc->enable_reg, enable_raw,
+			 desc->enable_mask, enable_field, enable_ret,
+			 desc->vsel_reg, vsel_raw, desc->vsel_mask, selector,
+			 uV, vsel_ret);
+	}
+
+	dev_info(dev, "REGSNAP_END phase=%s\n", phase);
+}
+
+static int s2mps11_pmic_resume_noirq(struct device *dev)
+{
+	s2mpg14_15_debug_dump(dev, "resume-noirq");
+	return 0;
+}
+
+static int s2mps11_pmic_suspend_noirq(struct device *dev)
+{
+	s2mpg14_15_debug_dump(dev, "suspend-noirq");
+	return 0;
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(s2mps11_pmic_pm_ops,
+				       s2mps11_pmic_suspend_noirq,
+				       s2mps11_pmic_resume_noirq);
+
 static int s2mps11_pmic_probe(struct platform_device *pdev)
 {
 	struct sec_pmic_dev *iodev = dev_get_drvdata(pdev->dev.parent);
@@ -2505,6 +2566,7 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 	device_set_of_node_from_dev(&pdev->dev, pdev->dev.parent);
 
 	platform_set_drvdata(pdev, s2mps11);
+	s2mps11->rdev_num = rdev_num;
 
 	config.dev = &pdev->dev;
 	config.regmap = iodev->regmap_pmic;
@@ -2524,11 +2586,14 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 			return dev_err_probe(&pdev->dev, PTR_ERR(regulator),
 					     "regulator init failed for %d/%s\n",
 					     rdesc->id, rdesc->name);
+		s2mps11->rdev[i] = regulator;
 
 		ret = s2mps11_handle_ext_control(s2mps11, regulator);
 		if (ret < 0)
 			return ret;
 	}
+
+	s2mpg14_15_debug_dump(&pdev->dev, "probe");
 
 	return 0;
 }
@@ -2552,6 +2617,7 @@ static struct platform_driver s2mps11_pmic_driver = {
 	.driver = {
 		.name = "s2mps11-pmic",
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.pm = pm_sleep_ptr(&s2mps11_pmic_pm_ops),
 	},
 	.probe = s2mps11_pmic_probe,
 	.id_table = s2mps11_pmic_id,

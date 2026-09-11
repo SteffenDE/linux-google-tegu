@@ -53,6 +53,8 @@ struct s2mps11_info {
 	DECLARE_BITMAP(suspend_state, S2MPS_REGULATOR_MAX);
 	struct regulator_dev *rdev[S2MPS_REGULATOR_MAX];
 	unsigned int rdev_num;
+	unsigned int debug_suspend_enable[S2MPS_REGULATOR_MAX];
+	DECLARE_BITMAP(debug_suspend_valid, S2MPS_REGULATOR_MAX);
 };
 
 #define to_s2mpg10_regulator_desc(x) container_of((x), struct s2mpg10_regulator_desc, desc)
@@ -2421,7 +2423,8 @@ static int s2mps11_handle_ext_control(struct s2mps11_info *s2mps11,
 	return ret;
 }
 
-static void s2mpg14_15_debug_dump(struct device *dev, const char *phase)
+static void s2mpg14_15_debug_dump(struct device *dev, const char *phase,
+				  bool save_enable)
 {
 	struct s2mps11_info *s2mps11 = dev_get_drvdata(dev);
 	unsigned int i;
@@ -2442,9 +2445,17 @@ static void s2mpg14_15_debug_dump(struct device *dev, const char *phase)
 
 		enable_ret = regmap_read(regmap, desc->enable_reg, &enable_raw);
 		vsel_ret = regmap_read(regmap, desc->vsel_reg, &vsel_raw);
-		if (!enable_ret)
+		if (!enable_ret) {
 			enable_field = (enable_raw & desc->enable_mask) >>
 				       __ffs(desc->enable_mask);
+			if (save_enable) {
+				s2mps11->debug_suspend_enable[i] =
+					enable_raw & desc->enable_mask;
+				set_bit(i, s2mps11->debug_suspend_valid);
+			}
+		} else if (save_enable) {
+			clear_bit(i, s2mps11->debug_suspend_valid);
+		}
 		if (!vsel_ret) {
 			selector = (vsel_raw & desc->vsel_mask) >>
 				   __ffs(desc->vsel_mask);
@@ -2463,15 +2474,50 @@ static void s2mpg14_15_debug_dump(struct device *dev, const char *phase)
 	dev_info(dev, "REGSNAP_END phase=%s\n", phase);
 }
 
+static void s2mpg14_15_debug_restore(struct device *dev)
+{
+	struct s2mps11_info *s2mps11 = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (s2mps11->dev_type != S2MPG14 && s2mps11->dev_type != S2MPG15)
+		return;
+
+	dev_info(dev, "REGRESTORE_BEGIN rails=%u\n", s2mps11->rdev_num);
+
+	for (i = 0; i < s2mps11->rdev_num; i++) {
+		struct regulator_dev *rdev = s2mps11->rdev[i];
+		const struct regulator_desc *desc = rdev->desc;
+		bool changed = false;
+		int ret;
+
+		if (!test_bit(i, s2mps11->debug_suspend_valid))
+			continue;
+
+		ret = regmap_update_bits_check(rdev_get_regmap(rdev),
+					       desc->enable_reg,
+					       desc->enable_mask,
+					       s2mps11->debug_suspend_enable[i],
+					       &changed);
+		if (ret || changed)
+			dev_info(dev,
+				 "REGRESTORE rail=%s reg=%#x mask=%#02x value=%#02x changed=%u err=%d\n",
+				 desc->name, desc->enable_reg, desc->enable_mask,
+				 s2mps11->debug_suspend_enable[i], changed, ret);
+	}
+
+	dev_info(dev, "REGRESTORE_END\n");
+}
+
 static int s2mps11_pmic_resume_noirq(struct device *dev)
 {
-	s2mpg14_15_debug_dump(dev, "resume-noirq");
+	s2mpg14_15_debug_dump(dev, "resume-noirq", false);
+	s2mpg14_15_debug_restore(dev);
 	return 0;
 }
 
 static int s2mps11_pmic_suspend_noirq(struct device *dev)
 {
-	s2mpg14_15_debug_dump(dev, "suspend-noirq");
+	s2mpg14_15_debug_dump(dev, "suspend-noirq", true);
 	return 0;
 }
 
@@ -2593,7 +2639,7 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	s2mpg14_15_debug_dump(&pdev->dev, "probe");
+	s2mpg14_15_debug_dump(&pdev->dev, "probe", false);
 
 	return 0;
 }

@@ -325,7 +325,7 @@ static const struct s3c2410_wdt_variant drv_data_gs101_cl0 = {
 	.rst_stat_reg = GS_RST_STAT_REG_OFFSET,
 	.rst_stat_bit = 0,
 	.cnt_en_reg = GS_CLUSTER0_NONCPU_OUT,
-	.cnt_en_bit = 8,
+	.cnt_en_bit = 4, /* DEBUG: Zuma CNT_EN_WDT, deliberately not GS101. */
 	.quirks = QUIRK_HAS_PMU_RST_STAT | QUIRK_HAS_PMU_MASK_RESET |
 		  QUIRK_HAS_PMU_CNT_EN | QUIRK_HAS_WTCLRINT_REG |
 		  QUIRK_HAS_DBGACK_BIT,
@@ -889,6 +889,14 @@ static int s3c2410wdt_suspend(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+
+	/* DEBUG: match Zuma CL0 entry: feed/save, preserving WTCON and PMU. */
+	if (wdt->drv_data == &drv_data_gs101_cl0) {
+		s3c2410wdt_keepalive(&wdt->wdt_device);
+		wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
+		wdt->wtdat_save = readl(wdt->reg_base + S3C2410_WTDAT);
+		return 0;
+	}
 
 	/* Save watchdog state, and turn it off. */
 	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);

@@ -742,6 +742,17 @@
 		 * sensor_power_list below.
 		 */
 		regulators {
+			/*
+			 * SLC memory supply. Downstream keeps BUCK10S in normal-on
+			 * mode (B10S_CTRL[7:6] = 3), rather than following PWREN.
+			 * The enable operation sets only this field; retain the
+			 * firmware's voltage selector and other control bits.
+			 */
+			buck10s {
+				regulator-name = "S10S_VDD_SLC_M";
+				regulator-always-on;
+			};
+
 			s2mpg15_ldo5: ldo5s {
 				regulator-name = "L5S_PROX";
 			};

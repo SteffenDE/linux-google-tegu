@@ -1147,15 +1147,6 @@ static int exynos_ufs_phy_init(struct exynos_ufs *ufs)
 	if (ret)
 		goto out_exit_phy;
 
-	/* Zumapro must not calibrate during the earlier resume power-on. */
-	if (ufs->opts & EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL) {
-		ret = phy_calibrate(generic_phy);
-		if (ret) {
-			phy_power_off(generic_phy);
-			goto out_exit_phy;
-		}
-	}
-
 	return 0;
 
 out_exit_phy:
@@ -1264,6 +1255,13 @@ static int exynos_ufs_pre_link(struct ufs_hba *hba)
 
 	exynos_ufs_setup_clocks(hba, true, PRE_CHANGE);
 
+	/* Do not cycle Zumapro PHY isolation after programming the PCS. */
+	if (ufs->opts & EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL) {
+		ret = exynos_ufs_phy_init(ufs);
+		if (ret)
+			return ret;
+	}
+
 	/* unipro */
 	exynos_ufs_config_unipro(ufs);
 
@@ -1277,7 +1275,15 @@ static int exynos_ufs_pre_link(struct ufs_hba *hba)
 	}
 
 	/* m-phy */
-	ret = exynos_ufs_phy_init(ufs);
+	if (ufs->opts & EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL) {
+		ret = phy_calibrate(ufs->phy);
+		if (ret) {
+			phy_power_off(ufs->phy);
+			phy_exit(ufs->phy);
+		}
+	} else {
+		ret = exynos_ufs_phy_init(ufs);
+	}
 	if (ret)
 		return ret;
 	if (!(ufs->opts & EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR)) {

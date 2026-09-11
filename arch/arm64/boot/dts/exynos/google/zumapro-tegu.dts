@@ -1749,7 +1749,7 @@
 };
 
 &pcie0_phy {
-	status = "okay";
+	status = "disabled";
 };
 
 &pcie0 {
@@ -1770,7 +1770,7 @@
 	 * may boot into dump mode instead of normal IPC.
 	 */
 	google,cp-dump-noti-gpios = <&gpp16 1 GPIO_ACTIVE_HIGH>;
-	status = "okay";
+	status = "disabled";
 };
 
 /*
@@ -1810,6 +1810,7 @@
 
 	modem {
 		compatible = "samsung,s5300-modem";
+		status = "disabled";
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
 				<&cp_rmem_1_reserved>;
 		memory-region-names = "ipc", "msi", "pktproc";
@@ -1831,14 +1832,14 @@
 };
 
 &pcie_phy {
-	status = "okay";
+	status = "disabled";
 };
 
 &pcie {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie1_clkreq>;
 	reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
-	status = "okay";
+	status = "disabled";
 
 	/*
 	 * Describe the on-board BCM4383 endpoint (bus 1, device 0) behind the

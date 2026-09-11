@@ -215,14 +215,12 @@ static inline void exynos_ufs_ungate_clks(struct exynos_ufs *ufs)
 	exynos_ufs_ctrl_clkstop(ufs, false);
 }
 
-static void exynos_ufs_mphy_apbclk_ctrl(struct exynos_ufs *ufs, bool en)
+static void exynos_ufs_force_cal_clks(struct exynos_ufs *ufs)
 {
 	u32 reg = hci_readl(ufs, HCI_MISC);
 
-	if (en)
-		hci_writel(ufs, reg | MPHY_APBCLK_CTRL_EN, HCI_MISC);
-	else
-		hci_writel(ufs, reg & ~MPHY_APBCLK_CTRL_EN, HCI_MISC);
+	reg &= ~(UNIPRO_MCLK_CTRL_EN | MPHY_APBCLK_CTRL_EN);
+	hci_writel(ufs, reg, HCI_MISC);
 }
 
 static void exynos_ufs_restore_link_clk_ctrl(struct exynos_ufs *ufs)
@@ -306,11 +304,11 @@ static int zumapro_ufs_drv_init(struct exynos_ufs *ufs)
 	hci_writel(ufs, reg & (~HCI_IOP_ACG_DISABLE_EN), HCI_IOP_ACG_DISABLE);
 
 	/*
-	 * Downstream brackets CAL with M-PHY APB enabled. Keep it forced on
-	 * while runtime PM is disabled for bring-up; bracket this around CAL
-	 * if runtime PM is re-enabled later.
+	 * Downstream brackets CAL by forcing the UniPro MCLK and M-PHY APB
+	 * clocks on. Keep them forced on while runtime PM is disabled for
+	 * bring-up; bracket this around CAL if runtime PM is re-enabled later.
 	 */
-	exynos_ufs_mphy_apbclk_ctrl(ufs, false);
+	exynos_ufs_force_cal_clks(ufs);
 
 	return zumapro_ufs_config_externals(ufs);
 }
@@ -1971,13 +1969,13 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 
 	if (!ufshcd_is_link_active(hba)) {
 		/*
-		 * HCI_MISC is lost with the UFS block.  Zuma needs the M-PHY
-		 * APB clock forced on before phy_power_on() replays pre-link CAL;
+		 * HCI_MISC is lost with the UFS block.  Zuma needs the UniPro MCLK
+		 * and M-PHY APB clocks forced on before phy_power_on() replays CAL;
 		 * exynos_ufs_pre_link() restores automatic clock control once CAL
 		 * has completed.
 		 */
 		if (ufs->opts & EXYNOS_UFS_OPT_RESTORE_MPHY_APBCLK)
-			exynos_ufs_mphy_apbclk_ctrl(ufs, false);
+			exynos_ufs_force_cal_clks(ufs);
 		phy_power_on(ufs->phy);
 	}
 

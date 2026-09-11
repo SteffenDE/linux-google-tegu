@@ -1969,8 +1969,17 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 
-	if (!ufshcd_is_link_active(hba))
+	if (!ufshcd_is_link_active(hba)) {
+		/*
+		 * HCI_MISC is lost with the UFS block.  Zuma needs the M-PHY
+		 * APB clock forced on before phy_power_on() replays pre-link CAL;
+		 * exynos_ufs_pre_link() restores automatic clock control once CAL
+		 * has completed.
+		 */
+		if (ufs->opts & EXYNOS_UFS_OPT_RESTORE_MPHY_APBCLK)
+			exynos_ufs_mphy_apbclk_ctrl(ufs, false);
 		phy_power_on(ufs->phy);
+	}
 
 	exynos_ufs_config_smu(ufs);
 	exynos_ufs_fmp_resume(hba);

@@ -1751,6 +1751,27 @@
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X4>;
 		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
 	};
+
+	/*
+	 * WL_REG_ON (gph3-4) is the BCM4383's enable.  A pad with no CON_PDN
+	 * of its own does not retain its level in SYS_SLEEP, so the enable
+	 * stops being driven and the chip loses power -- it then returns from
+	 * every deep suspend with no firmware and brcmfmac re-downloads it.
+	 * PERST# and CLKREQ# above already retain; this is the third pin of
+	 * the same group, and downstream sets it the same way in cfg_wlanen
+	 * (research/dumped.dts:4732), off the same PCIe RC node.
+	 *
+	 * samsung,pin-function is deliberately omitted so that wlan_reg_on_hog
+	 * stays the only writer of this pin's CON and DAT fields; the group
+	 * then applies as pinconf alone, touching PUD, CON_PDN and PUD_PDN,
+	 * which is the powerdown retention a gpio-hog cannot express.
+	 */
+	wlan_reg_on: wlan-reg-on-pins {
+		samsung,pins = "gph3-4";
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
+		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_NONE>;
+	};
 };
 
 &gph3 {
@@ -1895,7 +1916,7 @@
 
 &pcie {
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie1_clkreq &pcie1_perst>;
+	pinctrl-0 = <&pcie1_clkreq &pcie1_perst &wlan_reg_on>;
 	reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
 	status = "okay";
 

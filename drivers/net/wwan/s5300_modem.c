@@ -78,6 +78,7 @@
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/wwan.h>
@@ -161,6 +162,8 @@
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
 #define S5300_IPC_CP2AP_STATUS		0x80c
+#define S5300_IPC_AP2CP_KERNELTIME	0x824
+#define S5300_KERNELTIME_SEC_SHIFT	20
 /*
  * ap2cp_united_status ds_det field (downstream sbi_ds_det_pos=14, mask 0x3;
  * get_ds_detect() returns 1 on this device).  Load-bearing for runtime IPC --
@@ -1594,6 +1597,25 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 	writel(0, sm->ipc + S5300_IPC_CP2AP_STATUS);
 	for (i = 0; i < S5300_IPC_CAP_WORDS; i++)
 		writel(0, sm->ipc + S5300_IPC_CAP_BASE + 4 * i);
+}
+
+/*
+ * Downstream publishes this DRAM_V1 control message immediately before each
+ * AP2CP_PDA_ACTIVE transition.  The upper 12 bits carry monotonic seconds
+ * within the hour and the lower 20 bits carry microseconds.
+ */
+static void s5300_publish_kernel_time(struct s5300_modem *sm)
+{
+	struct timespec64 ts;
+	u32 seconds;
+	u32 useconds;
+
+	ktime_get_ts64(&ts);
+	seconds = ts.tv_sec % 3600;
+	useconds = ts.tv_nsec / NSEC_PER_USEC;
+	writel((seconds << S5300_KERNELTIME_SEC_SHIFT) | useconds,
+	       sm->ipc + S5300_IPC_AP2CP_KERNELTIME);
+	dev_info(sm->dev, "AP2CP kernel time %u.%06u\n", seconds, useconds);
 }
 
 /*
@@ -4527,6 +4549,7 @@ static int s5300_suspend_noirq(struct device *dev)
 		return -EBUSY;
 	}
 
+	s5300_publish_kernel_time(sm);
 	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
 }
 
@@ -4534,6 +4557,7 @@ static int s5300_resume_noirq(struct device *dev)
 {
 	struct s5300_modem *sm = dev_get_drvdata(dev);
 
+	s5300_publish_kernel_time(sm);
 	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
 }
 

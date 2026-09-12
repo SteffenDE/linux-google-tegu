@@ -1323,11 +1323,22 @@ EXPORT_SYMBOL_GPL(zumapro_pcie_modem_wake);
 int zumapro_pcie_modem_set_ap_active(struct device *rc_dev, bool active)
 {
 	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	int value;
+	int ret;
 
 	if (!zp || !zp->cp_pda_active)
 		return -ENODEV;
 
-	return gpiod_set_value(zp->cp_pda_active, active);
+	ret = gpiod_set_value(zp->cp_pda_active, active);
+	if (ret)
+		return ret;
+
+	value = gpiod_get_value(zp->cp_pda_active);
+	if (value < 0)
+		return value;
+
+	dev_info(zp->pci.dev, "AP2CP_PDA_ACTIVE=%d\n", value);
+	return value == active ? 0 : -EIO;
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_set_ap_active);
 

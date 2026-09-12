@@ -27,20 +27,14 @@ struct google_s2mpu {
 	struct clk *clk;
 };
 
-static int google_s2mpu_runtime_resume(struct device *dev)
+static int google_s2mpu_open(struct device *dev)
 {
 	struct google_s2mpu *s2mpu = dev_get_drvdata(dev);
 	u32 version;
-	int ret;
-
-	ret = clk_prepare_enable(s2mpu->clk);
-	if (ret)
-		return ret;
 
 	version = readl(s2mpu->base + S2MPU_VERSION);
 	if ((version & S2MPU_VERSION_MASK) != S2MPU_VERSION_9) {
 		dev_err(dev, "unsupported S2MPU version %#x\n", version);
-		clk_disable_unprepare(s2mpu->clk);
 		return -ENODEV;
 	}
 
@@ -48,6 +42,22 @@ static int google_s2mpu_runtime_resume(struct device *dev)
 	writel(S2MPU_ALL_VIDS, s2mpu->base + S2MPU_PROT_EN_PER_VID_CLR);
 	readl(s2mpu->base + S2MPU_VERSION);
 	return 0;
+}
+
+static int google_s2mpu_runtime_resume(struct device *dev)
+{
+	struct google_s2mpu *s2mpu = dev_get_drvdata(dev);
+	int ret;
+
+	ret = clk_prepare_enable(s2mpu->clk);
+	if (ret)
+		return ret;
+
+	ret = google_s2mpu_open(dev);
+	if (ret)
+		clk_disable_unprepare(s2mpu->clk);
+
+	return ret;
 }
 
 static int google_s2mpu_runtime_suspend(struct device *dev)
@@ -98,14 +108,39 @@ static void google_s2mpu_remove(struct platform_device *pdev)
 	pm_runtime_set_suspended(dev);
 }
 
+static int google_s2mpu_resume_early(struct device *dev)
+{
+	struct google_s2mpu *s2mpu = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret || dev->pm_domain || !pm_runtime_status_suspended(dev))
+		return ret;
+
+	/*
+	 * An always-on S2MPU can still lose its protection state during system
+	 * sleep.  Reopen it even when no consumer kept the runtime-PM supplier
+	 * active, while preserving its runtime-suspended clock state.
+	 */
+	ret = clk_prepare_enable(s2mpu->clk);
+	if (ret)
+		return ret;
+
+	ret = google_s2mpu_open(dev);
+	clk_disable_unprepare(s2mpu->clk);
+	return ret;
+}
+
 /*
  * Late, like the System MMU that links to this device: the device list then
  * closes the S2MPU after the MMU at suspend and reopens it before the MMU at
- * resume, the order the runtime path produces through the link.
+ * resume, the order the runtime path produces through the link.  Units with
+ * no power domain are reopened even when they were runtime-suspended because
+ * firmware sleep can reset their protection state without a genpd transition.
  */
 static const struct dev_pm_ops google_s2mpu_pm_ops = {
 	RUNTIME_PM_OPS(google_s2mpu_runtime_suspend, google_s2mpu_runtime_resume, NULL)
-	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, google_s2mpu_resume_early)
 };
 
 static const struct of_device_id google_s2mpu_of_match[] = {

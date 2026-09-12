@@ -2366,6 +2366,20 @@
 			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_SYSREG_HSI2_PCLK>;
 		};
 
+		/*
+		 * HSI2's always-on stage-2 protection unit fronts UFS and PCIe.
+		 * Firmware sleep can reset it to blocking even though it has no
+		 * Linux power domain, so its consumers keep resume ordering through
+		 * access-controllers and the provider reopens it at resume_early.
+		 */
+		s2mpu_hsi2: access-controller@131f0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x131f0000 0x10000>;
+			interrupts = <GIC_SPI 460 IRQ_TYPE_LEVEL_HIGH 0>;
+			#access-controller-cells = <0>;
+			status = "okay";
+		};
+
 		ufs_0: ufs@13200000 {
 			compatible = "google,zumapro-ufs";
 			reg = <0x13200000 0x200>,
@@ -2389,6 +2403,7 @@
 			pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
 			phys = <&ufs_0_phy>;
 			phy-names = "ufs-phy";
+			access-controllers = <&s2mpu_hsi2>;
 			samsung,sysreg = <&sysreg_hsi2 0x710>;
 			vcc-supply = <&ufs_0_fixed_vcc_reg>;
 			status = "okay";
@@ -2520,6 +2535,7 @@
 			clock-names = "dbi", "mstr", "slv", "apb";
 			phys = <&pcie_phy>;
 			phy-names = "pcie";
+			access-controllers = <&s2mpu_hsi2>;
 			samsung,pmu-syscon = <&pmu_system_controller 0x3ec8>;
 			num-lanes = <1>;
 			max-link-speed = <2>;

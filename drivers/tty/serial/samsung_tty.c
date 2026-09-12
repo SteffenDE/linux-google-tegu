@@ -1857,6 +1857,11 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 		dev_err(port->dev, "failed to find memory resource for uart\n");
 		return -EINVAL;
 	}
+	if (ourport->has_usi_v2 &&
+	    resource_size(res) < USI_V2_OPTION + sizeof(u32)) {
+		dev_err(port->dev, "register window does not contain USIv2 wrapper\n");
+		return -EINVAL;
+	}
 
 	dev_dbg(port->dev, "resource %pR)\n", res);
 
@@ -1910,6 +1915,8 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 	if (ret)
 		pr_warn("uart: failed to enable baudclk\n");
 
+	s3c24xx_serial_enable_usi_v2(port);
+
 	/* Keep all interrupts masked and cleared */
 	switch (ourport->info->type) {
 	case TYPE_S3C6400:
@@ -1936,9 +1943,6 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 	dev_dbg(port->dev, "port: map=%pa, mem=%p, irq=%d (%d,%d), clock=%u\n",
 		&port->mapbase, port->membase, port->irq,
 		ourport->rx_irq, ourport->tx_irq, port->uartclk);
-
-	/* Enable an embedded USIv2 wrapper before touching UART registers. */
-	s3c24xx_serial_enable_usi_v2(port);
 
 	/* reset the fifos (and setup the uart) */
 	s3c24xx_serial_resetport(port, cfg);
@@ -2139,6 +2143,7 @@ static int s3c24xx_serial_resume_noirq(struct device *dev)
 			clk_prepare_enable(ourport->clk);
 			if (!IS_ERR(ourport->baudclk))
 				clk_prepare_enable(ourport->baudclk);
+			s3c24xx_serial_enable_usi_v2(port);
 			wr_regl(port, S3C64XX_UINTM, uintm);
 			if (!IS_ERR(ourport->baudclk))
 				clk_disable_unprepare(ourport->baudclk);

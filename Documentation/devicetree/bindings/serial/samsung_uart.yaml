@@ -93,6 +93,13 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     enum: [16, 64, 256]
 
+  samsung,usi-serial-v2:
+    type: boolean
+    description:
+      The UART register window also contains an embedded USIv2 wrapper. The
+      wrapper must be released from reset and configured to request its clock
+      before the UART registers can be accessed after system resume.
+
 required:
   - compatible
   - clocks

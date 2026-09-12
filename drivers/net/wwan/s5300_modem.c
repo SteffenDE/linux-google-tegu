@@ -4499,6 +4499,34 @@ static void s5300_remove(struct platform_device *pdev)
 	kfifo_free(&sm->rx_fifo);
 }
 
+/*
+ * Downstream tegu (CONFIG_CP_LCD_NOTIFIER=n) uses its modem noirq callbacks to
+ * carry the AP sleep state over AP2CP_PDA_ACTIVE.  CP2AP_WAKEUP must already
+ * be low: high means the CP still needs the PCIe link and system suspend has
+ * to be retried after it parks.
+ */
+static int s5300_suspend_noirq(struct device *dev)
+{
+	struct s5300_modem *sm = dev_get_drvdata(dev);
+
+	if (gpiod_get_value(sm->cp2ap_wakeup)) {
+		dev_info(dev, "CP requests PCIe, aborting system suspend\n");
+		return -EBUSY;
+	}
+
+	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
+}
+
+static int s5300_resume_noirq(struct device *dev)
+{
+	struct s5300_modem *sm = dev_get_drvdata(dev);
+
+	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(s5300_pm_ops, s5300_suspend_noirq,
+			       s5300_resume_noirq);
+
 static const struct of_device_id s5300_of_match[] = {
 	{ .compatible = "samsung,s5300-modem" },
 	{ },
@@ -4511,6 +4539,7 @@ static struct platform_driver s5300_driver = {
 	.driver	= {
 		.name		= "s5300-modem",
 		.of_match_table	= s5300_of_match,
+		.pm		= pm_sleep_ptr(&s5300_pm_ops),
 	},
 };
 module_platform_driver(s5300_driver);

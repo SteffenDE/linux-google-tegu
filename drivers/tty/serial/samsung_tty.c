@@ -1772,6 +1772,7 @@ static void s3c24xx_serial_resetport(struct uart_port *port,
 #if defined(CONFIG_PM_SLEEP) && defined(CONFIG_SERIAL_SAMSUNG_CONSOLE)
 
 /* Embedded USI wrapper registers used by the Zumapro debug UART. */
+#define ZUMAPRO_DEBUG_UART_PA		0x10870000
 #define ZUMAPRO_USI_CON			0xc4
 #define ZUMAPRO_USI_OPTION		0xc8
 
@@ -1870,7 +1871,7 @@ static void zumapro_early_console_register(struct s3c24xx_uart_port *ourport)
 {
 	struct uart_port *port = &ourport->port;
 
-	if (!uart_console(port) ||
+	if (!uart_console(port) || port->mapbase != ZUMAPRO_DEBUG_UART_PA ||
 	    !of_machine_is_compatible("google,zumapro"))
 		return;
 

@@ -4325,6 +4325,11 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_err(dev, "CP2AP_WAKEUP request_irq: %d\n", ret);
 		goto err_wq;
 	}
+	ret = enable_irq_wake(sm->cp2ap_irq);
+	if (ret) {
+		dev_err(dev, "CP2AP_WAKEUP enable_irq_wake: %d\n", ret);
+		goto err_cp2ap_irq;
+	}
 
 	/*
 	 * Optional CP-crash detector: CP_ACTIVE falling edge.  Armed with the
@@ -4413,6 +4418,8 @@ err_boot0:
 err_cp2ap:
 	if (sm->cp2ap_active_irq > 0)
 		free_irq(sm->cp2ap_active_irq, sm);
+	disable_irq_wake(sm->cp2ap_irq);
+err_cp2ap_irq:
 	free_irq(sm->cp2ap_irq, sm);
 err_wq:
 	destroy_workqueue(sm->pm_wq);
@@ -4456,6 +4463,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 */
 	if (sm->cp2ap_active_irq > 0)
 		free_irq(sm->cp2ap_active_irq, sm);
+	disable_irq_wake(sm->cp2ap_irq);
 	free_irq(sm->cp2ap_irq, sm);
 	zumapro_pcie_unregister_linkdown_cb(sm->rc_dev);
 	/*
@@ -4509,6 +4517,11 @@ static int s5300_suspend_noirq(struct device *dev)
 {
 	struct s5300_modem *sm = dev_get_drvdata(dev);
 
+	/*
+	 * Downstream permits this during an explicitly tracked voice call.
+	 * Mainline has no in-kernel call-state notifier yet, so stay conservative
+	 * and reject every high level rather than risk sleeping under CP traffic.
+	 */
 	if (gpiod_get_value(sm->cp2ap_wakeup)) {
 		dev_info(dev, "CP requests PCIe, aborting system suspend\n");
 		return -EBUSY;

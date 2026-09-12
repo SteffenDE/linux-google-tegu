@@ -1327,8 +1327,7 @@ int zumapro_pcie_modem_set_ap_active(struct device *rc_dev, bool active)
 	if (!zp || !zp->cp_pda_active)
 		return -ENODEV;
 
-	gpiod_set_value(zp->cp_pda_active, active);
-	return 0;
+	return gpiod_set_value(zp->cp_pda_active, active);
 }
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_set_ap_active);
 

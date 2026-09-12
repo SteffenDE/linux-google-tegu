@@ -703,6 +703,7 @@ struct s5300_modem {
 	bool			link_up;	/* RC link powered on (sm->lock) */
 	bool			db_reserved;	/* doorbell deferred to wake (sm->lock) */
 	bool			relink_requested; /* sudden-linkdown relink pending (sm->lock) */
+	bool			resume_recheck; /* reconcile a noirq-forced link park */
 	unsigned long		last_linkdown;	/* jiffies of last linkdown relink (rate limit) */
 	unsigned long		fmt_busy_until;	/* inhibit park during an FMT transfer (jiffies) */
 	struct delayed_work	park_work;	/* deferred-park re-check (queues pm_work) */
@@ -1209,6 +1210,7 @@ static void s5300_pm_work(struct work_struct *work)
 {
 	struct s5300_modem *sm = container_of(work, struct s5300_modem, pm_work);
 	bool want_up = gpiod_get_value_cansleep(sm->cp2ap_wakeup);
+	bool resume_recheck;
 	unsigned long flags;
 
 	/*
@@ -1222,6 +1224,26 @@ static void s5300_pm_work(struct work_struct *work)
 		return;
 
 	mutex_lock(&sm->pcie_onoff_lock);
+
+	spin_lock_irqsave(&sm->lock, flags);
+	resume_recheck = sm->resume_recheck;
+	sm->resume_recheck = false;
+	spin_unlock_irqrestore(&sm->lock, flags);
+
+	/*
+	 * The RC's system-suspend callback parks a link that was still up after
+	 * the runtime worker deferred its own park, and deliberately suppresses
+	 * the link-down callback for that intentional teardown.  Reconcile the
+	 * cached state after all device resume callbacks have completed, before
+	 * deciding whether a CP wake request needs a relink.
+	 */
+	if (resume_recheck && READ_ONCE(sm->link_up) &&
+	    !zumapro_pcie_modem_link_active(sm->rc_dev)) {
+		spin_lock_irqsave(&sm->lock, flags);
+		sm->link_up = false;
+		spin_unlock_irqrestore(&sm->lock, flags);
+		dev_dbg(sm->dev, "system resume: link was parked by RC\n");
+	}
 
 	/*
 	 * Relink when the CP asks (CP2AP_WAKEUP high) OR when the AP itself has a
@@ -4329,8 +4351,12 @@ static int s5300_probe(struct platform_device *pdev)
 	 * link back (or announce it is parking).  Requested disabled -- the boot
 	 * path still polls this GPIO for the mid-boot re-link -- and enabled once
 	 * the CP reaches ONLINE (PHONE_START).  Ordered wq: relinks must not race.
+	 * Keep it frozen across system sleep: wake IRQs are enabled before
+	 * resume_early reopens the always-on HSI1 S2MPU, and an immediate relink
+	 * would let the CP fault its first shared-memory DMA.  A queued worker
+	 * reads the current GPIO level after thaw, so no edge is lost.
 	 */
-	sm->pm_wq = alloc_ordered_workqueue("s5300-pm", 0);
+	sm->pm_wq = alloc_ordered_workqueue("s5300-pm", WQ_FREEZABLE);
 	if (!sm->pm_wq) {
 		ret = -ENOMEM;
 		goto err_irq;
@@ -4556,9 +4582,19 @@ static int s5300_suspend_noirq(struct device *dev)
 static int s5300_resume_noirq(struct device *dev)
 {
 	struct s5300_modem *sm = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
 
 	s5300_publish_kernel_time(sm);
-	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
+	ret = zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
+
+	/* pm_wq stays frozen until every device resume callback has completed. */
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->resume_recheck = true;
+	spin_unlock_irqrestore(&sm->lock, flags);
+	queue_work(sm->pm_wq, &sm->pm_work);
+
+	return ret;
 }
 
 static DEFINE_NOIRQ_DEV_PM_OPS(s5300_pm_ops, s5300_suspend_noirq,

@@ -12,10 +12,12 @@ maintainers:
 description:
   The S2MPU checks physical memory accesses from a DMA master and its stage-1
   IOMMU. Its protection state is lost when the containing power domain turns
-  off. Consumers reference the whole controller through access-controllers.
-  The bus clock is the clock provider's way of ordering the CMU's restore
-  before the S2MPU is touched; a block whose CMU is restored by its power
-  domain instead has no clock to name.
+  off, and some always-on units reset during system sleep without belonging to
+  a Linux power domain. Consumers reference the whole controller through
+  access-controllers. The bus clock is the clock provider's way of ordering
+  the CMU's restore before the S2MPU is touched; a block whose CMU is restored
+  by its power domain, or remains accessible across system sleep, has no clock
+  to name.
 
 properties:
   compatible:
@@ -43,7 +45,6 @@ required:
   - compatible
   - reg
   - interrupts
-  - power-domains
   - "#access-controller-cells"
 
 additionalProperties: false

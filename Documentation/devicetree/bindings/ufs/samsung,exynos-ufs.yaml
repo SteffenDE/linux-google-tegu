@@ -66,6 +66,10 @@ properties:
   power-domains:
     maxItems: 1
 
+  access-controllers:
+    maxItems: 1
+    description: Stage-2 protection unit covering the UFS DMA path.
+
   samsung,sysreg:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     items:

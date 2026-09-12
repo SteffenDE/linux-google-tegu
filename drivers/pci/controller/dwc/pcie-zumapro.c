@@ -1311,6 +1311,38 @@ int zumapro_pcie_modem_wake(struct device *rc_dev)
 EXPORT_SYMBOL_GPL(zumapro_pcie_modem_wake);
 
 /*
+ * Tell the CP whether the AP is awake.  Downstream's s5300 suspend_noirq path
+ * lowers AP2CP_PDA_ACTIVE before system sleep and raises it again on resume;
+ * without that handshake the CP keeps treating the disappearing AP/HSI1
+ * fabric as live and falls out of ONLINE during deep sleep.
+ *
+ * This is called from noirq system-sleep callbacks.  The GPIO is a Samsung
+ * SoC GPIO and therefore non-sleeping; cp_power_on() has already configured it
+ * as an output.
+ */
+int zumapro_pcie_modem_set_ap_active(struct device *rc_dev, bool active)
+{
+	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
+	int value;
+	int ret;
+
+	if (!zp || !zp->cp_pda_active)
+		return -ENODEV;
+
+	ret = gpiod_set_value(zp->cp_pda_active, active);
+	if (ret)
+		return ret;
+
+	value = gpiod_get_value(zp->cp_pda_active);
+	if (value < 0)
+		return value;
+
+	dev_info(zp->pci.dev, "AP2CP_PDA_ACTIVE=%d\n", value);
+	return value == active ? 0 : -EIO;
+}
+EXPORT_SYMBOL_GPL(zumapro_pcie_modem_set_ap_active);
+
+/*
  * Enable ASPM L1.1/L1.2 on the modem link once the CP is ONLINE.  Deferred out
  * of host_post_init() because at enumeration the endpoint is the CP mask ROM,
  * which can't take L1 mid-boot; the modem driver calls this after the boot

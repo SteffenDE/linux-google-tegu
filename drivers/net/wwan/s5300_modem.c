@@ -78,6 +78,7 @@
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/wwan.h>
@@ -161,6 +162,8 @@
 #define S5300_IPC_CP2AP_MSG		0x804
 #define S5300_IPC_AP2CP_STATUS		0x808
 #define S5300_IPC_CP2AP_STATUS		0x80c
+#define S5300_IPC_AP2CP_KERNELTIME	0x824
+#define S5300_KERNELTIME_SEC_SHIFT	20
 /*
  * ap2cp_united_status ds_det field (downstream sbi_ds_det_pos=14, mask 0x3;
  * get_ds_detect() returns 1 on this device).  Load-bearing for runtime IPC --
@@ -1594,6 +1597,25 @@ static void s5300_init_control_messages(struct s5300_modem *sm)
 	writel(0, sm->ipc + S5300_IPC_CP2AP_STATUS);
 	for (i = 0; i < S5300_IPC_CAP_WORDS; i++)
 		writel(0, sm->ipc + S5300_IPC_CAP_BASE + 4 * i);
+}
+
+/*
+ * Downstream publishes this DRAM_V1 control message immediately before each
+ * AP2CP_PDA_ACTIVE transition.  The upper 12 bits carry monotonic seconds
+ * within the hour and the lower 20 bits carry microseconds.
+ */
+static void s5300_publish_kernel_time(struct s5300_modem *sm)
+{
+	struct timespec64 ts;
+	u32 seconds;
+	u32 useconds;
+
+	ktime_get_ts64(&ts);
+	seconds = ts.tv_sec % 3600;
+	useconds = ts.tv_nsec / NSEC_PER_USEC;
+	writel((seconds << S5300_KERNELTIME_SEC_SHIFT) | useconds,
+	       sm->ipc + S5300_IPC_AP2CP_KERNELTIME);
+	dev_info(sm->dev, "AP2CP kernel time %u.%06u\n", seconds, useconds);
 }
 
 /*
@@ -4325,6 +4347,11 @@ static int s5300_probe(struct platform_device *pdev)
 		dev_err(dev, "CP2AP_WAKEUP request_irq: %d\n", ret);
 		goto err_wq;
 	}
+	ret = enable_irq_wake(sm->cp2ap_irq);
+	if (ret) {
+		dev_err(dev, "CP2AP_WAKEUP enable_irq_wake: %d\n", ret);
+		goto err_cp2ap_irq;
+	}
 
 	/*
 	 * Optional CP-crash detector: CP_ACTIVE falling edge.  Armed with the
@@ -4413,6 +4440,8 @@ err_boot0:
 err_cp2ap:
 	if (sm->cp2ap_active_irq > 0)
 		free_irq(sm->cp2ap_active_irq, sm);
+	disable_irq_wake(sm->cp2ap_irq);
+err_cp2ap_irq:
 	free_irq(sm->cp2ap_irq, sm);
 err_wq:
 	destroy_workqueue(sm->pm_wq);
@@ -4456,6 +4485,7 @@ static void s5300_remove(struct platform_device *pdev)
 	 */
 	if (sm->cp2ap_active_irq > 0)
 		free_irq(sm->cp2ap_active_irq, sm);
+	disable_irq_wake(sm->cp2ap_irq);
 	free_irq(sm->cp2ap_irq, sm);
 	zumapro_pcie_unregister_linkdown_cb(sm->rc_dev);
 	/*
@@ -4499,6 +4529,41 @@ static void s5300_remove(struct platform_device *pdev)
 	kfifo_free(&sm->rx_fifo);
 }
 
+/*
+ * Downstream tegu (CONFIG_CP_LCD_NOTIFIER=n) uses its modem noirq callbacks to
+ * carry the AP sleep state over AP2CP_PDA_ACTIVE.  CP2AP_WAKEUP must already
+ * be low: high means the CP still needs the PCIe link and system suspend has
+ * to be retried after it parks.
+ */
+static int s5300_suspend_noirq(struct device *dev)
+{
+	struct s5300_modem *sm = dev_get_drvdata(dev);
+
+	/*
+	 * Downstream permits this during an explicitly tracked voice call.
+	 * Mainline has no in-kernel call-state notifier yet, so stay conservative
+	 * and reject every high level rather than risk sleeping under CP traffic.
+	 */
+	if (gpiod_get_value(sm->cp2ap_wakeup)) {
+		dev_info(dev, "CP requests PCIe, aborting system suspend\n");
+		return -EBUSY;
+	}
+
+	s5300_publish_kernel_time(sm);
+	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
+}
+
+static int s5300_resume_noirq(struct device *dev)
+{
+	struct s5300_modem *sm = dev_get_drvdata(dev);
+
+	s5300_publish_kernel_time(sm);
+	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(s5300_pm_ops, s5300_suspend_noirq,
+			       s5300_resume_noirq);
+
 static const struct of_device_id s5300_of_match[] = {
 	{ .compatible = "samsung,s5300-modem" },
 	{ },
@@ -4511,6 +4576,7 @@ static struct platform_driver s5300_driver = {
 	.driver	= {
 		.name		= "s5300-modem",
 		.of_match_table	= s5300_of_match,
+		.pm		= pm_sleep_ptr(&s5300_pm_ops),
 	},
 };
 module_platform_driver(s5300_driver);

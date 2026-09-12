@@ -25,11 +25,12 @@ source "drivers/hwtracing/coresight/Kconfig"
 config ARM64_RESUME_ENTRY_RESET_PROBE
 	bool "DIAGNOSTIC: reset the machine at the suspend resume entry point"
 	help
-	  Reset the machine from the first instruction of cpu_resume, before
-	  the MMU, the stack or any DRAM access.  The reboot is then the only
-	  signal needed to prove the firmware brought the AP back, on a machine
-	  where suspend-to-RAM goes down and never returns and every later
-	  probe depends on state that may not have survived.
+	  Reset the machine from the first instructions of cpu_resume, before
+	  restoring the MMU, stack or CPU state and before any explicit data
+	  access.  An automatic reboot proves that firmware transferred control
+	  to the AP, instruction fetch from the resume text worked, and the reset
+	  SMC was serviced.  Silence remains ambiguous because fetching this code
+	  still depends on executable DRAM and the reset SMC can itself fail.
 
 	  This makes suspend-to-RAM and every power-down idle state reset the
 	  machine, so a kernel built with it is good for one measurement and

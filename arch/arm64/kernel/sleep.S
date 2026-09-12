@@ -105,18 +105,19 @@ SYM_CODE_START(cpu_resume)
 	 *
 	 * This is the first instruction the AP executes after the firmware
 	 * brings it back: EL3 jumps here with the MMU off, before
-	 * init_kernel_el(), before __cpu_setup(), before any DRAM access, and
-	 * long before a console exists.  Reset the machine from here and the
-	 * reboot itself is the signal -- it needs no memory, no restored clock
-	 * tree and no working console, which is what every earlier probe
-	 * needed and could not get.
+	 * init_kernel_el(), before __cpu_setup(), before any explicit data
+	 * access and long before a console exists.  Reset the machine from here
+	 * and an automatic reboot proves that firmware transferred control,
+	 * instruction fetch from the resume text worked and EL3 serviced the
+	 * reset SMC.  Silence remains ambiguous: the instructions themselves
+	 * are fetched from DRAM, and the reset SMC can fail.
 	 *
 	 * The existing PSCI probe panics after cpu_suspend() has already
 	 * restored the MMU, the stack and the CPU state, and panic() can then
 	 * stall in its own console flush; the watchdog cannot report either,
 	 * because its block loses its enable bit when it loses power.  Neither
 	 * can tell "the AP was never powered up" from "the AP came back and
-	 * could not say so".  This can.
+	 * could not say so".  This provides an earlier positive witness.
 	 *
 	 * Unconditional on purpose: a flag would have to be read from memory
 	 * that may not have survived, which is the very thing in question.

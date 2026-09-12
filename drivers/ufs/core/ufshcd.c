@@ -5259,7 +5259,11 @@ link_startup:
 	do {
 		ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
 
+		if (hba->vops && hba->vops->debug_link_startup)
+			hba->vops->debug_link_startup(hba, true, 0);
 		ret = ufshcd_dme_link_startup(hba);
+		if (hba->vops && hba->vops->debug_link_startup)
+			hba->vops->debug_link_startup(hba, false, ret);
 
 		/* check if device is detected by inter-connect layer */
 		if (!ret && !ufshcd_is_device_present(hba)) {

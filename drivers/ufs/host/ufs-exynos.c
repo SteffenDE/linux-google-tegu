@@ -1829,10 +1829,29 @@ out:
 static void exynos_ufs_dev_hw_reset(struct ufs_hba *hba)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	bool debug = (ufs->opts & EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL) &&
+		     !ufs->debug_link_dumped;
+	u32 old = 0, low = 0, high = 0;
+	u32 misc = 0, stop = 0, refsel = 0;
+
+	if (debug) {
+		old = hci_readl(ufs, HCI_GPIO_OUT);
+		misc = hci_readl(ufs, HCI_MISC);
+		stop = hci_readl(ufs, HCI_CLKSTOP_CTRL);
+		refsel = hci_readl(ufs, 0x108);
+	}
 
 	hci_writel(ufs, 0 << 0, HCI_GPIO_OUT);
+	if (debug)
+		low = hci_readl(ufs, HCI_GPIO_OUT);
 	udelay(5);
 	hci_writel(ufs, 1 << 0, HCI_GPIO_OUT);
+	if (debug) {
+		high = hci_readl(ufs, HCI_GPIO_OUT);
+		dev_info(hba->dev,
+			 "UFSDBG device-reset gpio=%#x/%#x/%#x misc=%#x stop=%#x refsel=%#x delay-us=5\n",
+			 old, low, high, misc, stop, refsel);
+	}
 }
 
 static void exynos_ufs_pre_hibern8(struct ufs_hba *hba, enum uic_cmd_dme cmd)
@@ -1960,6 +1979,157 @@ static int exynos_ufs_link_startup_notify(struct ufs_hba *hba,
 	return ret;
 }
 
+/* Uncommitted diagnostic; no clear-on-read standard error reads. */
+#if IS_REACHABLE(CONFIG_COMMON_CLK_SAMSUNG)
+extern void samsung_ufs_debug_clocks(const char *stage);
+#endif
+
+#if IS_REACHABLE(CONFIG_PHY_SAMSUNG_UFS)
+extern void samsung_ufs_debug_pma(struct phy *phy, const u32 *offsets,
+				 u32 *values, unsigned int count);
+
+static void zumapro_ufs_debug_lanes(struct exynos_ufs *ufs, const char *stage)
+{
+	/* PCS attributes read by the vendor dump, plus pre-link CAL settings. */
+	static const u16 tx_attrs[] = {
+		0x21, 0x22, 0x23, 0x24, 0x28, 0x29, 0x2a, 0x2b,
+		0x2c, 0x2d, 0x33, 0x35, 0x36, 0x41,
+		0x04, 0x7f, 0xa9, 0xaa, 0xab, 0xac, 0xad,
+	};
+	static const u16 rx_attrs[] = {
+		0xa1, 0xa2, 0xa3, 0xa4, 0xa7, 0xc1, 0x06, 0x12,
+		0x19, 0x23, 0x24, 0x5d,
+		0x11, 0x1b, 0x1c, 0x1d, 0x2f, 0x84, 0x25,
+	};
+	/* Byte offsets from the vendor PMA dump; lane 1 is +0x800. */
+	static const u32 pma_common[] = { 0x178, 0x184, 0x188 };
+	static const u32 pma_lane[] = {
+		0xbec, 0xbf0, 0xbf4, 0xbf8, 0xbfc, 0xc00,
+		0xc40, 0xc44, 0xc58, 0xc5c, 0xc74, 0xc78,
+		0xc7c, 0xcbc, 0xcc8, 0xccc,
+	};
+	u32 tx[2][ARRAY_SIZE(tx_attrs)], rx[2][ARRAY_SIZE(rx_attrs)];
+	u32 common[ARRAY_SIZE(pma_common)], pma[2][ARRAY_SIZE(pma_lane)];
+	u32 offsets[ARRAY_SIZE(pma_lane)];
+	u32 misc, aux, restored_misc, restored_aux;
+	unsigned int i, lane;
+
+	if (ufs->avail_ln_tx != 2 || ufs->avail_ln_rx != 2) {
+		dev_info(ufs->hba->dev, "UFSDBG %s lane dump skipped: not 2/2\n",
+			 stage);
+		return;
+	}
+	misc = hci_readl(ufs, HCI_MISC);
+	aux = unipro_readl(ufs, 0x40);
+	/* Match the vendor dump's access-clock window, restoring it exactly. */
+	hci_writel(ufs, misc & ~(MPHY_APBCLK_CTRL_EN | UNIPRO_MCLK_CTRL_EN),
+		   HCI_MISC);
+	hci_readl(ufs, HCI_MISC);
+	samsung_ufs_debug_pma(ufs->phy, pma_common, common,
+			      ARRAY_SIZE(pma_common));
+	for (lane = 0; lane < 2; lane++) {
+		for (i = 0; i < ARRAY_SIZE(pma_lane); i++)
+			offsets[i] = pma_lane[i] + lane * 0x800;
+		samsung_ufs_debug_pma(ufs->phy, offsets, pma[lane],
+				      ARRAY_SIZE(pma_lane));
+		/* AXI AUX selector: TX 0/1, RX 4/5, full write strobes. */
+		unipro_writel(ufs, 0xf000000 | lane, 0x40);
+		for (i = 0; i < ARRAY_SIZE(tx_attrs); i++)
+			tx[lane][i] = unipro_readl(ufs, 0x2000 + tx_attrs[i] * 4);
+		unipro_writel(ufs, 0xf000000 | (4 + lane), 0x40);
+		for (i = 0; i < ARRAY_SIZE(rx_attrs); i++)
+			rx[lane][i] = unipro_readl(ufs, 0x2000 + rx_attrs[i] * 4);
+	}
+	unipro_writel(ufs, aux, 0x40);
+	restored_aux = unipro_readl(ufs, 0x40);
+	hci_writel(ufs, misc, HCI_MISC);
+	restored_misc = hci_readl(ufs, HCI_MISC);
+
+	/* Print only after all reads and restoration, not inside the window. */
+	dev_info(ufs->hba->dev, "UFSDBG %s lane-probe misc=%#x/%#x aux=%#x/%#x\n",
+		 stage, misc, restored_misc, aux, restored_aux);
+	for (i = 0; i < ARRAY_SIZE(pma_common); i++)
+		dev_info(ufs->hba->dev, "UFSDBG %s PMA[%#x]=%#x\n",
+			 stage, pma_common[i], common[i]);
+	for (i = 0; i < ARRAY_SIZE(pma_lane); i++)
+		dev_info(ufs->hba->dev, "UFSDBG %s PMA-lanes[%#x]=%#x/%#x\n",
+			 stage, pma_lane[i], pma[0][i], pma[1][i]);
+	for (i = 0; i < ARRAY_SIZE(tx_attrs); i++)
+		dev_info(ufs->hba->dev, "UFSDBG %s PCS-TX[%#x]=%#x/%#x\n",
+			 stage, tx_attrs[i], tx[0][i], tx[1][i]);
+	for (i = 0; i < ARRAY_SIZE(rx_attrs); i++)
+		dev_info(ufs->hba->dev, "UFSDBG %s PCS-RX[%#x]=%#x/%#x\n",
+			 stage, rx_attrs[i], rx[0][i], rx[1][i]);
+}
+#endif
+
+static void zumapro_ufs_debug_link(struct ufs_hba *hba, bool before, int result)
+{
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	const char *stage = before ? "before-link" : "after-link";
+	static const u32 hci_regs[] = {
+		0x0c, 0x68, 0xb0, 0xb4, 0xc0, 0xfc, 0x100, 0x108,
+	};
+	static const u32 unipro_regs[] = {
+		0x44, 0x2800, 0x2808, 0x39a8, 0x39b4, 0x7854,
+		0x7d00, 0x7d14, 0x7d18, 0x7e10, 0x7e14,
+		0x7e20, 0x7e24, 0x7e28, 0x7e2c,
+		0x7e30, 0x7e34, 0x7e38, 0x7e3c,
+	};
+	struct ufs_event_hist events[UFS_EVT_DME_ERR + 1];
+	unsigned long flags;
+	unsigned int i;
+
+	if (!(ufs->opts & EXYNOS_UFS_OPT_EXPLICIT_PHY_CAL) ||
+	    ufs->debug_link_failed ||
+	    (ufs->debug_link_dumped && (before || !result)))
+		return;
+
+	dev_info(hba->dev,
+		 "UFSDBG %s result=%d hce=%#x hcs=%#x gpio=%#x lanes=%d/%d cached-mclk=%lu\n",
+		 stage, result, ufshcd_readl(hba, REG_CONTROLLER_ENABLE),
+		 ufshcd_readl(hba, REG_CONTROLLER_STATUS),
+		 hci_readl(ufs, HCI_GPIO_OUT), ufs->avail_ln_rx,
+		 ufs->avail_ln_tx, ufs->mclk_rate);
+	dev_info(hba->dev, "UFSDBG %s UIC cmd=%#x arg1=%#x arg2=%#x arg3=%#x\n",
+		 stage, ufshcd_readl(hba, REG_UIC_COMMAND),
+		 ufshcd_readl(hba, REG_UIC_COMMAND_ARG_1),
+		 ufshcd_readl(hba, REG_UIC_COMMAND_ARG_2),
+		 ufshcd_readl(hba, REG_UIC_COMMAND_ARG_3));
+	/* CCF values are model-derived; Shared0 is a fixed-rate placeholder. */
+	dev_info(hba->dev, "UFSDBG %s CCF hci-hz=%lu unipro-hz=%lu\n", stage,
+		 clk_get_rate(ufs->clk_hci_core), clk_get_rate(ufs->clk_unipro_main));
+	for (i = 0; i < ARRAY_SIZE(hci_regs); i++)
+		dev_info(hba->dev, "UFSDBG %s HCI[%#x]=%#x\n", stage,
+			 hci_regs[i], hci_readl(ufs, hci_regs[i]));
+	for (i = 0; i < ARRAY_SIZE(unipro_regs); i++)
+		dev_info(hba->dev, "UFSDBG %s UniPro[%#x]=%#x\n", stage,
+			 unipro_regs[i], unipro_readl(ufs, unipro_regs[i]));
+
+	/* Use the IRQ handler's saved errors rather than consuming UECPA, etc. */
+	spin_lock_irqsave(hba->host->host_lock, flags);
+	memcpy(events, hba->ufs_stats.event, sizeof(events));
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(events); i++) {
+		struct ufs_event_hist *e = &events[i];
+		unsigned int last = (e->pos + UFS_EVENT_HIST_LENGTH - 1) %
+				    UFS_EVENT_HIST_LENGTH;
+
+		dev_info(hba->dev, "UFSDBG %s event=%u count=%llu last=%#x stamp=%llu\n",
+			 stage, i, e->cnt, e->val[last], e->tstamp[last]);
+	}
+#if IS_REACHABLE(CONFIG_COMMON_CLK_SAMSUNG)
+	samsung_ufs_debug_clocks(stage);
+#endif
+#if IS_REACHABLE(CONFIG_PHY_SAMSUNG_UFS)
+	zumapro_ufs_debug_lanes(ufs, stage);
+#endif
+	if (!before) {
+		ufs->debug_link_dumped = true;
+		ufs->debug_link_failed = result != 0;
+	}
+}
+
 static int exynos_ufs_negotiate_pwr_mode(struct ufs_hba *hba,
 					 const struct ufs_pa_layer_attr *dev_max_params,
 					 struct ufs_pa_layer_attr *dev_req_params)
@@ -2035,6 +2205,8 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 	int ret;
 
+	ufs->debug_link_dumped = false;
+	ufs->debug_link_failed = false;
 	if (!ufshcd_is_link_active(hba)) {
 		ret = phy_power_on(ufs->phy);
 		if (ret)
@@ -2399,6 +2571,7 @@ static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
 	.exit				= exynos_ufs_exit,
 	.hce_enable_notify		= exynos_ufs_hce_enable_notify,
 	.link_startup_notify		= exynos_ufs_link_startup_notify,
+	.debug_link_startup		= zumapro_ufs_debug_link,
 	.negotiate_pwr_mode		= exynos_ufs_negotiate_pwr_mode,
 	.pwr_change_notify		= exynos_ufs_pwr_change_notify,
 	.setup_clocks			= exynos_ufs_setup_clocks,

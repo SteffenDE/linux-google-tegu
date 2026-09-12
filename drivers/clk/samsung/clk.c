@@ -21,6 +21,47 @@
 
 static LIST_HEAD(clock_reg_cache_list);
 
+/* Uncommitted UFS resume probe: reuse the providers' existing mappings. */
+static void __iomem *ufs_debug_top;
+static void __iomem *ufs_debug_hsi2;
+
+void samsung_ufs_debug_clocks(const char *stage);
+void samsung_ufs_debug_clocks(const char *stage)
+{
+	static const u32 top_regs[] = {
+		/* Shared0 supplies the observed UFS and HSI2 NoC mux selections. */
+		0x014c, 0x0160, 0x0800,
+		0x10b0, 0x18a8, 0x20d8, 0x60d8,
+		0x10b8, 0x18b0, 0x20e0, 0x60e0,
+	};
+	static const u32 hsi2_regs[] = {
+		0x0614, 0x0634, 0x0800,
+		0x0610, 0x0630, 0x210c, 0x610c, 0x2110, 0x6110,
+		0x2114, 0x6114, 0x2008, 0x6008, 0x302c, 0x702c,
+		0x30c4, 0x70c4, 0x30c8, 0x70c8,
+	};
+	u32 con3, con8;
+	unsigned int i;
+
+	if (!ufs_debug_top || !ufs_debug_hsi2) {
+		pr_info("UFSDBG %s CMU mappings missing\n", stage);
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(top_regs); i++)
+		pr_info("UFSDBG %s CMU_TOP[%#x]=%#x\n", stage,
+			top_regs[i], readl(ufs_debug_top + top_regs[i]));
+	for (i = 0; i < ARRAY_SIZE(hsi2_regs); i++)
+		pr_info("UFSDBG %s CMU_HSI2[%#x]=%#x\n", stage,
+			hsi2_regs[i], readl(ufs_debug_hsi2 + hsi2_regs[i]));
+	con3 = readl(ufs_debug_top + 0x14c);
+	con8 = readl(ufs_debug_top + 0x160);
+	pr_info("UFSDBG %s SHARED0 enable=%u stable=%u mux=%u P=%u M=%u S=%u F=%#x\n",
+		stage, !!(con3 & BIT(31)), !!(con3 & BIT(29)),
+		!!(con3 & BIT(4)), (con3 >> 8) & 0x3f,
+		(con3 >> 16) & 0x3ff, con3 & 7, con8);
+}
+EXPORT_SYMBOL_GPL(samsung_ufs_debug_clocks);
+
 void samsung_clk_save(void __iomem *base,
 				    struct regmap *regmap,
 				    struct samsung_clk_reg_dump *rd,
@@ -100,6 +141,10 @@ void __init samsung_clk_of_add_provider(struct device_node *np,
 				struct samsung_clk_provider *ctx)
 {
 	if (np) {
+		if (of_device_is_compatible(np, "google,zumapro-cmu-top"))
+			ufs_debug_top = ctx->reg_base;
+		if (of_device_is_compatible(np, "google,zumapro-cmu-hsi2"))
+			ufs_debug_hsi2 = ctx->reg_base;
 		if (of_clk_add_hw_provider(np, of_clk_hw_onecell_get,
 					&ctx->clk_data))
 			panic("could not register clk provider\n");

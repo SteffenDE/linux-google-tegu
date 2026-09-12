@@ -152,6 +152,9 @@ static inline void samsung_ufs_phy_ctrl_isol(
 }
 
 int samsung_ufs_phy_wait_for_lock_acq(struct phy *phy, u8 lane);
+/* Temporary diagnostic: caller keeps the M-PHY APB clock running. */
+void samsung_ufs_debug_pma(struct phy *phy, const u32 *offsets, u32 *values,
+			   unsigned int count);
 int exynosautov920_ufs_phy_wait_cdr_lock(struct phy *phy, u8 lane);
 void samsung_ufs_phy_config(struct samsung_ufs_phy *phy,
 			    const struct samsung_ufs_phy_cfg *cfg, u8 lane);

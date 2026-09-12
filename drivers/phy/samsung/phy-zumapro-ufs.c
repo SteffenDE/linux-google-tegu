@@ -8,6 +8,7 @@
 
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/module.h>
 
 #include "phy-samsung-ufs.h"
 
@@ -84,6 +85,8 @@ static int zumapro_phy_wait_for_calibration(struct phy *phy, u8 lane)
 	err = readl_poll_timeout(ufs_phy->reg_pma + off,
 				 val, (val & PHY_ZUMAPRO_EMB_CAL_DONE_BIT),
 				 sleep_us, timeout_us);
+	dev_info(ufs_phy->dev, "UFSDBG CAL lane=%u value=%#x ret=%d\n",
+		 lane, val, err);
 	if (err)
 		dev_warn(ufs_phy->dev,
 			 "lane %u embedded phy cal done bit not set (continuing)\n",
@@ -91,6 +94,17 @@ static int zumapro_phy_wait_for_calibration(struct phy *phy, u8 lane)
 
 	return 0;
 }
+
+void samsung_ufs_debug_pma(struct phy *phy, const u32 *offsets, u32 *values,
+			   unsigned int count)
+{
+	struct samsung_ufs_phy *ufs_phy = get_samsung_ufs_phy(phy);
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		values[i] = readl(ufs_phy->reg_pma + offsets[i]);
+}
+EXPORT_SYMBOL_GPL(samsung_ufs_debug_pma);
 
 const struct samsung_ufs_phy_drvdata tensor_zumapro_ufs_phy = {
 	.cfgs = tensor_zumapro_ufs_phy_cfgs,

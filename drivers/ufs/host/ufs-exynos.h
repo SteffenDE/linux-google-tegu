@@ -234,6 +234,8 @@ struct exynos_ufs {
 	ktime_t entry_hibern8_t;
 	const struct exynos_ufs_drv_data *drv_data;
 	bool clks_gated_for_link_off;
+	bool debug_link_dumped;
+	bool debug_link_failed;
 	struct regmap *sysreg;
 	u32 iocc_offset;
 	u32 iocc_mask;

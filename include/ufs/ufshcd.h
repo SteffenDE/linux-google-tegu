@@ -433,6 +433,8 @@ struct ufs_hba_variant_ops {
 				     enum ufs_notify_change_status);
 	int	(*link_startup_notify)(struct ufs_hba *,
 				       enum ufs_notify_change_status);
+	/* Temporary first-attempt observation, including failed startup. */
+	void	(*debug_link_startup)(struct ufs_hba *, bool before, int result);
 	int	(*negotiate_pwr_mode)(struct ufs_hba *hba,
 				      const struct ufs_pa_layer_attr *desired_pwr_mode,
 				      struct ufs_pa_layer_attr *final_params);

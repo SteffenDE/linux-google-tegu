@@ -1364,6 +1364,13 @@ static int __maybe_unused samsung_pinctrl_suspend(struct device *dev)
 			if (widths[type])
 				bank->pm_save[type] = readl(reg + offs[type]);
 
+		if (!strcmp(bank->name, "gph5") &&
+		    of_device_is_compatible(dev->of_node, "google,zumapro-pinctrl"))
+			for (type = 0; type < PINCFG_TYPE_NUM; type++)
+				if (widths[type])
+					dev_info(dev, "UFSDBG pins-save type=%u off=%#x value=%#x\n",
+						 type, offs[type], bank->pm_save[type]);
+
 		if (widths[PINCFG_TYPE_FUNC] * bank->nr_pins > 32) {
 			/* Some banks have two config registers */
 			bank->pm_save[PINCFG_TYPE_NUM] =
@@ -1453,6 +1460,13 @@ static int __maybe_unused samsung_pinctrl_resume(struct device *dev)
 		for (type = 0; type < PINCFG_TYPE_NUM; type++)
 			if (widths[type])
 				writel(bank->pm_save[type], reg + offs[type]);
+
+		if (!strcmp(bank->name, "gph5") &&
+		    of_device_is_compatible(dev->of_node, "google,zumapro-pinctrl"))
+			for (type = 0; type < PINCFG_TYPE_NUM; type++)
+				if (widths[type])
+					dev_info(dev, "UFSDBG pins-restored type=%u off=%#x value=%#x\n",
+						 type, offs[type], readl(reg + offs[type]));
 	}
 
 	clk_disable(drvdata->pclk);

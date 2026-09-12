@@ -183,6 +183,43 @@
 	};
 
 	/*
+	 * Interconnect transaction monitors.  Interrupts are from downstream
+	 * exynos-itmon in research/dumped.dts:1756-1767.  Register ranges and
+	 * their order follow downstream's hard-coded Zumapro node-group table.
+	 */
+	itmon@26440000 {
+		compatible = "google,zumapro-itmon";
+		reg = <0x0 0x26440000 0x4000>,
+		      <0x0 0x26840000 0x4000>,
+		      <0x0 0x26c40000 0x4000>,
+		      <0x0 0x27040000 0x4000>,
+		      <0x0 0x26050000 0x4000>,
+		      <0x0 0x26450000 0x4000>,
+		      <0x0 0x26850000 0x4000>,
+		      <0x0 0x26c50000 0x4000>,
+		      <0x0 0x27050000 0x4000>,
+		      <0x0 0x26060000 0x4000>;
+		reg-names = "nocl1a-data", "nocl1b-data", "nocl2aa-data",
+			    "nocl2ab-data", "nocl0-data", "nocl1a-config",
+			    "nocl1b-config", "nocl2aa-config", "nocl2ab-config",
+			    "nocl0-config";
+		interrupts = <GIC_SPI 619 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 624 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 628 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 632 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 596 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 620 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 625 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 629 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 633 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 597 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "nocl1a-data", "nocl1b-data", "nocl2aa-data",
+				  "nocl2ab-data", "nocl0-data", "nocl1a-config",
+				  "nocl1b-config", "nocl2aa-config",
+				  "nocl2ab-config", "nocl0-config";
+	};
+
+	/*
 	 * SoC chip-id block.  Source: downstream chipid@10000000 in
 	 * research/dumped.dts:14927 (reg verbatim).  No in-tree driver binds this
 	 * compatible; the AoC chip-id reader (aoc_chipid.c) maps it to forward the

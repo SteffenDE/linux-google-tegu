@@ -2343,6 +2343,20 @@
 		};
 
 		/*
+		 * HSI1's always-on stage-2 protection unit fronts the modem PCIe
+		 * root complex.  Firmware sleep resets it to blocking, so keep
+		 * resume ordering through access-controllers and let the provider
+		 * reopen it after system sleep.
+		 */
+		s2mpu_hsi1: access-controller@12090000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x12090000 0x10000>;
+			interrupts = <GIC_SPI 426 IRQ_TYPE_LEVEL_HIGH 0>;
+			#access-controller-cells = <0>;
+			status = "okay";
+		};
+
+		/*
 		 * Source: CMU_HSI2 UFS-related registers are from downstream
 		 * Zuma cmucal-sfr.c/cmucal-node.c.  The node shape follows
 		 * upstream GS101, with the Zumapro base address from
@@ -2482,6 +2496,7 @@
 			clock-names = "dbi", "mstr", "slv", "apb";
 			phys = <&pcie0_phy>;
 			phy-names = "pcie";
+			access-controllers = <&s2mpu_hsi1>;
 			samsung,pmu-syscon = <&pmu_system_controller 0x3ec4>;
 			num-lanes = <2>;
 			max-link-speed = <3>;

@@ -2134,6 +2134,7 @@
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart0_bus>;
 			samsung,uart-fifosize = <256>;
+			samsung,usi-serial-v2;
 			status = "okay";
 		};
 

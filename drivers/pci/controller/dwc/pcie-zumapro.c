@@ -521,9 +521,32 @@ static bool zumapro_pcie_link_up(struct dw_pcie *pci)
 	return state >= LTSSM_STATE_RCVRY_LOCK && state <= LTSSM_STATE_L1_IDLE;
 }
 
+static enum dw_pcie_ltssm zumapro_pcie_get_ltssm(struct dw_pcie *pci)
+{
+	return readl(pci->elbi_base + PCIE_ELBI_RDLH_LINKUP) &
+	       LTSSM_STATE_MASK;
+}
+
+static void zumapro_pcie_stop_link(struct dw_pcie *pci)
+{
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
+
+	/* Keep controller accesses safe once the endpoint stops CLKREQ#. */
+	gpiod_set_value_cansleep(zp->perst, 1);
+	zumapro_pcie_phy_safe_clk(zp->phy, true);
+	writel(0, pci->elbi_base + PCIE_APP_LTSSM_ENABLE);
+
+	/* Match downstream's controller-core reset before PHY power-down. */
+	writel(SOFT_RESET_PWR_PULSE, pci->elbi_base + PCIE_SOFT_RESET);
+	udelay(20);
+	writel(SOFT_RESET_ALL, pci->elbi_base + PCIE_SOFT_RESET);
+}
+
 static const struct dw_pcie_ops zumapro_dw_pcie_ops = {
 	.link_up	= zumapro_pcie_link_up,
+	.get_ltssm	= zumapro_pcie_get_ltssm,
 	.start_link	= zumapro_pcie_start_link,
+	.stop_link	= zumapro_pcie_stop_link,
 };
 
 /* Masked read-modify-write of a secure PMU register through the EL3 SMC. */
@@ -586,6 +609,74 @@ err_phy_off:
 err_phy_exit:
 	phy_exit(zp->phy);
 	return ret;
+}
+
+static void zumapro_pcie_host_deinit(struct dw_pcie_rp *pp)
+{
+	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+	struct zumapro_pcie *zp = to_zumapro_pcie(pci);
+
+	phy_power_off(zp->phy);
+	phy_exit(zp->phy);
+}
+
+static void zumapro_pcie_send_pme_turn_off(struct zumapro_pcie *zp)
+{
+	void __iomem *elbi = zp->pci.elbi_base;
+	u32 val, mode;
+	int ret;
+
+	val = readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK;
+	if (val < LTSSM_STATE_RCVRY_LOCK || val > LTSSM_STATE_L1_IDLE) {
+		dev_dbg(zp->pci.dev,
+			"link not up (ltssm %#x), skipping PME_Turn_Off\n", val);
+		return;
+	}
+
+	/* Clear a stale PM_TO_ACK latch before starting this handshake. */
+	val = readl(elbi + PCIE_IRQ0);
+	writel(val, elbi + PCIE_IRQ0);
+	dev_dbg(zp->pci.dev,
+		 "pre-PME ltssm %#x irq0 %#010x (%#010x after clear)\n",
+		 readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK,
+		 val, readl(elbi + PCIE_IRQ0));
+
+	writel(1, elbi + PCIE_APP_REQ_EXIT_L1);
+	mode = readl(elbi + PCIE_APP_REQ_EXIT_L1_MODE);
+	mode &= ~APP_REQ_EXIT_L1_MODE;
+	mode |= L1_REQ_NAK_CTRL_MASTER;
+	writel(mode, elbi + PCIE_APP_REQ_EXIT_L1_MODE);
+
+	writel(1, elbi + PCIE_XMIT_PME_TURNOFF);
+	ret = readl_poll_timeout(elbi + PCIE_IRQ0, val,
+				 val & IRQ_RADM_PM_TO_ACK,
+				 PCIE_L2_ENTER_WAIT_STEP_US,
+				 PCIE_L2_ENTER_WAIT_US);
+	if (ret)
+		dev_warn(zp->pci.dev,
+			 "no PM_TO_ACK from endpoint (irq0 %#x)\n", val);
+	else
+		dev_dbg(zp->pci.dev, "PM_TO_ACK (irq0 %#010x)\n", val);
+	udelay(10);
+	writel(0, elbi + PCIE_XMIT_PME_TURNOFF);
+
+	ret = readl_poll_timeout(elbi + PCIE_ELBI_RDLH_LINKUP, val,
+				 (val & LTSSM_STATE_MASK) == LTSSM_STATE_L2_IDLE,
+				 PCIE_L2_ENTER_WAIT_STEP_US,
+				 PCIE_L2_ENTER_WAIT_US);
+	if (ret)
+		dev_warn(zp->pci.dev,
+			 "link did not reach L2_IDLE before PERST (ltssm %#x)\n",
+			 val & LTSSM_STATE_MASK);
+	else
+		dev_dbg(zp->pci.dev, "link reached L2_IDLE, orderly down\n");
+}
+
+static void zumapro_pcie_host_pme_turn_off(struct dw_pcie_rp *pp)
+{
+	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+
+	zumapro_pcie_send_pme_turn_off(to_zumapro_pcie(pci));
 }
 
 /*
@@ -761,7 +852,9 @@ static void zumapro_pcie_host_post_init(struct dw_pcie_rp *pp)
 
 static const struct dw_pcie_host_ops zumapro_pcie_host_ops = {
 	.init		= zumapro_pcie_host_init,
+	.deinit		= zumapro_pcie_host_deinit,
 	.post_init	= zumapro_pcie_host_post_init,
+	.pme_turn_off	= zumapro_pcie_host_pme_turn_off,
 };
 
 /*
@@ -876,8 +969,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev, bool guarded)
 {
 	struct zumapro_pcie *zp = zumapro_pcie_from_dev(rc_dev);
 	void __iomem *elbi;
-	u32 val, mode;
-	int ret;
+	u32 val;
 
 	if (!zp)
 		return -ENODEV;
@@ -946,64 +1038,7 @@ int zumapro_pcie_modem_link_down(struct device *rc_dev, bool guarded)
 	 * from L1 the PME should now complete to L2.  ELBI accesses are safe
 	 * here -- the link is up and the EP is still driving CLKREQ#.
 	 */
-	val = readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK;
-	if (val < LTSSM_STATE_RCVRY_LOCK || val > LTSSM_STATE_L1_IDLE) {
-		dev_dbg(zp->pci.dev,
-			 "link not up (ltssm %#x), skipping PME_Turn_Off\n", val);
-	} else {
-		/*
-		 * PCIE_IRQ0 is write-1-to-clear (establish_link reads it and
-		 * writes the value straight back); clear any stale PM_TO_ACK
-		 * latch first so the poll below observes this handshake, and
-		 * log the raw state so a pre-latched bit 29 (which would make
-		 * the ack poll pass vacuously) is visible in the boot log.
-		 */
-		val = readl(elbi + PCIE_IRQ0);
-		writel(val, elbi + PCIE_IRQ0);
-		dev_dbg(zp->pci.dev,
-			 "pre-PME ltssm %#x irq0 %#010x (%#010x after clear)\n",
-			 readl(elbi + PCIE_ELBI_RDLH_LINKUP) & LTSSM_STATE_MASK,
-			 val, readl(elbi + PCIE_IRQ0));
-
-		writel(1, elbi + PCIE_APP_REQ_EXIT_L1);
-		mode = readl(elbi + PCIE_APP_REQ_EXIT_L1_MODE);
-		mode &= ~APP_REQ_EXIT_L1_MODE;
-		mode |= L1_REQ_NAK_CTRL_MASTER;
-		writel(mode, elbi + PCIE_APP_REQ_EXIT_L1_MODE);
-
-		writel(1, elbi + PCIE_XMIT_PME_TURNOFF);
-		ret = readl_poll_timeout(elbi + PCIE_IRQ0, val,
-					 val & IRQ_RADM_PM_TO_ACK,
-					 PCIE_L2_ENTER_WAIT_STEP_US,
-					 PCIE_L2_ENTER_WAIT_US);
-		if (ret)
-			dev_warn(zp->pci.dev,
-				 "no PM_TO_ACK from endpoint (irq0 %#x)\n", val);
-		else
-			dev_dbg(zp->pci.dev, "PM_TO_ACK (irq0 %#010x)\n", val);
-		udelay(10);
-		writel(0, elbi + PCIE_XMIT_PME_TURNOFF);
-
-		/*
-		 * Let the EP send Enter_L23_Ready and the link settle into
-		 * L2_IDLE before PERST -- the orderly power-down the golden
-		 * trace shows and the CP controller's inbound decode likely
-		 * depends on.  Proceed on timeout like downstream, but log the
-		 * achieved state: reaching 0x15 here is the whole point of this
-		 * experiment.
-		 */
-		ret = readl_poll_timeout(elbi + PCIE_ELBI_RDLH_LINKUP, val,
-					 (val & LTSSM_STATE_MASK) ==
-					 LTSSM_STATE_L2_IDLE,
-					 PCIE_L2_ENTER_WAIT_STEP_US,
-					 PCIE_L2_ENTER_WAIT_US);
-		if (ret)
-			dev_warn(zp->pci.dev,
-				 "link did not reach L2_IDLE before PERST (ltssm %#x)\n",
-				 val & LTSSM_STATE_MASK);
-		else
-			dev_dbg(zp->pci.dev, "link reached L2_IDLE, orderly down\n");
-	}
+	zumapro_pcie_send_pme_turn_off(zp);
 
 	/*
 	 * Teardown in the order the downstream trace executes: assert PERST,
@@ -1583,8 +1618,6 @@ static void zumapro_pcie_remove(struct platform_device *pdev)
 	struct zumapro_pcie *zp = platform_get_drvdata(pdev);
 
 	dw_pcie_host_deinit(&zp->pci.pp);
-	phy_power_off(zp->phy);
-	phy_exit(zp->phy);
 }
 
 /*
@@ -1605,9 +1638,16 @@ static void zumapro_pcie_remove(struct platform_device *pdev)
 static int zumapro_pcie_suspend_noirq(struct device *dev)
 {
 	struct zumapro_pcie *zp = dev_get_drvdata(dev);
+	int ret;
 
-	if (!zp->cp_pwr)
+	if (!zp->cp_pwr) {
+		ret = dw_pcie_suspend_noirq(&zp->pci);
+		if (ret || !zp->pci.suspended)
+			return ret;
+
+		clk_bulk_disable_unprepare(zp->num_clks, zp->clks);
 		return 0;
+	}
 
 	if (zumapro_pcie_modem_link_active(dev))
 		zumapro_pcie_modem_link_down(dev, false);
@@ -1620,9 +1660,28 @@ static int zumapro_pcie_suspend_noirq(struct device *dev)
 static int zumapro_pcie_resume_noirq(struct device *dev)
 {
 	struct zumapro_pcie *zp = dev_get_drvdata(dev);
+	u32 state;
+	int ret;
 
-	if (!zp->cp_pwr)
-		return 0;
+	if (!zp->cp_pwr) {
+		if (!zp->pci.suspended)
+			return 0;
+
+		ret = clk_bulk_prepare_enable(zp->num_clks, zp->clks);
+		if (ret)
+			return ret;
+
+		/* Safe after the controller clocks return; no endpoint access. */
+		state = readl(zp->pci.elbi_base + PCIE_ELBI_RDLH_LINKUP) &
+			LTSSM_STATE_MASK;
+		dev_info(dev, "WiFi link before system-resume rebuild: LTSSM %#x\n",
+			 state);
+
+		ret = dw_pcie_resume_noirq(&zp->pci);
+		if (ret)
+			clk_bulk_disable_unprepare(zp->num_clks, zp->clks);
+		return ret;
+	}
 
 	return clk_bulk_prepare_enable(zp->num_clks, zp->clks);
 }

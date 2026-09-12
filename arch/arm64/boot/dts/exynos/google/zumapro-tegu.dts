@@ -1695,6 +1695,15 @@
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
+		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_UP>;
+	};
+
+	pcie1_perst: pcie1-perst-pins {
+		samsung,pins = "gph3-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X4>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
 	};
 };
 
@@ -1827,7 +1836,7 @@
 
 &pcie {
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie1_clkreq>;
+	pinctrl-0 = <&pcie1_clkreq &pcie1_perst>;
 	reset-gpios = <&gph3 0 GPIO_ACTIVE_LOW>;
 	status = "okay";
 

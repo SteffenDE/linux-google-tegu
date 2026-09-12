@@ -917,9 +917,16 @@
 	 * their CON_PDN fields at input, which can drop the CP rails in SYS_SLEEP.
 	 */
 	modem_ap2cp_ctrl: modem-ap2cp-ctrl-pins {
-		samsung,pins = "gpp8-3", "gpp12-2", "gpp12-3",
-			       "gpp16-0", "gpp16-1", "gpp16-2",
+		samsung,pins = "gpp12-2", "gpp12-3", "gpp16-0",
+			       "gpp16-1", "gpp16-2",
 			       "gpp16-3";
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
+		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	modem_ap2cp_pm_wrst: modem-ap2cp-pm-wrst-pins {
+		samsung,pins = "gpp8-3";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
@@ -1002,7 +1009,7 @@
 	modem_cp2ap_wakeup: modem-cp2ap-wakeup-pins {
 		samsung,pins = "gpa5-1";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
-		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
 	};
 
 	modem_cp2ap_active: modem-cp2ap-active-pins {
@@ -1776,7 +1783,7 @@
 		samsung,pins = "gph0-1";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
-		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X4>;
 		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
 		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_UP>;
 	};
@@ -1802,7 +1809,8 @@
 
 &pcie0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie0_clkreq &pcie0_perst &modem_ap2cp_ctrl>;
+	pinctrl-0 = <&pcie0_clkreq &pcie0_perst &modem_ap2cp_ctrl
+		     &modem_ap2cp_pm_wrst>;
 	reset-gpios = <&gph0 0 GPIO_ACTIVE_LOW>;
 	num-lanes = <1>;
 	max-link-speed = <1>;

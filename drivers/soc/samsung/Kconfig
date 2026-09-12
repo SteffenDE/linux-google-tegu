@@ -16,6 +16,17 @@ config GOOGLE_S2MPU
 	  transitions. This supports systems without a hypervisor managing
 	  protected DMA domains; the master's IOMMU handles DMA translations.
 
+config GOOGLE_ZUMAPRO_ITMON
+	bool "Google Tensor G4 interconnect transaction monitor"
+	depends on ARCH_EXYNOS && PM_SLEEP
+	help
+	  Enable the transaction monitors in the five Tensor G4 NoC fabrics.
+	  Protocol errors and response timeouts are decoded from the hardware
+	  error FIFO and panic the kernel so ramoops preserves the report.
+
+	  This is diagnostic support. A detected interconnect error deliberately
+	  terminates the boot.
+
 # There is no need to enable these drivers for ARMv8
 config EXYNOS_ASV_ARM
 	bool "Exynos ASV ARMv7-specific driver extensions" if COMPILE_TEST

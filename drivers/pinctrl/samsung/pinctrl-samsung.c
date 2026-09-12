@@ -1508,19 +1508,36 @@ static int samsung_pinctrl_syscore_suspend(void *unused)
 	struct samsung_pinctrl_drv_data *drvdata;
 	int ret;
 
+	/*
+	 * Acquire every controller clock before replacing the suspend_late
+	 * snapshots.  If one clock cannot be enabled, leave all saved state as
+	 * the abort fallback rather than mixing early and final snapshots.
+	 */
 	list_for_each_entry(drvdata, &samsung_pinctrl_syscore_list, node) {
 		ret = clk_enable(drvdata->pclk);
 		if (ret) {
 			dev_err(drvdata->dev,
 				"failed to enable clock for saving state\n");
-			return ret;
+			goto err_disable_clocks;
 		}
-
-		samsung_pinctrl_save_state(drvdata);
-		clk_disable(drvdata->pclk);
 	}
 
+	list_for_each_entry(drvdata, &samsung_pinctrl_syscore_list, node)
+		samsung_pinctrl_save_state(drvdata);
+
+	list_for_each_entry_reverse(drvdata, &samsung_pinctrl_syscore_list,
+				    node)
+		clk_disable(drvdata->pclk);
+
 	return 0;
+
+err_disable_clocks:
+	list_for_each_entry_continue_reverse(drvdata,
+					     &samsung_pinctrl_syscore_list,
+					     node)
+		clk_disable(drvdata->pclk);
+
+	return ret;
 }
 
 static void samsung_pinctrl_syscore_resume(void *unused)

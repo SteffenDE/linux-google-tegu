@@ -39,7 +39,6 @@
 #include <linux/serial_s3c.h>
 #include <linux/slab.h>
 #include <linux/sysrq.h>
-#include <linux/syscore_ops.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/types.h>
@@ -153,13 +152,6 @@ struct s3c24xx_uart_port {
 	const struct s3c2410_uartcfg	*cfg;
 
 	struct s3c24xx_uart_dma		*dma;
-
-#if defined(CONFIG_PM_SLEEP) && defined(CONFIG_SERIAL_SAMSUNG_CONSOLE)
-	struct syscore			early_console_syscore;
-	u32				early_console_regs[9];
-	bool				early_console_saved;
-	bool				early_console_registered;
-#endif
 };
 
 static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport);
@@ -1769,135 +1761,6 @@ static void s3c24xx_serial_resetport(struct uart_port *port,
 	udelay(1);
 }
 
-#if defined(CONFIG_PM_SLEEP) && defined(CONFIG_SERIAL_SAMSUNG_CONSOLE)
-
-/* Embedded USI wrapper registers used by the Zumapro debug UART. */
-#define ZUMAPRO_DEBUG_UART_PA		0x10870000
-#define ZUMAPRO_USI_CON			0xc4
-#define ZUMAPRO_USI_OPTION		0xc8
-
-enum zumapro_early_console_reg {
-	ZUMAPRO_EARLY_ULCON,
-	ZUMAPRO_EARLY_UCON,
-	ZUMAPRO_EARLY_UFCON,
-	ZUMAPRO_EARLY_UMCON,
-	ZUMAPRO_EARLY_UBRDIV,
-	ZUMAPRO_EARLY_UFRACVAL,
-	ZUMAPRO_EARLY_UINTM,
-	ZUMAPRO_EARLY_USI_CON,
-	ZUMAPRO_EARLY_USI_OPTION,
-};
-
-static int zumapro_early_console_suspend(void *data)
-{
-	struct s3c24xx_uart_port *ourport = data;
-	struct uart_port *port = &ourport->port;
-	u32 *regs = ourport->early_console_regs;
-
-	ourport->early_console_saved = false;
-	if (console_suspend_enabled)
-		return 0;
-
-	regs[ZUMAPRO_EARLY_ULCON] = rd_regl(port, S3C2410_ULCON);
-	regs[ZUMAPRO_EARLY_UCON] = rd_regl(port, S3C2410_UCON);
-	regs[ZUMAPRO_EARLY_UFCON] = rd_regl(port, S3C2410_UFCON);
-	regs[ZUMAPRO_EARLY_UMCON] = rd_regl(port, S3C2410_UMCON);
-	regs[ZUMAPRO_EARLY_UBRDIV] = rd_regl(port, S3C2410_UBRDIV);
-	regs[ZUMAPRO_EARLY_UFRACVAL] = rd_regl(port, S3C2443_DIVSLOT);
-	regs[ZUMAPRO_EARLY_UINTM] = rd_regl(port, S3C64XX_UINTM);
-	regs[ZUMAPRO_EARLY_USI_CON] = rd_regl(port, ZUMAPRO_USI_CON);
-	regs[ZUMAPRO_EARLY_USI_OPTION] = rd_regl(port, ZUMAPRO_USI_OPTION);
-	ourport->early_console_saved = true;
-
-	return 0;
-}
-
-static void zumapro_early_console_puts(struct uart_port *port, const char *s)
-{
-	unsigned int timeout;
-
-	while (*s)
-		wr_reg(port, S3C2410_UTXH, *s++);
-
-	/* Make the marker physical before a later resume access can wedge. */
-	for (timeout = 1000000; timeout; timeout--)
-		if (rd_regl(port, S3C2410_UTRSTAT) & S3C2410_UTRSTAT_TXE)
-			break;
-}
-
-static void zumapro_early_console_resume(void *data)
-{
-	struct s3c24xx_uart_port *ourport = data;
-	struct uart_port *port = &ourport->port;
-	u32 *regs = ourport->early_console_regs;
-
-	if (console_suspend_enabled || !ourport->early_console_saved)
-		return;
-
-	/* The CMU syscore callback has already restored both UART clocks. */
-	wr_regl(port, ZUMAPRO_USI_CON, regs[ZUMAPRO_EARLY_USI_CON]);
-	udelay(1);
-	wr_regl(port, ZUMAPRO_USI_OPTION, regs[ZUMAPRO_EARLY_USI_OPTION]);
-	writel_relaxed(regs[ZUMAPRO_EARLY_ULCON],
-		       portaddr(port, S3C2410_ULCON));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UBRDIV],
-		       portaddr(port, S3C2410_UBRDIV));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UFRACVAL],
-		       portaddr(port, S3C2443_DIVSLOT));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UMCON],
-		       portaddr(port, S3C2410_UMCON));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UCON],
-		       portaddr(port, S3C2410_UCON));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UFCON] | S3C2410_UFCON_RESETBOTH,
-		       portaddr(port, S3C2410_UFCON));
-	udelay(1);
-	writel_relaxed(regs[ZUMAPRO_EARLY_UFCON],
-		       portaddr(port, S3C2410_UFCON));
-	writel_relaxed(regs[ZUMAPRO_EARLY_UINTM],
-		       portaddr(port, S3C64XX_UINTM));
-	readl(portaddr(port, S3C2410_UCON));
-
-	zumapro_early_console_puts(port,
-				   "\r\n[early resume console restored]\r\n");
-	ourport->early_console_saved = false;
-}
-
-static const struct syscore_ops zumapro_early_console_syscore_ops = {
-	.suspend = zumapro_early_console_suspend,
-	.resume = zumapro_early_console_resume,
-};
-
-static void zumapro_early_console_register(struct s3c24xx_uart_port *ourport)
-{
-	struct uart_port *port = &ourport->port;
-
-	if (!uart_console(port) || port->mapbase != ZUMAPRO_DEBUG_UART_PA ||
-	    !of_machine_is_compatible("google,zumapro"))
-		return;
-
-	ourport->early_console_syscore.ops = &zumapro_early_console_syscore_ops;
-	ourport->early_console_syscore.data = ourport;
-	register_syscore(&ourport->early_console_syscore);
-	ourport->early_console_registered = true;
-	dev_info(port->dev, "early resume console restore available\n");
-}
-
-static void zumapro_early_console_unregister(struct s3c24xx_uart_port *ourport)
-{
-	if (!ourport->early_console_registered)
-		return;
-
-	unregister_syscore(&ourport->early_console_syscore);
-	ourport->early_console_registered = false;
-}
-
-#else
-
-static void zumapro_early_console_register(struct s3c24xx_uart_port *ourport) { }
-static void zumapro_early_console_unregister(struct s3c24xx_uart_port *ourport) { }
-
-#endif
-
 static int s3c24xx_serial_enable_baudclk(struct s3c24xx_uart_port *ourport)
 {
 	struct device *dev = ourport->port.dev;
@@ -2170,7 +2033,6 @@ static int s3c24xx_serial_probe(struct platform_device *pdev)
 	dev_dbg(&pdev->dev, "%s: adding port\n", __func__);
 	uart_add_one_port(&s3c24xx_uart_drv, &ourport->port);
 	platform_set_drvdata(pdev, &ourport->port);
-	zumapro_early_console_register(ourport);
 
 	/*
 	 * Deactivate the clock enabled in s3c24xx_serial_init_port here,
@@ -2190,10 +2052,8 @@ static void s3c24xx_serial_remove(struct platform_device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(&dev->dev);
 
-	if (port) {
-		zumapro_early_console_unregister(to_ourport(port));
+	if (port)
 		uart_remove_one_port(&s3c24xx_uart_drv, port);
-	}
 
 	uart_unregister_driver(&s3c24xx_uart_drv);
 }

@@ -79,16 +79,15 @@ struct zumapro_itmon {
 
 /*
  * Source: downstream zuma-itmon.c.  Node IDs and checker/timeout offsets are
- * contiguous within each mask; NOCL0's configuration path has the one gap in
- * timeout coverage represented below.
+ * contiguous within each mask.
  */
 static const struct zumapro_itmon_group_cfg zumapro_itmon_groups[] = {
-	{ "nocl1a-data",   GENMASK(17, 0), GENMASK(13, 0), 0, 0 },
-	{ "nocl1b-data",   GENMASK(6, 0),  GENMASK(5, 0),  0, 0 },
-	{ "nocl2aa-data",  GENMASK(17, 0), GENMASK(15, 0), 0, 0 },
-	{ "nocl2ab-data",  GENMASK(18, 0), GENMASK(16, 0), 0, 0 },
+	{ "nocl1a-data",   GENMASK(17, 0), GENMASK(13, 0), GENMASK(3, 0), 0 },
+	{ "nocl1b-data",   GENMASK(6, 0),  GENMASK(5, 0),  BIT(0), 0 },
+	{ "nocl2aa-data",  GENMASK(17, 0), GENMASK(15, 0), GENMASK(1, 0), 0 },
+	{ "nocl2ab-data",  GENMASK(18, 0), GENMASK(16, 0), GENMASK(1, 0), 0 },
 	{ "nocl0-data",    GENMASK(15, 0), GENMASK(8, 0),
-						      GENMASK(4, 0), 0 },
+						      GENMASK(6, 0), 0 },
 	{ "nocl1a-config", GENMASK(5, 0),  BIT(0), GENMASK(4, 0),
 						      GENMASK(4, 0) },
 	{ "nocl1b-config", GENMASK(5, 0),  BIT(0), GENMASK(4, 0),
@@ -97,8 +96,9 @@ static const struct zumapro_itmon_group_cfg zumapro_itmon_groups[] = {
 						      GENMASK(7, 0) },
 	{ "nocl2ab-config", GENMASK(7, 0), BIT(0), GENMASK(6, 0),
 						      GENMASK(6, 0) },
+	/* SLC is timeout slot 12 but protocol-checker slot 16. */
 	{ "nocl0-config",  GENMASK(19, 0), GENMASK(2, 0), GENMASK(16, 0),
-						      GENMASK(12, 0) | BIT(16) },
+						      GENMASK(12, 0) },
 };
 
 static const char *zumapro_itmon_err_name(u32 code)

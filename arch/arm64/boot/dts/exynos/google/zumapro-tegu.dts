@@ -910,6 +910,21 @@
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
 	};
+
+	/*
+	 * CP power/reset and AP-status outputs.  Downstream programs every one
+	 * to retain its previous output level in powerdown; the bootloader leaves
+	 * their CON_PDN fields at input, which can drop the CP rails in SYS_SLEEP.
+	 */
+	modem_ap2cp_ctrl: modem-ap2cp-ctrl-pins {
+		samsung,pins = "gpp8-3", "gpp12-2", "gpp12-3",
+			       "gpp16-0", "gpp16-1", "gpp16-2",
+			       "gpp16-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
+		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_NONE>;
+	};
 };
 
 &pinctrl_peric1 {
@@ -953,6 +968,12 @@
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
 
+	modem_cp2ap_wrst: modem-cp2ap-wrst-pins {
+		samsung,pins = "gpa7-3";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_INPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_DOWN>;
+	};
+
 	/* MAX77759 USB Type-C interrupt (downstream usb-pd-irq). */
 	usb_pd_irq: usb-pd-irq-pins {
 		samsung,pins = "gpa8-3";
@@ -972,6 +993,24 @@
 
 /* Left speaker amp IRQ, XEINT_5 (downstream tas2572_1_irq). */
 &pinctrl_far_alive {
+	modem_cp2ap_ps_hold: modem-cp2ap-ps-hold-pins {
+		samsung,pins = "gpa5-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_INPUT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
+	modem_cp2ap_wakeup: modem-cp2ap-wakeup-pins {
+		samsung,pins = "gpa5-1";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+	};
+
+	modem_cp2ap_active: modem-cp2ap-active-pins {
+		samsung,pins = "gpa5-2";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_NONE>;
+	};
+
 	spk_amp_l_irq: spk-amp-l-irq-pins {
 		samsung,pins = "gpa5-5";
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
@@ -1738,6 +1777,15 @@
 		samsung,pin-function = <ZUMAPRO_PIN_FUNC_2>;
 		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X3>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
+		samsung,pin-pud-pdn = <ZUMAPRO_PIN_PULL_UP>;
+	};
+
+	pcie0_perst: pcie0-perst-pins {
+		samsung,pins = "gph0-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_OUTPUT>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X4>;
+		samsung,pin-con-pdn = <ZUMAPRO_PIN_CON_PDN_PREV>;
 	};
 
 	/* Right speaker amp reset (downstream tas2572_2_rst). */
@@ -1754,7 +1802,7 @@
 
 &pcie0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&pcie0_clkreq>;
+	pinctrl-0 = <&pcie0_clkreq &pcie0_perst &modem_ap2cp_ctrl>;
 	reset-gpios = <&gph0 0 GPIO_ACTIVE_LOW>;
 	num-lanes = <1>;
 	max-link-speed = <1>;
@@ -1810,6 +1858,9 @@
 
 	modem {
 		compatible = "samsung,s5300-modem";
+		pinctrl-names = "default";
+		pinctrl-0 = <&modem_cp2ap_ps_hold &modem_cp2ap_wakeup
+			     &modem_cp2ap_active &modem_cp2ap_wrst>;
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
 				<&cp_rmem_1_reserved>;
 		memory-region-names = "ipc", "msi", "pktproc";

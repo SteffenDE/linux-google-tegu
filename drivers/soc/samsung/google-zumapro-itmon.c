@@ -335,7 +335,13 @@ static struct platform_driver zumapro_itmon_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
-module_platform_driver(zumapro_itmon_driver);
+
+static int __init zumapro_itmon_driver_init(void)
+{
+	return platform_driver_register(&zumapro_itmon_driver);
+}
+/* Let the debug UART register its syscore restore before ITMON is rearmed. */
+late_initcall(zumapro_itmon_driver_init);
 
 MODULE_DESCRIPTION("Google Tensor G4 interconnect transaction monitor");
 MODULE_LICENSE("GPL");

@@ -1542,23 +1542,36 @@ static irqreturn_t zumapro_pcie_intr_isr(int irq, void *data)
 {
 	struct zumapro_pcie *zp = data;
 	void __iomem *elbi = zp->pci.elbi_base;
-	u32 irq0, irq1, irq2;
+	u32 irq1, irq2;
 
-	irq0 = readl(elbi + PCIE_IRQ0);
-	writel(irq0, elbi + PCIE_IRQ0);
+	/*
+	 * This line is shared with the root port's PME/AER services, so the
+	 * handler only owns the two bits it enabled and must leave everything
+	 * else latched.  In particular PCIE_IRQ0 is NOT touched: PM_TO_ACK is
+	 * polled out of it by send_pme_turn_off(), and write-clearing it here
+	 * would swallow the ack of a suspend handshake that a PME interrupt
+	 * happened to overlap.  Nothing enables a PCIE_IRQ0 source, so leaving
+	 * it alone cannot leave the level line asserted either.
+	 *
+	 * Downstream blanket-clears all three and always claims the interrupt,
+	 * but its handler is the root complex's primary one (it services MSI
+	 * too) rather than a second consumer of somebody else's line.
+	 */
 	irq1 = readl(elbi + PCIE_IRQ1);
-	writel(irq1, elbi + PCIE_IRQ1);
 	irq2 = readl(elbi + PCIE_IRQ2);
-	writel(irq2, elbi + PCIE_IRQ2);
+	if (!(irq1 & IRQ_LINK_DOWN_ASSERT) &&
+	    !(irq2 & IRQ_RADM_CPL_TIMEOUT_ASSERT))
+		return IRQ_NONE;
 
-	if ((irq1 & IRQ_LINK_DOWN_ASSERT) ||
-	    (irq2 & IRQ_RADM_CPL_TIMEOUT_ASSERT)) {
-		dev_info(zp->pci.dev,
-			 "modem link lost (irq1 %#x irq2 %#x), requesting relink\n",
-			 irq1, irq2);
-		if (zp->linkdown_cb)
-			zp->linkdown_cb(zp->linkdown_data);
-	}
+	/* Write-1-to-clear, so this acks our bits and leaves the rest latched. */
+	writel(irq1 & IRQ_LINK_DOWN_ASSERT, elbi + PCIE_IRQ1);
+	writel(irq2 & IRQ_RADM_CPL_TIMEOUT_ASSERT, elbi + PCIE_IRQ2);
+
+	dev_info(zp->pci.dev,
+		 "modem link lost (irq1 %#x irq2 %#x), requesting relink\n",
+		 irq1, irq2);
+	if (zp->linkdown_cb)
+		zp->linkdown_cb(zp->linkdown_data);
 
 	return IRQ_HANDLED;
 }
@@ -1587,7 +1600,15 @@ int zumapro_pcie_register_linkdown_cb(struct device *rc_dev,
 	zp->linkdown_cb = cb;
 	zp->linkdown_data = data;
 
-	ret = request_irq(irq, zumapro_pcie_intr_isr, 0, "pcie-intr", zp);
+	/*
+	 * Shared with the root port's PME/AER services, which get there first
+	 * and register the line IRQF_SHARED: without the flag this request is
+	 * refused -EBUSY and the recovery path silently never arms.  Downstream
+	 * requests the same line IRQF_SHARED | IRQF_TRIGGER_HIGH; the trigger
+	 * type comes from the DT here, so only the shared flag is needed.
+	 */
+	ret = request_irq(irq, zumapro_pcie_intr_isr, IRQF_SHARED, "pcie-intr",
+			  zp);
 	if (ret) {
 		dev_err(rc_dev, "link-down intr request_irq: %d\n", ret);
 		zp->linkdown_cb = NULL;

@@ -4162,6 +4162,12 @@ static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
 
 	brcmf_dbg(TRACE, "Suspend, wake on any traffic.\n");
 
+	/* The unicast-only filter would break AP and P2P-GO service. */
+	if (brcmf_is_apmode_operating(cfg->wiphy)) {
+		brcmf_dbg(INFO, "refusing wake-on-any while AP mode is active\n");
+		return 1;
+	}
+
 	if (!cfg->wowl.any_filter_set) {
 		filter_buf.filter.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID);
 		filter_buf.filter.type =

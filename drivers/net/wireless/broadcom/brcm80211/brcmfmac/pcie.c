@@ -623,7 +623,7 @@ static struct brcmf_fw_request *
 brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo);
-static bool brcmf_pcie_oob_host_wake_avail(struct brcmf_pciedev_info *devinfo);
+static bool brcmf_pcie_oob_host_wake_setup(struct brcmf_pciedev_info *devinfo);
 static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 					bool error);
 static void
@@ -3473,13 +3473,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 			  brcmf_pcie_ds_state_name(devinfo->ds_state),
 			  atomic_read(&devinfo->ds_active_count));
 
-	bus->oob_host_wake = brcmf_pcie_oob_host_wake_avail(devinfo);
-	/*
-	 * PCIe firmware may signal WoWLAN through a dedicated sideband IRQ
-	 * instead of PCI PME.  The common feature probe only asks the firmware
-	 * about WoWLAN when the bus says the host has a usable wake path.
-	 */
-	bus->wowl_supported |= bus->oob_host_wake;
+	bus->oob_host_wake = brcmf_pcie_oob_host_wake_setup(devinfo);
 
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
@@ -3927,29 +3921,43 @@ brcmf_pcie_remove(struct pci_dev *pdev)
  * stub out) because the call sites in setup/remove are unconditional.
  */
 /*
- * Whether the host will be able to see the firmware's out-of-band host-wake.
- * The line is optional and described per board, and the PM core only arms it
- * as a dedicated wake IRQ while runtime PM has the device in D3 and across
- * system suspend when device wakeup is enabled, so all three conditions have
- * to hold for a wake to ever reach us.
+ * Set up the firmware's out-of-band host-wake before common feature probing.
+ * The line is optional and described per board.  Registering it here leaves
+ * the dedicated IRQ disabled until runtime or system PM arms it, but lets the
+ * common code advertise only features backed by a usable host wake path.
  *
- * Evaluated in brcmf_pcie_setup() before brcmf_attach(), so that
- * brcmf_c_preinit_dcmds() can decide whether to let the firmware assert the
- * line at all.  It only predicts what brcmf_pcie_runtime_pm_enable() will do
- * below; that runs after attach and is the sole owner of the interrupt.
+ * This must precede brcmf_attach(): brcmf_c_preinit_dcmds() uses the result to
+ * decide whether to let the firmware assert the line at all, and feature
+ * probing must not promise an OOB-backed mode if requesting the IRQ failed.
  */
-static bool brcmf_pcie_oob_host_wake_avail(struct brcmf_pciedev_info *devinfo)
+static bool brcmf_pcie_oob_host_wake_setup(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;
+	int irq;
 
-	return brcmf_pcie_runtime_pm && brcmf_pcie_inband_ds(devinfo) &&
-	       of_irq_get_byname(dev_of_node(dev), "host-wake") > 0;
+	if (devinfo->host_wake_irq)
+		return true;
+
+	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
+		return false;
+
+	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
+	if (irq <= 0)
+		return false;
+
+	if (dev_pm_set_dedicated_wake_irq(dev, irq)) {
+		dev_warn(dev, "failed to set up host-wake IRQ %d\n", irq);
+		return false;
+	}
+
+	devinfo->host_wake_irq = irq;
+
+	return true;
 }
 
 static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;
-	int irq;
 
 	if (!brcmf_pcie_runtime_pm || !brcmf_pcie_inband_ds(devinfo))
 		return;
@@ -3967,21 +3975,13 @@ static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 		return;
 
 	/*
-	 * Optional OOB host-wake: an inbound frame cannot raise an in-band MSI
-	 * while the link is in D3, so the chip pulses a sideband line instead.
-	 * As a dedicated wake IRQ the PM core arms it on runtime suspend and
-	 * resumes the device when it fires -- no handler here.  brcmf_pcie_attach()
-	 * enables device wakeup, so the same IRQ is armed across system suspend
-	 * when cfg80211 supplies a WoWLAN configuration.
+	 * The optional OOB host-wake was registered before common attach.  An
+	 * inbound frame cannot raise an in-band MSI while the link is in D3, so
+	 * the chip pulses this sideband line instead.  Runtime PM enables its
+	 * dedicated handler around D3; system PM arms it as a wake source when
+	 * device wakeup is enabled.  Firmware WoWLAN policy determines whether
+	 * received traffic asserts it during system suspend.
 	 */
-	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
-	if (irq > 0) {
-		if (dev_pm_set_dedicated_wake_irq(dev, irq))
-			dev_warn(dev, "failed to set up host-wake IRQ %d\n", irq);
-		else
-			devinfo->host_wake_irq = irq;
-	}
-
 	pm_runtime_set_autosuspend_delay(dev,
 					 BRCMF_PCIE_RUNTIME_PM_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);
@@ -3995,19 +3995,17 @@ static void brcmf_pcie_runtime_pm_disable(struct brcmf_pciedev_info *devinfo)
 {
 	struct device *dev = &devinfo->pdev->dev;
 
-	if (!devinfo->runtime_pm_enabled)
-		return;
-
-	pm_runtime_get_sync(dev);		/* restore probe ref, resume */
-	pm_runtime_forbid(dev);			/* control=on again */
-	pm_runtime_dont_use_autosuspend(dev);
+	if (devinfo->runtime_pm_enabled) {
+		pm_runtime_get_sync(dev);	/* restore probe ref, resume */
+		pm_runtime_forbid(dev);		/* control=on again */
+		pm_runtime_dont_use_autosuspend(dev);
+		devinfo->runtime_pm_enabled = false;
+	}
 
 	if (devinfo->host_wake_irq) {
 		dev_pm_clear_wake_irq(dev);
 		devinfo->host_wake_irq = 0;
 	}
-
-	devinfo->runtime_pm_enabled = false;
 }
 
 #ifdef CONFIG_PM

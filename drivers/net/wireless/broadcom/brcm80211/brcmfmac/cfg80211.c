@@ -4295,7 +4295,11 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		brcmf_set_mpc(ifp, 1);
 
 	} else {
-		if (wowl->any) {
+		if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ANY)) {
+			if (!wowl->any) {
+				brcmf_dbg(INFO, "refusing empty wake-on-any configuration\n");
+				return 1;
+			}
 			err = brcmf_configure_wowl_any(cfg, ifp);
 			if (err)
 				return err;

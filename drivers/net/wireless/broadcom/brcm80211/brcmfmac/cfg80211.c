@@ -7935,11 +7935,9 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 static const struct wiphy_wowlan_support brcmf_wowlan_any_support = {
 	.flags = WIPHY_WOWLAN_ANY,
 };
-#endif
 
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
-#ifdef CONFIG_PM
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct wiphy_wowlan_support *wowl;
@@ -7965,8 +7963,8 @@ static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 	}
 
 	wiphy->wowlan = wowl;
-#endif
 }
+#endif
 
 static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 {

@@ -4313,17 +4313,17 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		brcmf_set_mpc(ifp, 1);
 
 	} else {
-		if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ANY)) {
-			if (!wowl->any) {
-				brcmf_dbg(INFO, "refusing empty wake-on-any configuration\n");
-				return 1;
-			}
+		if (wowl->any &&
+		    brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ANY)) {
 			err = brcmf_configure_wowl_any(cfg, ifp);
 			if (err)
 				return err;
-		} else {
+		} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
 			/* Configure selective WOWL parameters. */
 			brcmf_configure_wowl(cfg, ifp, wowl);
+		} else {
+			brcmf_dbg(INFO, "refusing unsupported WoWLAN configuration\n");
+			return 1;
 		}
 
 		/* Prevent disassociation due to inactivity with keep-alive */

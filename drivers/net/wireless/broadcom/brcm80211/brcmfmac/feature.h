@@ -37,6 +37,8 @@
  * EVENT_MSGS_EXT: Event messages extension
  * JOIN_V1: Version 1 join struct
  * GCMP: GCMP Cipher suite support
+ * WOWL_ANY: firmware remains associated in bus host sleep and wakes for any
+ *           received traffic, without the classic wowl iovars.
  */
 #define BRCMF_FEAT_LIST \
 	BRCMF_FEAT_DEF(MBSS) \
@@ -66,7 +68,8 @@
 	BRCMF_FEAT_DEF(PMKDB) \
 	BRCMF_FEAT_DEF(SAE_EXT) \
 	BRCMF_FEAT_DEF(EVENT_MSGS_EXT) \
-	BRCMF_FEAT_DEF(GCMP)
+	BRCMF_FEAT_DEF(GCMP) \
+	BRCMF_FEAT_DEF(WOWL_ANY)
 
 /*
  * Quirks:

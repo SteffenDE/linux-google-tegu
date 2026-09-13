@@ -318,9 +318,17 @@ int brcmf_feat_attach(struct brcmf_pub *drvr)
 	/* BCM4383 firmware advertises SAE offload but does not perform it
 	 * correctly; it does support driving SAE from the host supplicant
 	 * (external auth). Enable that path for it.
+	 *
+	 * It also supports remaining associated through PCIe host sleep and
+	 * waking the host for received traffic, despite not implementing the
+	 * classic wowl iovars used by brcmfmac's selective WoWLAN path.
 	 */
-	if (drvr->bus_if->chip == BRCM_CC_4383_CHIP_ID)
+	if (drvr->bus_if->chip == BRCM_CC_4383_CHIP_ID) {
 		ifp->drvr->feat_flags |= BIT(BRCMF_FEAT_SAE_EXT);
+		if (drvr->bus_if->wowl_supported &&
+		    drvr->bus_if->oob_host_wake)
+			ifp->drvr->feat_flags |= BIT(BRCMF_FEAT_WOWL_ANY);
+	}
 	memset(&gscan_cfg, 0, sizeof(gscan_cfg));
 	if (drvr->bus_if->chip != BRCM_CC_43430_CHIP_ID &&
 	    drvr->bus_if->chip != BRCM_CC_4345_CHIP_ID &&

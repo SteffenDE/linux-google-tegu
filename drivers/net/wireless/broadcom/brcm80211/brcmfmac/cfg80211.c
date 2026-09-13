@@ -4054,6 +4054,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
+	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -4062,6 +4063,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID),
 			.enable = cpu_to_le32(0),
 		};
+		s32 pm_err;
 
 		if (!cfg->wowl.any) {
 			brcmf_report_wowl_wakeind(wiphy, ifp);
@@ -4071,14 +4073,30 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			if (!brcmf_feat_is_enabled(ifp,
 						   BRCMF_FEAT_WOWL_ARP_ND))
 				brcmf_configure_arp_nd_offload(ifp, true);
-		} else if (brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable",
-						     &filter, sizeof(filter))) {
-			brcmf_dbg(TRACE, "failed to disable wake-on-any packet filter\n");
+			brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+					      cfg->wowl.pre_pmmode);
+			cfg->wowl.active = false;
+		} else {
+			err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable",
+						       &filter, sizeof(filter));
+			if (err)
+				bphy_err(cfg->pub, "failed to disable wake-on-any packet filter: %d\n",
+					 err);
+
+			pm_err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+						    cfg->wowl.pre_pmmode);
+			if (pm_err) {
+				bphy_err(cfg->pub, "failed to restore power-save mode: %d\n",
+					 pm_err);
+				if (!err)
+					err = pm_err;
+			}
+
+			if (!err) {
+				cfg->wowl.active = false;
+				cfg->wowl.any = false;
+			}
 		}
-		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
-				      cfg->wowl.pre_pmmode);
-		cfg->wowl.active = false;
-		cfg->wowl.any = false;
 		if (cfg->wowl.nd_enabled) {
 			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
 			brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
@@ -4087,7 +4105,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
-	return 0;
+	return err;
 }
 
 static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,

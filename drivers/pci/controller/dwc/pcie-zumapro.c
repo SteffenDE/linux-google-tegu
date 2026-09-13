@@ -105,6 +105,18 @@ static const struct of_device_id zumapro_pcie_of_match[];
 /* PERST settle time after deassert (downstream perst-delay-us default). */
 #define PCIE_PERST_DELAY_US		20000
 
+/*
+ * Set when the modem RC's first probe cannot train the link, so the deferred
+ * re-probe powers the CP with the full cold cycle instead of the warm reset.
+ * It cannot live in struct zumapro_pcie: the driver core frees the devm
+ * allocation and clears drvdata when a probe fails, and dw_pcie_host_init()
+ * cannot simply be called twice from one probe either (it takes the config
+ * region with devm_pci_remap_cfg_resource(), so a second call gets -EBUSY).
+ * There is exactly one modem root complex per SoC, and only that port has
+ * cp_pwr, so file scope is the whole of its scope.
+ */
+static bool zumapro_pcie_cp_cold_boot;
+
 /* Per-attempt link-up poll budget and cold-boot retraining retry count. */
 #define PCIE_LINK_WAIT_US		50000
 #define PCIE_LINK_WAIT_STEP_US		10
@@ -486,9 +498,22 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 			return 0;
 		}
 
+		/*
+		 * The LTSSM state is the only thing that separates the two ways
+		 * this times out, and it is not otherwise logged: when
+		 * start_link fails, dw_pcie_host_init() unwinds before
+		 * dw_pcie_wait_for_link() would have printed it.  A Detect state
+		 * means the RC never found a receiver -- the endpoint's PCIe
+		 * controller is not running -- while Polling or Configuration
+		 * means the endpoint is there and training itself is failing.
+		 * The poll above already reads this register continuously, so
+		 * the read adds no hazard of its own.
+		 */
 		dev_info(pci->dev,
-			 "link training attempt %d timed out, retraining\n",
-			 try + 1);
+			 "link training attempt %d timed out (ltssm %#x), retraining\n",
+			 try + 1,
+			 readl(pci->elbi_base + PCIE_ELBI_RDLH_LINKUP) &
+			 LTSSM_STATE_MASK);
 
 		/*
 		 * The endpoint may have stopped driving CLKREQ# by now (a
@@ -508,7 +533,15 @@ static int zumapro_pcie_start_link(struct dw_pcie *pci)
 
 	dev_err(pci->dev, "link failed to come up after %d attempts\n",
 		PCIE_LINK_TRAIN_RETRIES);
-	/* Downstream also releases the bring-up hold on the failure path. */
+	/*
+	 * Downstream also releases the bring-up hold on the failure path.  By
+	 * now the endpoint is quite likely not driving CLKREQ# -- that is one
+	 * of the ways training fails -- so park the sub-block clock on the OSC
+	 * for the write rather than risk wedging the interconnect on it, and
+	 * leave it parked: nothing trains on this port again without a
+	 * re-probe, and host_deinit() powers the PHY off right after.
+	 */
+	zumapro_pcie_phy_safe_clk(zp->phy, true);
 	writel(0, pci->elbi_base + PCIE_APP_XFER_PENDING);
 	return -ETIMEDOUT;
 }
@@ -568,7 +601,7 @@ static int zumapro_pcie_host_init(struct dw_pcie_rp *pp)
 
 	/* Power the modem endpoint before the link comes up (stub). */
 	if (zp->cp_pwr)
-		zumapro_pcie_cp_power_on(zp, false, false);
+		zumapro_pcie_cp_power_on(zp, false, zumapro_pcie_cp_cold_boot);
 
 	/* Release the PHY from PMU isolation. */
 	ret = phy_init(zp->phy);
@@ -1639,8 +1672,39 @@ static int zumapro_pcie_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, zp);
 
 	ret = dw_pcie_host_init(&zp->pci.pp);
-	if (ret)
+	if (ret) {
+		/*
+		 * Boot-time link training against the CP fails outright now and
+		 * then (hw: all ten attempts time out, the modem platform device
+		 * then defers forever and the phone comes up with no modem).
+		 * The one thing probe never varies is how the CP was reset, and
+		 * downstream never warm-resets a CP it is booting --
+		 * gpio_power_wreset_cp() belongs to the crash/dump paths
+		 * (power_reset_dump_cp), while power_on_cp() and
+		 * power_reset_cp() both run the full gpio_power_offon_cp()
+		 * cycle.  So give up the port and ask to be re-probed with the
+		 * cold cycle, which is the same sequence the leaving-dump path
+		 * is already validated on.
+		 *
+		 * Deferring rather than retrying in place is what makes this a
+		 * clean test as well as a clean unwind: the re-probe re-runs the
+		 * whole bring-up in its normal order, so cold-versus-warm is the
+		 * only thing that differs between the two attempts.
+		 *
+		 * Whether a warm reset is what wedges the CP is a hypothesis --
+		 * the failure is intermittent while the warm reset runs on every
+		 * boot, so something else is varying too.  The LTSSM state now
+		 * logged per attempt is what will say which.
+		 */
+		if (ret == -ETIMEDOUT && zp->cp_pwr &&
+		    !zumapro_pcie_cp_cold_boot) {
+			zumapro_pcie_cp_cold_boot = true;
+			dev_warn(dev,
+				 "modem link would not train after the warm CP reset, re-probing with a cold CP power cycle\n");
+			return -EPROBE_DEFER;
+		}
 		return dev_err_probe(dev, ret, "failed to initialize host\n");
+	}
 
 	return 0;
 }

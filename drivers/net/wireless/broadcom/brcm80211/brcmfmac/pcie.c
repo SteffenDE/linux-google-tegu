@@ -3474,6 +3474,12 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 			  atomic_read(&devinfo->ds_active_count));
 
 	bus->oob_host_wake = brcmf_pcie_oob_host_wake_avail(devinfo);
+	/*
+	 * PCIe firmware may signal WoWLAN through a dedicated sideband IRQ
+	 * instead of PCI PME.  The common feature probe only asks the firmware
+	 * about WoWLAN when the bus says the host has a usable wake path.
+	 */
+	bus->wowl_supported |= bus->oob_host_wake;
 
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
@@ -3923,8 +3929,9 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 /*
  * Whether the host will be able to see the firmware's out-of-band host-wake.
  * The line is optional and described per board, and the PM core only arms it
- * as a dedicated wake IRQ while runtime PM has the device in D3, so all three
- * conditions have to hold for a wake to ever reach us.
+ * as a dedicated wake IRQ while runtime PM has the device in D3 and across
+ * system suspend when device wakeup is enabled, so all three conditions have
+ * to hold for a wake to ever reach us.
  *
  * Evaluated in brcmf_pcie_setup() before brcmf_attach(), so that
  * brcmf_c_preinit_dcmds() can decide whether to let the firmware assert the
@@ -3963,9 +3970,9 @@ static void brcmf_pcie_runtime_pm_enable(struct brcmf_pciedev_info *devinfo)
 	 * Optional OOB host-wake: an inbound frame cannot raise an in-band MSI
 	 * while the link is in D3, so the chip pulses a sideband line instead.
 	 * As a dedicated wake IRQ the PM core arms it on runtime suspend and
-	 * resumes the device when it fires -- no handler here.  This does not
-	 * touch system-suspend wake (that stays gated on device_may_wakeup),
-	 * leaving the existing WoWL policy unchanged.
+	 * resumes the device when it fires -- no handler here.  brcmf_pcie_attach()
+	 * enables device wakeup, so the same IRQ is armed across system suspend
+	 * when cfg80211 supplies a WoWLAN configuration.
 	 */
 	irq = of_irq_get_byname(dev_of_node(dev), "host-wake");
 	if (irq > 0) {

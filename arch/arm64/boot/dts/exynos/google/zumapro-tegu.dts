@@ -2662,6 +2662,26 @@
 	status = "okay";
 };
 
+&s2mpu_gdc {
+	status = "okay";
+};
+
+&s2mpu_mcsc {
+	status = "okay";
+};
+
+&s2mpu_rgbp_s0 {
+	status = "okay";
+};
+
+&s2mpu_rgbp_s1 {
+	status = "okay";
+};
+
+&s2mpu_yuvp {
+	status = "okay";
+};
+
 &sysmmu_gdc {
 	status = "okay";
 };

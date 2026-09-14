@@ -3942,10 +3942,68 @@
 		 * windows and all stream tables are the downstream Zumapro values.
 		 * RGBP has two controllers with two and five PMMUs respectively;
 		 * YUVP has one.  GDC has three PMMUs and is included because RGBP's
-		 * command loader resides in that domain.  They stay disabled until
-		 * a BE-core consumer can open every S2MPU before DMA is enabled;
-		 * the domains themselves restore their own CMUs.
+		 * command loader resides in that domain.  Each links to the stage-2
+		 * unit in front of it, which the power domain resets to blocking
+		 * every time the block powers off; the domains themselves restore
+		 * their own CMUs.
 		 */
+
+		/*
+		 * Camera back-end stage-2 protection units.  Bases and fault IRQs
+		 * are the downstream values (research/dumped.dts s2mpu_s0_gdc,
+		 * s2mpu_s0_mcsc, s2mpu_s0_rgbp, s2mpu_s1_rgbp, s2mpu_s0_yuvp).
+		 * No clock, like the DPU's and the GPU's: the power domain restores
+		 * the block's CMU around the transition.  Each System MMU takes its
+		 * unit through access-controllers, which makes the unit resume --
+		 * and so reopen -- before the walker is used.  Without that link
+		 * the first walk after the domain powers on takes a page-table walk
+		 * access fault: the unit comes back blocking.
+		 */
+		s2mpu_gdc: access-controller@1d4f0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1d4f0000 0x10000>;
+			interrupts = <GIC_SPI 373 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_gdc>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		s2mpu_mcsc: access-controller@1d0d0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1d0d0000 0x10000>;
+			interrupts = <GIC_SPI 513 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_mcsc>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		s2mpu_rgbp_s0: access-controller@1c4d0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1c4d0000 0x10000>;
+			interrupts = <GIC_SPI 677 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_rgbp>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		s2mpu_rgbp_s1: access-controller@1c510000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1c510000 0x10000>;
+			interrupts = <GIC_SPI 681 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_rgbp>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
+		s2mpu_yuvp: access-controller@1c8a0000 {
+			compatible = "google,zumapro-s2mpu";
+			reg = <0x1c8a0000 0x10000>;
+			interrupts = <GIC_SPI 742 IRQ_TYPE_LEVEL_HIGH 0>;
+			power-domains = <&pd_yuvp>;
+			#access-controller-cells = <0>;
+			status = "disabled";
+		};
+
 		sysmmu_gdc: iommu@1d4c0000 {
 			compatible = "samsung,sysmmu-v9";
 			reg = <0x1d4c0000 0x10000>;
@@ -4016,6 +4074,7 @@
 				<0x08 0x1208010b 0x201 0x04 0x07>,
 				<0x09 0x1209010b 0x201 0x05 0x07>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_gdc>;
 			status = "disabled";
 		};
 
@@ -4045,6 +4104,7 @@
 				<0x0c 0x6060108 0x201 0x02 0x1f>,
 				<0x0d 0x6060108 0x201 0x06 0x1f>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_yuvp>;
 			status = "disabled";
 		};
 
@@ -4082,6 +4142,7 @@
 				<0x0c 0xa060108 0x201 0x02 0x0f>,
 				<0x0d 0xa060108 0x201 0x06 0x0f>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_rgbp_s0>;
 			status = "disabled";
 		};
 
@@ -4143,6 +4204,7 @@
 				<0x0c 0x500010b 0x101 0x04 0x1f>,
 				<0x0d 0x500010b 0x101 0x0c 0x1f>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_rgbp_s1>;
 			status = "disabled";
 		};
 
@@ -4343,6 +4405,7 @@
 				<0x16 0x1d0b010a 0x201 0x03 0x3f>,
 				<0x17 0x1d0b010a 0x201 0x07 0x3f>;
 			#iommu-cells = <0>;
+			access-controllers = <&s2mpu_mcsc>;
 			status = "disabled";
 		};
 

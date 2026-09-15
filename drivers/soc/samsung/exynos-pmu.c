@@ -27,6 +27,13 @@
 
 #include "exynos-pmu.h"
 
+#define ZUMAPRO_MIF_DEBUG_BLOCKS	4
+#define ZUMAPRO_MIF_DEBUG_WORDS		6
+
+struct zumapro_mif_debug_sample {
+	u32 value[ZUMAPRO_MIF_DEBUG_BLOCKS][ZUMAPRO_MIF_DEBUG_WORDS];
+};
+
 struct exynos_pmu_context {
 	struct device *dev;
 	const struct exynos_pmu_data *pmu_data;
@@ -40,6 +47,13 @@ struct exynos_pmu_context {
 	raw_spinlock_t cpupm_lock;
 	unsigned long *in_cpuhp;
 	void __iomem **zumapro_sleep_exit_drcg;
+	void __iomem *zumapro_mif_debug_cmu[ZUMAPRO_MIF_DEBUG_BLOCKS];
+	void __iomem *zumapro_mif_debug_sysreg[ZUMAPRO_MIF_DEBUG_BLOCKS];
+	void __iomem *zumapro_mif_debug_pwrmgmt[ZUMAPRO_MIF_DEBUG_BLOCKS];
+	struct zumapro_mif_debug_sample zumapro_mif_debug_baseline;
+	struct zumapro_mif_debug_sample zumapro_mif_debug_entry;
+	struct zumapro_mif_debug_sample zumapro_mif_debug_scratch;
+	unsigned int zumapro_mif_debug_cycle;
 	bool sys_insuspend;
 	bool sys_inreboot;
 };
@@ -763,6 +777,145 @@ static void zumapro_restore_sleep_exit_drcg(void)
 	}
 }
 
+/*
+ * Temporary suspend diagnostics for the MIF0..3 state that downstream saves
+ * and restores around SYS_SLEEP.  In particular, MIF3 is the block named by
+ * the ACPM power-link timeout seen during the rapid suspend soak.  Keep this
+ * strictly read-only: the purpose is to learn whether one of these words has
+ * already drifted before a failing entry, and whether normal and early wake
+ * paths return different state.
+ */
+#define ZUMAPRO_MIF_CMU_BASE		0x27c00000
+#define ZUMAPRO_MIF_SYSREG_BASE		0x27c20000
+#define ZUMAPRO_MIF_PWRMGMT_BASE	0x27c40000
+#define ZUMAPRO_MIF_STRIDE		0x00100000
+
+#define ZUMAPRO_MIF_CONTROLLER_OPTION	0x0800
+#define ZUMAPRO_MIF_CLKOUT		0x0810
+#define ZUMAPRO_MIF_SHORTSTOP		0x0820
+#define ZUMAPRO_MIF_HCHGEN		0x0850
+#define ZUMAPRO_MIF_PWRMGMT_MODE2	0xf240
+
+enum zumapro_mif_debug_word {
+	ZUMAPRO_MIF_DEBUG_CONTROLLER_OPTION,
+	ZUMAPRO_MIF_DEBUG_CLKOUT,
+	ZUMAPRO_MIF_DEBUG_SHORTSTOP,
+	ZUMAPRO_MIF_DEBUG_HCHGEN,
+	ZUMAPRO_MIF_DEBUG_PWRMGMT_MODE2,
+	ZUMAPRO_MIF_DEBUG_DRCG,
+};
+
+static void
+zumapro_read_mif_debug_sample(struct zumapro_mif_debug_sample *sample)
+{
+	unsigned int i;
+
+	for (i = 0; i < ZUMAPRO_MIF_DEBUG_BLOCKS; i++) {
+		sample->value[i][ZUMAPRO_MIF_DEBUG_CONTROLLER_OPTION] =
+			readl(pmu_context->zumapro_mif_debug_cmu[i] +
+			      ZUMAPRO_MIF_CONTROLLER_OPTION);
+		sample->value[i][ZUMAPRO_MIF_DEBUG_CLKOUT] =
+			readl(pmu_context->zumapro_mif_debug_cmu[i] +
+			      ZUMAPRO_MIF_CLKOUT);
+		sample->value[i][ZUMAPRO_MIF_DEBUG_SHORTSTOP] =
+			readl(pmu_context->zumapro_mif_debug_cmu[i] +
+			      ZUMAPRO_MIF_SHORTSTOP);
+		sample->value[i][ZUMAPRO_MIF_DEBUG_HCHGEN] =
+			readl(pmu_context->zumapro_mif_debug_cmu[i] +
+			      ZUMAPRO_MIF_HCHGEN);
+		sample->value[i][ZUMAPRO_MIF_DEBUG_PWRMGMT_MODE2] =
+			readl(pmu_context->zumapro_mif_debug_pwrmgmt[i] +
+			      ZUMAPRO_MIF_PWRMGMT_MODE2);
+		sample->value[i][ZUMAPRO_MIF_DEBUG_DRCG] =
+			readl(pmu_context->zumapro_mif_debug_sysreg[i] +
+			      ZUMAPRO_DRCG_EN_OFFSET);
+	}
+}
+
+static u32
+zumapro_mif_debug_diff(const struct zumapro_mif_debug_sample *sample,
+		       const struct zumapro_mif_debug_sample *reference,
+		       unsigned int mif)
+{
+	u32 changed = 0;
+	unsigned int word;
+
+	if (!reference)
+		return GENMASK(ZUMAPRO_MIF_DEBUG_WORDS - 1, 0);
+
+	for (word = 0; word < ZUMAPRO_MIF_DEBUG_WORDS; word++) {
+		if (sample->value[mif][word] != reference->value[mif][word])
+			changed |= BIT(word);
+	}
+
+	return changed;
+}
+
+static void
+zumapro_log_mif_debug_sample(const char *phase,
+			     struct zumapro_mif_debug_sample *sample,
+			     const struct zumapro_mif_debug_sample *reference)
+{
+	u32 block_diff[ZUMAPRO_MIF_DEBUG_BLOCKS];
+	unsigned int changed = 0;
+	unsigned int i;
+
+	zumapro_read_mif_debug_sample(sample);
+	for (i = 0; i < ZUMAPRO_MIF_DEBUG_BLOCKS; i++) {
+		block_diff[i] = zumapro_mif_debug_diff(sample, reference, i);
+		if (block_diff[i])
+			changed |= BIT(i);
+	}
+
+	pr_info("zumapro-mifdbg: cycle=%u phase=%s changed=%#x\n",
+		pmu_context->zumapro_mif_debug_cycle, phase, changed);
+	for (i = 0; i < ZUMAPRO_MIF_DEBUG_BLOCKS; i++) {
+		if (!block_diff[i])
+			continue;
+
+		pr_info("zumapro-mifdbg: mif%u diff=%#x ctrl=%08x clkout=%08x short=%08x hch=%08x pwr2=%08x drcg=%08x\n",
+			i, block_diff[i],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_CONTROLLER_OPTION],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_CLKOUT],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_SHORTSTOP],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_HCHGEN],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_PWRMGMT_MODE2],
+			sample->value[i][ZUMAPRO_MIF_DEBUG_DRCG]);
+	}
+}
+
+static int zumapro_prepare_mif_debug(struct device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < ZUMAPRO_MIF_DEBUG_BLOCKS; i++) {
+		phys_addr_t cmu = ZUMAPRO_MIF_CMU_BASE + i * ZUMAPRO_MIF_STRIDE;
+		phys_addr_t sysreg = ZUMAPRO_MIF_SYSREG_BASE +
+				     i * ZUMAPRO_MIF_STRIDE;
+		phys_addr_t pwrmgmt = ZUMAPRO_MIF_PWRMGMT_BASE +
+				      i * ZUMAPRO_MIF_STRIDE;
+
+		pmu_context->zumapro_mif_debug_cmu[i] =
+			devm_ioremap(dev, cmu, 0x1000);
+		pmu_context->zumapro_mif_debug_sysreg[i] =
+			devm_ioremap(dev, sysreg, 0x1000);
+		pmu_context->zumapro_mif_debug_pwrmgmt[i] =
+			devm_ioremap(dev, pwrmgmt, 0x10000);
+		if (!pmu_context->zumapro_mif_debug_cmu[i] ||
+		    !pmu_context->zumapro_mif_debug_sysreg[i] ||
+		    !pmu_context->zumapro_mif_debug_pwrmgmt[i])
+			return dev_err_probe(dev, -ENOMEM,
+					     "cannot map MIF%u debug registers\n", i);
+	}
+
+	pr_info("zumapro-mifdbg: fields diff[0:5]=ctrl,clkout,short,hch,pwr2,drcg\n");
+	zumapro_log_mif_debug_sample("probe",
+				     &pmu_context->zumapro_mif_debug_baseline,
+				     NULL);
+
+	return 0;
+}
+
 #define ZUMAPRO_SLEEP_EXIT_TOP_OUT_MASK	(GENMASK(14, 11) | BIT(9) | BIT(7))
 
 /*
@@ -912,7 +1065,11 @@ static int zumapro_sys_sleep_suspend(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return 0;
 
+	pmu_context->zumapro_mif_debug_cycle++;
 	zumapro_sys_sleep_arm();
+	zumapro_log_mif_debug_sample("entry",
+				     &pmu_context->zumapro_mif_debug_entry,
+				     &pmu_context->zumapro_mif_debug_baseline);
 	return 0;
 }
 
@@ -921,9 +1078,15 @@ static void zumapro_sys_sleep_resume(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return;
 
+	zumapro_log_mif_debug_sample("raw-return",
+				     &pmu_context->zumapro_mif_debug_scratch,
+				     &pmu_context->zumapro_mif_debug_entry);
 	zumapro_sys_sleep_disarm();
 	zumapro_restore_sleep_exit_drcg();
 	zumapro_restore_sleep_exit_top_out();
+	zumapro_log_mif_debug_sample("restored-return",
+				     &pmu_context->zumapro_mif_debug_scratch,
+				     &pmu_context->zumapro_mif_debug_baseline);
 }
 
 static const struct syscore_ops zumapro_sys_sleep_syscore_ops = {
@@ -1330,6 +1493,9 @@ static int exynos_pmu_probe(struct platform_device *pdev)
 		zumapro_program_lpm_durations(dev);
 		zumapro_program_lpm_init(dev);
 		ret = zumapro_prepare_sleep_exit_drcg(dev);
+		if (ret)
+			return ret;
+		ret = zumapro_prepare_mif_debug(dev);
 		if (ret)
 			return ret;
 	}

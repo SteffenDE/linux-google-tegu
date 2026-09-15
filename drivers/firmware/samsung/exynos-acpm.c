@@ -66,6 +66,34 @@ struct acpm_build_info {
 };
 
 /**
+ * struct acpm_fw_log_snapshot - host copy of one firmware log tail.
+ * @name: diagnostic name of the firmware ring.
+ * @entries: preallocated host buffer, in newest-first order.
+ * @error: validation failure, or NULL for a usable snapshot.
+ * @rear_offset: SRAM offset of the firmware's rear index.
+ * @front_offset: SRAM offset of the firmware's front index.
+ * @data_offset: SRAM offset of the firmware's entry array.
+ * @entry_size: firmware entry stride in bytes.
+ * @len: number of entries in the firmware ring.
+ * @rear: sampled firmware rear index.
+ * @front: sampled firmware front index.
+ * @count: number of entries copied into @entries.
+ */
+struct acpm_fw_log_snapshot {
+	const char *name;
+	u32 *entries;
+	const char *error;
+	u32 rear_offset;
+	u32 front_offset;
+	u32 data_offset;
+	u32 entry_size;
+	u32 len;
+	u32 rear;
+	u32 front;
+	u32 count;
+};
+
+/**
  * struct acpm_shmem - shared memory configuration information.
  * @plugins:	offset to the firmware plugin table.
  * @num_plugins: number of firmware plugins.
@@ -237,6 +265,8 @@ struct acpm_chan {
  * @handle:	instance of acpm_handle to send to clients.
  * @num_chans:	number of channels available for this controller.
  * @sram_size:	size of the firmware SRAM mapping.
+ * @normal_log: preallocated snapshot of the normal firmware log.
+ * @preempt_log: preallocated snapshot of the preempt firmware log.
  * @timeout_claimed: elects one timeout caller to collect fatal diagnostics.
  * @timeout_debug: panic with firmware diagnostics on the first timeout.
  */
@@ -248,6 +278,8 @@ struct acpm_info {
 	struct acpm_handle handle;
 	u32 num_chans;
 	resource_size_t sram_size;
+	struct acpm_fw_log_snapshot normal_log;
+	struct acpm_fw_log_snapshot preempt_log;
 	atomic_t timeout_claimed;
 	bool timeout_debug;
 };
@@ -270,6 +302,23 @@ struct acpm_match_data {
 static bool acpm_sram_range_valid(const struct acpm_info *acpm, u32 offset,
 				  resource_size_t size)
 {
+	return offset < acpm->sram_size && size <= acpm->sram_size - offset;
+}
+
+static bool acpm_sram_pointer_valid(const struct acpm_info *acpm,
+				    const void __iomem *pointer,
+				    resource_size_t size)
+{
+	unsigned long address = (unsigned long)pointer;
+	unsigned long base = (unsigned long)acpm->sram_base;
+	resource_size_t offset;
+
+	if (address < base)
+		return false;
+	if (!IS_ALIGNED(address, sizeof(u32)))
+		return false;
+
+	offset = address - base;
 	return offset < acpm->sram_size && size <= acpm->sram_size - offset;
 }
 
@@ -298,19 +347,29 @@ static bool acpm_fw_log_string(struct acpm_info *acpm, u32 encoded_offset,
 	return true;
 }
 
-static void acpm_dump_fw_log(struct acpm_info *acpm, const char *name,
-			     u32 rear_offset, u32 front_offset,
-			     u32 data_offset, u32 entry_size, u32 len)
+static void acpm_snapshot_fw_log(struct acpm_info *acpm,
+				 struct acpm_fw_log_snapshot *snapshot,
+				 u32 rear_offset, u32 front_offset,
+				 u32 data_offset, u32 entry_size, u32 len)
 {
-	struct device *dev = acpm->dev;
-	u32 count, front, rear, i;
 	resource_size_t data_size;
+	u32 i;
+
+	snapshot->error = NULL;
+	snapshot->rear_offset = rear_offset;
+	snapshot->front_offset = front_offset;
+	snapshot->data_offset = data_offset;
+	snapshot->entry_size = entry_size;
+	snapshot->len = len;
+	snapshot->count = 0;
 
 	if (entry_size < ACPM_FW_LOG_ENTRY_WORDS * sizeof(u32) || !len ||
+	    !IS_ALIGNED(rear_offset, sizeof(u32)) ||
+	    !IS_ALIGNED(front_offset, sizeof(u32)) ||
+	    !IS_ALIGNED(data_offset, sizeof(u32)) ||
+	    !IS_ALIGNED(entry_size, sizeof(u32)) ||
 	    len > acpm->sram_size / entry_size) {
-		dev_emerg(dev,
-			  "firmware %s log has invalid geometry: data:%#x entry:%u len:%u\n",
-			  name, data_offset, entry_size, len);
+		snapshot->error = "invalid geometry";
 		return;
 	}
 
@@ -318,37 +377,77 @@ static void acpm_dump_fw_log(struct acpm_info *acpm, const char *name,
 	if (!acpm_sram_range_valid(acpm, rear_offset, sizeof(u32)) ||
 	    !acpm_sram_range_valid(acpm, front_offset, sizeof(u32)) ||
 	    !acpm_sram_range_valid(acpm, data_offset, data_size)) {
-		dev_emerg(dev,
-			  "firmware %s log lies outside SRAM: rear:%#x front:%#x data:%#x bytes:%pa\n",
-			  name, rear_offset, front_offset, data_offset, &data_size);
+		snapshot->error = "outside SRAM";
 		return;
 	}
 
-	rear = readl(acpm->sram_base + rear_offset);
-	front = readl(acpm->sram_base + front_offset);
-	if (front >= len) {
-		dev_emerg(dev,
-			  "firmware %s log has invalid indices: rear:%u front:%u len:%u\n",
-			  name, rear, front, len);
+	snapshot->rear = readl(acpm->sram_base + rear_offset);
+	snapshot->front = readl(acpm->sram_base + front_offset);
+	if (snapshot->front >= len) {
+		snapshot->error = "invalid indices";
 		return;
 	}
 
-	count = min_t(u32, len, ACPM_FW_LOG_DUMP_MAX_ENTRIES);
-	dev_emerg(dev,
-		  "firmware %s log: rear:%u front:%u len:%u entry:%u; dumping %u newest-first\n",
-		  name, rear, front, len, entry_size, count);
-
-	for (i = 0; i < count; i++) {
+	snapshot->count = min_t(u32, len, ACPM_FW_LOG_DUMP_MAX_ENTRIES);
+	for (i = 0; i < snapshot->count; i++) {
 		void __iomem *entry;
+		u32 index;
+
+		index = (snapshot->front + len - 1 - i) % len;
+		entry = acpm->sram_base + data_offset + index * entry_size;
+		__ioread32_copy(&snapshot->entries[i * ACPM_FW_LOG_ENTRY_WORDS],
+				  entry, ACPM_FW_LOG_ENTRY_WORDS);
+	}
+}
+
+static void acpm_snapshot_fw_logs(struct acpm_info *acpm)
+{
+	struct acpm_shmem __iomem *shmem = acpm->shmem;
+	u32 entry_size = readl(&shmem->log_entry_size);
+
+	/* The normal ring is the high-volume ring, so preserve it first. */
+	acpm_snapshot_fw_log(acpm, &acpm->normal_log,
+			     readl(&shmem->log_buf_rear),
+			     readl(&shmem->log_buf_front),
+			     readl(&shmem->log_data), entry_size,
+			     readl(&shmem->log_entry_len));
+
+	acpm_snapshot_fw_log(acpm, &acpm->preempt_log,
+			     readl(&shmem->preempt_log_buf_rear),
+			     readl(&shmem->preempt_log_buf_front),
+			     readl(&shmem->preempt_log_data), entry_size,
+			     readl(&shmem->preempt_log_entry_len));
+}
+
+static void acpm_print_fw_log(struct acpm_info *acpm,
+			      const struct acpm_fw_log_snapshot *snapshot)
+{
+	struct device *dev = acpm->dev;
+	u32 i;
+
+	if (snapshot->error) {
+		dev_emerg(dev,
+			  "firmware %s log snapshot failed (%s): rear:%#x front:%#x data:%#x entry:%u len:%u sampled-rear:%u sampled-front:%u\n",
+			  snapshot->name, snapshot->error, snapshot->rear_offset,
+			  snapshot->front_offset, snapshot->data_offset,
+			  snapshot->entry_size, snapshot->len, snapshot->rear,
+			  snapshot->front);
+		return;
+	}
+
+	dev_emerg(dev,
+		  "firmware %s log snapshot: rear:%u front:%u len:%u entry:%u; dumping %u newest-first\n",
+		  snapshot->name, snapshot->rear, snapshot->front, snapshot->len,
+		  snapshot->entry_size, snapshot->count);
+
+	for (i = 0; i < snapshot->count; i++) {
 		char message[ACPM_FW_LOG_STRING_MAX];
-		u32 word[ACPM_FW_LOG_ENTRY_WORDS];
+		const u32 *word = &snapshot->entries[i * ACPM_FW_LOG_ENTRY_WORDS];
 		u32 index, id;
 		u64 ticks, time_ns;
 		bool raw, flag26;
 
-		index = (front + len - 1 - i) % len;
-		entry = acpm->sram_base + data_offset + index * entry_size;
-		__ioread32_copy(word, entry, ARRAY_SIZE(word));
+		index = (snapshot->front + snapshot->len - 1 - i) % snapshot->len;
 
 		if (!(word[0] | word[1] | word[2] | word[3]))
 			continue;
@@ -362,38 +461,30 @@ static void acpm_dump_fw_log(struct acpm_info *acpm, const char *name,
 		if (raw) {
 			dev_emerg(dev,
 				  "firmware %s[%u]: raw id:%u flag26:%u data:%08x %08x %08x %08x\n",
-				  name, index, id, flag26, word[0], word[1],
+				  snapshot->name, index, id, flag26, word[0], word[1],
 				  word[2], word[3]);
 		} else if (acpm_fw_log_string(acpm, word[2], message,
 					       sizeof(message))) {
 			dev_emerg(dev,
 				  "firmware %s[%u]: time-ns:%llu id:%u flag26:%u \"%s\" arg:%08x raw:%08x %08x %08x %08x\n",
-				  name, index, time_ns, id, flag26, message, word[3],
+				  snapshot->name, index, time_ns, id, flag26,
+				  message, word[3],
 				  word[0], word[1], word[2], word[3]);
 		} else {
 			dev_emerg(dev,
 				  "firmware %s[%u]: time-ns:%llu id:%u flag26:%u bad-string:%08x arg:%08x raw:%08x %08x %08x %08x\n",
-				  name, index, time_ns, id, flag26, word[2], word[3],
+				  snapshot->name, index, time_ns, id, flag26,
+				  word[2], word[3],
 				  word[0], word[1], word[2], word[3]);
 		}
 	}
 }
 
-static void acpm_dump_fw_logs(struct acpm_info *acpm)
+static void acpm_print_fw_logs(struct acpm_info *acpm)
 {
-	struct acpm_shmem __iomem *shmem = acpm->shmem;
-	u32 entry_size = readl(&shmem->log_entry_size);
-
 	/* Preempt records include exception and high-priority handler context. */
-	acpm_dump_fw_log(acpm, "preempt",
-			 readl(&shmem->preempt_log_buf_rear),
-			 readl(&shmem->preempt_log_buf_front),
-			 readl(&shmem->preempt_log_data), entry_size,
-			 readl(&shmem->preempt_log_entry_len));
-
-	acpm_dump_fw_log(acpm, "normal", readl(&shmem->log_buf_rear),
-			 readl(&shmem->log_buf_front), readl(&shmem->log_data),
-			 entry_size, readl(&shmem->log_entry_len));
+	acpm_print_fw_log(acpm, &acpm->preempt_log);
+	acpm_print_fw_log(acpm, &acpm->normal_log);
 }
 
 static void acpm_dump_queue_slots(struct acpm_chan *achan, const char *name,
@@ -404,6 +495,15 @@ static void acpm_dump_queue_slots(struct acpm_chan *achan, const char *name,
 	u32 words = min_t(u32, achan->mlen / sizeof(u32),
 			  ACPM_QUEUE_DUMP_WORDS);
 	u32 i;
+	resource_size_t size = (resource_size_t)achan->mlen * count;
+
+	if (!count || !words || !IS_ALIGNED(achan->mlen, sizeof(u32)) ||
+	    !acpm_sram_pointer_valid(achan->acpm, queue->base, size)) {
+		dev_emerg(dev,
+			  "ch:%u %s queue cannot be dumped safely: base:%px slots:%u mlen:%u words:%u\n",
+			  achan->id, name, queue->base, count, achan->mlen, words);
+		return;
+	}
 
 	for (i = 0; i < count; i++) {
 		u32 data[ACPM_QUEUE_DUMP_WORDS] = {};
@@ -427,14 +527,27 @@ static void acpm_dump_channels(struct acpm_info *acpm,
 	for (i = 0; i < acpm->num_chans; i++) {
 		struct acpm_chan *achan = &acpm->chans[i];
 		DECLARE_BITMAP(pending, ACPM_SEQNUM_MAX - 1);
+		u32 rx_rear = 0, rx_front = 0, tx_rear = 0, tx_front = 0;
+		bool indices_valid;
 		unsigned long seq;
 
 		bitmap_copy(pending, achan->bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
+		indices_valid =
+			acpm_sram_pointer_valid(acpm, achan->rx.rear, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->rx.front, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->tx.rear, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->tx.front, sizeof(u32));
+		if (indices_valid) {
+			rx_rear = readl(achan->rx.rear);
+			rx_front = readl(achan->rx.front);
+			tx_rear = readl(achan->tx.rear);
+			tx_front = readl(achan->tx.front);
+		}
+
 		dev_emerg(acpm->dev,
-			  "ch:%u state: pending:%*pb RX rear:%u front:%u TX rear:%u front:%u qlen:%u mlen:%u\n",
+			  "ch:%u state: pending:%*pb indices-valid:%u RX rear:%u front:%u TX rear:%u front:%u qlen:%u mlen:%u\n",
 			  achan->id, ACPM_SEQNUM_MAX - 1, pending,
-			  readl(achan->rx.rear), readl(achan->rx.front),
-			  readl(achan->tx.rear), readl(achan->tx.front),
+			  indices_valid, rx_rear, rx_front, tx_rear, tx_front,
 			  achan->qlen, achan->mlen);
 
 		for_each_set_bit(seq, pending, ACPM_SEQNUM_MAX - 1) {
@@ -474,6 +587,10 @@ static void acpm_timeout_debug(struct acpm_chan *achan,
 
 	words = min_t(size_t, xfer->txcnt, ARRAY_SIZE(request));
 	memcpy(request, xfer->txd, words * sizeof(*request));
+
+	/* Preserve volatile firmware evidence before synchronous console output. */
+	acpm_snapshot_fw_logs(acpm);
+
 	dev_emerg(acpm->dev,
 		  "first IPC timeout: ch:%u seq:%u txcnt:%zu request:%08x %08x %08x %08x\n",
 		  achan->id, seqnum, xfer->txcnt, request[0], request[1],
@@ -481,7 +598,7 @@ static void acpm_timeout_debug(struct acpm_chan *achan,
 
 	exynos_mbox_dump_regs(achan->chan);
 	acpm_dump_channels(acpm, achan);
-	acpm_dump_fw_logs(acpm);
+	acpm_print_fw_logs(acpm);
 	dump_stack();
 
 	/* A diagnostic kernel must come back even without panic= on cmdline. */
@@ -982,6 +1099,30 @@ static void acpm_clk_pdev_unregister(void *data)
 	platform_device_unregister(data);
 }
 
+static int acpm_timeout_debug_init(struct acpm_info *acpm)
+{
+	size_t words = ACPM_FW_LOG_DUMP_MAX_ENTRIES * ACPM_FW_LOG_ENTRY_WORDS;
+
+	if (!acpm->timeout_debug)
+		return 0;
+
+	acpm->normal_log.name = "normal";
+	acpm->normal_log.entries = devm_kcalloc(acpm->dev, words,
+						 sizeof(*acpm->normal_log.entries),
+						 GFP_KERNEL);
+	if (!acpm->normal_log.entries)
+		return -ENOMEM;
+
+	acpm->preempt_log.name = "preempt";
+	acpm->preempt_log.entries = devm_kcalloc(acpm->dev, words,
+						  sizeof(*acpm->preempt_log.entries),
+						  GFP_KERNEL);
+	if (!acpm->preempt_log.entries)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static const struct acpm_ops exynos_acpm_driver_ops = {
 	.dvfs = {
 		.set_rate = acpm_dvfs_set_rate,
@@ -1046,6 +1187,11 @@ static int acpm_probe(struct platform_device *pdev)
 	acpm->sram_size = size;
 	acpm->timeout_debug = match_data->timeout_debug;
 	atomic_set(&acpm->timeout_claimed, 0);
+
+	ret = acpm_timeout_debug_init(acpm);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Failed to allocate timeout log snapshots.\n");
 
 	ret = acpm_channels_init(acpm);
 	if (ret)

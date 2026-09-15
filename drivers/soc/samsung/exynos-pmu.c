@@ -30,6 +30,9 @@
 #define ZUMAPRO_MIF_DEBUG_BLOCKS	4
 #define ZUMAPRO_MIF_DEBUG_WORDS		6
 
+/* CONTROLLER_OPTION, CLKOUT, SHORTSTOP, HCHGEN_CLKMUX_CMUREF */
+#define ZUMAPRO_MIF_SLEEP_SAVE_WORDS	4
+
 struct zumapro_mif_debug_sample {
 	u32 value[ZUMAPRO_MIF_DEBUG_BLOCKS][ZUMAPRO_MIF_DEBUG_WORDS];
 };
@@ -54,6 +57,8 @@ struct exynos_pmu_context {
 	struct zumapro_mif_debug_sample zumapro_mif_debug_entry;
 	struct zumapro_mif_debug_sample zumapro_mif_debug_scratch;
 	unsigned int zumapro_mif_debug_cycle;
+	u32 zumapro_mif_sleep_save[ZUMAPRO_MIF_DEBUG_BLOCKS]
+				  [ZUMAPRO_MIF_SLEEP_SAVE_WORDS];
 	bool sys_insuspend;
 	bool sys_inreboot;
 };
@@ -884,6 +889,79 @@ zumapro_log_mif_debug_sample(const char *phase,
 	}
 }
 
+/*
+ * Downstream snapshots four CMU words per MIF before every SYS_SLEEP and
+ * replays them on the way back, and clears PWRMGMT_MODE2 bit 31 on a full
+ * resume before it rewrites DRCG.  Mainline has only the DRCG rewrite, so this
+ * is the one source-visible difference left on the entry path that the MIF3
+ * power-down stall could plausibly turn on.
+ *
+ * The read-only recorder says none of these words changes across a healthy
+ * cycle, and the failing entry's own sample is at the probe baseline too, so
+ * this is a long shot on its own evidence.  It is cheap, and it is the last
+ * thing downstream does here that we do not.
+ */
+static const u16 zumapro_mif_sleep_save_offset[ZUMAPRO_MIF_SLEEP_SAVE_WORDS] = {
+	ZUMAPRO_MIF_CONTROLLER_OPTION,
+	ZUMAPRO_MIF_CLKOUT,
+	ZUMAPRO_MIF_SHORTSTOP,
+	ZUMAPRO_MIF_HCHGEN,
+};
+
+/*
+ * Downstream's plain SYS_SLEEP table omits MIF0's CLKOUT, and only that one.
+ * Reproduce the omission rather than tidy it away: a CLKOUT write on MIF0 is
+ * exactly the kind of difference this A/B is meant to keep out.
+ */
+static bool zumapro_mif_sleep_save_skip(unsigned int mif, unsigned int word)
+{
+	return mif == 0 && zumapro_mif_sleep_save_offset[word] ==
+			   ZUMAPRO_MIF_CLKOUT;
+}
+
+static void zumapro_save_mif_sleep_state(void)
+{
+	unsigned int mif, word;
+
+	for (mif = 0; mif < ZUMAPRO_MIF_DEBUG_BLOCKS; mif++)
+		for (word = 0; word < ZUMAPRO_MIF_SLEEP_SAVE_WORDS; word++)
+			pmu_context->zumapro_mif_sleep_save[mif][word] =
+				readl(pmu_context->zumapro_mif_debug_cmu[mif] +
+				      zumapro_mif_sleep_save_offset[word]);
+}
+
+static void zumapro_restore_mif_sleep_state(void)
+{
+	unsigned int mif, word;
+
+	for (mif = 0; mif < ZUMAPRO_MIF_DEBUG_BLOCKS; mif++) {
+		for (word = 0; word < ZUMAPRO_MIF_SLEEP_SAVE_WORDS; word++) {
+			if (zumapro_mif_sleep_save_skip(mif, word))
+				continue;
+
+			writel(pmu_context->zumapro_mif_sleep_save[mif][word],
+			       pmu_context->zumapro_mif_debug_cmu[mif] +
+			       zumapro_mif_sleep_save_offset[word]);
+		}
+	}
+}
+
+/* exit_sleep[] steps 7-10: PWRMGMT_BUNDLE_PwrMgmtMode2 bit 31 clear. */
+static void zumapro_clear_mif_pwrmgmt_mode2(void)
+{
+	unsigned int mif;
+	u32 val;
+
+	for (mif = 0; mif < ZUMAPRO_MIF_DEBUG_BLOCKS; mif++) {
+		void __iomem *reg = pmu_context->zumapro_mif_debug_pwrmgmt[mif] +
+				    ZUMAPRO_MIF_PWRMGMT_MODE2;
+
+		val = readl(reg);
+		if (val & BIT(31))
+			writel(val & ~BIT(31), reg);
+	}
+}
+
 static int zumapro_prepare_mif_debug(struct device *dev)
 {
 	unsigned int i;
@@ -1085,6 +1163,7 @@ static int zumapro_sys_sleep_suspend(void *data)
 	zumapro_log_mif_debug_sample("entry",
 				     &pmu_context->zumapro_mif_debug_entry,
 				     &pmu_context->zumapro_mif_debug_baseline);
+	zumapro_save_mif_sleep_state();
 	return 0;
 }
 
@@ -1097,8 +1176,12 @@ static void zumapro_sys_sleep_resume(void *data)
 				     &pmu_context->zumapro_mif_debug_scratch,
 				     &pmu_context->zumapro_mif_debug_entry);
 	zumapro_sys_sleep_disarm();
+	/* exit_sleep[] order: PWRMGMT, then DRCG, then TOP_OUT. */
+	zumapro_clear_mif_pwrmgmt_mode2();
 	zumapro_restore_sleep_exit_drcg();
 	zumapro_restore_sleep_exit_top_out();
+	/* Downstream replays save_sleep[] after exit_sleep[] completes. */
+	zumapro_restore_mif_sleep_state();
 	zumapro_log_mif_debug_sample("restored-return",
 				     &pmu_context->zumapro_mif_debug_scratch,
 				     &pmu_context->zumapro_mif_debug_baseline);

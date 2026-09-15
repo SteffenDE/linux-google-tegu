@@ -1562,9 +1562,23 @@ static int exynos_cpupm_suspend_noirq(struct device *dev)
 
 static int exynos_cpupm_resume_noirq(struct device *dev)
 {
+	u32 wakeup_stat[ARRAY_SIZE(zumapro_wakeup_mask)] = {};
 	unsigned int cpu;
+	int i;
 
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
+		if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+			for (i = 0; i < ARRAY_SIZE(zumapro_wakeup_mask); i++)
+				regmap_read(pmu_context->pmureg,
+					    zumapro_wakeup_mask[i].stat_reg,
+					    &wakeup_stat[i]);
+
+			pr_info("zumapro: cycle=%u wakeup-stat=%08x wakeup2-stat=%08x mailbox-apm2ap=%u\n",
+				pmu_context->zumapro_mif_debug_cycle,
+				wakeup_stat[0], wakeup_stat[1],
+				!!(wakeup_stat[1] & BIT(4)));
+		}
+
 		zumapro_set_wakeup_mask(false);
 		pr_debug("zumapro: resume: CPU_INFORM hints c2=%u sicd=%u fails=%u\n",
 			zumapro_dbg_c2, zumapro_dbg_sicd, zumapro_dbg_fail);

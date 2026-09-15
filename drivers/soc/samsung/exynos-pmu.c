@@ -973,6 +973,11 @@ static void zumapro_enable_dsu_drcg(struct device *dev)
 /* tegu cluster membership: cluster0 = {0-3}, cluster1 = {4-6}, cluster2 = {7} */
 static const u8 zumapro_cpu_cluster[] = { 0, 0, 0, 0, 1, 1, 1, 2 };
 
+#define ZUMAPRO_GRP27_INTR_BID_UPEND	0x1b08
+#define ZUMAPRO_GRP27_INTR_BID_CLEAR	0x1b0c
+#define ZUMAPRO_GRP31_INTR_BID_UPEND	0x1f08
+#define ZUMAPRO_GRP31_INTR_BID_CLEAR	0x1f0c
+
 /*
  * Set while a suspend-to-RAM is in flight, for the hotplug hints below.  Unlike
  * its siblings in pmu_context this needs no lock: it is written in the noirq
@@ -1039,6 +1044,16 @@ static void zumapro_sys_sleep_disarm(void)
 
 	if (!pmu_context->pmuintrgen)
 		return;
+
+	/* First four exit_sleep steps after the wake-enable writes downstream. */
+	regmap_read(pmu_context->pmuintrgen,
+		    ZUMAPRO_GRP27_INTR_BID_UPEND, &reg);
+	regmap_write(pmu_context->pmuintrgen,
+		     ZUMAPRO_GRP27_INTR_BID_CLEAR, reg);
+	regmap_read(pmu_context->pmuintrgen,
+		    ZUMAPRO_GRP31_INTR_BID_UPEND, &reg);
+	regmap_write(pmu_context->pmuintrgen,
+		     ZUMAPRO_GRP31_INTR_BID_CLEAR, reg);
 
 	regmap_update_bits(pmu_context->pmuintrgen,
 			   GS101_GRP2_INTR_BID_ENABLE, BIT(0), 0);

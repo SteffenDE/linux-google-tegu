@@ -40,6 +40,38 @@ struct exynos_mbox {
 };
 
 /**
+ * exynos_mbox_read_regs() - snapshot read-only mailbox state
+ * @chan: mailbox channel whose controller should be sampled
+ * @snapshot: caller-owned destination
+ *
+ * Return: true when all registers were sampled, false for an invalid channel.
+ */
+bool exynos_mbox_read_regs(struct mbox_chan *chan,
+			   struct exynos_mbox_regs *snapshot)
+{
+	struct exynos_mbox *exynos_mbox;
+	void __iomem *regs;
+
+	if (!chan || !chan->mbox || !chan->mbox->dev || !snapshot)
+		return false;
+
+	exynos_mbox = dev_get_drvdata(chan->mbox->dev);
+	if (!exynos_mbox)
+		return false;
+
+	regs = exynos_mbox->regs;
+	snapshot->intsr0 = readl(regs + EXYNOS_MBOX_INTSR0);
+	snapshot->intmr0 = readl(regs + EXYNOS_MBOX_INTMR0);
+	snapshot->intmsr0 = readl(regs + EXYNOS_MBOX_INTMSR0);
+	snapshot->intsr1 = readl(regs + EXYNOS_MBOX_INTSR1);
+	snapshot->intmr1 = readl(regs + EXYNOS_MBOX_INTMR1);
+	snapshot->intmsr1 = readl(regs + EXYNOS_MBOX_INTMSR1);
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(exynos_mbox_read_regs);
+
+/**
  * exynos_mbox_dump_regs() - dump mailbox state without taking locks
  * @chan: mailbox channel whose controller should be dumped
  *
@@ -49,27 +81,20 @@ struct exynos_mbox {
  */
 void exynos_mbox_dump_regs(struct mbox_chan *chan)
 {
+	struct exynos_mbox_regs snapshot;
 	struct device *dev;
-	struct exynos_mbox *exynos_mbox;
-	void __iomem *regs;
 
 	if (!chan || !chan->mbox || !chan->mbox->dev)
 		return;
 
 	dev = chan->mbox->dev;
-	exynos_mbox = dev_get_drvdata(dev);
-	if (!exynos_mbox)
+	if (!exynos_mbox_read_regs(chan, &snapshot))
 		return;
 
-	regs = exynos_mbox->regs;
 	dev_emerg(dev,
 		  "registers: INTSR0:%08x INTMR0:%08x INTMSR0:%08x INTSR1:%08x INTMR1:%08x INTMSR1:%08x\n",
-		  readl(regs + EXYNOS_MBOX_INTSR0),
-		  readl(regs + EXYNOS_MBOX_INTMR0),
-		  readl(regs + EXYNOS_MBOX_INTMSR0),
-		  readl(regs + EXYNOS_MBOX_INTSR1),
-		  readl(regs + EXYNOS_MBOX_INTMR1),
-		  readl(regs + EXYNOS_MBOX_INTMSR1));
+		  snapshot.intsr0, snapshot.intmr0, snapshot.intmsr0,
+		  snapshot.intsr1, snapshot.intmr1, snapshot.intmsr1);
 }
 EXPORT_SYMBOL_GPL(exynos_mbox_dump_regs);
 

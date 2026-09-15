@@ -766,9 +766,9 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 		udelay(20);
 	} while (ktime_before(ktime_get(), timeout));
 
+	acpm_timeout_debug(achan, xfer, seqnum);
 	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
 		achan->id, seqnum, achan->bitmap_seqnum[0]);
-	acpm_timeout_debug(achan, xfer, seqnum);
 
 	return -ETIME;
 }

@@ -101,6 +101,40 @@ int exynos_mbox_set_chan_polling(struct mbox_chan *chan, unsigned int chan_id,
 EXPORT_SYMBOL_GPL(exynos_mbox_set_chan_polling);
 
 /**
+ * exynos_mbox_clear_chan_irq() - acknowledge one incoming mailbox channel
+ * @chan: mailbox channel whose controller owns the hardware channel
+ * @chan_id: hardware mailbox channel number
+ *
+ * The firmware asserts the incoming status bit for every message it appends,
+ * on polling channels too, whose interrupt line stays masked and whose replies
+ * are therefore never acknowledged by exynos_mbox_irq().  Let the consumer of
+ * a masked channel clear its own bit once it has drained the channel, the way
+ * the vendor driver does after every receive.
+ *
+ * Return: 0 on success, -errno otherwise.
+ */
+int exynos_mbox_clear_chan_irq(struct mbox_chan *chan, unsigned int chan_id)
+{
+	struct exynos_mbox *exynos_mbox;
+
+	if (!chan || !chan->mbox || chan_id >= EXYNOS_MBOX_CHAN_COUNT)
+		return -EINVAL;
+
+	exynos_mbox = dev_get_drvdata(chan->mbox->dev);
+	if (!exynos_mbox)
+		return -ENODEV;
+
+	/*
+	 * Write one to clear, so this neither needs a read-modify-write nor
+	 * the mask lock: the write cannot disturb another channel's bit.
+	 */
+	writel(BIT(chan_id), exynos_mbox->regs + EXYNOS_MBOX_INTCR0);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(exynos_mbox_clear_chan_irq);
+
+/**
  * exynos_mbox_dump_regs() - dump mailbox state without taking locks
  * @chan: mailbox channel whose controller should be dumped
  *

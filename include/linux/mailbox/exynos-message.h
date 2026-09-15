@@ -25,6 +25,7 @@ struct exynos_mbox_msg {
 void exynos_mbox_dump_regs(struct mbox_chan *chan);
 int exynos_mbox_set_chan_polling(struct mbox_chan *chan, unsigned int chan_id,
 				 bool polling);
+int exynos_mbox_clear_chan_irq(struct mbox_chan *chan, unsigned int chan_id);
 #else
 static inline void exynos_mbox_dump_regs(struct mbox_chan *chan)
 {
@@ -33,6 +34,12 @@ static inline void exynos_mbox_dump_regs(struct mbox_chan *chan)
 static inline int exynos_mbox_set_chan_polling(struct mbox_chan *chan,
 					       unsigned int chan_id,
 					       bool polling)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int exynos_mbox_clear_chan_irq(struct mbox_chan *chan,
+					     unsigned int chan_id)
 {
 	return -EOPNOTSUPP;
 }

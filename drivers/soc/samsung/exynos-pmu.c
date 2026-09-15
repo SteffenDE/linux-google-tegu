@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mfd/core.h>
+#include <linux/moduleparam.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -27,6 +28,12 @@
 
 #include "exynos-pmu.h"
 
+#define ZUMAPRO_MISC_DBG_SAMPLE_WORDS	288
+
+struct zumapro_misc_dbg_sample {
+	u32 w[ZUMAPRO_MISC_DBG_SAMPLE_WORDS];
+};
+
 struct exynos_pmu_context {
 	struct device *dev;
 	const struct exynos_pmu_data *pmu_data;
@@ -40,6 +47,12 @@ struct exynos_pmu_context {
 	raw_spinlock_t cpupm_lock;
 	unsigned long *in_cpuhp;
 	void __iomem **zumapro_sleep_exit_drcg;
+	void __iomem *zumapro_misc_dbg_map[7];
+	struct zumapro_misc_dbg_sample zumapro_misc_dbg_baseline;
+	struct zumapro_misc_dbg_sample zumapro_misc_dbg_prev;
+	struct zumapro_misc_dbg_sample zumapro_misc_dbg_entry;
+	struct zumapro_misc_dbg_sample zumapro_misc_dbg_scratch;
+	unsigned int zumapro_misc_dbg_cycle;
 	bool sys_insuspend;
 	bool sys_inreboot;
 };
@@ -763,6 +776,283 @@ static void zumapro_restore_sleep_exit_drcg(void)
 	}
 }
 
+/*
+ * Temporary read-only diagnostics for BLK_MISC around SYS_SLEEP.
+ *
+ * MISC is the block the firmware fails to take idle during the SoC-down phase
+ * of a failing deep-suspend entry: the retained ACPM ring reports
+ * "pdn_err 1f ... addr 154627a4", which is PMU slot 0x2780 (MISC) bit 6 of its
+ * IN word.  See docs/subsystems/power/open.md item 14 and
+ * docs/subsystems/power/reference/pmu-power-links.md.
+ *
+ * The questions this answers are (a) does a SYS_SLEEP descent lose CMU_MISC
+ * state that mainline never restores - downstream rewrites 59 CMU_MISC words
+ * on every exit, mainline four - and (b) is anything pending in the GIC, the
+ * TMUs or the MCT comparators at the entry that never returns.
+ *
+ * Strictly read-only.  Writing CMU control registers from a syscore callback
+ * hard-locked CPU0 once already (the reverted MIF replay), and a restore, if
+ * one turns out to be justified, belongs in the clock driver's save/restore
+ * list, not here.
+ */
+#define ZUMAPRO_MISC_CMU_BASE		0x10010000
+#define ZUMAPRO_MISC_CMU_SIZE		0x8000
+#define ZUMAPRO_GICD_BASE		0x10400000
+#define ZUMAPRO_TMU_TOP_BASE		0x100a0000
+#define ZUMAPRO_TMU_SUB_BASE		0x100b0000
+#define ZUMAPRO_MCT_V41_BASE		0x100d0000
+#define ZUMAPRO_WDT_CL0_BASE		0x10060000
+
+enum zumapro_misc_dbg_map {
+	ZMD_PMU,		/* read through the secure PMU regmap */
+	ZMD_CMU,
+	ZMD_GICD,
+	ZMD_TMU_TOP,
+	ZMD_TMU_SUB,
+	ZMD_MCT,
+	ZMD_WDT0,
+	ZMD_MAP_COUNT,
+};
+
+static const phys_addr_t zumapro_misc_dbg_map_base[ZMD_MAP_COUNT] = {
+	[ZMD_CMU]	= ZUMAPRO_MISC_CMU_BASE,
+	[ZMD_GICD]	= ZUMAPRO_GICD_BASE,
+	[ZMD_TMU_TOP]	= ZUMAPRO_TMU_TOP_BASE,
+	[ZMD_TMU_SUB]	= ZUMAPRO_TMU_SUB_BASE,
+	[ZMD_MCT]	= ZUMAPRO_MCT_V41_BASE,
+	[ZMD_WDT0]	= ZUMAPRO_WDT_CL0_BASE,
+};
+
+static const size_t zumapro_misc_dbg_map_size[ZMD_MAP_COUNT] = {
+	[ZMD_CMU]	= ZUMAPRO_MISC_CMU_SIZE,
+	[ZMD_GICD]	= 0x1000,
+	[ZMD_TMU_TOP]	= 0x800,
+	[ZMD_TMU_SUB]	= 0x800,
+	[ZMD_MCT]	= 0x1000,
+	[ZMD_WDT0]	= 0x100,
+};
+
+/*
+ * MISC's PMU slot: CONFIGURATION, STATUS, STATES, OUT and IN (the word the
+ * firmware polls), plus the PMU's SYSTEM_CTRL, whose bit 14 downstream clears
+ * after an aborted descent.
+ */
+static const u16 zumapro_misc_dbg_pmu_offs[] = {
+	0x2780, 0x2784, 0x2788, 0x27a0, 0x27a4, 0x3a10,
+};
+
+/* The four CMU_MISC words mainline already saves and restores. */
+static const u16 zumapro_misc_dbg_cmu_offs[] = {
+	0x0600, 0x0800, 0x1808, 0x20c8,
+};
+
+/*
+ * Every CMU_MISC QCH_CON, in downstream's save_sleep[] order
+ * (flexpmu_cal_system_zuma.h).  The DBG_NFO word of each channel is the same
+ * offset plus 0x4000, and is what the firmware's NOT_IDLE list names.
+ */
+static const u16 zumapro_misc_dbg_qch_offs[] = {
+	0x3000, 0x3040, 0x3044, 0x3048, 0x304c, 0x3050, 0x3054, 0x3058,
+	0x305c, 0x3060, 0x3064, 0x3068, 0x306c, 0x3070, 0x3074, 0x3078,
+	0x307c, 0x3080, 0x3084, 0x3088, 0x308c, 0x3090, 0x3094, 0x3098,
+	0x309c, 0x30a0, 0x30a4, 0x30a8, 0x30ac, 0x30b0, 0x30b4, 0x30b8,
+	0x30bc, 0x30c0, 0x30c4, 0x30c8, 0x30cc, 0x30d0, 0x30d4, 0x30d8,
+	0x30dc, 0x30e0, 0x30e4, 0x30e8, 0x30ec, 0x30f0, 0x30f4, 0x30f8,
+	0x30fc, 0x3100, 0x3104, 0x3108, 0x310c, 0x3110, 0x3114,
+};
+
+/* COMP_ENABLE, INT_ENB and INT_CSTAT of the nine MCT_V41 comparators. */
+static const u16 zumapro_misc_dbg_mct_offs[] = {
+	0x0210, 0x0214, 0x0218, 0x0310, 0x0314, 0x0318,
+	0x0410, 0x0414, 0x0418, 0x0510, 0x0514, 0x0518,
+	0x0610, 0x0614, 0x0618, 0x0710, 0x0714, 0x0718,
+	0x0810, 0x0814, 0x0818, 0x0910, 0x0914, 0x0918,
+	0x0a10, 0x0a14, 0x0a18,
+};
+
+struct zumapro_misc_dbg_region {
+	const char *name;
+	u8 map;
+	u8 count;
+	u16 base;		/* added to every offset in the region */
+	u16 stride;		/* 0: take the offsets from offs[] */
+	const u16 *offs;
+};
+
+static const struct zumapro_misc_dbg_region zumapro_misc_dbg_regions[] = {
+	{ "pmu",  ZMD_PMU, ARRAY_SIZE(zumapro_misc_dbg_pmu_offs), 0, 0,
+	  zumapro_misc_dbg_pmu_offs },
+	{ "cmu",  ZMD_CMU, ARRAY_SIZE(zumapro_misc_dbg_cmu_offs), 0, 0,
+	  zumapro_misc_dbg_cmu_offs },
+	{ "qch",  ZMD_CMU, ARRAY_SIZE(zumapro_misc_dbg_qch_offs), 0, 0,
+	  zumapro_misc_dbg_qch_offs },
+	{ "nfo",  ZMD_CMU, ARRAY_SIZE(zumapro_misc_dbg_qch_offs), 0x4000, 0,
+	  zumapro_misc_dbg_qch_offs },
+	/* GICD_ISENABLER/ISPENDR/ISACTIVER for SPI 0..959. */
+	{ "gicen",  ZMD_GICD, 30, 0x100, 4, NULL },
+	{ "gicpd",  ZMD_GICD, 30, 0x200, 4, NULL },
+	{ "gicact", ZMD_GICD, 30, 0x300, 4, NULL },
+	/* TMU_TOP/SUB P0..P15 INTPEND. */
+	{ "tmutop", ZMD_TMU_TOP, 16, 0x128, 0x40, NULL },
+	{ "tmusub", ZMD_TMU_SUB, 16, 0x128, 0x40, NULL },
+	{ "mct",    ZMD_MCT, ARRAY_SIZE(zumapro_misc_dbg_mct_offs), 0, 0,
+	  zumapro_misc_dbg_mct_offs },
+	{ "mctfrc", ZMD_MCT, 1, 0x100, 4, NULL },
+	{ "wdt",    ZMD_WDT0, 1, 0x000, 4, NULL },
+};
+
+static u16 zumapro_misc_dbg_first[ARRAY_SIZE(zumapro_misc_dbg_regions)];
+
+/* Detail lines per log; 0 prints the per-region masks only. */
+static unsigned int misc_dbg_detail = 16;
+module_param(misc_dbg_detail, uint, 0644);
+
+/* Log the two post-return phases as well as the entry. */
+static bool misc_dbg_return = true;
+module_param(misc_dbg_return, bool, 0644);
+
+static u32 zumapro_misc_dbg_off(const struct zumapro_misc_dbg_region *reg,
+				unsigned int i)
+{
+	return reg->base + (reg->offs ? reg->offs[i] : i * reg->stride);
+}
+
+static void
+zumapro_read_misc_dbg_sample(struct zumapro_misc_dbg_sample *sample)
+{
+	unsigned int r, i, n = 0;
+
+	for (r = 0; r < ARRAY_SIZE(zumapro_misc_dbg_regions); r++) {
+		const struct zumapro_misc_dbg_region *reg =
+			&zumapro_misc_dbg_regions[r];
+		void __iomem *va = pmu_context->zumapro_misc_dbg_map[reg->map];
+
+		for (i = 0; i < reg->count; i++) {
+			u32 off = zumapro_misc_dbg_off(reg, i);
+			u32 val;
+
+			if (reg->map == ZMD_PMU) {
+				if (regmap_read(pmu_context->pmureg, off, &val))
+					val = 0xdeadbeef;
+			} else {
+				val = readl_relaxed(va + off);
+			}
+
+			sample->w[n++] = val;
+		}
+	}
+}
+
+static void
+zumapro_log_misc_dbg(const char *phase,
+		     const struct zumapro_misc_dbg_sample *sample,
+		     const struct zumapro_misc_dbg_sample *reference)
+{
+	unsigned int cycle = pmu_context->zumapro_misc_dbg_cycle;
+	unsigned int r, i, total = 0, shown_all = 0;
+
+	for (r = 0; r < ARRAY_SIZE(zumapro_misc_dbg_regions); r++) {
+		const struct zumapro_misc_dbg_region *reg =
+			&zumapro_misc_dbg_regions[r];
+		unsigned int n = zumapro_misc_dbg_first[r];
+		unsigned int changed = 0, shown = 0;
+		u64 mask = 0;
+
+		for (i = 0; i < reg->count; i++) {
+			if (sample->w[n + i] == reference->w[n + i])
+				continue;
+			mask |= BIT_ULL(i);
+			changed++;
+		}
+
+		if (!changed)
+			continue;
+
+		total += changed;
+		pr_info("zumapro-miscdbg: c=%u %s %s n=%u mask=%#llx\n",
+			cycle, phase, reg->name, changed, mask);
+
+		for (i = 0; i < reg->count && shown < misc_dbg_detail; i++) {
+			if (sample->w[n + i] == reference->w[n + i])
+				continue;
+
+			pr_info("zumapro-miscdbg:  %s[%u] @%04x %08x -> %08x\n",
+				reg->name, i, zumapro_misc_dbg_off(reg, i),
+				reference->w[n + i], sample->w[n + i]);
+			shown++;
+		}
+		shown_all += shown;
+	}
+
+	if (!total)
+		pr_info("zumapro-miscdbg: c=%u %s clean\n", cycle, phase);
+	else if (shown_all < total)
+		pr_info("zumapro-miscdbg: c=%u %s %u of %u shown\n",
+			cycle, phase, shown_all, total);
+}
+
+static void
+zumapro_dump_misc_dbg(const struct zumapro_misc_dbg_sample *sample)
+{
+	unsigned int r, i;
+
+	for (r = 0; r < ARRAY_SIZE(zumapro_misc_dbg_regions); r++) {
+		const struct zumapro_misc_dbg_region *reg =
+			&zumapro_misc_dbg_regions[r];
+		unsigned int n = zumapro_misc_dbg_first[r];
+
+		for (i = 0; i < reg->count; i += 8)
+			pr_info("zumapro-miscdbg: base %s[%u] @%04x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				reg->name, i, zumapro_misc_dbg_off(reg, i),
+				sample->w[n + i],
+				i + 1 < reg->count ? sample->w[n + i + 1] : 0,
+				i + 2 < reg->count ? sample->w[n + i + 2] : 0,
+				i + 3 < reg->count ? sample->w[n + i + 3] : 0,
+				i + 4 < reg->count ? sample->w[n + i + 4] : 0,
+				i + 5 < reg->count ? sample->w[n + i + 5] : 0,
+				i + 6 < reg->count ? sample->w[n + i + 6] : 0,
+				i + 7 < reg->count ? sample->w[n + i + 7] : 0);
+	}
+}
+
+static int zumapro_prepare_misc_dbg(struct device *dev)
+{
+	unsigned int r, map, words = 0;
+
+	for (r = 0; r < ARRAY_SIZE(zumapro_misc_dbg_regions); r++) {
+		zumapro_misc_dbg_first[r] = words;
+		words += zumapro_misc_dbg_regions[r].count;
+	}
+
+	BUILD_BUG_ON(ARRAY_SIZE(pmu_context->zumapro_misc_dbg_map) !=
+		     ZMD_MAP_COUNT);
+
+	if (words > ZUMAPRO_MISC_DBG_SAMPLE_WORDS)
+		return dev_err_probe(dev, -EINVAL,
+				     "MISC debug sample needs %u words\n",
+				     words);
+	for (map = ZMD_PMU + 1; map < ZMD_MAP_COUNT; map++) {
+		phys_addr_t base = zumapro_misc_dbg_map_base[map];
+
+		pmu_context->zumapro_misc_dbg_map[map] =
+			devm_ioremap(dev, base,
+				     zumapro_misc_dbg_map_size[map]);
+		if (!pmu_context->zumapro_misc_dbg_map[map])
+			return dev_err_probe(dev, -ENOMEM,
+					     "cannot map MISC debug block %pa\n",
+					     &base);
+	}
+
+	pr_info("zumapro-miscdbg: %u words in %zu regions\n", words,
+		ARRAY_SIZE(zumapro_misc_dbg_regions));
+	zumapro_read_misc_dbg_sample(&pmu_context->zumapro_misc_dbg_baseline);
+	zumapro_dump_misc_dbg(&pmu_context->zumapro_misc_dbg_baseline);
+	pmu_context->zumapro_misc_dbg_prev =
+		pmu_context->zumapro_misc_dbg_baseline;
+
+	return 0;
+}
+
 #define ZUMAPRO_SLEEP_EXIT_TOP_OUT_MASK	(GENMASK(14, 11) | BIT(9) | BIT(7))
 
 /*
@@ -913,6 +1203,12 @@ static int zumapro_sys_sleep_suspend(void *data)
 		return 0;
 
 	zumapro_sys_sleep_arm();
+
+	pmu_context->zumapro_misc_dbg_cycle++;
+	zumapro_read_misc_dbg_sample(&pmu_context->zumapro_misc_dbg_entry);
+	zumapro_log_misc_dbg("entry", &pmu_context->zumapro_misc_dbg_entry,
+			     &pmu_context->zumapro_misc_dbg_prev);
+	pmu_context->zumapro_misc_dbg_prev = pmu_context->zumapro_misc_dbg_entry;
 	return 0;
 }
 
@@ -921,9 +1217,25 @@ static void zumapro_sys_sleep_resume(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return;
 
+	if (misc_dbg_return) {
+		zumapro_read_misc_dbg_sample(
+			&pmu_context->zumapro_misc_dbg_scratch);
+		zumapro_log_misc_dbg("raw-return",
+				     &pmu_context->zumapro_misc_dbg_scratch,
+				     &pmu_context->zumapro_misc_dbg_entry);
+	}
+
 	zumapro_sys_sleep_disarm();
 	zumapro_restore_sleep_exit_drcg();
 	zumapro_restore_sleep_exit_top_out();
+
+	if (misc_dbg_return) {
+		zumapro_read_misc_dbg_sample(
+			&pmu_context->zumapro_misc_dbg_scratch);
+		zumapro_log_misc_dbg("restored-return",
+				     &pmu_context->zumapro_misc_dbg_scratch,
+				     &pmu_context->zumapro_misc_dbg_entry);
+	}
 }
 
 static const struct syscore_ops zumapro_sys_sleep_syscore_ops = {
@@ -1330,6 +1642,9 @@ static int exynos_pmu_probe(struct platform_device *pdev)
 		zumapro_program_lpm_durations(dev);
 		zumapro_program_lpm_init(dev);
 		ret = zumapro_prepare_sleep_exit_drcg(dev);
+		if (ret)
+			return ret;
+		ret = zumapro_prepare_misc_dbg(dev);
 		if (ret)
 			return ret;
 	}

@@ -596,9 +596,10 @@ static void acpm_timeout_debug(struct acpm_chan *achan,
 		  achan->id, seqnum, xfer->txcnt, request[0], request[1],
 		  request[2], request[3]);
 
+	/* Firmware may raise a fatal SError while the longer host dump runs. */
+	acpm_print_fw_logs(acpm);
 	exynos_mbox_dump_regs(achan->chan);
 	acpm_dump_channels(acpm, achan);
-	acpm_print_fw_logs(acpm);
 	dump_stack();
 
 	/* A diagnostic kernel must come back even without panic= on cmdline. */

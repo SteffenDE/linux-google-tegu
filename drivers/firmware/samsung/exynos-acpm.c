@@ -522,7 +522,18 @@ static void acpm_debug_syscore_resume(void *data)
 				    acpm->sleep_cycle);
 }
 
+static int acpm_debug_syscore_suspend(void *data)
+{
+	struct acpm_info *acpm = data;
+
+	/* A resume rollback must never consume an unused entry token. */
+	acpm->sleep_entry_armed = false;
+
+	return 0;
+}
+
 static const struct syscore_ops acpm_debug_syscore_ops = {
+	.suspend = acpm_debug_syscore_suspend,
 	.resume = acpm_debug_syscore_resume,
 };
 

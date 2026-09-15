@@ -59,7 +59,8 @@
 
 #define ACPM_CHAN_TYPE_QUEUE		1
 
-/* Zumapro's second wake-status register; GS101_WAKEUP2_STAT is different. */
+/* Zumapro's wake-status registers; GS101_WAKEUP2_STAT is different. */
+#define ACPM_ZUMAPRO_WAKEUP_STAT	0x3950
 #define ACPM_ZUMAPRO_WAKEUP2_STAT	0x3970
 
 /* Firmware tick period in picoseconds, despite the downstream _US name. */
@@ -138,9 +139,11 @@ struct acpm_chan_snapshot {
  * @mbox: mailbox registers sampled together with the queues.
  * @num_chans: number of entries in @chans.
  * @cycle: deep-sleep attempt number assigned at syscore suspend.
+ * @wakeup_stat: Zumapro WAKEUP_STAT value.
  * @wakeup2_stat: Zumapro WAKEUP2_STAT value.
  * @rx_full: IDs of TYPE_QUEUE channels whose firmware-to-AP queue was full.
  * @mbox_valid: @mbox contains a successful sample.
+ * @wakeup_valid: @wakeup_stat contains a successful sample.
  * @wakeup2_valid: @wakeup2_stat contains a successful sample.
  * @captured: the snapshot has been populated.
  */
@@ -150,9 +153,11 @@ struct acpm_state_snapshot {
 	struct exynos_mbox_regs mbox;
 	u32 num_chans;
 	u32 cycle;
+	u32 wakeup_stat;
 	u32 wakeup2_stat;
 	u32 rx_full;
 	bool mbox_valid;
+	bool wakeup_valid;
 	bool wakeup2_valid;
 	bool captured;
 };
@@ -423,8 +428,12 @@ static void acpm_snapshot_state(struct acpm_info *acpm,
 	snapshot->cycle = cycle;
 	snapshot->num_chans = acpm->num_chans;
 	snapshot->rx_full = 0;
+	snapshot->wakeup_stat = 0;
 	snapshot->wakeup2_stat = 0;
 	memset(&snapshot->mbox, 0, sizeof(snapshot->mbox));
+	snapshot->wakeup_valid = acpm->pmureg &&
+		!regmap_read(acpm->pmureg, ACPM_ZUMAPRO_WAKEUP_STAT,
+			     &snapshot->wakeup_stat);
 	snapshot->wakeup2_valid = acpm->pmureg &&
 		!regmap_read(acpm->pmureg, ACPM_ZUMAPRO_WAKEUP2_STAT,
 			     &snapshot->wakeup2_stat);
@@ -479,8 +488,9 @@ static void acpm_print_state_snapshot(struct acpm_info *acpm,
 	}
 
 	len = scnprintf(line, sizeof(line),
-			"state %s cycle:%u rx-full:%08x wakeup2-valid:%u wakeup2:%08x mbox-valid:%u INTSR0:%08x INTMR0:%08x INTMSR0:%08x INTSR1:%08x INTMR1:%08x INTMSR1:%08x channels:",
+			"state %s cycle:%u rx-full:%08x wakeup-valid:%u wakeup:%08x wakeup2-valid:%u wakeup2:%08x mbox-valid:%u INTSR0:%08x INTMR0:%08x INTMSR0:%08x INTSR1:%08x INTMR1:%08x INTMSR1:%08x channels:",
 			snapshot->name, snapshot->cycle, snapshot->rx_full,
+			snapshot->wakeup_valid, snapshot->wakeup_stat,
 			snapshot->wakeup2_valid, snapshot->wakeup2_stat,
 			snapshot->mbox_valid, snapshot->mbox.intsr0,
 			snapshot->mbox.intmr0, snapshot->mbox.intmsr0,
@@ -789,11 +799,12 @@ static void acpm_timeout_debug(struct acpm_chan *achan,
 		  achan->id, seqnum, xfer->txcnt, request[0], request[1],
 		  request[2], request[3]);
 	dev_emerg(acpm->dev,
-		  "state transition: cycle:%u entry-valid:%u return-valid:%u entry-full:%08x return-full:%08x timeout-full:%08x return-wakeup2:%08x return-INTSR0:%08x return-INTMSR0:%08x timeout-INTSR0:%08x timeout-INTMSR0:%08x\n",
+		  "state transition: cycle:%u entry-valid:%u return-valid:%u entry-full:%08x return-full:%08x timeout-full:%08x return-wakeup:%08x return-wakeup2:%08x return-INTSR0:%08x return-INTMSR0:%08x timeout-INTSR0:%08x timeout-INTMSR0:%08x\n",
 		  acpm->sleep_cycle, acpm->sleep_entry.captured,
 		  acpm->sleep_return.captured, acpm->sleep_entry.rx_full,
 		  acpm->sleep_return.rx_full,
-		  acpm->timeout_state.rx_full, acpm->sleep_return.wakeup2_stat,
+		  acpm->timeout_state.rx_full, acpm->sleep_return.wakeup_stat,
+		  acpm->sleep_return.wakeup2_stat,
 		  acpm->sleep_return.mbox.intsr0,
 		  acpm->sleep_return.mbox.intmsr0,
 		  acpm->timeout_state.mbox.intsr0,

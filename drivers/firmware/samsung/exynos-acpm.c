@@ -349,6 +349,7 @@ struct acpm_chan {
  * @pmureg: PMU regmap used to sample Zumapro wake status.
  * @debug_syscore: early system-resume capture callback.
  * @sleep_cycle: deep-sleep attempt counter.
+ * @sleep_entry_armed: current PM attempt still needs its entry snapshot.
  * @timeout_claimed: elects one timeout caller to collect fatal diagnostics.
  * @timeout_debug: panic with firmware diagnostics on the first timeout.
  */
@@ -369,6 +370,7 @@ struct acpm_info {
 	struct syscore debug_syscore;
 	u32 sleep_cycle;
 	atomic_t timeout_claimed;
+	bool sleep_entry_armed;
 	bool timeout_debug;
 };
 
@@ -522,6 +524,32 @@ static void acpm_debug_syscore_resume(void *data)
 
 static const struct syscore_ops acpm_debug_syscore_ops = {
 	.resume = acpm_debug_syscore_resume,
+};
+
+static int acpm_debug_prepare(struct device *dev)
+{
+	struct acpm_info *acpm = dev_get_drvdata(dev);
+
+	if (acpm->timeout_debug &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM) {
+		acpm->sleep_entry.captured = false;
+		acpm->sleep_return.captured = false;
+		acpm->sleep_entry_armed = true;
+	}
+
+	return 0;
+}
+
+static void acpm_debug_complete(struct device *dev)
+{
+	struct acpm_info *acpm = dev_get_drvdata(dev);
+
+	acpm->sleep_entry_armed = false;
+}
+
+static const struct dev_pm_ops acpm_pm_ops = {
+	.prepare = acpm_debug_prepare,
+	.complete = acpm_debug_complete,
 };
 
 static bool acpm_fw_log_string(struct acpm_info *acpm, u32 encoded_offset,
@@ -1383,10 +1411,12 @@ static int acpm_tmu_suspend_with_snapshot(struct acpm_handle *handle,
 {
 	struct acpm_info *acpm = handle_to_acpm_info(handle);
 
-	if (acpm->timeout_debug &&
-	    pm_suspend_target_state == PM_SUSPEND_MEM)
+	if (acpm->timeout_debug && acpm->sleep_entry_armed &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM) {
+		acpm->sleep_entry_armed = false;
 		acpm_snapshot_state(acpm, &acpm->sleep_entry,
 				    ++acpm->sleep_cycle);
+	}
 
 	return acpm_tmu_suspend(handle, acpm_chan_id);
 }
@@ -1637,6 +1667,7 @@ static struct platform_driver acpm_driver = {
 	.driver	= {
 		.name = "exynos-acpm-protocol",
 		.of_match_table	= acpm_match,
+		.pm = pm_sleep_ptr(&acpm_pm_ops),
 	},
 };
 module_platform_driver(acpm_driver);

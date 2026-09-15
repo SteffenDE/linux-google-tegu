@@ -640,11 +640,35 @@ static int acpm_tmu_suspend_firmware(struct acpm_tmu_priv *priv,
 	return 0;
 }
 
+/* Called with acpm_tmu_pm_lock held. */
+static int acpm_tmu_resume_firmware(struct acpm_tmu_priv *priv,
+				    bool *transitioned)
+{
+	struct acpm_handle *handle = priv->handle;
+	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
+	int ret;
+
+	if (transitioned)
+		*transitioned = false;
+
+	if (!acpm_tmu_firmware_suspended)
+		return 0;
+
+	/* APB clock not required for this specific msg */
+	ret = ops->resume(handle, priv->mbox_chan_id);
+	if (ret)
+		return ret;
+
+	acpm_tmu_firmware_suspended = false;
+	if (transitioned)
+		*transitioned = true;
+
+	return 0;
+}
+
 static void acpm_tmu_remove(struct platform_device *pdev)
 {
 	struct acpm_tmu_priv *priv = platform_get_drvdata(pdev);
-	struct acpm_handle *handle = priv->handle;
-	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
 	bool firmware_available = true;
 	int ret;
 
@@ -653,20 +677,16 @@ static void acpm_tmu_remove(struct platform_device *pdev)
 
 	guard(mutex)(&acpm_tmu_pm_lock);
 
+	/* Per-zone commands require the global firmware state to be active. */
+	ret = acpm_tmu_resume_firmware(priv, NULL);
+	if (ret) {
+		dev_err(priv->dev,
+			"Failed to resume ACPM while removing TMU: %d\n", ret);
+		firmware_available = false;
+	}
+
 	/* Recover a device left quiesced by a failed system resume. */
 	if (priv->system_suspended) {
-		if (acpm_tmu_firmware_suspended) {
-			ret = ops->resume(handle, priv->mbox_chan_id);
-			if (ret) {
-				dev_err(priv->dev,
-					"Failed to resume ACPM while removing TMU: %d\n",
-					ret);
-				firmware_available = false;
-			} else {
-				acpm_tmu_firmware_suspended = false;
-			}
-		}
-
 		ret = pm_runtime_force_resume(&pdev->dev);
 		if (ret)
 			dev_err(priv->dev,
@@ -707,6 +727,14 @@ static int acpm_tmu_pm_suspend(struct device *dev)
 	/* A failed prior resume can leave this instance quiesced. */
 	if (priv->system_suspended)
 		return acpm_tmu_suspend_firmware(priv, NULL);
+
+	/* Normalize a failed rollback before sending per-zone commands. */
+	if (acpm_tmu_firmware_suspended) {
+		ret = acpm_tmu_resume_firmware(priv, NULL);
+		if (ret)
+			return ret;
+		dev_info(dev, "ACPM TMU global resume for suspend recovery\n");
+	}
 
 	ret = acpm_tmu_control(priv, false, false);
 	if (ret)
@@ -760,16 +788,11 @@ static int acpm_tmu_pm_resume(struct device *dev)
 	if (!priv->system_suspended)
 		return 0;
 
-	if (acpm_tmu_firmware_suspended) {
-		/* APB clock not required for this specific msg */
-		ret = ops->resume(handle, priv->mbox_chan_id);
-		if (ret)
-			return ret;
-
-		acpm_tmu_firmware_suspended = false;
-		resumed_acpm = true;
+	ret = acpm_tmu_resume_firmware(priv, &resumed_acpm);
+	if (ret)
+		return ret;
+	if (resumed_acpm)
 		dev_info(dev, "ACPM TMU global resume before first device\n");
-	}
 
 	ret = pm_runtime_force_resume(dev);
 	if (ret)

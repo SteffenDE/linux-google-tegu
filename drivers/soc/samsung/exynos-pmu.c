@@ -1567,7 +1567,7 @@ static int exynos_cpupm_resume_noirq(struct device *dev)
 	int i;
 
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
-		if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+		if (zumapro_in_sys_sleep) {
 			for (i = 0; i < ARRAY_SIZE(zumapro_wakeup_mask); i++)
 				regmap_read(pmu_context->pmureg,
 					    zumapro_wakeup_mask[i].stat_reg,

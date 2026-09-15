@@ -611,12 +611,71 @@ err_pm_put:
 	return ret;
 }
 
+/* Called with acpm_tmu_pm_lock held. */
+static int acpm_tmu_suspend_firmware(struct acpm_tmu_priv *priv,
+				     bool *transitioned)
+{
+	struct acpm_handle *handle = priv->handle;
+	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
+	int ret;
+
+	if (transitioned)
+		*transitioned = false;
+
+	if (acpm_tmu_suspended_devices != acpm_tmu_num_devices ||
+	    acpm_tmu_firmware_suspended)
+		return 0;
+
+	/* APB clock not required for this specific msg */
+	ret = ops->suspend(handle, priv->mbox_chan_id);
+	if (ret)
+		return ret;
+
+	acpm_tmu_firmware_suspended = true;
+	if (transitioned)
+		*transitioned = true;
+	dev_info(priv->dev, "ACPM TMU global suspend after %u devices\n",
+		 acpm_tmu_suspended_devices);
+
+	return 0;
+}
+
 static void acpm_tmu_remove(struct platform_device *pdev)
 {
 	struct acpm_tmu_priv *priv = platform_get_drvdata(pdev);
+	struct acpm_handle *handle = priv->handle;
+	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
+	bool firmware_available = true;
+	int ret;
 
 	/* Stop IRQ first to prevent race with thread_fn */
 	disable_irq(priv->irq);
+
+	guard(mutex)(&acpm_tmu_pm_lock);
+
+	/* Recover a device left quiesced by a failed system resume. */
+	if (priv->system_suspended) {
+		if (acpm_tmu_firmware_suspended) {
+			ret = ops->resume(handle, priv->mbox_chan_id);
+			if (ret) {
+				dev_err(priv->dev,
+					"Failed to resume ACPM while removing TMU: %d\n",
+					ret);
+				firmware_available = false;
+			} else {
+				acpm_tmu_firmware_suspended = false;
+			}
+		}
+
+		ret = pm_runtime_force_resume(&pdev->dev);
+		if (ret)
+			dev_err(priv->dev,
+				"Failed to force resume while removing TMU: %d\n",
+				ret);
+		priv->system_suspended = false;
+		if (!WARN_ON(!acpm_tmu_suspended_devices))
+			acpm_tmu_suspended_devices--;
+	}
 
 	/*
 	 * Disable autosuspend to force the subsequent pm_runtime_put_sync()
@@ -624,14 +683,15 @@ static void acpm_tmu_remove(struct platform_device *pdev)
 	 * immediately, preventing clock leaks when the driver is removed.
 	 */
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
-	acpm_tmu_control(priv, false, false);
+	if (firmware_available)
+		acpm_tmu_control(priv, false, false);
 
-	guard(mutex)(&acpm_tmu_pm_lock);
-	if (priv->system_suspended) {
-		if (!WARN_ON(!acpm_tmu_suspended_devices))
-			acpm_tmu_suspended_devices--;
-	}
 	acpm_tmu_num_devices--;
+	if (!acpm_tmu_num_devices) {
+		WARN_ON(acpm_tmu_suspended_devices);
+		acpm_tmu_suspended_devices = 0;
+		acpm_tmu_firmware_suspended = false;
+	}
 }
 
 static int acpm_tmu_pm_suspend(struct device *dev)
@@ -646,25 +706,17 @@ static int acpm_tmu_pm_suspend(struct device *dev)
 
 	/* A failed prior resume can leave this instance quiesced. */
 	if (priv->system_suspended)
-		return 0;
+		return acpm_tmu_suspend_firmware(priv, NULL);
 
 	ret = acpm_tmu_control(priv, false, false);
 	if (ret)
 		goto err_restore_sensors;
 
 	acpm_tmu_suspended_devices++;
-	if (acpm_tmu_suspended_devices == acpm_tmu_num_devices) {
-		/* APB clock not required for this specific msg */
-		ret = ops->suspend(handle, priv->mbox_chan_id);
-		if (ret) {
-			acpm_tmu_suspended_devices--;
-			goto err_restore_sensors;
-		}
-
-		acpm_tmu_firmware_suspended = true;
-		suspended_acpm = true;
-		dev_info(dev, "ACPM TMU global suspend after %u devices\n",
-			 acpm_tmu_suspended_devices);
+	ret = acpm_tmu_suspend_firmware(priv, &suspended_acpm);
+	if (ret) {
+		acpm_tmu_suspended_devices--;
+		goto err_restore_sensors;
 	}
 
 	ret = pm_runtime_force_suspend(dev);

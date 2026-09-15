@@ -13,7 +13,6 @@
 #include <linux/container_of.h>
 #include <linux/delay.h>
 #include <linux/device.h>
-#include <linux/err.h>
 #include <linux/find.h>
 #include <linux/firmware/samsung/exynos-acpm-protocol.h>
 #include <linux/io.h>
@@ -30,11 +29,7 @@
 #include <linux/of_platform.h>
 #include <linux/panic.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 #include <linux/slab.h>
-#include <linux/soc/samsung/exynos-pmu.h>
-#include <linux/suspend.h>
-#include <linux/syscore_ops.h>
 #include <linux/types.h>
 
 #include "exynos-acpm.h"
@@ -54,14 +49,6 @@
 #define ACPM_FW_LOG_STRING_MAX		80
 #define ACPM_QUEUE_DUMP_MAX_SLOTS	32
 #define ACPM_QUEUE_DUMP_WORDS		4
-#define ACPM_STATE_LINE_MAX		1024
-#define ACPM_SEQNUM_MAX			64
-
-#define ACPM_CHAN_TYPE_QUEUE		1
-
-/* Zumapro's wake-status registers; GS101_WAKEUP2_STAT is different. */
-#define ACPM_ZUMAPRO_WAKEUP_STAT	0x3950
-#define ACPM_ZUMAPRO_WAKEUP2_STAT	0x3970
 
 /* Firmware tick period in picoseconds, despite the downstream _US name. */
 #define ACPM_SYSTICK_PERIOD_PS		20345
@@ -104,62 +91,6 @@ struct acpm_fw_log_snapshot {
 	u32 rear;
 	u32 front;
 	u32 count;
-};
-
-/**
- * struct acpm_chan_snapshot - one host copy of volatile channel state.
- * @pending: host sequence numbers awaiting firmware responses.
- * @id: firmware channel ID.
- * @type: firmware channel type.
- * @poll_completion: whether the AP polls this channel.
- * @indices_valid: all four queue-index pointers were safe to read.
- * @qlen: queue length from the firmware descriptor.
- * @rx_rear: AP-owned rear of the firmware-to-AP queue.
- * @rx_front: firmware-owned front of the firmware-to-AP queue.
- * @tx_rear: firmware-owned rear of the AP-to-firmware queue.
- * @tx_front: AP-owned front of the AP-to-firmware queue.
- */
-struct acpm_chan_snapshot {
-	DECLARE_BITMAP(pending, ACPM_SEQNUM_MAX - 1);
-	u32 id;
-	u32 type;
-	u32 qlen;
-	u32 rx_rear;
-	u32 rx_front;
-	u32 tx_rear;
-	u32 tx_front;
-	bool poll_completion;
-	bool indices_valid;
-};
-
-/**
- * struct acpm_state_snapshot - queues, mailbox and wake state at one instant.
- * @name: diagnostic name of the capture point.
- * @chans: preallocated array of per-channel snapshots.
- * @mbox: mailbox registers sampled together with the queues.
- * @num_chans: number of entries in @chans.
- * @cycle: deep-sleep attempt number assigned before firmware TMU suspend.
- * @wakeup_stat: Zumapro WAKEUP_STAT value.
- * @wakeup2_stat: Zumapro WAKEUP2_STAT value.
- * @rx_full: IDs of TYPE_QUEUE channels whose firmware-to-AP queue was full.
- * @mbox_valid: @mbox contains a successful sample.
- * @wakeup_valid: @wakeup_stat contains a successful sample.
- * @wakeup2_valid: @wakeup2_stat contains a successful sample.
- * @captured: the snapshot has been populated.
- */
-struct acpm_state_snapshot {
-	const char *name;
-	struct acpm_chan_snapshot *chans;
-	struct exynos_mbox_regs mbox;
-	u32 num_chans;
-	u32 cycle;
-	u32 wakeup_stat;
-	u32 wakeup2_stat;
-	u32 rx_full;
-	bool mbox_valid;
-	bool wakeup_valid;
-	bool wakeup2_valid;
-	bool captured;
 };
 
 /**
@@ -219,9 +150,7 @@ static_assert(offsetof(struct acpm_shmem, preempt_log_buf_rear) == 0xa8);
  * struct acpm_chan_shmem - descriptor of a shared memory channel.
  *
  * @id:			channel ID.
- * @field:		mailbox field and firmware flags.
- * @owner:		firmware plugin owning the channel.
- * @type:		firmware channel type.
+ * @reserved:		unused fields.
  * @rx_rear:		rear pointer of APM RX queue (TX for AP).
  * @rx_front:		front pointer of APM RX queue (TX for AP).
  * @rx_base:		base address of APM RX queue (TX for AP).
@@ -236,9 +165,7 @@ static_assert(offsetof(struct acpm_shmem, preempt_log_buf_rear) == 0xa8);
  */
 struct acpm_chan_shmem {
 	u32 id;
-	u32 field;
-	s32 owner;
-	u32 type;
+	u32 reserved[3];
 	u32 rx_rear;
 	u32 rx_front;
 	u32 rx_base;
@@ -251,9 +178,6 @@ struct acpm_chan_shmem {
 	u32 reserved2[2];
 	u32 poll_completion;
 };
-
-static_assert(offsetof(struct acpm_chan_shmem, type) == 0xc);
-static_assert(sizeof(struct acpm_chan_shmem) == 0x48);
 
 /**
  * struct acpm_queue - exynos acpm queue.
@@ -288,6 +212,8 @@ struct acpm_rx_data {
 	size_t txcnt;
 };
 
+#define ACPM_SEQNUM_MAX    64
+
 /**
  * struct acpm_chan - driver internal representation of a channel.
  * @cl:		mailbox client.
@@ -304,7 +230,6 @@ struct acpm_rx_data {
  * @rx_lock:	protects RX queue.
  * @qlen:	queue length. Applies to both TX/RX queues.
  * @mlen:	message length. Applies to both TX/RX queues.
- * @type:	firmware channel type.
  * @seqnum:	sequence number of the last message enqueued on TX queue.
  * @id:		channel ID.
  * @poll_completion:	indicates if the transfer needs to be polled for
@@ -323,7 +248,6 @@ struct acpm_chan {
 
 	unsigned int qlen;
 	unsigned int mlen;
-	u32 type;
 	u8 seqnum;
 	u8 id;
 	bool poll_completion;
@@ -343,13 +267,6 @@ struct acpm_chan {
  * @sram_size:	size of the firmware SRAM mapping.
  * @normal_log: preallocated snapshot of the normal firmware log.
  * @preempt_log: preallocated snapshot of the preempt firmware log.
- * @sleep_entry: channel state immediately before firmware TMU suspend.
- * @sleep_return: channel state before ACPM consumers resume.
- * @timeout_state: channel state sampled at the first IPC timeout.
- * @pmureg: PMU regmap used to sample Zumapro wake status.
- * @debug_syscore: early system-resume capture callback.
- * @sleep_cycle: deep-sleep attempt counter.
- * @sleep_entry_armed: current PM attempt still needs its entry snapshot.
  * @timeout_claimed: elects one timeout caller to collect fatal diagnostics.
  * @timeout_debug: panic with firmware diagnostics on the first timeout.
  */
@@ -363,14 +280,7 @@ struct acpm_info {
 	resource_size_t sram_size;
 	struct acpm_fw_log_snapshot normal_log;
 	struct acpm_fw_log_snapshot preempt_log;
-	struct acpm_state_snapshot sleep_entry;
-	struct acpm_state_snapshot sleep_return;
-	struct acpm_state_snapshot timeout_state;
-	struct regmap *pmureg;
-	struct syscore debug_syscore;
-	u32 sleep_cycle;
 	atomic_t timeout_claimed;
-	bool sleep_entry_armed;
 	bool timeout_debug;
 };
 
@@ -411,157 +321,6 @@ static bool acpm_sram_pointer_valid(const struct acpm_info *acpm,
 	offset = address - base;
 	return offset < acpm->sram_size && size <= acpm->sram_size - offset;
 }
-
-static bool acpm_chan_snapshot_rx_full(const struct acpm_chan_snapshot *chan)
-{
-	return chan->type == ACPM_CHAN_TYPE_QUEUE && chan->indices_valid &&
-		chan->qlen > 1 && chan->rx_rear < chan->qlen &&
-		chan->rx_front < chan->qlen &&
-		(chan->rx_front + 1) % chan->qlen == chan->rx_rear;
-}
-
-static void acpm_snapshot_state(struct acpm_info *acpm,
-				struct acpm_state_snapshot *snapshot,
-				u32 cycle)
-{
-	u32 i;
-
-	snapshot->captured = false;
-	snapshot->cycle = cycle;
-	snapshot->num_chans = acpm->num_chans;
-	snapshot->rx_full = 0;
-	snapshot->wakeup_stat = 0;
-	snapshot->wakeup2_stat = 0;
-	memset(&snapshot->mbox, 0, sizeof(snapshot->mbox));
-	snapshot->wakeup_valid = acpm->pmureg &&
-		!regmap_read(acpm->pmureg, ACPM_ZUMAPRO_WAKEUP_STAT,
-			     &snapshot->wakeup_stat);
-	snapshot->wakeup2_valid = acpm->pmureg &&
-		!regmap_read(acpm->pmureg, ACPM_ZUMAPRO_WAKEUP2_STAT,
-			     &snapshot->wakeup2_stat);
-	snapshot->mbox_valid = acpm->num_chans &&
-		exynos_mbox_read_regs(acpm->chans[0].chan, &snapshot->mbox);
-
-	for (i = 0; i < acpm->num_chans; i++) {
-		struct acpm_chan_snapshot *sample = &snapshot->chans[i];
-		struct acpm_chan *achan = &acpm->chans[i];
-
-		bitmap_copy(sample->pending, achan->bitmap_seqnum,
-			    ACPM_SEQNUM_MAX - 1);
-		sample->id = achan->id;
-		sample->type = achan->type;
-		sample->poll_completion = achan->poll_completion;
-		sample->qlen = achan->qlen;
-		sample->rx_rear = 0;
-		sample->rx_front = 0;
-		sample->tx_rear = 0;
-		sample->tx_front = 0;
-		sample->indices_valid =
-			acpm_sram_pointer_valid(acpm, achan->rx.rear, sizeof(u32)) &&
-			acpm_sram_pointer_valid(acpm, achan->rx.front, sizeof(u32)) &&
-			acpm_sram_pointer_valid(acpm, achan->tx.rear, sizeof(u32)) &&
-			acpm_sram_pointer_valid(acpm, achan->tx.front, sizeof(u32));
-
-		if (sample->indices_valid) {
-			sample->rx_rear = readl(achan->rx.rear);
-			sample->rx_front = readl(achan->rx.front);
-			sample->tx_rear = readl(achan->tx.rear);
-			sample->tx_front = readl(achan->tx.front);
-		}
-
-		if (sample->id < 32 && acpm_chan_snapshot_rx_full(sample))
-			snapshot->rx_full |= BIT(sample->id);
-	}
-
-	snapshot->captured = true;
-}
-
-static void acpm_print_state_snapshot(struct acpm_info *acpm,
-				      const struct acpm_state_snapshot *snapshot)
-{
-	char line[ACPM_STATE_LINE_MAX];
-	size_t len;
-	u32 i;
-
-	if (!snapshot->captured) {
-		dev_emerg(acpm->dev, "state %s snapshot unavailable\n",
-			  snapshot->name);
-		return;
-	}
-
-	len = scnprintf(line, sizeof(line),
-			"state %s cycle:%u rx-full:%08x wakeup-valid:%u wakeup:%08x wakeup2-valid:%u wakeup2:%08x mbox-valid:%u INTSR0:%08x INTMR0:%08x INTMSR0:%08x INTSR1:%08x INTMR1:%08x INTMSR1:%08x channels:",
-			snapshot->name, snapshot->cycle, snapshot->rx_full,
-			snapshot->wakeup_valid, snapshot->wakeup_stat,
-			snapshot->wakeup2_valid, snapshot->wakeup2_stat,
-			snapshot->mbox_valid, snapshot->mbox.intsr0,
-			snapshot->mbox.intmr0, snapshot->mbox.intmsr0,
-			snapshot->mbox.intsr1, snapshot->mbox.intmr1,
-			snapshot->mbox.intmsr1);
-
-	for (i = 0; i < snapshot->num_chans && len < sizeof(line); i++) {
-		const struct acpm_chan_snapshot *sample = &snapshot->chans[i];
-
-		len += scnprintf(line + len, sizeof(line) - len,
-				 " ch%u(t%u p%u q%u)=%u,%u/%u,%u%s",
-				 sample->id, sample->type, sample->poll_completion,
-				 sample->qlen, sample->rx_rear, sample->rx_front,
-				 sample->tx_rear, sample->tx_front,
-				 sample->indices_valid ? "" : "!");
-	}
-
-	dev_emerg(acpm->dev, "%s\n", line);
-}
-
-static void acpm_debug_syscore_resume(void *data)
-{
-	struct acpm_info *acpm = data;
-
-	if (pm_suspend_target_state == PM_SUSPEND_MEM)
-		acpm_snapshot_state(acpm, &acpm->sleep_return,
-				    acpm->sleep_cycle);
-}
-
-static int acpm_debug_syscore_suspend(void *data)
-{
-	struct acpm_info *acpm = data;
-
-	/* A resume rollback must never consume an unused entry token. */
-	acpm->sleep_entry_armed = false;
-
-	return 0;
-}
-
-static const struct syscore_ops acpm_debug_syscore_ops = {
-	.suspend = acpm_debug_syscore_suspend,
-	.resume = acpm_debug_syscore_resume,
-};
-
-static int acpm_debug_prepare(struct device *dev)
-{
-	struct acpm_info *acpm = dev_get_drvdata(dev);
-
-	if (acpm->timeout_debug &&
-	    pm_suspend_target_state == PM_SUSPEND_MEM) {
-		acpm->sleep_entry.captured = false;
-		acpm->sleep_return.captured = false;
-		acpm->sleep_entry_armed = true;
-	}
-
-	return 0;
-}
-
-static void acpm_debug_complete(struct device *dev)
-{
-	struct acpm_info *acpm = dev_get_drvdata(dev);
-
-	acpm->sleep_entry_armed = false;
-}
-
-static const struct dev_pm_ops acpm_pm_ops = {
-	.prepare = acpm_debug_prepare,
-	.complete = acpm_debug_complete,
-};
 
 static bool acpm_fw_log_string(struct acpm_info *acpm, u32 encoded_offset,
 			       char *buf, size_t buf_size)
@@ -761,25 +520,37 @@ static void acpm_dump_queue_slots(struct acpm_chan *achan, const char *name,
 }
 
 static void acpm_dump_channels(struct acpm_info *acpm,
-			       const struct acpm_chan *timed_out,
-			       const struct acpm_state_snapshot *snapshot)
+			       const struct acpm_chan *timed_out)
 {
 	u32 i;
 
-	for (i = 0; i < min(acpm->num_chans, snapshot->num_chans); i++) {
-		const struct acpm_chan_snapshot *sample = &snapshot->chans[i];
+	for (i = 0; i < acpm->num_chans; i++) {
 		struct acpm_chan *achan = &acpm->chans[i];
+		DECLARE_BITMAP(pending, ACPM_SEQNUM_MAX - 1);
+		u32 rx_rear = 0, rx_front = 0, tx_rear = 0, tx_front = 0;
+		bool indices_valid;
 		unsigned long seq;
 
-		dev_emerg(acpm->dev,
-			  "ch:%u state: type:%u poll:%u pending:%*pb indices-valid:%u RX rear:%u front:%u TX rear:%u front:%u qlen:%u mlen:%u\n",
-			  sample->id, sample->type, sample->poll_completion,
-			  ACPM_SEQNUM_MAX - 1, sample->pending,
-			  sample->indices_valid, sample->rx_rear, sample->rx_front,
-			  sample->tx_rear, sample->tx_front, sample->qlen,
-			  achan->mlen);
+		bitmap_copy(pending, achan->bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
+		indices_valid =
+			acpm_sram_pointer_valid(acpm, achan->rx.rear, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->rx.front, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->tx.rear, sizeof(u32)) &&
+			acpm_sram_pointer_valid(acpm, achan->tx.front, sizeof(u32));
+		if (indices_valid) {
+			rx_rear = readl(achan->rx.rear);
+			rx_front = readl(achan->rx.front);
+			tx_rear = readl(achan->tx.rear);
+			tx_front = readl(achan->tx.front);
+		}
 
-		for_each_set_bit(seq, sample->pending, ACPM_SEQNUM_MAX - 1) {
+		dev_emerg(acpm->dev,
+			  "ch:%u state: pending:%*pb indices-valid:%u RX rear:%u front:%u TX rear:%u front:%u qlen:%u mlen:%u\n",
+			  achan->id, ACPM_SEQNUM_MAX - 1, pending,
+			  indices_valid, rx_rear, rx_front, tx_rear, tx_front,
+			  achan->qlen, achan->mlen);
+
+		for_each_set_bit(seq, pending, ACPM_SEQNUM_MAX - 1) {
 			struct acpm_rx_data *rx_data = &achan->rx_data[seq];
 			u32 data[ACPM_QUEUE_DUMP_WORDS] = {};
 			size_t words;
@@ -795,7 +566,7 @@ static void acpm_dump_channels(struct acpm_info *acpm,
 				  data[2], data[3]);
 		}
 
-		if (!bitmap_empty(sample->pending, ACPM_SEQNUM_MAX - 1) ||
+		if (!bitmap_empty(pending, ACPM_SEQNUM_MAX - 1) ||
 		    achan == timed_out) {
 			acpm_dump_queue_slots(achan, "TX", &achan->tx);
 			acpm_dump_queue_slots(achan, "RX", &achan->rx);
@@ -818,31 +589,17 @@ static void acpm_timeout_debug(struct acpm_chan *achan,
 	memcpy(request, xfer->txd, words * sizeof(*request));
 
 	/* Preserve volatile firmware evidence before synchronous console output. */
-	acpm_snapshot_state(acpm, &acpm->timeout_state, acpm->sleep_cycle);
 	acpm_snapshot_fw_logs(acpm);
 
 	dev_emerg(acpm->dev,
 		  "first IPC timeout: ch:%u seq:%u txcnt:%zu request:%08x %08x %08x %08x\n",
 		  achan->id, seqnum, xfer->txcnt, request[0], request[1],
 		  request[2], request[3]);
-	dev_emerg(acpm->dev,
-		  "state transition: cycle:%u entry-valid:%u return-valid:%u entry-full:%08x return-full:%08x timeout-full:%08x return-wakeup:%08x return-wakeup2:%08x return-INTSR0:%08x return-INTMSR0:%08x timeout-INTSR0:%08x timeout-INTMSR0:%08x\n",
-		  acpm->sleep_cycle, acpm->sleep_entry.captured,
-		  acpm->sleep_return.captured, acpm->sleep_entry.rx_full,
-		  acpm->sleep_return.rx_full,
-		  acpm->timeout_state.rx_full, acpm->sleep_return.wakeup_stat,
-		  acpm->sleep_return.wakeup2_stat,
-		  acpm->sleep_return.mbox.intsr0,
-		  acpm->sleep_return.mbox.intmsr0,
-		  acpm->timeout_state.mbox.intsr0,
-		  acpm->timeout_state.mbox.intmsr0);
-	acpm_print_state_snapshot(acpm, &acpm->timeout_state);
-	acpm_print_state_snapshot(acpm, &acpm->sleep_return);
-	acpm_print_state_snapshot(acpm, &acpm->sleep_entry);
 
 	/* Firmware may raise a fatal SError while the longer host dump runs. */
 	acpm_print_fw_logs(acpm);
-	acpm_dump_channels(acpm, achan, &acpm->timeout_state);
+	exynos_mbox_dump_regs(achan->chan);
+	acpm_dump_channels(acpm, achan);
 	dump_stack();
 
 	/* A diagnostic kernel must come back even without panic= on cmdline. */
@@ -1227,7 +984,6 @@ static void acpm_chan_shmem_get_params(struct acpm_chan *achan,
 	achan->mlen = readl(&chan_shmem->mlen);
 	achan->poll_completion = readl(&chan_shmem->poll_completion);
 	achan->id = readl(&chan_shmem->id);
-	achan->type = readl(&chan_shmem->type);
 	achan->qlen = readl(&chan_shmem->qlen);
 
 	tx->base = base + readl(&chan_shmem->rx_base);
@@ -1254,7 +1010,7 @@ static int acpm_achan_alloc_cmds(struct acpm_chan *achan)
 	struct device *dev = achan->acpm->dev;
 	struct acpm_rx_data *rx_data;
 	size_t cmd_size, cmdcnt;
-	size_t i;
+	int i;
 
 	if (achan->mlen == 0)
 		return 0;
@@ -1351,17 +1107,6 @@ static void acpm_clk_pdev_unregister(void *data)
 static int acpm_timeout_debug_init(struct acpm_info *acpm)
 {
 	size_t words = ACPM_FW_LOG_DUMP_MAX_ENTRIES * ACPM_FW_LOG_ENTRY_WORDS;
-	struct acpm_state_snapshot *state[] = {
-		&acpm->sleep_entry,
-		&acpm->sleep_return,
-		&acpm->timeout_state,
-	};
-	static const char * const name[] = {
-		"sleep-entry",
-		"sleep-return",
-		"first-timeout",
-	};
-	int i;
 
 	if (!acpm->timeout_debug)
 		return 0;
@@ -1380,56 +1125,7 @@ static int acpm_timeout_debug_init(struct acpm_info *acpm)
 	if (!acpm->preempt_log.entries)
 		return -ENOMEM;
 
-	for (i = 0; i < ARRAY_SIZE(state); i++) {
-		state[i]->name = name[i];
-		state[i]->chans = devm_kcalloc(acpm->dev, acpm->num_chans,
-						 sizeof(*state[i]->chans), GFP_KERNEL);
-		if (!state[i]->chans)
-			return -ENOMEM;
-	}
-
-	acpm->pmureg = exynos_get_pmu_regmap();
-	if (IS_ERR(acpm->pmureg)) {
-		dev_warn(acpm->dev, "cannot sample PMU wake status: %pe\n",
-			 acpm->pmureg);
-		acpm->pmureg = NULL;
-	}
-
 	return 0;
-}
-
-static void acpm_debug_syscore_unregister(void *data)
-{
-	unregister_syscore(data);
-}
-
-static int acpm_debug_syscore_register(struct acpm_info *acpm)
-{
-	if (!acpm->timeout_debug)
-		return 0;
-
-	acpm->debug_syscore.ops = &acpm_debug_syscore_ops;
-	acpm->debug_syscore.data = acpm;
-	register_syscore(&acpm->debug_syscore);
-
-	return devm_add_action_or_reset(acpm->dev,
-					acpm_debug_syscore_unregister,
-					&acpm->debug_syscore);
-}
-
-static int acpm_tmu_suspend_with_snapshot(struct acpm_handle *handle,
-					  unsigned int acpm_chan_id)
-{
-	struct acpm_info *acpm = handle_to_acpm_info(handle);
-
-	if (acpm->timeout_debug && acpm->sleep_entry_armed &&
-	    pm_suspend_target_state == PM_SUSPEND_MEM) {
-		acpm->sleep_entry_armed = false;
-		acpm_snapshot_state(acpm, &acpm->sleep_entry,
-				    ++acpm->sleep_cycle);
-	}
-
-	return acpm_tmu_suspend(handle, acpm_chan_id);
 }
 
 static const struct acpm_ops exynos_acpm_driver_ops = {
@@ -1453,7 +1149,7 @@ static const struct acpm_ops exynos_acpm_driver_ops = {
 		.set_interrupt_enable = acpm_tmu_set_interrupt_enable,
 		.tz_control = acpm_tmu_tz_control,
 		.clear_tz_irq = acpm_tmu_clear_tz_irq,
-		.suspend = acpm_tmu_suspend_with_snapshot,
+		.suspend = acpm_tmu_suspend,
 		.resume = acpm_tmu_resume,
 	},
 };
@@ -1497,14 +1193,14 @@ static int acpm_probe(struct platform_device *pdev)
 	acpm->timeout_debug = match_data->timeout_debug;
 	atomic_set(&acpm->timeout_claimed, 0);
 
-	ret = acpm_channels_init(acpm);
-	if (ret)
-		return ret;
-
 	ret = acpm_timeout_debug_init(acpm);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "Failed to allocate timeout snapshots.\n");
+				     "Failed to allocate timeout log snapshots.\n");
+
+	ret = acpm_channels_init(acpm);
+	if (ret)
+		return ret;
 
 	acpm->handle.ops = &exynos_acpm_driver_ops;
 
@@ -1521,11 +1217,6 @@ static int acpm_probe(struct platform_device *pdev)
 				       acpm_clk_pdev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to add devm action.\n");
-
-	ret = acpm_debug_syscore_register(acpm);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to register debug syscore capture.\n");
 
 	return devm_of_platform_populate(dev);
 }
@@ -1678,7 +1369,6 @@ static struct platform_driver acpm_driver = {
 	.driver	= {
 		.name = "exynos-acpm-protocol",
 		.of_match_table	= acpm_match,
-		.pm = pm_sleep_ptr(&acpm_pm_ops),
 	},
 };
 module_platform_driver(acpm_driver);

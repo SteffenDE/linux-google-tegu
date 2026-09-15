@@ -138,7 +138,7 @@ struct acpm_chan_snapshot {
  * @chans: preallocated array of per-channel snapshots.
  * @mbox: mailbox registers sampled together with the queues.
  * @num_chans: number of entries in @chans.
- * @cycle: deep-sleep attempt number assigned at device suspend.
+ * @cycle: deep-sleep attempt number assigned before firmware TMU suspend.
  * @wakeup_stat: Zumapro WAKEUP_STAT value.
  * @wakeup2_stat: Zumapro WAKEUP2_STAT value.
  * @rx_full: IDs of TYPE_QUEUE channels whose firmware-to-AP queue was full.
@@ -343,7 +343,7 @@ struct acpm_chan {
  * @sram_size:	size of the firmware SRAM mapping.
  * @normal_log: preallocated snapshot of the normal firmware log.
  * @preempt_log: preallocated snapshot of the preempt firmware log.
- * @sleep_entry: channel state after consumers suspend, before CPUs are offlined.
+ * @sleep_entry: channel state immediately before firmware TMU suspend.
  * @sleep_return: channel state before ACPM consumers resume.
  * @timeout_state: channel state sampled at the first IPC timeout.
  * @pmureg: PMU regmap used to sample Zumapro wake status.
@@ -511,18 +511,6 @@ static void acpm_print_state_snapshot(struct acpm_info *acpm,
 	dev_emerg(acpm->dev, "%s\n", line);
 }
 
-static int acpm_debug_suspend(struct device *dev)
-{
-	struct acpm_info *acpm = dev_get_drvdata(dev);
-
-	if (acpm->timeout_debug &&
-	    pm_suspend_target_state == PM_SUSPEND_MEM)
-		acpm_snapshot_state(acpm, &acpm->sleep_entry,
-				    ++acpm->sleep_cycle);
-
-	return 0;
-}
-
 static void acpm_debug_syscore_resume(void *data)
 {
 	struct acpm_info *acpm = data;
@@ -531,10 +519,6 @@ static void acpm_debug_syscore_resume(void *data)
 		acpm_snapshot_state(acpm, &acpm->sleep_return,
 				    acpm->sleep_cycle);
 }
-
-static const struct dev_pm_ops acpm_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(acpm_debug_suspend, NULL)
-};
 
 static const struct syscore_ops acpm_debug_syscore_ops = {
 	.resume = acpm_debug_syscore_resume,
@@ -1394,6 +1378,19 @@ static int acpm_debug_syscore_register(struct acpm_info *acpm)
 					&acpm->debug_syscore);
 }
 
+static int acpm_tmu_suspend_with_snapshot(struct acpm_handle *handle,
+					  unsigned int acpm_chan_id)
+{
+	struct acpm_info *acpm = handle_to_acpm_info(handle);
+
+	if (acpm->timeout_debug &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM)
+		acpm_snapshot_state(acpm, &acpm->sleep_entry,
+				    ++acpm->sleep_cycle);
+
+	return acpm_tmu_suspend(handle, acpm_chan_id);
+}
+
 static const struct acpm_ops exynos_acpm_driver_ops = {
 	.dvfs = {
 		.set_rate = acpm_dvfs_set_rate,
@@ -1415,7 +1412,7 @@ static const struct acpm_ops exynos_acpm_driver_ops = {
 		.set_interrupt_enable = acpm_tmu_set_interrupt_enable,
 		.tz_control = acpm_tmu_tz_control,
 		.clear_tz_irq = acpm_tmu_clear_tz_irq,
-		.suspend = acpm_tmu_suspend,
+		.suspend = acpm_tmu_suspend_with_snapshot,
 		.resume = acpm_tmu_resume,
 	},
 };
@@ -1640,7 +1637,6 @@ static struct platform_driver acpm_driver = {
 	.driver	= {
 		.name = "exynos-acpm-protocol",
 		.of_match_table	= acpm_match,
-		.pm = pm_sleep_ptr(&acpm_pm_ops),
 	},
 };
 module_platform_driver(acpm_driver);

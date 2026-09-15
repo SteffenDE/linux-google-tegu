@@ -5,6 +5,7 @@
  * Copyright 2024 Linaro Ltd.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
@@ -22,9 +23,11 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/panic.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -41,19 +44,79 @@
 
 #define ACPM_GS101_INITDATA_BASE	0xa000
 
+#define ACPM_FW_LOG_ENTRY_WORDS		4
+#define ACPM_FW_LOG_DUMP_MAX_ENTRIES	512
+#define ACPM_FW_LOG_STRING_MAX		80
+#define ACPM_QUEUE_DUMP_MAX_SLOTS	32
+#define ACPM_QUEUE_DUMP_WORDS		4
+
+/* Firmware tick period in picoseconds, despite the downstream _US name. */
+#define ACPM_SYSTICK_PERIOD_PS		20345
+
+/**
+ * struct acpm_build_info - firmware build identity embedded in initdata.
+ * @build_version: firmware build string.
+ * @major: framework ABI major version.
+ * @minor: framework ABI minor version.
+ */
+struct acpm_build_info {
+	char build_version[48];
+	u8 major;
+	u8 minor;
+};
+
 /**
  * struct acpm_shmem - shared memory configuration information.
- * @reserved:	unused fields.
+ * @plugins:	offset to the firmware plugin table.
+ * @num_plugins: number of firmware plugins.
  * @chans:	offset to array of struct acpm_chan_shmem.
- * @reserved1:	unused fields.
- * @num_chans:	number of channels.
+ * @num_ipc_chans: number of firmware IPC channels.
+ * @pid_framework: framework plugin ID.
+ * @pid_max:	maximum plugin ID.
+ * @num_chans:	number of AP-visible channels.
+ * @reserved_ipc: channel counts for other ACPM peers and global limits.
+ * @ktime_index: firmware timekeeping index.
+ * @log_buf_rear: offset to the normal firmware log rear index.
+ * @log_buf_front: offset to the normal firmware log front index.
+ * @log_data:	offset to the normal firmware log entries.
+ * @log_entry_size: firmware log entry size in bytes.
+ * @log_entry_len: number of normal firmware log entries.
+ * @reserved_fw: firmware IPC and interrupt metadata.
+ * @info:	firmware build identity.
+ * @reserved_preempt: preemption metadata.
+ * @preempt_log_buf_rear: offset to the preempt log rear index.
+ * @preempt_log_buf_front: offset to the preempt log front index.
+ * @preempt_log_data: offset to the preempt firmware log entries.
+ * @preempt_log_entry_len: number of preempt firmware log entries.
  */
 struct acpm_shmem {
-	u32 reserved[2];
+	u32 plugins;
+	u32 num_plugins;
 	u32 chans;
-	u32 reserved1[3];
+	u32 num_ipc_chans;
+	u32 pid_framework;
+	u32 pid_max;
 	u32 num_chans;
+	u32 reserved_ipc[5];
+	u32 ktime_index;
+	u32 log_buf_rear;
+	u32 log_buf_front;
+	u32 log_data;
+	u32 log_entry_size;
+	u32 log_entry_len;
+	u32 reserved_fw[5];
+	struct acpm_build_info info;
+	u32 reserved_preempt[6];
+	u32 preempt_log_buf_rear;
+	u32 preempt_log_buf_front;
+	u32 preempt_log_data;
+	u32 preempt_log_entry_len;
 };
+
+static_assert(offsetof(struct acpm_shmem, chans) == 0x8);
+static_assert(offsetof(struct acpm_shmem, num_chans) == 0x18);
+static_assert(offsetof(struct acpm_shmem, log_buf_rear) == 0x34);
+static_assert(offsetof(struct acpm_shmem, preempt_log_buf_rear) == 0xa8);
 
 /**
  * struct acpm_chan_shmem - descriptor of a shared memory channel.
@@ -109,12 +172,16 @@ struct acpm_queue {
  * @rxcnt:	expected length of the response in 32-bit words.
  * @completed:	flag indicating if the firmware response has been fully
  *		processed.
+ * @tx_cmd:	copy of the request assigned to this sequence number.
+ * @txcnt:	request length in 32-bit words.
  */
 struct acpm_rx_data {
 	u32 *cmd __counted_by_ptr(cmdcnt);
 	size_t cmdcnt;
 	size_t rxcnt;
 	bool completed;
+	u32 *tx_cmd;
+	size_t txcnt;
 };
 
 #define ACPM_SEQNUM_MAX    64
@@ -169,6 +236,9 @@ struct acpm_chan {
  * @dev:	pointer to the exynos-acpm device.
  * @handle:	instance of acpm_handle to send to clients.
  * @num_chans:	number of channels available for this controller.
+ * @sram_size:	size of the firmware SRAM mapping.
+ * @timeout_claimed: elects one timeout caller to collect fatal diagnostics.
+ * @timeout_debug: panic with firmware diagnostics on the first timeout.
  */
 struct acpm_info {
 	struct acpm_shmem __iomem *shmem;
@@ -177,20 +247,249 @@ struct acpm_info {
 	struct device *dev;
 	struct acpm_handle handle;
 	u32 num_chans;
+	resource_size_t sram_size;
+	atomic_t timeout_claimed;
+	bool timeout_debug;
 };
 
 /**
  * struct acpm_match_data - of_device_id data.
  * @initdata_base:	offset in SRAM where the channels configuration resides.
  * @acpm_clk_dev_name:	base name for the ACPM clocks device that we're registering.
+ * @timeout_debug: collect firmware state and panic on the first IPC timeout.
  */
 struct acpm_match_data {
 	loff_t initdata_base;
 	const char *acpm_clk_dev_name;
+	bool timeout_debug;
 };
 
 #define client_to_acpm_chan(c) container_of(c, struct acpm_chan, cl)
 #define handle_to_acpm_info(h) container_of(h, struct acpm_info, handle)
+
+static bool acpm_sram_range_valid(const struct acpm_info *acpm, u32 offset,
+				  resource_size_t size)
+{
+	return offset < acpm->sram_size && size <= acpm->sram_size - offset;
+}
+
+static bool acpm_fw_log_string(struct acpm_info *acpm, u32 encoded_offset,
+			       char *buf, size_t buf_size)
+{
+	u32 offset = encoded_offset & GENMASK(23, 0);
+	size_t i;
+
+	if (!buf_size || !acpm_sram_range_valid(acpm, offset, 1))
+		return false;
+
+	for (i = 0; i < buf_size - 1 && offset + i < acpm->sram_size; i++) {
+		u8 c = readb(acpm->sram_base + offset + i);
+
+		if (!c) {
+			buf[i] = '\0';
+			return true;
+		}
+
+		/* Keep each firmware record on one printable console line. */
+		buf[i] = c >= 0x20 && c <= 0x7e ? c : '.';
+	}
+
+	buf[i] = '\0';
+	return true;
+}
+
+static void acpm_dump_fw_log(struct acpm_info *acpm, const char *name,
+			     u32 rear_offset, u32 front_offset,
+			     u32 data_offset, u32 entry_size, u32 len)
+{
+	struct device *dev = acpm->dev;
+	u32 count, front, rear, i;
+	resource_size_t data_size;
+
+	if (entry_size < ACPM_FW_LOG_ENTRY_WORDS * sizeof(u32) || !len ||
+	    len > acpm->sram_size / entry_size) {
+		dev_emerg(dev,
+			  "firmware %s log has invalid geometry: data:%#x entry:%u len:%u\n",
+			  name, data_offset, entry_size, len);
+		return;
+	}
+
+	data_size = (resource_size_t)entry_size * len;
+	if (!acpm_sram_range_valid(acpm, rear_offset, sizeof(u32)) ||
+	    !acpm_sram_range_valid(acpm, front_offset, sizeof(u32)) ||
+	    !acpm_sram_range_valid(acpm, data_offset, data_size)) {
+		dev_emerg(dev,
+			  "firmware %s log lies outside SRAM: rear:%#x front:%#x data:%#x bytes:%pa\n",
+			  name, rear_offset, front_offset, data_offset, &data_size);
+		return;
+	}
+
+	rear = readl(acpm->sram_base + rear_offset);
+	front = readl(acpm->sram_base + front_offset);
+	if (front >= len) {
+		dev_emerg(dev,
+			  "firmware %s log has invalid indices: rear:%u front:%u len:%u\n",
+			  name, rear, front, len);
+		return;
+	}
+
+	count = min_t(u32, len, ACPM_FW_LOG_DUMP_MAX_ENTRIES);
+	dev_emerg(dev,
+		  "firmware %s log: rear:%u front:%u len:%u entry:%u; dumping %u newest-first\n",
+		  name, rear, front, len, entry_size, count);
+
+	for (i = 0; i < count; i++) {
+		void __iomem *entry;
+		char message[ACPM_FW_LOG_STRING_MAX];
+		u32 word[ACPM_FW_LOG_ENTRY_WORDS];
+		u32 index, id;
+		u64 ticks, time_ns;
+		bool raw, flag26;
+
+		index = (front + len - 1 - i) % len;
+		entry = acpm->sram_base + data_offset + index * entry_size;
+		__ioread32_copy(word, entry, ARRAY_SIZE(word));
+
+		if (!(word[0] | word[1] | word[2] | word[3]))
+			continue;
+
+		id = FIELD_GET(GENMASK(31, 28), word[0]);
+		raw = word[0] & BIT(27);
+		flag26 = word[0] & BIT(26);
+		ticks = ((u64)word[1] << 24) | FIELD_GET(GENMASK(23, 0), word[0]);
+		time_ns = mul_u64_u32_div(ticks, ACPM_SYSTICK_PERIOD_PS, 1000);
+
+		if (raw) {
+			dev_emerg(dev,
+				  "firmware %s[%u]: raw id:%u flag26:%u data:%08x %08x %08x %08x\n",
+				  name, index, id, flag26, word[0], word[1],
+				  word[2], word[3]);
+		} else if (acpm_fw_log_string(acpm, word[2], message,
+					       sizeof(message))) {
+			dev_emerg(dev,
+				  "firmware %s[%u]: time-ns:%llu id:%u flag26:%u \"%s\" arg:%08x raw:%08x %08x %08x %08x\n",
+				  name, index, time_ns, id, flag26, message, word[3],
+				  word[0], word[1], word[2], word[3]);
+		} else {
+			dev_emerg(dev,
+				  "firmware %s[%u]: time-ns:%llu id:%u flag26:%u bad-string:%08x arg:%08x raw:%08x %08x %08x %08x\n",
+				  name, index, time_ns, id, flag26, word[2], word[3],
+				  word[0], word[1], word[2], word[3]);
+		}
+	}
+}
+
+static void acpm_dump_fw_logs(struct acpm_info *acpm)
+{
+	struct acpm_shmem __iomem *shmem = acpm->shmem;
+	u32 entry_size = readl(&shmem->log_entry_size);
+
+	/* Preempt records include exception and high-priority handler context. */
+	acpm_dump_fw_log(acpm, "preempt",
+			 readl(&shmem->preempt_log_buf_rear),
+			 readl(&shmem->preempt_log_buf_front),
+			 readl(&shmem->preempt_log_data), entry_size,
+			 readl(&shmem->preempt_log_entry_len));
+
+	acpm_dump_fw_log(acpm, "normal", readl(&shmem->log_buf_rear),
+			 readl(&shmem->log_buf_front), readl(&shmem->log_data),
+			 entry_size, readl(&shmem->log_entry_len));
+}
+
+static void acpm_dump_queue_slots(struct acpm_chan *achan, const char *name,
+				  const struct acpm_queue *queue)
+{
+	struct device *dev = achan->acpm->dev;
+	u32 count = min_t(u32, achan->qlen, ACPM_QUEUE_DUMP_MAX_SLOTS);
+	u32 words = min_t(u32, achan->mlen / sizeof(u32),
+			  ACPM_QUEUE_DUMP_WORDS);
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		u32 data[ACPM_QUEUE_DUMP_WORDS] = {};
+
+		__ioread32_copy(data, queue->base + achan->mlen * i, words);
+		dev_emerg(dev,
+			  "ch:%u %s-slot:%u data:%08x %08x %08x %08x\n",
+			  achan->id, name, i, data[0], data[1], data[2], data[3]);
+	}
+
+	if (count != achan->qlen)
+		dev_emerg(dev, "ch:%u %s queue truncated at %u of %u slots\n",
+			  achan->id, name, count, achan->qlen);
+}
+
+static void acpm_dump_channels(struct acpm_info *acpm,
+			       const struct acpm_chan *timed_out)
+{
+	u32 i;
+
+	for (i = 0; i < acpm->num_chans; i++) {
+		struct acpm_chan *achan = &acpm->chans[i];
+		DECLARE_BITMAP(pending, ACPM_SEQNUM_MAX - 1);
+		unsigned long seq;
+
+		bitmap_copy(pending, achan->bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
+		dev_emerg(acpm->dev,
+			  "ch:%u state: pending:%*pb RX rear:%u front:%u TX rear:%u front:%u qlen:%u mlen:%u\n",
+			  achan->id, ACPM_SEQNUM_MAX - 1, pending,
+			  readl(achan->rx.rear), readl(achan->rx.front),
+			  readl(achan->tx.rear), readl(achan->tx.front),
+			  achan->qlen, achan->mlen);
+
+		for_each_set_bit(seq, pending, ACPM_SEQNUM_MAX - 1) {
+			struct acpm_rx_data *rx_data = &achan->rx_data[seq];
+			u32 data[ACPM_QUEUE_DUMP_WORDS] = {};
+			size_t words;
+
+			words = min_t(size_t, rx_data->txcnt, ARRAY_SIZE(data));
+			if (rx_data->tx_cmd)
+				memcpy(data, rx_data->tx_cmd, words * sizeof(*data));
+
+			dev_emerg(acpm->dev,
+				  "ch:%u seq:%lu outstanding: complete:%u txcnt:%zu data:%08x %08x %08x %08x\n",
+				  achan->id, seq + 1, READ_ONCE(rx_data->completed),
+				  READ_ONCE(rx_data->txcnt), data[0], data[1],
+				  data[2], data[3]);
+		}
+
+		if (!bitmap_empty(pending, ACPM_SEQNUM_MAX - 1) ||
+		    achan == timed_out) {
+			acpm_dump_queue_slots(achan, "TX", &achan->tx);
+			acpm_dump_queue_slots(achan, "RX", &achan->rx);
+		}
+	}
+}
+
+static void acpm_timeout_debug(struct acpm_chan *achan,
+			       const struct acpm_xfer *xfer, u32 seqnum)
+{
+	struct acpm_info *acpm = achan->acpm;
+	u32 request[ACPM_QUEUE_DUMP_WORDS] = {};
+	size_t words;
+
+	if (!acpm->timeout_debug ||
+	    atomic_cmpxchg(&acpm->timeout_claimed, 0, 1))
+		return;
+
+	words = min_t(size_t, xfer->txcnt, ARRAY_SIZE(request));
+	memcpy(request, xfer->txd, words * sizeof(*request));
+	dev_emerg(acpm->dev,
+		  "first IPC timeout: ch:%u seq:%u txcnt:%zu request:%08x %08x %08x %08x\n",
+		  achan->id, seqnum, xfer->txcnt, request[0], request[1],
+		  request[2], request[3]);
+
+	exynos_mbox_dump_regs(achan->chan);
+	acpm_dump_channels(acpm, achan);
+	acpm_dump_fw_logs(acpm);
+	dump_stack();
+
+	/* A diagnostic kernel must come back even without panic= on cmdline. */
+	if (!panic_timeout)
+		panic_timeout = 5;
+
+	panic("ACPM IPC timeout on channel %u sequence %u", achan->id, seqnum);
+}
 
 /**
  * acpm_get_saved_rx() - get the response if it was already saved.
@@ -352,6 +651,7 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 
 	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
 		achan->id, seqnum, achan->bitmap_seqnum[0]);
+	acpm_timeout_debug(achan, xfer, seqnum);
 
 	return -ETIME;
 }
@@ -432,6 +732,12 @@ static int acpm_prepare_xfer(struct acpm_chan *achan,
 	memset(rx_data->cmd, 0, sizeof(*rx_data->cmd) * rx_data->cmdcnt);
 	/* zero means no response expected */
 	rx_data->rxcnt = xfer->rxcnt;
+
+	/* Retain the exact outstanding request for first-timeout diagnostics. */
+	memset(rx_data->tx_cmd, 0, sizeof(*rx_data->tx_cmd) * rx_data->cmdcnt);
+	memcpy(rx_data->tx_cmd, xfer->txd,
+	       min(xfer->txcnt, rx_data->cmdcnt) * sizeof(*rx_data->tx_cmd));
+	rx_data->txcnt = xfer->txcnt;
 
 	return 0;
 }
@@ -596,6 +902,10 @@ static int acpm_achan_alloc_cmds(struct acpm_chan *achan)
 		rx_data->cmd = devm_kcalloc(dev, cmdcnt, cmd_size, GFP_KERNEL);
 		if (!rx_data->cmd)
 			return -ENOMEM;
+
+		rx_data->tx_cmd = devm_kcalloc(dev, cmdcnt, cmd_size, GFP_KERNEL);
+		if (!rx_data->tx_cmd)
+			return -ENOMEM;
 	}
 
 	return 0;
@@ -733,6 +1043,9 @@ static int acpm_probe(struct platform_device *pdev)
 
 	acpm->shmem = acpm->sram_base + match_data->initdata_base;
 	acpm->dev = dev;
+	acpm->sram_size = size;
+	acpm->timeout_debug = match_data->timeout_debug;
+	atomic_set(&acpm->timeout_claimed, 0);
 
 	ret = acpm_channels_init(acpm);
 	if (ret)
@@ -885,6 +1198,7 @@ static const struct acpm_match_data acpm_zumapro = {
 	/* Same SRAM channel-table offset as gs101, confirmed on silicon. */
 	.initdata_base = ACPM_GS101_INITDATA_BASE,
 	.acpm_clk_dev_name = "zumapro-acpm-clk",
+	.timeout_debug = true,
 };
 
 static const struct of_device_id acpm_match[] = {

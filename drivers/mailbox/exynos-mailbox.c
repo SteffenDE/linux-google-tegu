@@ -17,7 +17,12 @@
 #include <linux/slab.h>
 
 #define EXYNOS_MBOX_INTMR0		0x28	/* Interrupt Mask Register 0 */
+#define EXYNOS_MBOX_INTSR0		0x2c	/* Interrupt Status Register 0 */
+#define EXYNOS_MBOX_INTMSR0		0x30	/* Masked Interrupt Status 0 */
 #define EXYNOS_MBOX_INTGR1		0x40	/* Interrupt Generation Register 1 */
+#define EXYNOS_MBOX_INTMR1		0x48	/* Interrupt Mask Register 1 */
+#define EXYNOS_MBOX_INTSR1		0x4c	/* Interrupt Status Register 1 */
+#define EXYNOS_MBOX_INTMSR1		0x50	/* Masked Interrupt Status 1 */
 
 #define EXYNOS_MBOX_INTMR0_MASK		GENMASK(15, 0)
 #define EXYNOS_MBOX_INTGR1_MASK		GENMASK(15, 0)
@@ -33,6 +38,40 @@ struct exynos_mbox {
 	void __iomem *regs;
 	struct mbox_controller *mbox;
 };
+
+/**
+ * exynos_mbox_dump_regs() - dump mailbox state without taking locks
+ * @chan: mailbox channel whose controller should be dumped
+ *
+ * This is intended for fatal diagnostics where the mailbox peer has stopped
+ * responding.  Keep the reads to the status and mask registers: unlike the
+ * generation and clear registers, these are safe to inspect.
+ */
+void exynos_mbox_dump_regs(struct mbox_chan *chan)
+{
+	struct device *dev;
+	struct exynos_mbox *exynos_mbox;
+	void __iomem *regs;
+
+	if (!chan || !chan->mbox || !chan->mbox->dev)
+		return;
+
+	dev = chan->mbox->dev;
+	exynos_mbox = dev_get_drvdata(dev);
+	if (!exynos_mbox)
+		return;
+
+	regs = exynos_mbox->regs;
+	dev_emerg(dev,
+		  "registers: INTSR0:%08x INTMR0:%08x INTMSR0:%08x INTSR1:%08x INTMR1:%08x INTMSR1:%08x\n",
+		  readl(regs + EXYNOS_MBOX_INTSR0),
+		  readl(regs + EXYNOS_MBOX_INTMR0),
+		  readl(regs + EXYNOS_MBOX_INTMSR0),
+		  readl(regs + EXYNOS_MBOX_INTSR1),
+		  readl(regs + EXYNOS_MBOX_INTMR1),
+		  readl(regs + EXYNOS_MBOX_INTMSR1));
+}
+EXPORT_SYMBOL_GPL(exynos_mbox_dump_regs);
 
 static int exynos_mbox_send_data(struct mbox_chan *chan, void *data)
 {

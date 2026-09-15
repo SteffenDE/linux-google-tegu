@@ -34,7 +34,6 @@
 #include <linux/slab.h>
 #include <linux/soc/samsung/exynos-pmu.h>
 #include <linux/suspend.h>
-#include <linux/syscore_ops.h>
 #include <linux/types.h>
 
 #include "exynos-acpm.h"
@@ -138,7 +137,7 @@ struct acpm_chan_snapshot {
  * @chans: preallocated array of per-channel snapshots.
  * @mbox: mailbox registers sampled together with the queues.
  * @num_chans: number of entries in @chans.
- * @cycle: deep-sleep attempt number assigned at syscore suspend.
+ * @cycle: deep-sleep attempt number assigned at noirq suspend.
  * @wakeup_stat: Zumapro WAKEUP_STAT value.
  * @wakeup2_stat: Zumapro WAKEUP2_STAT value.
  * @rx_full: IDs of TYPE_QUEUE channels whose firmware-to-AP queue was full.
@@ -343,11 +342,10 @@ struct acpm_chan {
  * @sram_size:	size of the firmware SRAM mapping.
  * @normal_log: preallocated snapshot of the normal firmware log.
  * @preempt_log: preallocated snapshot of the preempt firmware log.
- * @sleep_entry: channel state immediately before the firmware sleep call.
- * @sleep_return: channel state immediately after the firmware sleep return.
+ * @sleep_entry: channel state after consumers suspend, before CPUs are offlined.
+ * @sleep_return: channel state before ACPM consumers resume.
  * @timeout_state: channel state sampled at the first IPC timeout.
  * @pmureg: PMU regmap used to sample Zumapro wake status.
- * @debug_syscore: early system-sleep capture callbacks.
  * @sleep_cycle: deep-sleep attempt counter.
  * @timeout_claimed: elects one timeout caller to collect fatal diagnostics.
  * @timeout_debug: panic with firmware diagnostics on the first timeout.
@@ -366,7 +364,6 @@ struct acpm_info {
 	struct acpm_state_snapshot sleep_return;
 	struct acpm_state_snapshot timeout_state;
 	struct regmap *pmureg;
-	struct syscore debug_syscore;
 	u32 sleep_cycle;
 	atomic_t timeout_claimed;
 	bool timeout_debug;
@@ -511,29 +508,33 @@ static void acpm_print_state_snapshot(struct acpm_info *acpm,
 	dev_emerg(acpm->dev, "%s\n", line);
 }
 
-static int acpm_debug_syscore_suspend(void *data)
+static int acpm_debug_suspend_noirq(struct device *dev)
 {
-	struct acpm_info *acpm = data;
+	struct acpm_info *acpm = dev_get_drvdata(dev);
 
-	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+	if (acpm->timeout_debug &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM)
 		acpm_snapshot_state(acpm, &acpm->sleep_entry,
 				    ++acpm->sleep_cycle);
 
 	return 0;
 }
 
-static void acpm_debug_syscore_resume(void *data)
+static int acpm_debug_resume_noirq(struct device *dev)
 {
-	struct acpm_info *acpm = data;
+	struct acpm_info *acpm = dev_get_drvdata(dev);
 
-	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+	if (acpm->timeout_debug &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM)
 		acpm_snapshot_state(acpm, &acpm->sleep_return,
 				    acpm->sleep_cycle);
+
+	return 0;
 }
 
-static const struct syscore_ops acpm_debug_syscore_ops = {
-	.suspend = acpm_debug_syscore_suspend,
-	.resume = acpm_debug_syscore_resume,
+static const struct dev_pm_ops acpm_pm_ops = {
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(acpm_debug_suspend_noirq,
+				      acpm_debug_resume_noirq)
 };
 
 static bool acpm_fw_log_string(struct acpm_info *acpm, u32 encoded_offset,
@@ -1371,25 +1372,6 @@ static int acpm_timeout_debug_init(struct acpm_info *acpm)
 	return 0;
 }
 
-static void acpm_debug_syscore_unregister(void *data)
-{
-	unregister_syscore(data);
-}
-
-static int acpm_debug_syscore_register(struct acpm_info *acpm)
-{
-	if (!acpm->timeout_debug)
-		return 0;
-
-	acpm->debug_syscore.ops = &acpm_debug_syscore_ops;
-	acpm->debug_syscore.data = acpm;
-	register_syscore(&acpm->debug_syscore);
-
-	return devm_add_action_or_reset(acpm->dev,
-					acpm_debug_syscore_unregister,
-					&acpm->debug_syscore);
-}
-
 static const struct acpm_ops exynos_acpm_driver_ops = {
 	.dvfs = {
 		.set_rate = acpm_dvfs_set_rate,
@@ -1479,11 +1461,6 @@ static int acpm_probe(struct platform_device *pdev)
 				       acpm_clk_pdev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to add devm action.\n");
-
-	ret = acpm_debug_syscore_register(acpm);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to register debug syscore capture.\n");
 
 	return devm_of_platform_populate(dev);
 }
@@ -1636,6 +1613,7 @@ static struct platform_driver acpm_driver = {
 	.driver	= {
 		.name = "exynos-acpm-protocol",
 		.of_match_table	= acpm_match,
+		.pm = pm_sleep_ptr(&acpm_pm_ops),
 	},
 };
 module_platform_driver(acpm_driver);

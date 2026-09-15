@@ -138,7 +138,7 @@ struct acpm_chan_snapshot {
  * @chans: preallocated array of per-channel snapshots.
  * @mbox: mailbox registers sampled together with the queues.
  * @num_chans: number of entries in @chans.
- * @cycle: deep-sleep attempt number assigned at noirq suspend.
+ * @cycle: deep-sleep attempt number assigned at device suspend.
  * @wakeup_stat: Zumapro WAKEUP_STAT value.
  * @wakeup2_stat: Zumapro WAKEUP2_STAT value.
  * @rx_full: IDs of TYPE_QUEUE channels whose firmware-to-AP queue was full.
@@ -511,7 +511,7 @@ static void acpm_print_state_snapshot(struct acpm_info *acpm,
 	dev_emerg(acpm->dev, "%s\n", line);
 }
 
-static int acpm_debug_suspend_noirq(struct device *dev)
+static int acpm_debug_suspend(struct device *dev)
 {
 	struct acpm_info *acpm = dev_get_drvdata(dev);
 
@@ -533,7 +533,7 @@ static void acpm_debug_syscore_resume(void *data)
 }
 
 static const struct dev_pm_ops acpm_pm_ops = {
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(acpm_debug_suspend_noirq, NULL)
+	SET_SYSTEM_SLEEP_PM_OPS(acpm_debug_suspend, NULL)
 };
 
 static const struct syscore_ops acpm_debug_syscore_ops = {

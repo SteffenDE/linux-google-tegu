@@ -9,13 +9,16 @@
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/interrupt.h>
 #include <linux/mailbox_controller.h>
 #include <linux/mailbox/exynos-message.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
+#define EXYNOS_MBOX_INTCR0		0x24	/* Interrupt Clear Register 0 */
 #define EXYNOS_MBOX_INTMR0		0x28	/* Interrupt Mask Register 0 */
 #define EXYNOS_MBOX_INTSR0		0x2c	/* Interrupt Status Register 0 */
 #define EXYNOS_MBOX_INTMSR0		0x30	/* Masked Interrupt Status 0 */
@@ -33,11 +36,69 @@
  * struct exynos_mbox - driver's private data.
  * @regs:	mailbox registers base address.
  * @mbox:	pointer to the mailbox controller.
+ * @mask_lock:	serializes updates to the incoming interrupt mask.
  */
 struct exynos_mbox {
 	void __iomem *regs;
 	struct mbox_controller *mbox;
+	spinlock_t mask_lock;
 };
+
+static irqreturn_t exynos_mbox_irq(int irq, void *data)
+{
+	struct exynos_mbox *exynos_mbox = data;
+	u32 status;
+
+	status = readl(exynos_mbox->regs + EXYNOS_MBOX_INTMSR0);
+	status &= EXYNOS_MBOX_INTMR0_MASK;
+	if (!status)
+		return IRQ_NONE;
+
+	/* The asynchronous ACPM channels are shared buffers, not queues. */
+	writel(status, exynos_mbox->regs + EXYNOS_MBOX_INTCR0);
+
+	return IRQ_HANDLED;
+}
+
+/**
+ * exynos_mbox_set_chan_polling() - select polling or interrupt mode
+ * @chan: mailbox channel whose controller owns the hardware channel
+ * @chan_id: hardware mailbox channel number
+ * @polling: true to mask the incoming interrupt, false to unmask it
+ *
+ * ACPM describes this mode in its firmware-owned channel table.  Polling
+ * channels must remain masked because their replies are consumed directly by
+ * the caller; asynchronous channels need an unmasked interrupt so they can
+ * assert the APM2AP wake input and have the notification acknowledged.
+ *
+ * Return: 0 on success, -errno otherwise.
+ */
+int exynos_mbox_set_chan_polling(struct mbox_chan *chan, unsigned int chan_id,
+				 bool polling)
+{
+	struct exynos_mbox *exynos_mbox;
+	unsigned long flags;
+	u32 mask;
+
+	if (!chan || !chan->mbox || chan_id >= EXYNOS_MBOX_CHAN_COUNT)
+		return -EINVAL;
+
+	exynos_mbox = dev_get_drvdata(chan->mbox->dev);
+	if (!exynos_mbox)
+		return -ENODEV;
+
+	spin_lock_irqsave(&exynos_mbox->mask_lock, flags);
+	mask = readl(exynos_mbox->regs + EXYNOS_MBOX_INTMR0);
+	if (polling)
+		mask |= BIT(chan_id);
+	else
+		mask &= ~BIT(chan_id);
+	writel(mask, exynos_mbox->regs + EXYNOS_MBOX_INTMR0);
+	spin_unlock_irqrestore(&exynos_mbox->mask_lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(exynos_mbox_set_chan_polling);
 
 /**
  * exynos_mbox_dump_regs() - dump mailbox state without taking locks
@@ -131,6 +192,7 @@ static int exynos_mbox_probe(struct platform_device *pdev)
 	struct mbox_controller *mbox;
 	struct mbox_chan *chans;
 	struct clk *pclk;
+	int irq, ret;
 
 	exynos_mbox = devm_kzalloc(dev, sizeof(*exynos_mbox), GFP_KERNEL);
 	if (!exynos_mbox)
@@ -161,11 +223,21 @@ static int exynos_mbox_probe(struct platform_device *pdev)
 	mbox->of_xlate = exynos_mbox_of_xlate;
 
 	exynos_mbox->mbox = mbox;
+	spin_lock_init(&exynos_mbox->mask_lock);
 
 	platform_set_drvdata(pdev, exynos_mbox);
 
-	/* Mask out all interrupts. We support just polling channels for now. */
+	/* Start quiescent; ACPM unmasks channels described as asynchronous. */
 	writel(EXYNOS_MBOX_INTMR0_MASK, exynos_mbox->regs + EXYNOS_MBOX_INTMR0);
+
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
+
+	ret = devm_request_irq(dev, irq, exynos_mbox_irq, 0, dev_name(dev),
+			       exynos_mbox);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to request IRQ\n");
 
 	return devm_mbox_controller_register(dev, mbox);
 }

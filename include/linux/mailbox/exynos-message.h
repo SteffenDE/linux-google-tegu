@@ -9,6 +9,7 @@
 #define _LINUX_EXYNOS_MESSAGE_H_
 
 #include <linux/kconfig.h>
+#include <linux/types.h>
 
 #define EXYNOS_MBOX_CHAN_TYPE_DOORBELL		0
 #define EXYNOS_MBOX_CHAN_TYPE_DATA		1
@@ -22,9 +23,18 @@ struct exynos_mbox_msg {
 
 #if IS_REACHABLE(CONFIG_EXYNOS_MBOX)
 void exynos_mbox_dump_regs(struct mbox_chan *chan);
+int exynos_mbox_set_chan_polling(struct mbox_chan *chan, unsigned int chan_id,
+				 bool polling);
 #else
 static inline void exynos_mbox_dump_regs(struct mbox_chan *chan)
 {
+}
+
+static inline int exynos_mbox_set_chan_polling(struct mbox_chan *chan,
+					       unsigned int chan_id,
+					       bool polling)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 

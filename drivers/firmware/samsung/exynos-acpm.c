@@ -1094,6 +1094,13 @@ static int acpm_channels_init(struct acpm_info *acpm)
 		achan->chan = mbox_request_channel(cl, 0);
 		if (IS_ERR(achan->chan))
 			return PTR_ERR(achan->chan);
+
+		ret = exynos_mbox_set_chan_polling(achan->chan, achan->id,
+						  achan->poll_completion);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "Failed to configure channel %u mode\n",
+					     achan->id);
 	}
 
 	return 0;

@@ -118,6 +118,17 @@ struct acpm_tmu_driver_data {
 	unsigned int max_register;
 };
 
+/*
+ * ACPM's TMU suspend and resume messages describe the whole thermal
+ * subsystem, not one TMU register block.  Keep the per-device callbacks
+ * coordinated so that the firmware sees one global transition after every
+ * instance has been quiesced, matching the downstream driver.
+ */
+static DEFINE_MUTEX(acpm_tmu_pm_lock);
+static unsigned int acpm_tmu_num_devices;
+static unsigned int acpm_tmu_suspended_devices;
+static bool acpm_tmu_firmware_suspended;
+
 #define ACPM_TMU_SENSOR_GROUP(_mask, _id)	\
 	{					\
 		.mask	= _mask,		\
@@ -586,6 +597,9 @@ static int acpm_tmu_probe(struct platform_device *pdev)
 
 	pm_runtime_put_autosuspend(dev);
 
+	guard(mutex)(&acpm_tmu_pm_lock);
+	acpm_tmu_num_devices++;
+
 	return 0;
 
 err_rollback:
@@ -610,6 +624,10 @@ static void acpm_tmu_remove(struct platform_device *pdev)
 	 */
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	acpm_tmu_control(priv, false, false);
+
+	guard(mutex)(&acpm_tmu_pm_lock);
+	WARN_ON(acpm_tmu_suspended_devices);
+	acpm_tmu_num_devices--;
 }
 
 static int acpm_tmu_pm_suspend(struct device *dev)
@@ -617,28 +635,47 @@ static int acpm_tmu_pm_suspend(struct device *dev)
 	struct acpm_tmu_priv *priv = dev_get_drvdata(dev);
 	struct acpm_handle *handle = priv->handle;
 	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
+	bool suspended_acpm = false;
 	int ret, restore_ret;
+
+	guard(mutex)(&acpm_tmu_pm_lock);
 
 	ret = acpm_tmu_control(priv, false, false);
 	if (ret)
 		goto err_restore_sensors;
 
-	/* APB clock not required for this specific msg */
-	ret = ops->suspend(handle, priv->mbox_chan_id);
-	if (ret)
-		goto err_restore_sensors;
+	acpm_tmu_suspended_devices++;
+	if (acpm_tmu_suspended_devices == acpm_tmu_num_devices) {
+		/* APB clock not required for this specific msg */
+		ret = ops->suspend(handle, priv->mbox_chan_id);
+		if (ret) {
+			acpm_tmu_suspended_devices--;
+			goto err_restore_sensors;
+		}
+
+		acpm_tmu_firmware_suspended = true;
+		suspended_acpm = true;
+		dev_info(dev, "ACPM TMU global suspend after %u devices\n",
+			 acpm_tmu_suspended_devices);
+	}
 
 	ret = pm_runtime_force_suspend(dev);
 	if (ret)
-		goto err_resume_acpm;
+		goto err_mark_active;
 
 	return 0;
 
-err_resume_acpm:
-	restore_ret = ops->resume(handle, priv->mbox_chan_id);
-	if (restore_ret)
-		dev_err(dev, "Failed to resume ACPM after force suspend failure: %d\n",
-			restore_ret);
+err_mark_active:
+	if (suspended_acpm) {
+		restore_ret = ops->resume(handle, priv->mbox_chan_id);
+		if (restore_ret) {
+			dev_err(dev, "Failed to resume ACPM after force suspend failure: %d\n",
+				restore_ret);
+		} else {
+			acpm_tmu_firmware_suspended = false;
+		}
+	}
+	acpm_tmu_suspended_devices--;
 
 err_restore_sensors:
 	restore_ret = acpm_tmu_control(priv, true, false);
@@ -654,12 +691,21 @@ static int acpm_tmu_pm_resume(struct device *dev)
 	struct acpm_tmu_priv *priv = dev_get_drvdata(dev);
 	struct acpm_handle *handle = priv->handle;
 	const struct acpm_tmu_ops *ops = &handle->ops->tmu;
+	bool resumed_acpm = false;
 	int ret, restore_ret;
 
-	/* APB clock not required for this specific msg */
-	ret = ops->resume(handle, priv->mbox_chan_id);
-	if (ret)
-		return ret;
+	guard(mutex)(&acpm_tmu_pm_lock);
+
+	if (acpm_tmu_firmware_suspended) {
+		/* APB clock not required for this specific msg */
+		ret = ops->resume(handle, priv->mbox_chan_id);
+		if (ret)
+			return ret;
+
+		acpm_tmu_firmware_suspended = false;
+		resumed_acpm = true;
+		dev_info(dev, "ACPM TMU global resume before first device\n");
+	}
 
 	ret = pm_runtime_force_resume(dev);
 	if (ret)
@@ -669,6 +715,8 @@ static int acpm_tmu_pm_resume(struct device *dev)
 	if (ret)
 		goto err_suspend_pm;
 
+	acpm_tmu_suspended_devices--;
+
 	return 0;
 
 err_suspend_pm:
@@ -677,10 +725,15 @@ err_suspend_pm:
 		dev_err(dev, "Failed to force suspend during resume rollback: %d\n",
 			restore_ret);
 err_suspend_acpm:
-	restore_ret = ops->suspend(handle, priv->mbox_chan_id);
-	if (restore_ret)
-		dev_err(dev, "Failed to suspend ACPM during resume rollback: %d\n",
-			restore_ret);
+	if (resumed_acpm) {
+		restore_ret = ops->suspend(handle, priv->mbox_chan_id);
+		if (restore_ret) {
+			dev_err(dev, "Failed to suspend ACPM during resume rollback: %d\n",
+				restore_ret);
+		} else {
+			acpm_tmu_firmware_suspended = true;
+		}
+	}
 	return ret;
 }
 

@@ -107,6 +107,7 @@ struct acpm_tmu_priv {
 	unsigned int mbox_chan_id;
 	unsigned int num_sensors;
 	int irq;
+	bool system_suspended;
 	struct acpm_tmu_sensor sensors[] __counted_by(num_sensors);
 };
 
@@ -626,7 +627,10 @@ static void acpm_tmu_remove(struct platform_device *pdev)
 	acpm_tmu_control(priv, false, false);
 
 	guard(mutex)(&acpm_tmu_pm_lock);
-	WARN_ON(acpm_tmu_suspended_devices);
+	if (priv->system_suspended) {
+		if (!WARN_ON(!acpm_tmu_suspended_devices))
+			acpm_tmu_suspended_devices--;
+	}
 	acpm_tmu_num_devices--;
 }
 
@@ -639,6 +643,10 @@ static int acpm_tmu_pm_suspend(struct device *dev)
 	int ret, restore_ret;
 
 	guard(mutex)(&acpm_tmu_pm_lock);
+
+	/* A failed prior resume can leave this instance quiesced. */
+	if (priv->system_suspended)
+		return 0;
 
 	ret = acpm_tmu_control(priv, false, false);
 	if (ret)
@@ -662,6 +670,7 @@ static int acpm_tmu_pm_suspend(struct device *dev)
 	ret = pm_runtime_force_suspend(dev);
 	if (ret)
 		goto err_mark_active;
+	priv->system_suspended = true;
 
 	return 0;
 
@@ -696,6 +705,9 @@ static int acpm_tmu_pm_resume(struct device *dev)
 
 	guard(mutex)(&acpm_tmu_pm_lock);
 
+	if (!priv->system_suspended)
+		return 0;
+
 	if (acpm_tmu_firmware_suspended) {
 		/* APB clock not required for this specific msg */
 		ret = ops->resume(handle, priv->mbox_chan_id);
@@ -715,7 +727,9 @@ static int acpm_tmu_pm_resume(struct device *dev)
 	if (ret)
 		goto err_suspend_pm;
 
-	acpm_tmu_suspended_devices--;
+	priv->system_suspended = false;
+	if (!WARN_ON(!acpm_tmu_suspended_devices))
+		acpm_tmu_suspended_devices--;
 
 	return 0;
 

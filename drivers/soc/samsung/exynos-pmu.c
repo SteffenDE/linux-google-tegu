@@ -991,6 +991,60 @@ zumapro_log_misc_dbg(const char *phase,
 			cycle, phase, shown_all, total);
 }
 
+/*
+ * The MCT_V41 comparators, printed rather than diffed: the free-running
+ * counter and a comparator's target move every cycle, so they carry no
+ * information as a difference.  Only an armed or fired comparator is
+ * reported.  The comparators live in MISC, so one that expires while the
+ * firmware is taking the block down asserts a level SPI into a GIC that is
+ * also in MISC - and the PMU has no wake source for it.
+ */
+#define ZUMAPRO_MCT_CNT_L		0x110
+#define ZUMAPRO_MCT_CNT_U		0x114
+#define ZUMAPRO_MCT_COMP_L(i)		(0x200 + (i) * 0x100)
+#define ZUMAPRO_MCT_COMP_U(i)		(0x204 + (i) * 0x100)
+#define ZUMAPRO_MCT_COMP_MODE(i)	(0x208 + (i) * 0x100)
+#define ZUMAPRO_MCT_COMP_PERIOD(i)	(0x20c + (i) * 0x100)
+#define ZUMAPRO_MCT_COMP_ENABLE(i)	(0x210 + (i) * 0x100)
+#define ZUMAPRO_MCT_INT_ENB(i)		(0x214 + (i) * 0x100)
+#define ZUMAPRO_MCT_INT_CSTAT(i)	(0x218 + (i) * 0x100)
+#define ZUMAPRO_MCT_COMPS		9
+/* fin_pll / div, from the mct_v3 device tree node. */
+#define ZUMAPRO_MCT_HZ			24576000
+
+static void zumapro_log_misc_mct(const char *phase)
+{
+	void __iomem *va = pmu_context->zumapro_misc_dbg_map[ZMD_MCT];
+	unsigned int cycle = pmu_context->zumapro_misc_dbg_cycle;
+	u64 cnt;
+	unsigned int i;
+
+	cnt = readl_relaxed(va + ZUMAPRO_MCT_CNT_L);
+	cnt |= (u64)readl_relaxed(va + ZUMAPRO_MCT_CNT_U) << 32;
+
+	for (i = 0; i < ZUMAPRO_MCT_COMPS; i++) {
+		u32 en = readl_relaxed(va + ZUMAPRO_MCT_COMP_ENABLE(i));
+		u32 cstat = readl_relaxed(va + ZUMAPRO_MCT_INT_CSTAT(i));
+		u64 comp;
+		s64 delta;
+
+		if (!en && !cstat)
+			continue;
+
+		comp = readl_relaxed(va + ZUMAPRO_MCT_COMP_L(i));
+		comp |= (u64)readl_relaxed(va + ZUMAPRO_MCT_COMP_U(i)) << 32;
+		delta = (s64)(comp - cnt);
+
+		pr_info("zumapro-miscdbg: c=%u %s mct comp%u en=%u int=%u cstat=%u mode=%u period=%08x cnt=%016llx comp=%016llx delta=%lld (%lld us)\n",
+			cycle, phase, i, en,
+			readl_relaxed(va + ZUMAPRO_MCT_INT_ENB(i)), cstat,
+			readl_relaxed(va + ZUMAPRO_MCT_COMP_MODE(i)),
+			readl_relaxed(va + ZUMAPRO_MCT_COMP_PERIOD(i)),
+			cnt, comp, delta,
+			div_s64(delta * 1000, ZUMAPRO_MCT_HZ / 1000));
+	}
+}
+
 static void
 zumapro_dump_misc_dbg(const struct zumapro_misc_dbg_sample *sample)
 {
@@ -1208,6 +1262,7 @@ static int zumapro_sys_sleep_suspend(void *data)
 	zumapro_read_misc_dbg_sample(&pmu_context->zumapro_misc_dbg_entry);
 	zumapro_log_misc_dbg("entry", &pmu_context->zumapro_misc_dbg_entry,
 			     &pmu_context->zumapro_misc_dbg_prev);
+	zumapro_log_misc_mct("entry");
 	pmu_context->zumapro_misc_dbg_prev = pmu_context->zumapro_misc_dbg_entry;
 	return 0;
 }
@@ -1223,6 +1278,7 @@ static void zumapro_sys_sleep_resume(void *data)
 		zumapro_log_misc_dbg("raw-return",
 				     &pmu_context->zumapro_misc_dbg_scratch,
 				     &pmu_context->zumapro_misc_dbg_entry);
+		zumapro_log_misc_mct("raw-return");
 	}
 
 	zumapro_sys_sleep_disarm();

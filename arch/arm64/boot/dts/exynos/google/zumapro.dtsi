@@ -2046,9 +2046,9 @@
 		};
 
 		/*
-		 * v3 MCT: free-running counter + per-CPU comparators in the
-		 * always-on MISC block.  The comparators keep counting across the
-		 * c2 CPU power-down state in which the ARM architected timer stops,
+		 * v3 MCT: free-running counter + per-CPU comparators in BLK_MISC.
+		 * MISC stays powered across the c2 CPU power-down state in which
+		 * the ARM architected timer stops, so the comparators keep counting,
 		 * so each one is registered below the architected timer's rating and
 		 * becomes its CPU's one-shot wakeup device -- no broadcast timer is
 		 * needed (and this SoC has no usable global comparator).  Interrupts

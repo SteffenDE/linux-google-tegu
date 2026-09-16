@@ -69,13 +69,17 @@ struct google_tg4c {
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
 	/*
-	 * Serialises LHBM against the panel's own power transitions.
-	 * @lhbm_usable tracks display-on precisely: drm_panel's ->enabled is
+	 * Serialises every panel command against the panel's own power
+	 * transitions: LHBM, refresh rate and brightness against the init and
+	 * shutdown sequences, and against each other. samsung-dsim's cmd_lock
+	 * serialises individual packets, which is not enough for a sequence
+	 * whose 0x6F offset prefixes apply to the command that follows them.
+	 * @panel_ready tracks display-on precisely: drm_panel's ->enabled is
 	 * cleared by the core only *after* ->disable returns, so it would still
 	 * read true while the display-off sequence is running.
 	 */
-	struct mutex lhbm_lock;
-	bool lhbm_usable;
+	struct mutex panel_lock;
+	bool panel_ready;
 	bool lhbm_on;
 	unsigned int refresh_rate;
 };
@@ -319,9 +323,19 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	struct google_tg4c *ctx = to_google_tg4c(panel);
 	int ret;
 
+	/*
+	 * Taken before the supplies rather than around the flag update alone:
+	 * the DSIM is already accepting transfers by the time ->prepare runs
+	 * (prepare_prev_first), so without this another DCS writer can be
+	 * spliced into google_tg4c_on()'s stateful sequence.
+	 */
+	mutex_lock(&ctx->panel_lock);
+
 	ret = google_tg4c_enable_supplies(ctx);
-	if (ret < 0)
+	if (ret < 0) {
+		mutex_unlock(&ctx->panel_lock);
 		return ret;
+	}
 
 	google_tg4c_reset(ctx);
 
@@ -329,23 +343,24 @@ static int google_tg4c_prepare(struct drm_panel *panel)
 	if (ret < 0)
 		goto err;
 
-	/* Display is on: LHBM writes are safe from here until ->disable. */
-	mutex_lock(&ctx->lhbm_lock);
-	ctx->lhbm_usable = true;
+	/* Display is on: panel commands are safe from here until ->disable. */
+	ctx->panel_ready = true;
 	/* google_tg4c_on() ends with 0x2F 0x02, and this tracks it. */
 	ctx->refresh_rate = 60;
-	mutex_unlock(&ctx->lhbm_lock);
+	mutex_unlock(&ctx->panel_lock);
 
 	return 0;
 err:
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	google_tg4c_disable_supplies(ctx);
+	mutex_unlock(&ctx->panel_lock);
 	return ret;
 }
 
 static int google_tg4c_disable(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
+	int ret;
 
 	/*
 	 * Close the window before the display-off sequence starts, not after:
@@ -353,18 +368,46 @@ static int google_tg4c_disable(struct drm_panel *panel)
 	 * command-mode frame behind it. The panel forgets 0x87 along with the
 	 * rest of its state, so the cached flag goes too.
 	 */
-	mutex_lock(&ctx->lhbm_lock);
-	ctx->lhbm_usable = false;
+	mutex_lock(&ctx->panel_lock);
+	ctx->panel_ready = false;
 	ctx->lhbm_on = false;
 	ctx->refresh_rate = 0;
-	mutex_unlock(&ctx->lhbm_lock);
+	ret = google_tg4c_off(ctx);
+	mutex_unlock(&ctx->panel_lock);
 
-	return google_tg4c_off(ctx);
+	/*
+	 * Deliberately not propagated.  drm_panel_disable() leaves
+	 * panel->enabled set when ->disable fails, and every later
+	 * drm_panel_enable() then returns early on "already enabled panel" --
+	 * so backlight_enable() never runs again and the brightness the
+	 * backlight core is holding is never replayed for the rest of the
+	 * boot.  A single DCS timeout in the off sequence should not cost the
+	 * panel its backlight permanently, and the panel goes down either way:
+	 * ->unprepare drops reset and the supplies immediately after this.
+	 */
+	if (ret < 0)
+		dev_warn(&ctx->dsi->dev,
+			 "display-off sequence failed (%d), disabling anyway\n",
+			 ret);
+
+	return 0;
 }
 
 static int google_tg4c_unprepare(struct drm_panel *panel)
 {
 	struct google_tg4c *ctx = to_google_tg4c(panel);
+
+	/*
+	 * ->disable has normally cleared this already.  Clear it here too so
+	 * the flag does not depend on DRM having run ->disable first: once the
+	 * supplies are about to go, no DCS may be issued whatever path got us
+	 * here.
+	 */
+	mutex_lock(&ctx->panel_lock);
+	ctx->panel_ready = false;
+	ctx->lhbm_on = false;
+	ctx->refresh_rate = 0;
+	mutex_unlock(&ctx->panel_lock);
 
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 
@@ -557,9 +600,9 @@ static ssize_t refresh_rate_show(struct device *dev,
 	struct google_tg4c *ctx = dev_get_drvdata(dev);
 	unsigned int hz;
 
-	mutex_lock(&ctx->lhbm_lock);
+	mutex_lock(&ctx->panel_lock);
 	hz = ctx->refresh_rate;
-	mutex_unlock(&ctx->lhbm_lock);
+	mutex_unlock(&ctx->panel_lock);
 
 	return sysfs_emit(buf, "%u\n", hz);
 }
@@ -577,18 +620,18 @@ static ssize_t refresh_rate_store(struct device *dev,
 		return ret;
 
 	/*
-	 * Shares lhbm_lock rather than taking one of its own: the DDIC couples
+	 * Shares panel_lock rather than taking one of its own: the DDIC couples
 	 * the two, and downstream drops LHBM before leaving 120Hz. Serialising
 	 * them here keeps that invariant expressible.
 	 */
-	mutex_lock(&ctx->lhbm_lock);
-	if (!ctx->lhbm_usable)
+	mutex_lock(&ctx->panel_lock);
+	if (!ctx->panel_ready)
 		ret = -ENODEV;
 	else if (ctx->lhbm_on && hz != 120)
 		ret = -EBUSY;
 	else
 		ret = google_tg4c_set_refresh_rate(ctx, hz);
-	mutex_unlock(&ctx->lhbm_lock);
+	mutex_unlock(&ctx->panel_lock);
 
 	return ret ? ret : count;
 }
@@ -600,9 +643,9 @@ static ssize_t local_hbm_mode_show(struct device *dev,
 	struct google_tg4c *ctx = dev_get_drvdata(dev);
 	bool on;
 
-	mutex_lock(&ctx->lhbm_lock);
+	mutex_lock(&ctx->panel_lock);
 	on = ctx->lhbm_on;
-	mutex_unlock(&ctx->lhbm_lock);
+	mutex_unlock(&ctx->panel_lock);
 
 	return sysfs_emit(buf, "%d\n", on);
 }
@@ -619,15 +662,15 @@ static ssize_t local_hbm_mode_store(struct device *dev,
 	if (ret)
 		return ret;
 
-	mutex_lock(&ctx->lhbm_lock);
-	if (!ctx->lhbm_usable) {
+	mutex_lock(&ctx->panel_lock);
+	if (!ctx->panel_ready) {
 		ret = -ENODEV;
 	} else if (on != ctx->lhbm_on) {
 		ret = google_tg4c_set_lhbm(ctx, on);
 		if (!ret)
 			ctx->lhbm_on = on;
 	}
-	mutex_unlock(&ctx->lhbm_lock);
+	mutex_unlock(&ctx->panel_lock);
 
 	return ret ? ret : count;
 }
@@ -651,9 +694,30 @@ ATTRIBUTE_GROUPS(google_tg4c);
 static int google_tg4c_bl_update_status(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct google_tg4c *ctx = mipi_dsi_get_drvdata(dsi);
 	u16 brightness = backlight_get_brightness(bl);
+	int ret;
 
-	return mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+	/*
+	 * Runs from whatever task writes the sysfs node, so it takes the lock
+	 * for the same reason the LHBM and refresh-rate attributes do. A write
+	 * arriving during google_tg4c_on() does not have to hit a narrow
+	 * window: cmd_lock makes it queue, and it is then inserted at the next
+	 * command boundary -- one of which is the 0x6F 0x01 prefix in front of
+	 * SET_TEAR_ON, where a stolen offset leaves the panel emitting no TE.
+	 *
+	 * Dropped rather than deferred while the panel is down; the backlight
+	 * core keeps the value and drm_panel_enable() replays it through
+	 * backlight_enable() once the panel is back up.
+	 */
+	mutex_lock(&ctx->panel_lock);
+	if (ctx->panel_ready)
+		ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+	else
+		ret = 0;
+	mutex_unlock(&ctx->panel_lock);
+
+	return ret;
 }
 
 static const struct backlight_ops google_tg4c_bl_ops = {
@@ -769,7 +833,7 @@ static int google_tg4c_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
-	ret = devm_mutex_init(dev, &ctx->lhbm_lock);
+	ret = devm_mutex_init(dev, &ctx->panel_lock);
 	if (ret)
 		return ret;
 

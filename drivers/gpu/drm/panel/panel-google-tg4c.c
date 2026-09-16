@@ -206,6 +206,22 @@ MODULE_PARM_DESC(tear_settle_ms,
 		 "ms to settle between display-on and the tear re-issue (0 = none)");
 
 /*
+ * Whether to re-issue the tear configuration after display-on at all.
+ *
+ * On by default -- it is the fix, and turning it off restores the behaviour
+ * this driver had before it.  It exists as a knob because a blank/unblank soak
+ * measuring a sub-percent failure rate cannot tell "the platform reproduces
+ * the failure rarely" from "the platform does not reproduce it", and without
+ * that distinction a clean run proves nothing.  Clearing this is the positive
+ * control: the rate should climb sharply, which is what makes a subsequent
+ * clean run with it set meaningful.
+ */
+static bool tear_reissue = true;
+module_param(tear_reissue, bool, 0644);
+MODULE_PARM_DESC(tear_reissue,
+		 "re-issue the tear configuration after display-on (default on)");
+
+/*
  * Panel power-on / init sequence.
  *
  * Transcribed from downstream tg4c_init_cmds[] (DEFINE_GS_CMDSET(tg4c_init)).
@@ -316,13 +332,16 @@ static int google_tg4c_on(struct google_tg4c *ctx)
 	 * width = 0x2d (45H).  0x35 takes (byte0, byte1) here exactly as the
 	 * 0x6f/0x01 offset write in the init sequence does.
 	 */
-	if (tear_settle_ms)
-		mipi_dsi_msleep(&dsi_ctx, tear_settle_ms);
+	if (tear_reissue) {
+		if (tear_settle_ms)
+			mipi_dsi_msleep(&dsi_ctx, tear_settle_ms);
 
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_SCANLINE,
-				     0x00, 0x00);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON,
-				     0x00, 0x2d);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
+					     MIPI_DCS_SET_TEAR_SCANLINE,
+					     0x00, 0x00);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON,
+					     0x00, 0x2d);
+	}
 
 	return dsi_ctx.accum_err;
 }

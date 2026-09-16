@@ -181,6 +181,31 @@ static void google_tg4c_reset(struct google_tg4c *ctx)
 }
 
 /*
+ * Settle between display-on and the tear re-issue, in ms.
+ *
+ * Mainline re-issues SET_TEAR_SCANLINE/SET_TEAR_ON immediately after
+ * set_display_on with nothing in between.  Downstream's equivalent,
+ * tg4c_update_te2(), runs from gs_panel_bridge_enable() after the whole of
+ * drm_panel_enable() has returned -- tens of milliseconds and several more
+ * commands later.  That gap is the clearest mainline-versus-downstream delta
+ * left in the enable path, and the panel intermittently comes up emitting no
+ * TE at all, so whether the gap is load-bearing is a question to be measured
+ * rather than guessed.
+ *
+ * Hence a parameter rather than a constant, and writable at runtime so a
+ * single boot can sweep it against tools/tegu-kms-modeset's blank/unblank
+ * loop:
+ *
+ *	/sys/module/panel_google_tg4c/parameters/tear_settle_ms
+ *
+ * Zero keeps the current behaviour, so the default changes nothing.
+ */
+static unsigned int tear_settle_ms;
+module_param(tear_settle_ms, uint, 0644);
+MODULE_PARM_DESC(tear_settle_ms,
+		 "ms to settle between display-on and the tear re-issue (0 = none)");
+
+/*
  * Panel power-on / init sequence.
  *
  * Transcribed from downstream tg4c_init_cmds[] (DEFINE_GS_CMDSET(tg4c_init)).
@@ -291,6 +316,9 @@ static int google_tg4c_on(struct google_tg4c *ctx)
 	 * width = 0x2d (45H).  0x35 takes (byte0, byte1) here exactly as the
 	 * 0x6f/0x01 offset write in the init sequence does.
 	 */
+	if (tear_settle_ms)
+		mipi_dsi_msleep(&dsi_ctx, tear_settle_ms);
+
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_SCANLINE,
 				     0x00, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON,

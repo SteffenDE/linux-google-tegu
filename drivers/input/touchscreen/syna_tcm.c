@@ -1248,7 +1248,7 @@ static int syna_tcm_probe(struct spi_device *spi)
 	 * display off, but works.
 	 */
 	ts->follower.funcs = &syna_tcm_follower_funcs;
-	error = drm_panel_add_follower(dev, &ts->follower);
+	error = devm_drm_panel_add_follower(dev, &ts->follower);
 	if (error == -EPROBE_DEFER)
 		return error;
 	if (error) {
@@ -1259,7 +1259,9 @@ static int syna_tcm_probe(struct spi_device *spi)
 		/*
 		 * Registered after the follower so it unwinds first: the
 		 * removal path would otherwise hand the bus to AoC on the way
-		 * out, with nothing left to reclaim it.
+		 * out, with nothing left to reclaim it.  devm_ above puts the
+		 * follower's own removal on the same list, so LIFO keeps that
+		 * order.
 		 */
 		error = devm_add_action_or_reset(dev, syna_tcm_stop_following,
 						 ts);

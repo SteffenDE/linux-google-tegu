@@ -712,6 +712,15 @@
 		google,chg-taper-last-tier;
 
 		/*
+		 * Say the absent wireless charger is deliberate.  This does
+		 * not quiet the driver -- it logs either way, only a different
+		 * line -- but it stops it parsing a wireless mitigation table
+		 * that is not there, and records the intent in the place a
+		 * reader looks.
+		 */
+		no-wlc;
+
+		/*
 		 * Battery defender: stop charging and drain back when the pack
 		 * has been hot and near full for long enough, and resume when
 		 * it cools or falls back.
@@ -1752,30 +1761,26 @@
 	 * that rail is only reached with a pad under the phone.
 	 *
 	 * The vendor relaxes what it relaxes because its battery and charger
-	 * layers put profile-driven limits back in their place, and those
-	 * layers are not here yet -- so until they are, this is knowingly less
-	 * protection than the part ships with.  The JEITA and thermistor
-	 * protection is the backstop either way: no driver configures it, the
-	 * thresholds come from OTP, and nothing in this port can switch it off.
+	 * layers put profile-driven limits back in their place, and with those
+	 * layers described below this board now runs the same way.  The JEITA
+	 * and thermistor protection is the backstop regardless: no driver
+	 * configures it, the thresholds come from OTP, and nothing in this
+	 * port can switch it off.
 	 *
-	 * No charging mode is written.  That probe-time election does reach
-	 * the mode votable -- the DC_ICL callback casts a disabled WLCIN_OFF
-	 * ballot -- but max77779_mode_callback() accumulates its decision by
-	 * walking ballots and skipping disabled ones, so with no enabled
-	 * ballot anywhere its state stays empty, it takes the "nope" path and
-	 * CHG_CNFG_00 is left alone.  That holds for any election while
-	 * nothing votes, which is a stronger guarantee than the default merely
-	 * not running.  The use-case state machine that arranges buck, boost,
-	 * OTG and wireless-transmit modes is reached only from a mode vote,
-	 * and its device-tree lookup is lazy -- probe passes a NULL node
-	 * deliberately.
+	 * Nothing is written to CHG_CNFG_00 at probe: the election that runs
+	 * there resolves from ballots, skipping disabled ones, so with none
+	 * enabled yet the callback takes its "nope" path.  The mode does get
+	 * written once google_charger and the buck-mode voter cast theirs, and
+	 * the charge current and float voltage then come from the table rather
+	 * than from whatever the bootloader left.
 	 *
 	 * Note what the power supply this registers exposes.  ONLINE and
-	 * CURRENT_MAX are writable, and here they only go one way: writing
-	 * either to 0 casts an enabled ballot that turns CHG_CNFG_00 off, and
-	 * retracting it leaves the register off, because nothing in this port
-	 * votes a buck mode back on.  CHG_CNFG_00 is OTP-reset, so a warm
-	 * reset need not restore it.
+	 * CURRENT_MAX are writable, and writing either to 0 casts an enabled
+	 * ballot that turns CHG_CNFG_00 off.  Retracting it only disables that
+	 * ballot, and the election then resolves from what remains -- so
+	 * recovery depends on the buck-mode voter still holding its ballot for
+	 * an attached cable.  CHG_CNFG_00 is OTP-reset, so a warm reset need
+	 * not restore it either.
 	 *
 	 * Four groups of the vendor node's properties are dropped, all of them
 	 * naming hardware this board does not describe:

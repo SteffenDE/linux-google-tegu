@@ -2606,11 +2606,13 @@
 		 *
 		 * The combo USB32DRD PHY's "phy" reg (0x11100000) holds the DRD
 		 * link-control registers the driver writes (LINKCTRL 0x04, CLKRST
-		 * 0x0c, UTMI 0x10, HSP_MISC 0x114 — trace-confirmed).  Only this
-		 * single region is mapped: the SuperSpeed combo PCS (0x11130000) /
-		 * PMA (0x11140000) are intentionally left out for first high-speed
-		 * bring-up so the heavily-accessed SuperSpeed path is not touched.
-		 * The HS init is delegated to the Synopsys eUSB2 "hs" phy below.
+		 * 0x0c, UTMI 0x10, HSP_MISC 0x114 — trace-confirmed).  "pma" is the
+		 * Synopsys USB-DP PHY controller, which also carries the CR-para
+		 * port the PHY's internal registers are reached through, and "tca"
+		 * the Type-C Aggregator that crossbars its four lanes between USB3
+		 * and DisplayPort.  Both come from the downstream node's own reg
+		 * list.  The HS init is delegated to the Synopsys eUSB2 "hs" phy
+		 * below.
 		 *
 		 * The combo PHY itself takes no regulator supply (its driver data has
 		 * none); the eUSB2 PHY and the DWC3 wrapper draw vdd/vdda12 and
@@ -2622,10 +2624,22 @@
 		 */
 		usb32drd: phy@11100000 {
 			compatible = "google,zumapro-usb32drd-phy";
-			reg = <0x11100000 0x200>;
+			reg = <0x11100000 0x200>,
+			      <0x11130000 0x800>,
+			      <0x11140000 0x800>;
+			reg-names = "phy", "pma", "tca";
 
-			clocks = <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>;
-			clock-names = "phy";
+			/*
+			 * "phy" gates the link registers; the other three belong
+			 * to the SuperSpeed half.  Its PLL runs off the 40 MHz
+			 * reference, and the two APB clocks are what reach the
+			 * USB-DP controller and the aggregator.
+			 */
+			clocks = <&cmu_hsi0 CLK_MOUT_HSI0_NOC_USER>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USB32DRD_REF_CLK_40>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USBDPPHY_CTRL_PCLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK>;
+			clock-names = "phy", "ss_ref", "ss_apb", "tca_apb";
 
 			#phy-cells = <1>;
 			phys = <&usb_hsphy>;

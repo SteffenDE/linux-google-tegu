@@ -16,6 +16,7 @@
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 
 #include "tcpci_maxim.h"
@@ -26,6 +27,18 @@
 #define TCPC_VENDOR_USBSW_CTRL				0x93
 #define TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA		0x9
 #define TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA		0
+
+/*
+ * The SBU pins are a crossbar with exactly one customer at a time. They carry
+ * DisplayPort's AUX channel while an alt mode is up, and whatever the board
+ * wires them to otherwise -- on some boards a serial console, which is why the
+ * value found here is put back rather than cleared.
+ */
+#define TCPC_VENDOR_SBUSW_CTRL				0x94
+#define TCPC_VENDOR_SBUSW_CTRL_DP_AUX			0x9
+
+/* What the AUX receiver needs on the pull-up rail while a link is up. */
+#define VOLTAGE_DP_AUX_UV				3300000
 
 #define TCPC_RECEIVE_BUFFER_COUNT_OFFSET		0
 #define TCPC_RECEIVE_BUFFER_FRAME_TYPE_OFFSET		1
@@ -317,16 +330,100 @@ static void max_tcpci_set_partner_usb_comm_capable(struct tcpci *tcpci, struct t
  * attach and TYPEC_STATE_SAFE from tcpm_reset_port() on every detach,
  * independently of PD, which is the signal a non-PD port does get.
  */
+/*
+ * Route the SBU pins to the DisplayPort AUX channel, or back to whatever they
+ * carried before. Nothing reaches a DisplayPort sink without this: a mode can
+ * negotiate, the lanes can be muxed and hotplug can be asserted, and the link
+ * still has no way to read the sink's capabilities.
+ */
+static int max_tcpci_set_dp_aux(struct max_tcpci_chip *chip, bool route)
+{
+	int ret;
+
+	if (route == chip->aux_routed)
+		return 0;
+
+	if (route) {
+		unsigned int val;
+
+		/*
+		 * Remember what the SBU pins were carrying, so that leaving the
+		 * mode gives it back rather than turning them off.
+		 */
+		ret = regmap_read(chip->data.regmap, TCPC_VENDOR_SBUSW_CTRL,
+				  &val);
+		if (ret < 0)
+			return ret;
+		chip->sbusw_saved = val;
+	}
+
+	if (chip->aux_reg) {
+		if (route) {
+			ret = regulator_set_voltage(chip->aux_reg,
+						    VOLTAGE_DP_AUX_UV,
+						    VOLTAGE_DP_AUX_UV);
+			if (ret < 0)
+				dev_warn(chip->dev,
+					 "Failed to set AUX pull-up voltage\n");
+			ret = regulator_enable(chip->aux_reg);
+		} else {
+			ret = regulator_disable(chip->aux_reg);
+		}
+		if (ret < 0) {
+			dev_err(chip->dev, "Failed to %s the AUX pull-up\n",
+				route ? "enable" : "disable");
+			return ret;
+		}
+	}
+
+	ret = max_tcpci_write8(chip, TCPC_VENDOR_SBUSW_CTRL,
+			       route ? TCPC_VENDOR_SBUSW_CTRL_DP_AUX :
+				       chip->sbusw_saved);
+	if (ret < 0) {
+		dev_err(chip->dev, "Failed to route the SBU pins\n");
+		if (chip->aux_reg) {
+			int err = route ? regulator_disable(chip->aux_reg) :
+					  regulator_enable(chip->aux_reg);
+
+			if (err)
+				dev_warn(chip->dev,
+					 "Failed to put the AUX pull-up back\n");
+		}
+		return ret;
+	}
+
+	chip->aux_routed = route;
+
+	return 0;
+}
+
 static int max_tcpci_mux_set(struct typec_mux_dev *mux,
 			     struct typec_mux_state *state)
 {
 	struct max_tcpci_chip *chip = typec_mux_get_drvdata(mux);
 	int ret;
 
+	switch (state->mode) {
+	case TYPEC_DP_STATE_C:
+	case TYPEC_DP_STATE_D:
+	case TYPEC_DP_STATE_E:
+	case TYPEC_DP_STATE_F:
+		return max_tcpci_set_dp_aux(chip, true);
+	case TYPEC_STATE_USB:
+	case TYPEC_STATE_SAFE:
+		ret = max_tcpci_set_dp_aux(chip, false);
+		if (ret < 0)
+			return ret;
+		break;
+	default:
+		break;
+	}
+
 	/*
-	 * Leave alternate and accessory modes alone: they arrive only through
-	 * PD, where set_partner_usb_comm_capable() above already owns the
-	 * switches, and DP pin assignments may keep USB data connected.
+	 * Leave the USB data switches alone for alternate and accessory modes:
+	 * they arrive only through PD, where set_partner_usb_comm_capable()
+	 * above already owns them, and a DP pin assignment may keep USB data
+	 * connected alongside.
 	 */
 	if (state->mode != TYPEC_STATE_USB && state->mode != TYPEC_STATE_SAFE)
 		return 0;
@@ -539,6 +636,18 @@ static int max_tcpci_register_mux(struct max_tcpci_chip *chip)
 	 */
 	if (!device_property_present(chip->dev, "mode-switch"))
 		return 0;
+
+	/*
+	 * The rail that pulls the AUX channel up. Boards that do not wire SBU
+	 * to a DisplayPort receiver have none, and route the pins without it.
+	 */
+	chip->aux_reg = devm_regulator_get_optional(chip->dev, "pullup");
+	if (IS_ERR(chip->aux_reg)) {
+		if (PTR_ERR(chip->aux_reg) != -ENODEV)
+			return dev_err_probe(chip->dev, PTR_ERR(chip->aux_reg),
+					     "Failed to get the AUX pull-up\n");
+		chip->aux_reg = NULL;
+	}
 
 	mux_desc = (struct typec_mux_desc){
 		.fwnode = dev_fwnode(chip->dev),

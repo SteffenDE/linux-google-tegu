@@ -255,8 +255,12 @@ int max77779_pmic_init(struct max77779_pmic_info *info)
 		return -ENODEV;
 	}
 
-	mfd_add_devices(info->dev, PLATFORM_DEVID_AUTO, max77779_pmic_devs,
-			ARRAY_SIZE(max77779_pmic_devs), NULL, 0, NULL);
+	err = mfd_add_devices(info->dev, PLATFORM_DEVID_AUTO, max77779_pmic_devs,
+			      ARRAY_SIZE(max77779_pmic_devs), NULL, 0, NULL);
+	if (err) {
+		dev_err(info->dev, "Unable to add sub-devices (%d)\n", err);
+		return err;
+	}
 
 	dbg_init_fs(info);
 
@@ -265,7 +269,7 @@ int max77779_pmic_init(struct max77779_pmic_info *info)
 	if (err != 0)
 		dev_warn(info->dev, "Failed to create registers_dump, ret=%d\n", err);
 
-	return err;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(max77779_pmic_init);
 

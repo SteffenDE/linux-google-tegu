@@ -398,8 +398,7 @@ static void reschedule_chg_work(struct chg_drv *chg_drv)
 	pr_debug("%s: rescheduling\n", __func__);
 }
 
-static enum alarmtimer_restart
-google_chg_alarm_handler(struct alarm *alarm, ktime_t time)
+static void google_chg_alarm_handler(struct alarm *alarm, ktime_t time)
 {
 	struct chg_drv *chg_drv =
 	    container_of(alarm, struct chg_drv, chg_wakeup_alarm);
@@ -407,8 +406,6 @@ google_chg_alarm_handler(struct alarm *alarm, ktime_t time)
 	__pm_stay_awake(chg_drv->chg_ws);
 
 	reschedule_chg_work(chg_drv);
-
-	return ALARMTIMER_NORESTART;
 }
 
 static void chg_psy_work(struct work_struct *work)
@@ -1102,8 +1099,8 @@ static void chg_termination_work(struct work_struct *work)
 			pr_info("Get CHARGE_COUNTER fail, try_cnt=%d, rc=%d\n",
 				chg_term->retry_cnt, rc);
 			/* try again and keep the pm_stay_awake */
-			alarm_start_relative(&chg_term->alarm,
-					     ms_to_ktime(CHG_TERM_RETRY_MS));
+			alarm_start_timer(&chg_term->alarm,
+					  ms_to_ktime(CHG_TERM_RETRY_MS), true);
 			return;
 		} else {
 			goto error;
@@ -1135,7 +1132,7 @@ static void chg_termination_work(struct work_struct *work)
 	pr_info("Prevent overcharge data: cc: %d, cc_full_ref: %d, delay: %d\n",
 		cc, chg_term->cc_full_ref, delay);
 
-	alarm_start_relative(&chg_term->alarm, ms_to_ktime(delay));
+	alarm_start_timer(&chg_term->alarm, ms_to_ktime(delay), true);
 
 	pm_relax(chg_drv->device);
 	return;
@@ -1145,8 +1142,7 @@ error:
 	chg_reset_termination_data(chg_drv);
 }
 
-static enum alarmtimer_restart chg_termination_alarm_cb(struct alarm *alarm,
-							ktime_t now)
+static void chg_termination_alarm_cb(struct alarm *alarm, ktime_t now)
 {
 	struct chg_termination *chg_term =
 			container_of(alarm, struct chg_termination, alarm);
@@ -1158,8 +1154,6 @@ static enum alarmtimer_restart chg_termination_alarm_cb(struct alarm *alarm,
 
 	pm_stay_awake(chg_drv->device);
 	schedule_work(&chg_term->work);
-
-	return ALARMTIMER_NORESTART;
 }
 
 static void chg_reset_termination_data(struct chg_drv *chg_drv)
@@ -1188,8 +1182,8 @@ static void chg_eval_chg_termination(struct chg_termination *chg_term)
 	 * battery. Trigger the function once charging is completed
 	 * to prevent overcharing.
 	 */
-	alarm_start_relative(&chg_term->alarm,
-			     ms_to_ktime(CHG_TERM_LONG_DELAY_MS));
+	alarm_start_timer(&chg_term->alarm,
+			  ms_to_ktime(CHG_TERM_LONG_DELAY_MS), true);
 	chg_term->alarm_start = true;
 	chg_term->cc_full_ref = 0;
 	chg_term->retry_cnt = 0;
@@ -4603,8 +4597,8 @@ static int msc_update_charger_cb(struct gvotable_election *el,
 
 msc_reschedule:
 	alarm_try_to_cancel(&chg_drv->chg_wakeup_alarm);
-	alarm_start_relative(&chg_drv->chg_wakeup_alarm,
-			     ms_to_ktime(update_interval));
+	alarm_start_timer(&chg_drv->chg_wakeup_alarm,
+			  ms_to_ktime(update_interval), true);
 
 	pr_debug("MSC_CHG fv_uv=%d, cc_max=%d, rerun in %d ms (%d)\n",
 		 fv_uv, cc_max, update_interval, rc);
@@ -5604,7 +5598,11 @@ chg_thermal_device_register(const char *of_name,
 		return -EINVAL;
 	}
 
-	ctdev->tcd = thermal_of_cooling_device_register(cooling_node,
+	/*
+	 * cdev_id 0: these nodes use the old cooling binding
+	 * (<&cdev lower upper>), which the core matches against id 0.
+	 */
+	ctdev->tcd = thermal_of_cooling_device_register(cooling_node, 0,
 							tcd_name,
 							ctdev,
 							ops);
@@ -5767,9 +5765,9 @@ static struct power_supply *get_tcpm_psy(struct chg_drv *chg_drv)
 	int i, ret;
 	struct power_supply *tcpm_psy = NULL;
 
-	ret = power_supply_get_by_phandle_array(chg_drv->device->of_node,
-						"google,tcpm-power-supply", psy,
-						ARRAY_SIZE(psy));
+	ret = of_power_supply_get_by_phandle_array(chg_drv->device->of_node,
+						   "google,tcpm-power-supply", psy,
+						   ARRAY_SIZE(psy));
 	if (ret < 0 && !chg_drv->usb_skip_probe) {
 		dev_dbg_ratelimited(chg_drv->device,
 				    "failed to get tcpm power supply, retrying... ret:%d\n",
@@ -6142,7 +6140,7 @@ static int google_charger_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int google_charger_remove(struct platform_device *pdev)
+static void google_charger_remove(struct platform_device *pdev)
 {
 	struct chg_drv *chg_drv = (struct chg_drv *)platform_get_drvdata(pdev);
 
@@ -6179,8 +6177,6 @@ static int google_charger_remove(struct platform_device *pdev)
 		if (chg_drv->bd_state.bd_log)
 			logbuffer_unregister(chg_drv->bd_state.bd_log);
 	}
-
-	return 0;
 }
 
 static void google_charger_shutdown(struct platform_device *pdev)

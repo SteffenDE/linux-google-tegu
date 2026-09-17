@@ -1891,7 +1891,7 @@ static void max77779_wcin_charge_disable_work(struct work_struct *work)
 #if IS_ENABLED(CONFIG_GPIOLIB)
 static int max77779_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 {
-	return GPIOF_DIR_OUT;
+	return GPIO_LINE_DIRECTION_OUT;
 }
 
 static int max77779_gpio_get(struct gpio_chip *chip, unsigned int offset)
@@ -1899,7 +1899,7 @@ static int max77779_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	return 0;
 }
 
-static void max77779_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+static int max77779_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 {
 	struct max77779_chgr_data *data = gpiochip_get_data(chip);
 	int ret = 0;
@@ -1919,6 +1919,8 @@ static void max77779_gpio_set(struct gpio_chip *chip, unsigned int offset, int v
 
 	if (ret < 0)
 		dev_warn(data->dev, "GPIO%d: value=%d ret:%d\n", offset, value, ret);
+
+	return ret;
 }
 
 static void max77779_gpio_init(struct max77779_chgr_data *data)
@@ -2228,7 +2230,7 @@ static int max77779_init_wcin_psy(struct max77779_chgr_data *data)
 	int ret;
 
 	wcin_cfg.drv_data = data;
-	wcin_cfg.of_node = dev->of_node;
+	wcin_cfg.fwnode = dev_fwnode(dev);
 
 	if (of_property_read_bool(dev->of_node, "max77779,dc-psy-type-wireless"))
 		max77779_wcin_psy_desc.psy_dsc.type = POWER_SUPPLY_TYPE_WIRELESS;
@@ -3801,9 +3803,9 @@ int max77779_charger_init(struct max77779_chgr_data *data)
 #if IS_ENABLED(CONFIG_GPIOLIB)
 	max77779_gpio_init(data);
 	data->gpio.parent = dev;
-	data->gpio.of_node = of_find_node_by_name(dev->of_node,
-							    data->gpio.label);
-	if (!data->gpio.of_node)
+	data->gpio.fwnode = of_fwnode_handle(of_find_node_by_name(dev->of_node,
+								  data->gpio.label));
+	if (!data->gpio.fwnode)
 		dev_warn(dev, "Failed to find %s DT node\n", data->gpio.label);
 
 	ret = devm_gpiochip_add_data(dev, &data->gpio, data);

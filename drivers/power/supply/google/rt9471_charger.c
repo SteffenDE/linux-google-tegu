@@ -24,12 +24,12 @@
 #include <linux/mutex.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
-#include <linux/of_gpio.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/gpio.h>
 #include <linux/gpio/driver.h>
 #include <linux/regmap.h>
+#include "gbms_compat.h"
 #include "rt9471_charger.h"
 #include "gbms_power_supply.h"
 #include "google_psy.h"
@@ -1408,7 +1408,7 @@ static int rt9471_parse_dt(struct rt9471_chip *chip)
 	struct rt9471_desc *desc = NULL;
 	const char *name = NULL;
 	char *ceb_name = NULL;
-	unsigned long init_flags = GPIOF_DIR_OUT;
+	unsigned long init_flags = GPIOF_OUT_INIT_LOW;
 
 	dev_info(chip->dev, "%s\n", __func__);
 
@@ -1752,7 +1752,7 @@ static void rt9471_init_work_handler(struct work_struct *work)
 #if IS_ENABLED(CONFIG_GPIOLIB)
 static int rt9471_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 {
-	return GPIOF_DIR_OUT;
+	return GPIO_LINE_DIRECTION_OUT;
 }
 
 static int rt9471_gpio_get(struct gpio_chip *chip, unsigned int offset)
@@ -1760,7 +1760,7 @@ static int rt9471_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	return 0;
 }
 
-static void rt9471_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+static int rt9471_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 {
 	struct rt9471_chip *data = gpiochip_get_data(chip);
 	int ret;
@@ -1779,6 +1779,8 @@ static void rt9471_gpio_set(struct gpio_chip *chip, unsigned int offset, int val
 
 	if (ret < 0)
 		dev_err(data->dev, "GPIO%d: value=%d ret:%d\n", offset, value, ret);
+
+	return ret;
 }
 
 static void rt9471_gpio_init(struct rt9471_chip *chip)
@@ -2009,7 +2011,7 @@ static int rt9471_register_psy(struct rt9471_chip *chip)
 	chip->psy_desc.set_property = rt9471_psy_set_property;
 	chip->psy_desc.get_property = rt9471_psy_get_property;
 	chip->psy_desc.property_is_writeable = rt9471_psy_is_writeable;
-	chip->psy_cfg.of_node = chip->dev->of_node;
+	chip->psy_cfg.fwnode = dev_fwnode(chip->dev);
 	chip->psy_cfg.drv_data = chip;
 	chip->psy = devm_power_supply_register(chip->dev, &chip->psy_desc,
 					       &chip->psy_cfg);
@@ -2018,8 +2020,7 @@ static int rt9471_register_psy(struct rt9471_chip *chip)
 	return 0;
 }
 
-static int rt9471_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
+static int rt9471_probe(struct i2c_client *client)
 {
 	int ret = 0;
 	struct rt9471_chip *chip = NULL;
@@ -2096,9 +2097,10 @@ static int rt9471_probe(struct i2c_client *client,
 	if (chip->dev_id == RT9470_DEVID) {
 		rt9471_gpio_init(chip);
 		chip->gpio.parent = chip->dev;
-		chip->gpio.of_node = of_find_node_by_name(client->dev.of_node,
-							  chip->gpio.label);
-		if (!chip->gpio.of_node)
+		chip->gpio.fwnode =
+			of_fwnode_handle(of_find_node_by_name(client->dev.of_node,
+							      chip->gpio.label));
+		if (!chip->gpio.fwnode)
 			dev_warn(chip->dev, "Failed to find %s DT node\n",
 				chip->gpio.label);
 

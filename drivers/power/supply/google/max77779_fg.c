@@ -3770,8 +3770,19 @@ static void max77779_fg_read_serial_number(struct max77779_fg_chip *chip)
 	char buff[32] = {0};
 	int ret = gbms_storage_read(GBMS_TAG_MINF, buff, GBMS_MINF_LEN);
 
+	/*
+	 * Deliberately not strncpy()'s behaviour, unlike the other call site.
+	 * A tegu pack fills all GBMS_MINF_LEN bytes of the record with no NUL
+	 * among them [HW 2026-09-17], and this is handed to val->strval for
+	 * POWER_SUPPLY_PROP_SERIAL_NUMBER, which sysfs_emit()s with "%s" -- so
+	 * strncpy() left it unterminated and the read ran off the end of the
+	 * array into the fields behind it, out through a world-readable file.
+	 *
+	 * serial_number is GBMS_MINF_LEN + 1 for the terminator the record has
+	 * no room for, so nothing is lost and nothing is over-read.
+	 */
 	if (ret >= 0)
-		strncpy(chip->serial_number, buff, ret);
+		strscpy(chip->serial_number, buff, sizeof(chip->serial_number));
 	else
 		chip->serial_number[0] = '\0';
 }
@@ -4009,7 +4020,7 @@ int max77779_fg_init(struct max77779_fg_chip *chip)
 		dev_warn(chip->dev, "Unable to mask all interrupts (%d)\n", ret);
 
 	psy_cfg.drv_data = chip;
-	psy_cfg.of_node = chip->dev->of_node;
+	psy_cfg.fwnode = dev_fwnode(chip->dev);
 
 	ret = of_property_read_string(dev->of_node, "max77779,dual-battery", &psy_name);
 	if (ret == 0)

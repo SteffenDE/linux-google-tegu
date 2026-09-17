@@ -11,10 +11,10 @@
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 
+#include "gbms_compat.h"
 #include "max77779_pmic.h"
 
 #define MAX77779_NUM_IRQS	8   /* number of irqs to export */
@@ -277,10 +277,9 @@ static int max77779_pmic_irq_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int max77779_pmic_irq_remove(struct platform_device *pdev)
+static void max77779_pmic_irq_remove(struct platform_device *pdev)
 {
 	device_init_wakeup(&pdev->dev, false);
-	return 0;
 }
 
 static const struct platform_device_id max77779_pmic_irq_id[] = {

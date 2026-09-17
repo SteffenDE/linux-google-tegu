@@ -1197,7 +1197,7 @@ enum p9xxx_renego_state {
 
 #define UEVENT_ENVP_LEN 20
 
-static char *uevent_source_str[] = {
+static __maybe_unused char *uevent_source_str[] = {
 	"WLC", "FAN", "RTX"
 };
 

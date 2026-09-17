@@ -24,6 +24,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/soc/samsung/exynos-regs-pmu.h>
 #include <linux/usb/typec.h>
+#include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_mux.h>
 
 /* Exynos USB PHY registers */
@@ -542,6 +544,10 @@ struct exynos5_usbdrd_phy_drvdata {
  *		  bit rate it falls
  * @dp_active: DisplayPort holds the lanes. USB must not take them back, and
  *	       the connector must not reroute them, until it says otherwise
+ * @dp_lane_cap: how many lanes the negotiated pin assignment leaves for
+ *		 DisplayPort, or zero if no DisplayPort mode is entered
+ * @mux: TypeC mode switch handle, through which a negotiated alternate mode
+ *	 reaches the lanes it asked for
  */
 struct exynos5_usbdrd_phy {
 	struct device *dev;
@@ -569,6 +575,8 @@ struct exynos5_usbdrd_phy {
 	bool pipe3_ready;
 	unsigned int dp_link_rate;
 	bool dp_active;
+	unsigned int dp_lane_cap;
+	struct typec_mux_dev *mux;
 };
 
 static inline
@@ -3130,6 +3138,7 @@ static int zumapro_usbdrd_phy_validate(struct phy *phy, enum phy_mode mode,
 				       union phy_configure_opts *opts)
 {
 	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
 	struct phy_configure_opts_dp *dp = &opts->dp;
 	unsigned int i;
 
@@ -3142,6 +3151,13 @@ static int zumapro_usbdrd_phy_validate(struct phy *phy, enum phy_mode mode,
 	 * setting here.
 	 */
 	if (dp->lanes != 2 && dp->lanes != 4)
+		return -EINVAL;
+
+	/*
+	 * Where a connector negotiated the mode, its pin assignment decides
+	 * how many of the four lanes are DisplayPort's; the rest stay USB3's.
+	 */
+	if (phy_drd->dp_lane_cap && dp->lanes > phy_drd->dp_lane_cap)
 		return -EINVAL;
 
 	if (dp->set_rate) {
@@ -3311,12 +3327,64 @@ static void exynos5_usbdrd_orien_switch_unregister(void *data)
 	typec_switch_unregister(phy_drd->sw);
 }
 
+/*
+ * What a negotiated alternate mode means for the lanes. Pin assignments C and E
+ * give DisplayPort all four; D and F give it the lower pair and leave the upper
+ * one to USB3. Anything else is not DisplayPort, so the lanes stay USB3's.
+ */
+static int exynos5_usbdrd_mux_set(struct typec_mux_dev *mux,
+				  struct typec_mux_state *state)
+{
+	struct exynos5_usbdrd_phy *phy_drd = typec_mux_get_drvdata(mux);
+
+	switch (state->mode) {
+	case TYPEC_DP_STATE_C:
+	case TYPEC_DP_STATE_E:
+		phy_drd->dp_lane_cap = 4;
+		break;
+	case TYPEC_DP_STATE_D:
+	case TYPEC_DP_STATE_F:
+		phy_drd->dp_lane_cap = 2;
+		break;
+	default:
+		phy_drd->dp_lane_cap = 0;
+		break;
+	}
+
+	return 0;
+}
+
+static void exynos5_usbdrd_mux_unregister(void *data)
+{
+	typec_mux_unregister(data);
+}
+
 static int exynos5_usbdrd_setup_notifiers(struct exynos5_usbdrd_phy *phy_drd)
 {
 	int ret;
 
 	if (!IS_ENABLED(CONFIG_TYPEC))
 		return 0;
+
+	if (device_property_present(phy_drd->dev, "mode-switch")) {
+		struct typec_mux_desc mux_desc = { };
+
+		mux_desc.drvdata = phy_drd;
+		mux_desc.fwnode = dev_fwnode(phy_drd->dev);
+		mux_desc.set = exynos5_usbdrd_mux_set;
+
+		phy_drd->mux = typec_mux_register(phy_drd->dev, &mux_desc);
+		if (IS_ERR(phy_drd->mux))
+			return dev_err_probe(phy_drd->dev,
+					     PTR_ERR(phy_drd->mux),
+					     "Failed to register TypeC mode switch\n");
+
+		ret = devm_add_action_or_reset(phy_drd->dev,
+					       exynos5_usbdrd_mux_unregister,
+					       phy_drd->mux);
+		if (ret)
+			return ret;
+	}
 
 	if (device_property_present(phy_drd->dev, "orientation-switch")) {
 		struct typec_switch_desc sw_desc = { };

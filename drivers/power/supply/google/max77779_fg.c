@@ -3772,12 +3772,14 @@ static void max77779_fg_read_serial_number(struct max77779_fg_chip *chip)
 
 	/*
 	 * Deliberately not strncpy()'s behaviour, unlike the other call site.
-	 * GBMS_MINF_LEN is 30 and serial_number is char[30], so a record with
-	 * no NUL in it filled the array with no terminator -- and this is
-	 * handed to val->strval for POWER_SUPPLY_PROP_SERIAL_NUMBER, which
-	 * sysfs_emit()s with "%s". That reads off the end of the array into
-	 * the fields behind it and copies them to userspace. Losing the last
-	 * character of a full-width serial is the better trade.
+	 * A tegu pack fills all GBMS_MINF_LEN bytes of the record with no NUL
+	 * among them [HW 2026-09-17], and this is handed to val->strval for
+	 * POWER_SUPPLY_PROP_SERIAL_NUMBER, which sysfs_emit()s with "%s" -- so
+	 * strncpy() left it unterminated and the read ran off the end of the
+	 * array into the fields behind it, out through a world-readable file.
+	 *
+	 * serial_number is GBMS_MINF_LEN + 1 for the terminator the record has
+	 * no room for, so nothing is lost and nothing is over-read.
 	 */
 	if (ret >= 0)
 		strscpy(chip->serial_number, buff, sizeof(chip->serial_number));

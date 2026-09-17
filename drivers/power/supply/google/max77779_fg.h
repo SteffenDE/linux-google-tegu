@@ -137,7 +137,8 @@ struct max77779_fg_chip {
 	int previous_qh;
 	int current_capacity;
 	int prev_charge_status;
-	char serial_number[30];
+	/* GBMS_MINF_LEN characters plus the terminator the record has no room for */
+	char serial_number[GBMS_MINF_LEN + 1];
 	bool offmode_charger;
 	bool por;
 

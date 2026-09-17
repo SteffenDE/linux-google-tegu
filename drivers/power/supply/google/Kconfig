@@ -1,0 +1,302 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Google Battery Management System (GBMS)
+#
+
+menuconfig POWER_SUPPLY_GOOGLE_BMS
+	bool "Google Battery Management System (Pixel)"
+	depends on I2C
+	help
+	  Google's battery and charging stack as shipped on Pixel phones: the
+	  GBMS property extension and tag storage, the google_battery charge
+	  table / health layer, the google_charger multi-step charging policy,
+	  and the drivers for the MAX77779 IF-PMIC (charger, fuel gauge, V/I
+	  monitor, scratchpad) it drives.
+
+	  The charge profile these drivers implement is per-cell data supplied
+	  in the device tree, so a board wanting this must carry the vendor
+	  battery profile as well as the nodes.
+
+	  Say N unless you are building for a Pixel board.
+
+if POWER_SUPPLY_GOOGLE_BMS
+
+config GOOGLE_VOTABLE
+	tristate
+	help
+	  The votable ("gvotable") API arbitrates access to a shared resource
+	  from several drivers: each voter casts a vote and an election
+	  callback picks the effective value. GBMS uses it for charge current,
+	  float voltage, charge enable and the MAX77779 operating mode.
+
+	  To compile this as a module, choose M here: the module will be
+	  called gvotable.
+
+config GOOGLE_LOGBUFFER
+	tristate
+	help
+	  A per-client ring buffer exposed as a character device, for the
+	  high-rate internal state GBMS and the TCPM drivers log on every
+	  charging decision and which does not belong in the kernel log.
+
+	  To compile this as a module, choose M here: the module will be
+	  called logbuffer.
+
+config GOOGLE_BMS
+	tristate "Google BMS core"
+	select GOOGLE_VOTABLE
+	select GOOGLE_LOGBUFFER
+	select GOOGLE_BEE
+	help
+	  The shared core of the Google battery stack: the GBMS power_supply
+	  property extension, the charge-table and time-to-full helpers, the
+	  tag-addressed gbms_storage abstraction and the battery pack EEPROM
+	  layouts stored through it.
+
+	  This is a library for the drivers below rather than a driver itself.
+
+	  To compile this as a module, choose M here: the module will be
+	  called google-bms.
+
+config GOOGLE_BEE
+	tristate
+	help
+	  Battery EEPROM record layouts, built as part of the BMS core. This
+	  symbol is selected by GOOGLE_BMS and is not meant to be set directly.
+
+config GOOGLE_BATTERY
+	tristate "Google Battery"
+	depends on GOOGLE_BMS
+	select CRYPTO
+	select CRYPTO_HASH
+	select CRYPTO_MD5
+	help
+	  The battery layer: charge tables indexed by temperature and state of
+	  charge, recharge thresholds, charge limiting and the battery
+	  defender, cycle counts and battery health history, and time-to-full
+	  estimation. It aggregates the gauge and the chargers into the
+	  "battery" power_supply that userspace sees.
+
+	  To compile this as a module, choose M here: the module will be
+	  called google-battery.
+
+config GOOGLE_CHARGER
+	tristate "Google Multi Step Charging"
+	depends on GOOGLE_BMS
+	help
+	  The charging policy layer. It runs a multi CC-CV step charge using
+	  the battery temperature and voltage to pick the charger's constant
+	  charge current and float voltage, applies the charge stop/start
+	  levels, and negotiates PPS with the adapter.
+
+	  To compile this as a module, choose M here: the module will be
+	  called google-charger.
+
+config GOOGLE_CCD
+	tristate "Google Charger Combine Driver"
+	depends on GOOGLE_BMS
+	help
+	  Presents several wired chargers to google_charger as a single
+	  power_supply, for boards that have both a main and a buck charger.
+
+	  To compile this as a module, choose M here: the module will be
+	  called google_ccd.
+
+config CHARGER_MAX77779
+	tristate "Maxim MAX77779 charger"
+	depends on GOOGLE_BMS
+	select REGMAP_I2C
+	select IRQ_DOMAIN
+	help
+	  The charger block of the MAX77779 IF-PMIC, including the use-case
+	  state machine that arranges the buck, boost, OTG and wireless
+	  transmit modes. Charge current and float voltage are driven through
+	  votables by google_charger.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-charger.
+
+config CHARGER_MAX77779_I2C
+	tristate "Maxim MAX77779 charger I2C interface"
+	depends on CHARGER_MAX77779
+	default CHARGER_MAX77779
+	help
+	  I2C transport for the MAX77779 charger, for boards that reach it
+	  directly rather than through the PMIC I2C master.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-charger-i2c.
+
+config FG_MAX77779
+	tristate "Maxim MAX77779 fuel gauge (GBMS)"
+	depends on GOOGLE_BMS
+	depends on !BATTERY_MAX77779
+	select REGMAP_I2C
+	help
+	  The full ModelGauge m5 fuel-gauge driver for the MAX77779, including
+	  loading the battery model from the device tree, learning, impedance
+	  and fade-rate reporting, and the GBMS gauge properties google_battery
+	  asks for.
+
+	  This replaces the minimal read-only BATTERY_MAX77779 driver; the two
+	  cannot be built together.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-fg-gbms.
+
+config FG_MAX77779_I2C
+	tristate "Maxim MAX77779 fuel gauge I2C interface"
+	depends on FG_MAX77779
+	default FG_MAX77779
+	help
+	  I2C transport for the MAX77779 fuel gauge.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-fg-i2c.
+
+config VIMON_MAX77779
+	tristate "Maxim MAX77779 voltage and current monitor"
+	depends on GOOGLE_BMS
+	select REGMAP_I2C
+	help
+	  The MAX77779's V/I monitor, which captures synchronised voltage and
+	  current buffers around a load step. The fuel gauge uses them to
+	  estimate the pack impedance.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-vimon.
+
+config VIMON_MAX77779_I2C
+	tristate "Maxim MAX77779 voltage and current monitor I2C interface"
+	depends on VIMON_MAX77779
+	default VIMON_MAX77779
+	help
+	  I2C transport for the MAX77779 V/I monitor.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-vimon-i2c.
+
+config MAX77779_SP
+	tristate "Maxim MAX77779 scratchpad"
+	depends on GOOGLE_BMS
+	depends on !NVMEM_MAX77779
+	select REGMAP_I2C
+	help
+	  Exposes the MAX77779's battery-backed scratchpad as a gbms_storage
+	  provider, which is where the stack keeps the state it needs to
+	  survive a reboot.
+
+	  Note that this is the same scratchpad as NVMEM_MAX77779; only one of
+	  the two should own it on a given board.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-sp.
+
+config MAX77779_SP_I2C
+	tristate "Maxim MAX77779 scratchpad I2C interface"
+	depends on MAX77779_SP
+	default MAX77779_SP
+	help
+	  I2C transport for the MAX77779 scratchpad.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779-sp-i2c.
+
+config MAX77779_I2CM
+	tristate "Maxim MAX77779 I2C master"
+	select REGMAP_I2C
+	help
+	  The I2C master block of the MAX77779, which drives the devices the
+	  PMIC owns on its own bus.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_i2cm.
+
+config MAX77779_I2CM_I2C
+	tristate "Maxim MAX77779 I2C master I2C interface"
+	depends on MAX77779_I2CM
+	default MAX77779_I2CM
+	help
+	  I2C transport for the MAX77779 I2C master block.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_i2cm_i2c.
+
+config MAX77779_PMIC
+	tristate "Maxim MAX77779 PMIC core"
+	select REGMAP_I2C
+	select MFD_CORE
+	help
+	  The core of the MAX77779 IF-PMIC. It owns the shared interrupt the
+	  charger, fuel gauge and V/I monitor hang off, and instantiates the
+	  sub-devices.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_pmic.
+
+config MAX77779_PMIC_I2C
+	tristate "Maxim MAX77779 PMIC core I2C interface"
+	depends on MAX77779_PMIC
+	default MAX77779_PMIC
+	help
+	  I2C transport for the MAX77779 PMIC core.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_pmic_i2c.
+
+config MAX77779_PMIC_IRQ
+	tristate "Maxim MAX77779 PMIC interrupt controller"
+	depends on MAX77779_PMIC
+	select IRQ_DOMAIN
+	help
+	  The MAX77779's interrupt controller, which cascades the sub-device
+	  interrupts onto a single SoC line.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_pmic_irq.
+
+config MAX77779_PMIC_PINCTRL
+	tristate "Maxim MAX77779 PMIC pin control"
+	depends on MAX77779_PMIC && PINCTRL
+	select GENERIC_PINCONF
+	select PINMUX
+	help
+	  Pin configuration for the MAX77779's general purpose pins.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_pmic_pinctrl.
+
+config MAX77779_PMIC_SGPIO
+	tristate "Maxim MAX77779 PMIC GPIO"
+	depends on MAX77779_PMIC && GPIOLIB
+	select GPIOLIB_IRQCHIP
+	help
+	  GPIO controller for the MAX77779's general purpose pins.
+
+	  To compile this as a module, choose M here: the module will be
+	  called max77779_pmic_sgpio.
+
+config CHARGER_RT9471_GBMS
+	tristate "Richtek RT9471 charger (GBMS)"
+	depends on GOOGLE_BMS
+	depends on !CHARGER_RT9471
+	select REGMAP_I2C
+	help
+	  The vendor RT9471 driver, which unlike the mainline CHARGER_RT9471
+	  driver answers the GBMS properties google_ccd looks a buck charger
+	  up for. Both bind "richtek,rt9471", so only one can be built.
+
+	  To compile this as a module, choose M here: the module will be
+	  called rt9471_charger.
+
+config CHARGER_P9221
+	tristate "IDT P9221/P9222 wireless power receiver"
+	depends on GOOGLE_BMS
+	help
+	  The wireless charging receiver, presented to google_charger as the
+	  "wireless" power_supply. Covers the P9221, P9222 and P9412 parts.
+
+	  To compile this as a module, choose M here: the module will be
+	  called p9221.
+
+endif # POWER_SUPPLY_GOOGLE_BMS

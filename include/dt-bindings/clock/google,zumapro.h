@@ -90,6 +90,17 @@
 #define CLK_DOUT_CMU_MFC_MFC			65
 
 /*
+ * CMU_TOP DisplayPort oscillator feed.  The DP link's AUX bit timers, its HPD
+ * deglitch counter and its GTC millisecond counter are all derived from this
+ * one clock, so the transmitter's timing is only correct at the rate the
+ * vendor specifies for it: 40 MHz, which is fout_shared2_d2 divided by ten.
+ * The mux's other input is oscclk, at 24.576 MHz.
+ */
+#define CLK_MOUT_CMU_HSI0_DPOSC		66
+#define CLK_GOUT_CMU_HSI0_DPOSC		67
+#define CLK_DOUT_CMU_HSI0_DPOSC		68
+
+/*
  * CMU_TOP display feeds.  These keep the bootloader-owned display clock tree
  * visible to CCF while the proper DECON/DSIM/DPUF drivers are still being
  * brought up.
@@ -262,6 +273,15 @@
 #define CLK_GOUT_HSI0_USB32DRD_REF_CLK_40	19
 #define CLK_GOUT_HSI0_USBDPPHY_CTRL_PCLK	20
 #define CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK	21
+
+/*
+ * CMU_HSI0 DisplayPort link clocks: the DPOSC user mux that selects the
+ * CMU_TOP feed above, the oscillator gate the link itself runs from, and the
+ * APB gate its registers sit behind.
+ */
+#define CLK_MOUT_HSI0_DPOSC_USER		22
+#define CLK_GOUT_HSI0_DP_LINK_DP_OSC_CLK	23
+#define CLK_GOUT_HSI0_DP_LINK_PCLK		24
 
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1

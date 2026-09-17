@@ -989,6 +989,14 @@
 		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
 	};
 
+	/* MAX77779 IF-PMIC interrupt (downstream if-pmic-irq). */
+	if_pmic_irq: if-pmic-irq-pins {
+		samsung,pins = "gpa8-0";
+		samsung,pin-function = <ZUMAPRO_PIN_FUNC_EINT>;
+		samsung,pin-pud = <ZUMAPRO_PIN_PULL_UP>;
+		samsung,pin-drv = <ZUMAPRO_PIN_DRV_X1>;
+	};
+
 	/* Right speaker amp IRQ, XEINT_16 (downstream tas2572_2_irq). */
 	spk_amp_r_irq: spk-amp-r-irq-pins {
 		samsung,pins = "gpa7-2";
@@ -1177,11 +1185,11 @@
  * MAX77779 ModelGauge m5 fuel gauge on the PMIC I2C bus (USI6/PERIC0).  The
  * gauge tracks state-of-charge autonomously and this driver only reads it, so
  * no battery model is programmed and no rail is touched.  The interrupt lives
- * on the MAX77779 PMIC core (not yet supported), so the driver polls; the node
- * therefore carries no interrupt.  The 2 mOhm sense resistor matches the
- * downstream default (max77779,rsense-default of 200 in 10-uOhm units) and the
- * tegu battery model files (BC79_TG4_2mOhm_*), and scales the current and
- * charge readings.
+ * on the MAX77779 PMIC core described below at 0x66 rather than on a SoC GPIO;
+ * this driver does not use it, so the node carries no interrupt and it polls.
+ * The 2 mOhm sense resistor matches the downstream default
+ * (max77779,rsense-default of 200 in 10-uOhm units) and the tegu battery model
+ * files (BC79_TG4_2mOhm_*), and scales the current and charge readings.
  */
 &usi6 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -1285,6 +1293,39 @@
 			max77779_reboot_mode: reboot-mode@0 {
 				reg = <0x0 0x4>;
 			};
+		};
+	};
+
+	/*
+	 * MAX77779 IF-PMIC core (research/dumped.dts:6256).  Nothing on this
+	 * part reaches the AP interrupt controller directly: the fuel gauge,
+	 * charger, V/I monitor and I2C master all cascade into the interrupt
+	 * controller below, which is why the core has to be described before
+	 * any of them can be driven by interrupt rather than by polling.
+	 *
+	 * The core itself is an MFD.  It instantiates its sub-devices as cells
+	 * matched against the child compatibles here, so a child that is not
+	 * described gets a platform device with no of_node -- harmless, and
+	 * currently the case for the pin controller and the GPIO expander,
+	 * which nothing consumes yet.
+	 */
+	pmic@66 {
+		compatible = "maxim,max77779pmic-i2c";
+		reg = <0x66>;
+
+		/*
+		 * The AP-facing end of the cascade.  The driver takes its own
+		 * parent interrupt from the GPIO named here rather than from
+		 * an "interrupts" property, so this node describes only the
+		 * controller it provides to the sub-devices.
+		 */
+		max77779_pmic_irq: pmic-irq {
+			compatible = "max77779-pmic-irq";
+			max777x9,irq-gpio = <&gpa8 0 GPIO_ACTIVE_LOW>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&if_pmic_irq>;
 		};
 	};
 };

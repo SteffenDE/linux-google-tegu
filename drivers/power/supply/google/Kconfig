@@ -292,12 +292,18 @@ config MAX77779_PMIC_SGPIO
 config CHARGER_RT9471_GBMS
 	tristate "Richtek RT9471 charger (GBMS)"
 	depends on GOOGLE_BMS
-	depends on !CHARGER_RT9471
 	select REGMAP_I2C
 	help
 	  The vendor RT9471 driver, which unlike the mainline CHARGER_RT9471
-	  driver answers the GBMS properties google_ccd looks a buck charger
-	  up for. Both bind "richtek,rt9471", so only one can be built.
+	  driver answers the properties google_ccd writes to a buck charger --
+	  CONSTANT_CHARGE_CURRENT_MAX and CONSTANT_CHARGE_VOLTAGE_MAX, which
+	  upstream treats as read-only constraints -- and which can apply a
+	  board's charge, input and protection settings from the device tree,
+	  where the mainline driver reads no properties at all.
+
+	  It can be built alongside CHARGER_RT9471: this one matches
+	  "richtek,swchg" and mainline's matches "richtek,rt9471", so the
+	  device tree picks.
 
 	  To compile this as a module, choose M here: the module will be
 	  called rt9471_charger.

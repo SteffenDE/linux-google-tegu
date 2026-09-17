@@ -8486,29 +8486,6 @@ static ssize_t charge_type_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RO(charge_type);
 
-static ssize_t constant_charge_current_show(struct device *dev,
-					    struct device_attribute *attr, char *buf)
-{
-	struct power_supply *psy = container_of(dev, struct power_supply, dev);
-	struct batt_drv *batt_drv = power_supply_get_drvdata(psy);
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", batt_drv->cc_max);
-}
-
-static DEVICE_ATTR_RO(constant_charge_current);
-
-
-static ssize_t constant_charge_voltage_show(struct device *dev,
-					    struct device_attribute *attr, char *buf)
-{
-	struct power_supply *psy = container_of(dev, struct power_supply, dev);
-	struct batt_drv *batt_drv = power_supply_get_drvdata(psy);
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", batt_drv->fv_uv);
-}
-
-static DEVICE_ATTR_RO(constant_charge_voltage);
-
 static ssize_t health_safety_margin_show(struct device *dev,
 					 struct device_attribute *attr, char *buf)
 {
@@ -11197,8 +11174,6 @@ static struct attribute *batt_attrs[] = {
 	&dev_attr_resistance.attr,
 	&dev_attr_charger_state.attr,
 	&dev_attr_charge_type.attr,
-	&dev_attr_constant_charge_current.attr,
-	&dev_attr_constant_charge_voltage.attr,
 	&dev_attr_health_safety_margin.attr,
 	&dev_attr_aacr_state.attr,
 	&dev_attr_aacr_config.attr,
@@ -12526,6 +12501,39 @@ error:
  */
 
 static enum power_supply_property gbatt_battery_props[] = {
+	/*
+	 * The five below were removed from this list by the vendor, as the
+	 * comment above says, to keep them out of sysfs -- while leaving them
+	 * answerable.  That works only on a kernel whose
+	 * power_supply_get_property() does not check the property list.
+	 * Mainline's does, and returns -EINVAL before reaching the handler, so
+	 * google_charger cannot read cc_max, fails every pass with
+	 * "MSC_CHG error reading cc_max (-22)", and never programs a charge
+	 * current -- the pack does not charge at all [HW 2026-09-17].
+	 *
+	 * Three of them the handler answers directly; VOLTAGE_AVG falls to its
+	 * default, which forwards to the fuel gauge, and that does advertise
+	 * it.  Note power_supply_set_property() is *not* symmetric here: it
+	 * never checked the list, which is why the writes into this layer
+	 * worked all along and only the reads failed.
+	 *
+	 * Advertising a property makes the power_supply core create its sysfs
+	 * node, so the two constant-charge entries collided with hand-written
+	 * attributes of the same names -- and sysfs_create_group() is
+	 * all-or-nothing, so the collision took all 94 of this driver's
+	 * attributes with it, charge_limit included.  That is the other half
+	 * of why the vendor shortened this list.  The hand-written pair are
+	 * deleted rather than the properties dropped: they read the same two
+	 * fields the handler returns and were read-only too, so the generated
+	 * nodes are identical, and unlike the hand-written ones they can also
+	 * be read by google_charger.  CHARGE_TYPE is left out entirely --
+	 * nothing reads it, so its hand-written node stays as it was.
+	 */
+	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+	POWER_SUPPLY_PROP_VOLTAGE_AVG,
+
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,

@@ -1297,9 +1297,98 @@
 	};
 
 	fuel-gauge@36 {
-		compatible = "maxim,max77779fg";
+		compatible = "maxim,max77779fg-i2c";
 		reg = <0x36>;
-		shunt-resistor-micro-ohms = <2000>;
+		interrupt-parent = <&max77779_pmic_irq>;
+		interrupts = <1 IRQ_TYPE_LEVEL_LOW>;
+		max77779,pmic = <&max77779_pmic>;
+
+		/*
+		 * Per-cell profiles, copied unchanged from
+		 * research/dumped.dts:6158.  The driver picks one by the
+		 * battery ID it reads from the pack EEPROM through
+		 * gbms_storage: this unit reports 1, selecting atl-1k, whose
+		 * relaxcfg (0x083b, the second u16 of fg-params) and
+		 * fg_n_regval (0xb7 = 0x2341) both match what the gauge
+		 * already holds [HW 2026-09-17].  That agreement is what makes
+		 * the profile safe to apply: the configuration write the
+		 * driver makes at init puts back the value that is there.
+		 *
+		 * The model itself is not written.  A load needs
+		 * model_reload >= REQUEST, and the only non-debug path to that
+		 * is a POR interrupt; this gauge reports PONR=0, so the
+		 * bootloader's model stays.  The profiles matter for the day
+		 * it does POR, which our previous read-only driver could not
+		 * have recovered from at all.
+		 */
+		maxim,fg-data {
+
+			max77779,config {
+
+				max77779,fake-255k {
+					max77779,batt-id-kohm = <0xff>;
+					max77779,model-version = <0x03>;
+					max77779,force-reset-model-data;
+					max77779,fg-model = <0x86b0ab80 0xb770b960 0xbb60bc50 0xbdf0bee0
+						0xc0c0c2c0 0xc6c0ca40 0xcca0d1c0 0xd650deb0 0x200200 0x10200a00
+						0x1c401030 0x1d200e00 0xfd005f0 0x6c00bd0 0x3f008f0 0x5d005d0>;
+					max77779,fg-params = <0xc1b0043c 0x260e2000 0x5f00 0x7d607d6 0xc8007d6
+						0xa55a2000 0xd800400 0x2800540 0x15020278 0x38700400 0x58efcea4>;
+				};
+
+				max77779,fake-170k {
+					max77779,batt-id-kohm = <0xaa>;
+					max77779,model-version = <0x03>;
+					max77779,force-reset-model-data;
+					max77779,fg-model = <0x86b0ab80 0xb770b960 0xbb60bc50 0xbdf0bee0
+						0xc0c0c2c0 0xc6c0ca40 0xcca0d1c0 0xd650deb0 0x200200 0x10200a00
+						0x1c401030 0x1d200e00 0xfd005f0 0x6c00bd0 0x3f008f0 0x5d005d0>;
+					max77779,fg-params = <0xc1b0043c 0x260e2000 0x5f00 0x7d607d6 0xc8007d6
+						0xa55a2000 0xd800400 0x2800540 0x15020278 0x38700400 0x58efcea4>;
+				};
+
+				max77779,fake-0k {
+					max77779,batt-id-kohm = <0x00>;
+					max77779,model-version = <0x01>;
+					max77779,force-reset-model-data;
+					max77779,fg-model = <0x86b0ab80 0xb770b960 0xbb60bc50 0xbdf0bee0
+						0xc0c0c2c0 0xc6c0ca40 0xcca0d1c0 0xd650deb0 0x200200 0x10200a00
+						0x1c401030 0x1d200e00 0xfd005f0 0x6c00bd0 0x3f008f0 0x5d005d0>;
+					max77779,fg-params = <0xc1b0043c 0x260e2000 0x5f00 0x7d607d6 0xc8007d6
+						0xa55a2000 0xd800400 0x2800540 0x15020278 0x38700400 0x58efcea4>;
+				};
+
+				max77779,atl-1k {
+					max77779,batt-id-kohm = <0x01>;
+					max77779,model-version = <0x01>;
+					max77779,force-reset-model-data;
+					max77779,fg-model = <0x9620ad30 0xb8a0b8e0 0xb920bb30 0xbd70be40
+						0xbf60c020 0xc260c6c0 0xca60d150 0xd9a0df10 0x800170 0x332032e0
+						0xe000f20 0x15400e10 0x1b700cb0 0x77007c0 0x6b006d0 0x6900690>;
+					max77779,fg-params = <0xc1b0083b 0x660e4207 0x815f00 0x7fc07fc 0xc8007fc
+						0xa55a3600 0x18800a01 0x78405d0 0x1c020280 0x38700400 0xc8ffcea4>;
+					max77779,fg_n_regval = <0xb72341>;
+					max77779,fg-aafv = <0x00 0x5f 0x0f 0x280 0x14 0x5a 0x0f 0x140 0x28 0x55
+						0x0f 0x140 0x3c 0x50 0x0f 0x140 0x50 0x4b 0x0f 0x140 0x64 0x46 0x0f
+						0x140>;
+				};
+
+				max77779,lwn-4k {
+					max77779,batt-id-kohm = <0x04>;
+					max77779,model-version = <0x01>;
+					max77779,force-reset-model-data;
+					max77779,fg-model = <0x91d0a3a0 0xb590b830 0xba40bbb0 0xbd40bfd0
+						0xc2c0c670 0xc960cd40 0xd0f0d640 0xdb70df10 0x4000c0 0x6001010
+						0x11000f00 0x14000db0 0x6c007f0 0x6c006a0 0x6e006f0 0x5400540>;
+					max77779,fg-params = <0xc1b0083b 0x660e4207 0x815f00 0x8000800 0xc800800
+						0xa55a390a 0x1d851002 0xb0207b0 0x22020280 0x38700400 0xc8ffcea4>;
+					max77779,fg_n_regval = <0xb72341>;
+					max77779,fg-aafv = <0x00 0x5f 0x0f 0x280 0x14 0x5a 0x0f 0x140 0x28 0x55
+						0x0f 0x140 0x3c 0x50 0x0f 0x140 0x50 0x4b 0x0f 0x140 0x64 0x46 0x0f
+						0x140>;
+				};
+			};
+		};
 	};
 
 	/*
@@ -1338,7 +1427,7 @@
 	 * currently the case for the pin controller and the GPIO expander,
 	 * which nothing consumes yet.
 	 */
-	pmic@66 {
+	max77779_pmic: pmic@66 {
 		compatible = "maxim,max77779pmic-i2c";
 		reg = <0x66>;
 

@@ -4959,6 +4959,7 @@ static void tcpm_reset_port(struct tcpm_port *port)
 	power_supply_changed(port->psy);
 	port->nr_sink_caps = 0;
 	port->sink_cap_done = false;
+	port->nr_source_caps = 0;
 	if (port->tcpc->enable_frs)
 		port->tcpc->enable_frs(port->tcpc, false);
 

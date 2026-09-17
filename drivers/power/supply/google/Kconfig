@@ -132,6 +132,7 @@ config FG_MAX77779
 	tristate "Maxim MAX77779 fuel gauge (GBMS)"
 	depends on GOOGLE_BMS
 	depends on !BATTERY_MAX77779
+	depends on CHARGER_MAX77779
 	select REGMAP_I2C
 	help
 	  The full ModelGauge m5 fuel-gauge driver for the MAX77779, including
@@ -141,6 +142,10 @@ config FG_MAX77779
 
 	  This replaces the minimal read-only BATTERY_MAX77779 driver; the two
 	  cannot be built together.
+
+	  Depends on CHARGER_MAX77779 for max77779_get_dev(), which resolves the
+	  "max77779,pmic" phandle and which the vendor happens to define in the
+	  charger. The charger needs no device-tree node for that.
 
 	  To compile this as a module, choose M here: the module will be
 	  called max77779-fg-gbms.

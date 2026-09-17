@@ -19,7 +19,10 @@
 #include <linux/of.h>
 #include <linux/gpio/driver.h>
 #include <linux/gpio/legacy.h>
+#include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/usb/pd.h>
+#include <linux/usb/tcpm.h>
 #include <linux/power_supply.h>
 
 /*
@@ -173,6 +176,46 @@ static inline int of_power_supply_get_by_phandle_array(struct device_node *np,
 	psy[0] = found;
 
 	return 1;
+}
+
+/*
+ * The vendor sources take the partner's source capabilities through a pair
+ * that allocates: tcpm_get_partner_src_caps() hands back a buffer and
+ * tcpm_put_partner_src_caps() frees it. Downstream implements that pair in the
+ * MAX77759 TCPC driver over a driver-global cache, ignoring the port argument
+ * entirely.
+ *
+ * Our TCPM exports the upstream shape instead -- tcpm_get_partner_source_caps()
+ * fills an array the caller owns, which needs no allocation, no free function
+ * and no GFP argument for the 28 bytes PDO_MAX_OBJECTS costs. The vendor's
+ * allocating contract is reproduced here so that their call sites are
+ * unchanged and this stays the only place that knows about the difference.
+ */
+static inline int tcpm_get_partner_src_caps(struct tcpm_port *port,
+					    u32 **src_pdo)
+{
+	u32 *pdo;
+	int ret;
+
+	pdo = kcalloc(PDO_MAX_OBJECTS, sizeof(*pdo), GFP_KERNEL);
+	if (!pdo)
+		return -ENOMEM;
+
+	ret = tcpm_get_partner_source_caps(port, pdo, PDO_MAX_OBJECTS);
+	if (ret < 0) {
+		kfree(pdo);
+		return ret;
+	}
+
+	*src_pdo = pdo;
+
+	return ret;
+}
+
+static inline void tcpm_put_partner_src_caps(u32 **src_pdo)
+{
+	kfree(*src_pdo);
+	*src_pdo = NULL;
 }
 
 #endif /* __GBMS_COMPAT_H_ */

@@ -2682,11 +2682,13 @@
 
 		/*
 		 * DWC3 wrapper + core.  Wrapper IRQ 402 (0x192) and the snps quirks
-		 * are from research/dumped.dts.  dr_mode = peripheral and
-		 * maximum-speed = high-speed for first bring-up: the live DT requests
-		 * super-speed with force_gen1, but mainline's exynos2200-style combo
-		 * PHY ops drive only the HS (UTMI/eUSB2) path, so SuperSpeed is
-		 * deferred until the combo PCS/PMA path is brought up and validated.
+		 * are from research/dumped.dts.  dr_mode stays peripheral.
+		 *
+		 * maximum-speed is super-speed, which is Gen1: the downstream
+		 * wrapper carries force_gen1 alongside the same maximum-speed, so
+		 * this board runs the SuperSpeed link at 5 Gbps and the Gen2
+		 * transmitter de-emphasis its link registers can carry never
+		 * applies.
 		 */
 		usb: usb@11210000 {
 			compatible = "google,zumapro-dwusb3";
@@ -2728,11 +2730,11 @@
 
 				interrupts = <GIC_SPI 402 IRQ_TYPE_LEVEL_HIGH 0>;
 
-				phys = <&usb32drd 0>;
-				phy-names = "usb2-phy";
+				phys = <&usb32drd 0>, <&usb32drd 1>;
+				phy-names = "usb2-phy", "usb3-phy";
 
 				dr_mode = "peripheral";
-				maximum-speed = "high-speed";
+				maximum-speed = "super-speed";
 
 				snps,quirk-frame-length-adjustment = <0x20>;
 				snps,has-lpm-erratum;

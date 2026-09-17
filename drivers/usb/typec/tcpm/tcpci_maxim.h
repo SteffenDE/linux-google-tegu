@@ -64,6 +64,10 @@ struct max_tcpci_chip {
 	bool veto_vconn_swap;
 	struct regulator *vbus_reg;
 	struct typec_mux_dev *mux;
+	/* The SBU pull-up rail, present only where DP AUX is wired */
+	struct regulator *aux_reg;
+	bool aux_routed;
+	u8 sbusw_saved;
 };
 
 static inline int max_tcpci_read16(struct max_tcpci_chip *chip, unsigned int reg, u16 *val)

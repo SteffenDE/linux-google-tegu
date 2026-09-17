@@ -7022,6 +7022,56 @@ void tcpm_port_error_recovery(struct tcpm_port *port)
 }
 EXPORT_SYMBOL_GPL(tcpm_port_error_recovery);
 
+/**
+ * tcpm_get_partner_source_caps - copy out the partner's source capabilities
+ * @port: the TCPM port
+ * @src_pdo: array to fill with the partner's source PDOs
+ * @max_pdo: number of entries @src_pdo can hold
+ *
+ * The envelope of the APDO currently negotiated is reported on the port's
+ * power supply, but a sink that has to choose between several of them -- to
+ * classify an adapter, or to move to a higher-power profile -- needs the
+ * advertised capabilities themselves. They reach userspace through
+ * /sys/class/usb_power_delivery, and this is the in-kernel equivalent.
+ *
+ * An array of PDO_MAX_OBJECTS entries is always large enough.
+ *
+ * Context: Process context. Takes @port->lock.
+ * Return: the number of PDOs copied, -ENODATA when the port has no partner
+ * source capabilities -- which is the case until a partner sends them, and
+ * again once tcpm_reset_port() has cleared them -- or -EOVERFLOW if @max_pdo
+ * is too small to hold them.
+ */
+int tcpm_get_partner_source_caps(struct tcpm_port *port, u32 *src_pdo,
+				 unsigned int max_pdo)
+{
+	unsigned int i, nr_pdo;
+	int ret;
+
+	mutex_lock(&port->lock);
+
+	nr_pdo = port->nr_source_caps;
+	if (!nr_pdo) {
+		ret = -ENODATA;
+		goto unlock;
+	}
+
+	if (nr_pdo > max_pdo) {
+		ret = -EOVERFLOW;
+		goto unlock;
+	}
+
+	for (i = 0; i < nr_pdo; i++)
+		src_pdo[i] = port->source_caps[i];
+
+	ret = nr_pdo;
+unlock:
+	mutex_unlock(&port->lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tcpm_get_partner_source_caps);
+
 static void tcpm_enable_frs_work(struct kthread_work *work)
 {
 	struct tcpm_port *port = container_of(work, struct tcpm_port, enable_frs);

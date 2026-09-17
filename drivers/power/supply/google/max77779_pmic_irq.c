@@ -138,6 +138,18 @@ static void max77779_pmic_bus_sync_unlock(struct irq_data *d)
 	unsigned int id;
 	int err;
 
+	/*
+	 * Wake updates are independent of mask updates: a sub-device can call
+	 * enable_irq_wake() without touching the mask in the same bus-lock
+	 * window, and dropping the request there would leave the cascade unable
+	 * to wake the system with no indication that anything went wrong.
+	 */
+	while (info->wake_u) {
+		id = __ffs(info->wake_u);
+		irq_set_irq_wake(info->irq, !!(info->wake & BIT(id)));
+		info->wake_u &= ~BIT(id);
+	}
+
 	if (!info->mask_u)
 		goto unlock_out;
 
@@ -162,12 +174,6 @@ static void max77779_pmic_bus_sync_unlock(struct irq_data *d)
 	if (err < 0) {
 		dev_err(info->dev, "Unable to write interrupt mask (%d)\n", err);
 		goto unlock_out;
-	}
-
-	while (info->wake_u) {
-		id = __ffs(info->wake_u);
-		irq_set_irq_wake(info->irq, !!(info->wake & BIT(id)));
-		info->wake_u &= ~BIT(id);
 	}
 
  unlock_out:

@@ -1453,6 +1453,98 @@
 			pinctrl-0 = <&if_pmic_irq>;
 		};
 	};
+
+	/*
+	 * The MAX77779's main charger.  This is the first node in this stack
+	 * that reaches a rail: the driver owns CHG_CNFG_00's mode field and
+	 * the charge current and float voltage underneath it.
+	 *
+	 * Binding it writes five registers at probe, unconditionally and
+	 * exactly as the vendor driver does on this silicon.  Four are
+	 * protection settings: charge-over-current warn and limit go to their
+	 * maximum values, CHG_CNFG_01's fast-charge safety timer is cleared,
+	 * CHG_CNFG_15's watchdog is disabled, and CHG_CNFG_13's THM2
+	 * connector-temperature field is zeroed -- the vendor node sets
+	 * neither google,max77779-thm2-monitor nor max77779,usb-mon, so it
+	 * takes the same branch.  Measured against the documented reset values
+	 * only the safety timer is actually a relaxation: the watchdog and
+	 * THM2's hardware-control bit are already off, and the maxed COP
+	 * thresholds arm a protection whose enable bit nothing here ever sets.
+	 * These registers are OTP-shadowed, so what the part powers up with is
+	 * not necessarily what the datasheet reset says.
+	 *
+	 * The fifth is a current limit.  The DC_ICL votable is created with
+	 * gvotable_use_default(), which runs an election immediately, so
+	 * CHG_CNFG_10's wireless input limit is written to the vendor's
+	 * 700 mA default.  The receiver is fitted but not described here, so
+	 * that rail is only reached with a pad under the phone.
+	 *
+	 * The vendor relaxes what it relaxes because its battery and charger
+	 * layers put profile-driven limits back in their place, and those
+	 * layers are not here yet -- so until they are, this is knowingly less
+	 * protection than the part ships with.  The JEITA and thermistor
+	 * protection is the backstop either way: no driver configures it, the
+	 * thresholds come from OTP, and nothing in this port can switch it off.
+	 *
+	 * No charging mode is written.  That probe-time election does reach
+	 * the mode votable -- the DC_ICL callback casts a disabled WLCIN_OFF
+	 * ballot -- but max77779_mode_callback() accumulates its decision by
+	 * walking ballots and skipping disabled ones, so with no enabled
+	 * ballot anywhere its state stays empty, it takes the "nope" path and
+	 * CHG_CNFG_00 is left alone.  That holds for any election while
+	 * nothing votes, which is a stronger guarantee than the default merely
+	 * not running.  The use-case state machine that arranges buck, boost,
+	 * OTG and wireless-transmit modes is reached only from a mode vote,
+	 * and its device-tree lookup is lazy -- probe passes a NULL node
+	 * deliberately.
+	 *
+	 * Note what the power supply this registers exposes.  ONLINE and
+	 * CURRENT_MAX are writable, and here they only go one way: writing
+	 * either to 0 casts an enabled ballot that turns CHG_CNFG_00 off, and
+	 * retracting it leaves the register off, because nothing in this port
+	 * votes a buck mode back on.  CHG_CNFG_00 is OTP-reset, so a warm
+	 * reset need not restore it.
+	 *
+	 * Four groups of the vendor node's properties are dropped, all of them
+	 * naming hardware this board does not describe:
+	 *
+	 *   - wlc-en and wlc-spoof are GPIOs inside the P9222 wireless
+	 *     receiver, and extbst-ctl is one inside the RT9471 buck charger.
+	 *     Neither driver is here, so the phandles have no target.  A
+	 *     missing property reads back as a negative GPIO rather than
+	 *     -EPROBE_DEFER, which is what the use-case code treats as "not
+	 *     fitted"; a property pointing at an absent provider would instead
+	 *     defer forever.
+	 *   - wlc-spoof-vbyp and wlc_notify_charge_disable belong to the same
+	 *     wireless path.
+	 *   - rx-to-rx-otg-en and ext-otg-only describe OTG through that
+	 *     external boost.  The connector here is sink and device only with
+	 *     PD disabled, so no OTG use case is reachable to begin with.
+	 *   - chg-term-voltage is dead in the vendor tree too: this driver
+	 *     version never reads it, taking the termination voltage from the
+	 *     charger layer instead.
+	 *
+	 * The GPIO child and the interrupt-controller properties are kept
+	 * because the driver registers both providers against this node
+	 * regardless of what consumes them.
+	 */
+	chrg@69 {
+		compatible = "maxim,max77779chrg-i2c";
+		reg = <0x69>;
+		max77779,psy-name = "main-charger";
+		max77779,pmic = <&max77779_pmic>;
+		interrupt-parent = <&max77779_pmic_irq>;
+		interrupts = <2 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		max77779,wcin-inlim-headroom = <40000>;
+
+		max77779_gpio {
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <1>;
+		};
+	};
 };
 
 &usb32drd {

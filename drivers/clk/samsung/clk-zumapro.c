@@ -24,7 +24,7 @@
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI9_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
 #define CLKS_NR_HSI1		(CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK + 1)
-#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USI3_USI_PCLK + 1)
+#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
@@ -1076,6 +1076,12 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 							0x210c
 #define CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_PCLK \
 							0x2110
+#define CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40 \
+							0x20ac
+#define CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK \
+							0x20b4
+#define CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_TCA_APB_CLK \
+							0x20c0
 #define QCH_CON_USB32DRD_QCH_LINK		0x30c0
 
 static const unsigned long hsi0_clk_regs[] __initconst = {
@@ -1096,6 +1102,9 @@ static const unsigned long hsi0_clk_regs[] __initconst = {
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI3_HSI0_IPCLKPORT_PCLK,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_IPCLK,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40,
+	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK,
+	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_TCA_APB_CLK,
 	QCH_CON_USB32DRD_QCH_LINK,
 };
 
@@ -1160,6 +1169,24 @@ static const struct samsung_div_clock hsi0_div_clks[] __initconst = {
 static const struct samsung_gate_clock hsi0_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_HSI0_USB32DRD_LINK, "gout_hsi0_usb32drd_link",
 	     "dout_hsi0_usb", QCH_CON_USB32DRD_QCH_LINK, 0, 0, 0),
+	/*
+	 * SuperSpeed. The 40 MHz reference hangs off the same internal USB mux
+	 * as the link gate above; the two APB gates are BLK_HSI0 fabric
+	 * clocks, modelled here on the NOC user mux like the other pclk gates
+	 * in this block.
+	 */
+	GATE(CLK_GOUT_HSI0_USB32DRD_REF_CLK_40, "gout_hsi0_usb32drd_ref_clk_40",
+	     "dout_hsi0_usb",
+	     CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI0_USBDPPHY_CTRL_PCLK, "gout_hsi0_usbdpphy_ctrl_pclk",
+	     "mout_hsi0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK, "gout_hsi0_usbdpphy_tca_apb_clk",
+	     "mout_hsi0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_TCA_APB_CLK,
+	     21, 0, 0),
 	GATE(CLK_GOUT_HSI0_USI2_USI_CLK, "gout_hsi0_usi2_usi_clk",
 	     "dout_hsi0_usi2",
 	     CLK_CON_GAT_CLK_BLK_HSI0_UID_USI2_HSI0_IPCLKPORT_IPCLK,

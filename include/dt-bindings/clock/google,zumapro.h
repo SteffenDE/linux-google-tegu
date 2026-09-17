@@ -252,6 +252,17 @@
 #define CLK_GOUT_HSI0_USI3_USI_CLK		17
 #define CLK_GOUT_HSI0_USI3_USI_PCLK		18
 
+/*
+ * CMU_HSI0 USB32DRD SuperSpeed clocks.  The combo PHY's SuperSpeed half is a
+ * Synopsys USB-DP block behind two APB gates of its own -- one for the PHY
+ * controller, one for the Type-C Aggregator -- plus the 40 MHz reference its
+ * PLL runs from.  None of them is needed for the high-speed path, so nothing
+ * claimed them and clk_disable_unused() switched them off.
+ */
+#define CLK_GOUT_HSI0_USB32DRD_REF_CLK_40	19
+#define CLK_GOUT_HSI0_USBDPPHY_CTRL_PCLK	20
+#define CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK	21
+
 /* CMU_DPUB display backbone clocks */
 #define CLK_MOUT_DPUB_DSIM_USER		1
 #define CLK_MOUT_DPUB_NOC_USER			2

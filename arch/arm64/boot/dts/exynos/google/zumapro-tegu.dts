@@ -1263,6 +1263,44 @@
 		};
 	};
 
+	/*
+	 * The MAX77779's battery voltage/current monitor.  It captures 64
+	 * synchronised pack voltage and current samples into a buffer inside
+	 * the part, which the driver then reads back over i2c.  Measurement
+	 * only: everything the driver programs is a sample-count and
+	 * stop-condition word, a one-bit enable, a trigger-source select and a
+	 * one-bit interrupt mask, and none of it drives anything.  The block
+	 * also has comparison thresholds the driver never writes.
+	 *
+	 * Nothing in this tree consumes the samples.  The gauge does not --
+	 * neither this one nor downstream's mentions the monitor -- and the
+	 * two consumers that do, the battery current limiter and the MAX77779
+	 * firmware updater, are not ported.  So the block captures nothing:
+	 * bvim_trig selects which events start a capture, the driver derives
+	 * that register from the trigger masks of registered clients, and with
+	 * none registered it stays 0.  BVIM_CTRL's arm bit is not a second way
+	 * in; the hardware clears it when a capture ends and the driver
+	 * re-arms it, so setting it while it is already set does nothing.
+	 *
+	 * It is described now because it is the second consumer of the PMIC
+	 * interrupt cascade and the first one whose interrupt can be raised on
+	 * demand: a gauge interrupts only on an alert, so the gauge's
+	 * registration on that cascade does not exercise delivery through it.
+	 * A capture raises BVIM_Samples_Rdy one buffer later, which is what
+	 * turns the cascade from registered into delivering.
+	 *
+	 * The vendor device tree also gives this node max77779,pmic and
+	 * max77779,psy-type-unknown.  Both are dropped: this driver reads
+	 * neither property, and it registers no power supply for the second
+	 * one to apply to.
+	 */
+	vimon@28 {
+		compatible = "maxim,max77779vimon-i2c";
+		reg = <0x28>;
+		interrupt-parent = <&max77779_pmic_irq>;
+		interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
+	};
+
 	fuel-gauge@36 {
 		compatible = "maxim,max77779fg-i2c";
 		reg = <0x36>;

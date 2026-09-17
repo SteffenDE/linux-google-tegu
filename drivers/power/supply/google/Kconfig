@@ -165,9 +165,16 @@ config VIMON_MAX77779
 	depends on GOOGLE_BMS
 	select REGMAP_I2C
 	help
-	  The MAX77779's V/I monitor, which captures synchronised voltage and
-	  current buffers around a load step. The fuel gauge uses them to
-	  estimate the pack impedance.
+	  The MAX77779's V/I monitor, which captures a burst of synchronised
+	  pack voltage and current samples into a buffer inside the part and
+	  reads it back over i2c. A measurement block: the driver programs a
+	  sample count, stop conditions, an enable and a trigger source, and
+	  drives nothing.
+
+	  The samples go to clients that register a callback -- on Pixel, the
+	  battery current limiter and the firmware updater. The trigger source
+	  is derived from those clients' trigger masks, so with none
+	  registered nothing is armed and no capture runs.
 
 	  To compile this as a module, choose M here: the module will be
 	  called max77779-vimon.

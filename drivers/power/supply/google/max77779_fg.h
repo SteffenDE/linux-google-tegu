@@ -37,7 +37,7 @@
 
 #define MAX77779_FG_MAX_LOG_REGS	30
 
-static const struct maxfg_reg max77779_fg[] = {
+static __maybe_unused const struct maxfg_reg max77779_fg[] = {
 	[MAXFG_TAG_avgc] = { ATOM_INIT_REG16(MAX77779_FG_AvgCurrent)},
 	[MAXFG_TAG_cnfg] = { ATOM_INIT_REG16(MAX77779_FG_Config)},
 	[MAXFG_TAG_mmdv] = { ATOM_INIT_REG16(MAX77779_FG_MaxMinVolt)},
@@ -86,7 +86,7 @@ static const struct maxfg_reg max77779_fg[] = {
 	[MAXFG_TAG_ichgterm] = { ATOM_INIT_REG16(MAX77779_FG_IChgTerm)},
 };
 
-static const struct maxfg_reg max77779_debug_fg[] = {
+static __maybe_unused const struct maxfg_reg max77779_debug_fg[] = {
 	[MAXFG_TAG_tempco] = { ATOM_INIT_REG16(MAX77779_FG_NVM_nTempCo)},
 	[MAXFG_TAG_rcomp0] = { ATOM_INIT_REG16(MAX77779_FG_NVM_nRComp0)},
 	[MAXFG_TAG_filcfg] = { ATOM_INIT_REG16(MAX77779_FG_NVM_nFilterCfg)},

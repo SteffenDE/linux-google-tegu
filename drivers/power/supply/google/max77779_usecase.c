@@ -10,8 +10,8 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/regmap.h>
+#include "gbms_compat.h"
 #include "google_bms.h"
 #include "max77779.h"
 #include "max77779_charger.h"

@@ -3079,7 +3079,7 @@ int p9xxx_gpio_set_value(struct p9221_charger_data *chgr, int gpio, int value)
 static int p9xxx_gpio_get_direction(struct gpio_chip *chip,
 				    unsigned int offset)
 {
-	return GPIOF_DIR_OUT;
+	return GPIO_LINE_DIRECTION_OUT;
 }
 
 static int p9xxx_gpio_get(struct gpio_chip *chip, unsigned int offset)
@@ -3104,7 +3104,7 @@ static int p9xxx_gpio_get(struct gpio_chip *chip, unsigned int offset)
 
 #define P9412_BPP_VOUT_DFLT	5000
 #define P9412_BPP_WLC_OTG_VOUT	5200
-static void p9xxx_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+static int p9xxx_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 {
 	struct p9221_charger_data *charger = gpiochip_get_data(chip);
 	int ret = 0, vout_mv;
@@ -3226,6 +3226,8 @@ static void p9xxx_gpio_set(struct gpio_chip *chip, unsigned int offset, int valu
 	if (ret < 0)
 		dev_err(&charger->client->dev, "GPIO%d: value=%d ret:%d\n",
 			offset, value, ret);
+
+	return ret;
 }
 
 void p9xxx_gpio_init(struct p9221_charger_data *charger)

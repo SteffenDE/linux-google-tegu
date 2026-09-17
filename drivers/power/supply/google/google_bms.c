@@ -98,7 +98,7 @@ EXPORT_SYMBOL_GPL(gbms_chg_ev_adapter_s);
 /* Convert gbms_msc_states_t to letter code */
 static const char *gbms_get_code(const int index)
 {
-	const static char *codes[] = {"n", "s", "d", "l", "v", "vo", "p", "f",
+	static const char *codes[] = {"n", "s", "d", "l", "v", "vo", "p", "f",
 				      "t", "dl", "st", "tc", "r", "w", "rs",
 				      "n", "ny", "do", "h", "hp", "ha"};
 	const int len = ARRAY_SIZE(codes);
@@ -1514,7 +1514,7 @@ int gbms_decode_eeprom_sn(char *decode_sn, const size_t max_len)
 		return ret;
 
 	/* Pack barcode area data in ASCII format */
-	strncpy(decode_sn, sn, pack_barcode_len);
+	gbms_strncpy(decode_sn, sn, pack_barcode_len);
 
 	/*
 	 * decode address

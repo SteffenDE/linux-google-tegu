@@ -78,7 +78,7 @@ static int max77779_fg_i2c_regmap_init(struct max77779_fg_chip *chip, struct i2c
 	return 0;
 }
 
-static int max77779_fg_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
+static int max77779_fg_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct max77779_fg_chip *chip;

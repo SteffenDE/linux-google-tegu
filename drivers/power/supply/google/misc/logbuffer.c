@@ -275,19 +275,23 @@ void logbuffer_unregister(struct logbuffer *instance)
 }
 EXPORT_SYMBOL_GPL(logbuffer_unregister);
 
-static int logbuffer_suspend(void)
+static int logbuffer_suspend(void *data)
 {
 	driver_suspended_count += 1;
 	return 0;
 }
 
-static struct syscore_ops logbuffer_ops = {
+static const struct syscore_ops logbuffer_ops = {
 	.suspend        = logbuffer_suspend,
+};
+
+static struct syscore logbuffer_syscore = {
+	.ops = &logbuffer_ops,
 };
 
 static int __init logbuffer_dev_init(void)
 {
-	register_syscore_ops(&logbuffer_ops);
+	register_syscore(&logbuffer_syscore);
 
 	/* Limit the entry count of each logbuffer instance to maximum 2^20  */
 	if (buffer_entry_shift > LOGBUFFER_ENTRY_SHIFT_MAX)
@@ -306,7 +310,7 @@ static int __init logbuffer_dev_init(void)
 
 static void logbuffer_dev_exit(void)
 {
-	unregister_syscore_ops(&logbuffer_ops);
+	unregister_syscore(&logbuffer_syscore);
 }
 early_initcall(logbuffer_dev_init);
 module_exit(logbuffer_dev_exit);

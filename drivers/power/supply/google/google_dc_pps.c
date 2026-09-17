@@ -23,7 +23,32 @@
 #include "google_bms.h"
 #include "google_psy.h"
 #include "google_dc_pps.h"
-#include <linux/usb/max77759_export.h>
+
+/*
+ * tcpm_get_partner_src_caps() and tcpm_put_partner_src_caps() are vendor
+ * additions to the TCPM core, declared in <linux/usb/max77759_export.h> in the
+ * AOSP tree. Mainline exports no accessor for the partner's source
+ * capabilities and struct tcpm_port is opaque outside tcpm.c, so they cannot
+ * be provided from here.
+ *
+ * Stubbed so the port builds. pps_get_src_cap() then reports that the adapter
+ * advertised nothing, and every caller treats that as "no PPS" -- which is the
+ * safe direction: PPS is not negotiated rather than negotiated from source
+ * capabilities we never read. Restoring it means adding the two accessors to
+ * our TCPM, which belongs with the PD work and not with this import.
+ */
+static inline int tcpm_get_partner_src_caps(struct tcpm_port *port,
+					    u32 **src_pdo)
+{
+	*src_pdo = NULL;
+
+	return -EOPNOTSUPP;
+}
+
+static inline void tcpm_put_partner_src_caps(u32 **src_pdo)
+{
+	*src_pdo = NULL;
+}
 
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
@@ -882,8 +907,8 @@ struct power_supply *pps_get_tcpm_psy(struct device_node *node, size_t size)
 	if (!node)
 		return ERR_PTR(-EINVAL);
 
-	ret = power_supply_get_by_phandle_array(node, propname, psy,
-						ARRAY_SIZE(psy));
+	ret = of_power_supply_get_by_phandle_array(node, propname, psy,
+						   ARRAY_SIZE(psy));
 	if (ret < 0)
 		return ERR_PTR(-EAGAIN);
 

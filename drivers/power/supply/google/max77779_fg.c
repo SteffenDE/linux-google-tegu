@@ -3770,8 +3770,17 @@ static void max77779_fg_read_serial_number(struct max77779_fg_chip *chip)
 	char buff[32] = {0};
 	int ret = gbms_storage_read(GBMS_TAG_MINF, buff, GBMS_MINF_LEN);
 
+	/*
+	 * Deliberately not strncpy()'s behaviour, unlike the other call site.
+	 * GBMS_MINF_LEN is 30 and serial_number is char[30], so a record with
+	 * no NUL in it filled the array with no terminator -- and this is
+	 * handed to val->strval for POWER_SUPPLY_PROP_SERIAL_NUMBER, which
+	 * sysfs_emit()s with "%s". That reads off the end of the array into
+	 * the fields behind it and copies them to userspace. Losing the last
+	 * character of a full-width serial is the better trade.
+	 */
 	if (ret >= 0)
-		strncpy(chip->serial_number, buff, ret);
+		strscpy(chip->serial_number, buff, sizeof(chip->serial_number));
 	else
 		chip->serial_number[0] = '\0';
 }
@@ -4009,7 +4018,7 @@ int max77779_fg_init(struct max77779_fg_chip *chip)
 		dev_warn(chip->dev, "Unable to mask all interrupts (%d)\n", ret);
 
 	psy_cfg.drv_data = chip;
-	psy_cfg.of_node = chip->dev->of_node;
+	psy_cfg.fwnode = dev_fwnode(chip->dev);
 
 	ret = of_property_read_string(dev->of_node, "max77779,dual-battery", &psy_name);
 	if (ret == 0)

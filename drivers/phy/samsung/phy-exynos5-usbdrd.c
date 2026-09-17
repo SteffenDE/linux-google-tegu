@@ -297,6 +297,12 @@
 #define PHY_CR_PARA_CON2_PHY0_CR_PARA_WR_DATA		GENMASK(31, 16)
 
 #define EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0	0x100
+/*
+ * Only ANA_PWR_EN is common. The two *_PWR_STABLE bits below belong to this
+ * wrapper revision alone: on the zuma one they sit a bit higher, and bit 13 is
+ * an HDMI mode enable. Anything shared with another SoC has to be checked
+ * against that SoC's own map rather than assumed from this block.
+ */
 #define PHY_CONFIG0_PHY0_PMA_PWR_STABLE		BIT(14)
 #define PHY_CONFIG0_PHY0_PCS_PWR_STABLE		BIT(13)
 #define PHY_CONFIG0_PHY0_ANA_PWR_EN		BIT(1)
@@ -476,6 +482,8 @@ struct exynos5_usbdrd_phy_config {
 	u32 id;
 	void (*phy_isol)(struct phy_usb_instance *inst, bool isolate);
 	void (*phy_init)(struct exynos5_usbdrd_phy *phy_drd);
+	/* Quiesce what phy_init() started, before the block is isolated. */
+	void (*phy_deinit)(struct exynos5_usbdrd_phy *phy_drd);
 	unsigned int (*set_refclk)(struct phy_usb_instance *inst);
 };
 
@@ -498,6 +506,12 @@ struct exynos5_usbdrd_phy_drvdata {
 
 #define EXYNOS5_DRD_PHY_FULL_LINK_INIT		BIT(0)
 #define EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID	BIT(1)
+/*
+ * Keep the phy clock bulk enabled from init() to exit() rather than only
+ * across init(). A combo phy whose SuperSpeed PLL runs off one of them needs
+ * it after init() returns, to keep feeding the controller its pipe clock.
+ */
+#define EXYNOS5_DRD_PHY_CLKS_OUTLIVE_INIT	BIT(2)
 
 /**
  * struct exynos5_usbdrd_phy - driver data for USB 3.0 PHY
@@ -505,6 +519,8 @@ struct exynos5_usbdrd_phy_drvdata {
  * @reg_phy: usb phy controller register memory base
  * @reg_pcs: usb phy physical coding sublayer register memory base
  * @reg_pma: usb phy physical media attachment register memory base
+ * @reg_tca: type-c aggregator register memory base, on combo phys that
+ *	     crossbar their lanes between USB and DisplayPort
  * @clks: clocks for register access
  * @core_clks: core clocks for phy (ref, pipe3, utmi+, ITP, etc. as required)
  * @drv_data: pointer to SoC level driver data structure
@@ -523,6 +539,7 @@ struct exynos5_usbdrd_phy {
 	void __iomem *reg_phy;
 	void __iomem *reg_pcs;
 	void __iomem *reg_pma;
+	void __iomem *reg_tca;
 	struct clk_bulk_data *clks;
 	struct clk_bulk_data *core_clks;
 	const struct exynos5_usbdrd_phy_drvdata *drv_data;
@@ -705,6 +722,19 @@ exynos5_usbdrd_apply_phy_tunes(struct exynos5_usbdrd_phy *phy_drd,
 		default:
 			dev_warn_once(phy_drd->dev,
 				      "unknown phy region %d\n", tune->region);
+			continue;
+		}
+
+		/*
+		 * Not every phy maps every region -- a combo phy described for
+		 * high speed alone has no SuperSpeed banks -- so a tune naming
+		 * one that is absent is a device tree that does not match the
+		 * driver data, not something to write through a NULL.
+		 */
+		if (!reg_base) {
+			dev_warn_once(phy_drd->dev,
+				      "phy region %d is not mapped\n",
+				      tune->region);
 			continue;
 		}
 
@@ -1495,8 +1525,13 @@ static int exynos2200_usbdrd_phy_init(struct phy *phy)
 		return ret;
 
 	scoped_guard(mutex, &phy_drd->phy_mutex) {
-		/* Set up the link controller */
-		exynos2200_usbdrd_link_init(phy_drd);
+		/*
+		 * Set up the link controller. There is one link behind both
+		 * phys, and this pulses its soft reset, so it belongs to the
+		 * first of them rather than to each.
+		 */
+		if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
+			exynos2200_usbdrd_link_init(phy_drd);
 
 		/* UTMI or PIPE3 link preparation */
 		exynos2200_usbdrd_link_attach_detach_pipe3_phy(inst);
@@ -1505,7 +1540,9 @@ static int exynos2200_usbdrd_phy_init(struct phy *phy)
 		inst->phy_cfg->phy_init(phy_drd);
 	}
 
-	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
+	if (!(phy_drd->drv_data->flags & EXYNOS5_DRD_PHY_CLKS_OUTLIVE_INIT))
+		clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks,
+					   phy_drd->clks);
 
 	return 0;
 }
@@ -1554,11 +1591,25 @@ static int exynos2200_usbdrd_phy_exit(struct phy *phy)
 	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
 		phy_exit(phy_drd->hs_phy);
 
-	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
-	if (ret)
-		return ret;
+	/* Already enabled, and held that way, by phy_init(). */
+	if (!(phy_drd->drv_data->flags & EXYNOS5_DRD_PHY_CLKS_OUTLIVE_INIT)) {
+		ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks,
+					      phy_drd->clks);
+		if (ret)
+			return ret;
+	}
 
 	scoped_guard(mutex, &phy_drd->phy_mutex) {
+		if (inst->phy_cfg->phy_deinit)
+			inst->phy_cfg->phy_deinit(phy_drd);
+
+		/*
+		 * The link belongs to both sub-phys, so put it down with the
+		 * first of them, the way the link init brings it up.
+		 */
+		if (inst->phy_cfg->id != EXYNOS5_DRDPHY_UTMI)
+			break;
+
 		exynos2200_usbdrd_set_session_valid(phy_drd, false);
 
 		reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
@@ -1911,11 +1962,637 @@ static int exynos5_usbdrd_phy_clk_handle(struct exynos5_usbdrd_phy *phy_drd)
 	return 0;
 }
 
+/*
+ * Zumapro SuperSpeed: the Synopsys USB-DP combo PHY.
+ *
+ * The high-speed half of this combo is an external eUSB2 PHY reached through
+ * the link's UTMI path above. The SuperSpeed half is a Synopsys USB-DP block
+ * with its own register bank ("pma") and a Type-C Aggregator ("tca") that
+ * crossbars its four lanes between USB3 and DisplayPort. Both banks are
+ * reached over the APB; the PHY's own internal register space is reached
+ * indirectly, over a bit-banged CR-para serial bus in the "pma" bank.
+ *
+ * The CR-para registers themselves are the same ones exynosautov920 uses, but
+ * the access protocol differs, so these helpers do not share its code.
+ */
+#define ZUMAPRO_USBDP_PHY_CONFIG0_ANA_PWR_STABLE	BIT(2)
+#define ZUMAPRO_USBDP_PHY_CONFIG0_SS_MPLLA_SSC_EN	BIT(21)
+
+#define ZUMAPRO_USBDP_PHY_CONFIG2			0x108
+#define ZUMAPRO_USBDP_PHY_CONFIG2_UPCS_PWR_STABLE	BIT(16)
+#define ZUMAPRO_USBDP_PHY_CONFIG2_UPCS_PWR_EN		BIT(17)
+#define ZUMAPRO_USBDP_PHY_CONFIG2_PCS_PWR_EN		BIT(18)
+#define ZUMAPRO_USBDP_PHY_CONFIG2_PMA_PWR_EN		BIT(19)
+#define ZUMAPRO_USBDP_PHY_CONFIG2_TEST_POWERDOWN	BIT(24)
+
+#define ZUMAPRO_USBDP_PHY_SRAM_CON			0x110
+#define ZUMAPRO_USBDP_PHY_SRAM_BYPASS			BIT(0)
+#define ZUMAPRO_USBDP_PHY_SRAM_EXT_LD_DONE		BIT(1)
+#define ZUMAPRO_USBDP_PHY_SRAM_INIT_DONE		BIT(2)
+
+#define ZUMAPRO_USBDP_PHY_TCA_CONFIG			0x16c
+#define ZUMAPRO_USBDP_PHY_TCA_CONFIG_FLIP_INVERT	BIT(2)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG12			0x234
+#define DP_CONFIG12_TX_MPLL_EN				GENMASK(11, 8)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG13			0x238
+#define DP_CONFIG13_TX_RESET				GENMASK(7, 4)
+#define DP_CONFIG13_TX_DISABLE				GENMASK(3, 0)
+
+#define PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_DATA		GENMASK(31, 16)
+#define PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_EN		BIT(0)
+
+/* Type-C Aggregator, the second SuperSpeed register bank. */
+#define ZUMAPRO_USBDP_TCA_INTR_EN			0x04
+#define TCA_INTR_EN_XA_ACK_EVT_EN			BIT(0)
+#define TCA_INTR_EN_XA_TIMEOUT_EVT_EN			BIT(1)
+#define ZUMAPRO_USBDP_TCA_INTR_STS			0x08
+#define ZUMAPRO_USBDP_TCA_TCPC				0x14
+#define TCA_TCPC_MUX_CONTROL				GENMASK(1, 0)
+#define TCA_TCPC_CONNECTOR_ORIENTATION			BIT(2)
+#define TCA_TCPC_LOW_POWER_EN				BIT(3)
+#define TCA_TCPC_VALID					BIT(4)
+#define ZUMAPRO_USBDP_TCA_CTRLSYNCMODE_CFG0		0x20
+#define TCA_CTRLSYNCMODE_CFG0_AUTO_SAFE_STATE		BIT(16)
+
+/* tcpc_mux_control: no connection, USB3.1, DP 4 lanes, USB3.1 + DP lanes 0/1 */
+#define TCA_MUX_CONTROL_USB31				1
+
+/*
+ * Which of the two lane pairs the cable landed on. The PHY's per-lane
+ * registers are addressed relative to it, and so is the crossbar's own
+ * orientation bit, which is why that one stays at normal.
+ */
+#define ZUMAPRO_SS_FLIPPED(p)	((p)->orientation == TYPEC_ORIENTATION_REVERSE)
+#define CRREG_LANE_TX(p, r)	((r) + (ZUMAPRO_SS_FLIPPED(p) ? 0x0300 : 0x0000))
+#define CRREG_LANE_RX(p, r)	((r) + (ZUMAPRO_SS_FLIPPED(p) ? 0x0200 : 0x0100))
+
+/*
+ * The CR-para bus is clocked by this bit. The PHY's state machine samples on
+ * each edge and is far slower than the SoC driving it, so every edge has to
+ * settle before the next register access.
+ */
+static void zumapro_usbdrd_cr_clk(struct exynos5_usbdrd_phy *phy_drd, bool high)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	if (high)
+		reg |= PHY_CR_PARA_CON0_PHY0_CR_PARA_CLK;
+	else
+		reg &= ~PHY_CR_PARA_CON0_PHY0_CR_PARA_CLK;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	fsleep(1);
+}
+
+/*
+ * Return the bus to idle and wait for the PHY to drop its acknowledge. A PHY
+ * that never answers would spin here forever, so the wait is bounded: the
+ * caller's own access then fails and says so.
+ */
+static void zumapro_usbdrd_cr_port_clear(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int cnt = 100;
+	u32 reg;
+
+	writel(0, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON1);
+	writel(0, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON2);
+	writel(PHY_CR_PARA_CON0_PHY0_CR_PARA_SEL,
+	       reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+
+	do {
+		zumapro_usbdrd_cr_clk(phy_drd, true);
+		zumapro_usbdrd_cr_clk(phy_drd, false);
+		reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	} while ((reg & PHY_CR_PARA_CON0_PHY0_CR_PARA_ACK) && --cnt);
+
+	reg &= ~PHY_CR_PARA_CON0_PHY0_CR_PARA_CLK;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+}
+
+/*
+ * @no_ack: the PHY does not acknowledge writes that land in its SRAM while the
+ * Raw PCS is still loading, so those are sent without waiting for one.
+ */
+static void zumapro_usbdrd_cr_write(struct exynos5_usbdrd_phy *phy_drd,
+				    u16 addr, u16 data, bool no_ack)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int cnt = 0;
+	u32 reg;
+
+	zumapro_usbdrd_cr_port_clear(phy_drd);
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	reg &= ~PHY_CR_PARA_CON0_PHY0_CR_PARA_ADDR;
+	reg |= FIELD_PREP(PHY_CR_PARA_CON0_PHY0_CR_PARA_ADDR, addr) |
+	       PHY_CR_PARA_CON0_PHY0_CR_PARA_CLK;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+
+	reg = FIELD_PREP(PHY_CR_PARA_CON2_PHY0_CR_PARA_WR_DATA, data) |
+	      PHY_CR_PARA_CON2_PHY0_CR_PARA_WR_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON2);
+
+	zumapro_usbdrd_cr_clk(phy_drd, true);
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+
+	reg &= ~PHY_CR_PARA_CON2_PHY0_CR_PARA_WR_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON2);
+
+	if (no_ack) {
+		zumapro_usbdrd_cr_clk(phy_drd, true);
+		zumapro_usbdrd_cr_clk(phy_drd, false);
+		return;
+	}
+
+	do {
+		zumapro_usbdrd_cr_clk(phy_drd, true);
+		reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+		if (reg & PHY_CR_PARA_CON0_PHY0_CR_PARA_ACK)
+			break;
+		zumapro_usbdrd_cr_clk(phy_drd, false);
+	} while (++cnt < 10);
+
+	if (cnt == 10)
+		dev_warn(phy_drd->dev, "PHY write to %#06x not acknowledged\n",
+			 addr);
+	else
+		zumapro_usbdrd_cr_clk(phy_drd, false);
+}
+
+static int zumapro_usbdrd_cr_read(struct exynos5_usbdrd_phy *phy_drd, u16 addr,
+				  u16 *data)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int cnt = 0;
+	u32 reg;
+
+	zumapro_usbdrd_cr_port_clear(phy_drd);
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	reg &= ~PHY_CR_PARA_CON0_PHY0_CR_PARA_ADDR;
+	reg |= FIELD_PREP(PHY_CR_PARA_CON0_PHY0_CR_PARA_ADDR, addr) |
+	       PHY_CR_PARA_CON0_PHY0_CR_PARA_CLK;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	writel(PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_EN,
+	       reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON1);
+
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+	zumapro_usbdrd_cr_clk(phy_drd, true);
+
+	writel(0, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON1);
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+
+	do {
+		zumapro_usbdrd_cr_clk(phy_drd, true);
+		reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+		if (reg & PHY_CR_PARA_CON0_PHY0_CR_PARA_ACK)
+			break;
+		zumapro_usbdrd_cr_clk(phy_drd, false);
+	} while (++cnt < 10);
+
+	if (cnt == 10) {
+		dev_warn(phy_drd->dev, "PHY read from %#06x not acknowledged\n",
+			 addr);
+		return -ETIMEDOUT;
+	}
+
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON1);
+	*data = FIELD_GET(PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_DATA, reg);
+
+	return 0;
+}
+
+static int zumapro_usbdrd_cr_update(struct exynos5_usbdrd_phy *phy_drd,
+				    u16 addr, u16 clr, u16 set)
+{
+	u16 data;
+	int ret;
+
+	ret = zumapro_usbdrd_cr_read(phy_drd, addr, &data);
+	if (ret)
+		return ret;
+
+	data &= ~clr;
+	data |= set;
+	zumapro_usbdrd_cr_write(phy_drd, addr, data, false);
+
+	return 0;
+}
+
+static void zumapro_usbdrd_phy_reset(struct exynos5_usbdrd_phy *phy_drd,
+				     bool assert)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_RST_CTRL);
+	if (assert)
+		reg |= PHY_RST_CTRL_PHY_RESET;
+	else
+		reg &= ~PHY_RST_CTRL_PHY_RESET;
+	reg |= PHY_RST_CTRL_PHY_RESET_OVRD_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_RST_CTRL);
+}
+
+static void zumapro_usbdrd_lane0_reset(struct exynos5_usbdrd_phy *phy_drd,
+				       bool assert)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_RST_CTRL);
+	if (assert) {
+		reg &= ~PHY_RST_CTRL_PIPE_LANE0_RESET_N;
+		reg |= PHY_RST_CTRL_PIPE_LANE0_RESET_N_OVRD_EN;
+	} else {
+		reg |= PHY_RST_CTRL_PIPE_LANE0_RESET_N;
+		reg &= ~PHY_RST_CTRL_PIPE_LANE0_RESET_N_OVRD_EN;
+	}
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_RST_CTRL);
+}
+
+/*
+ * Leave the MPLLA at its default rate with spread spectrum on, and hand the
+ * four lanes to USB by taking their DisplayPort MPLL enables away.
+ */
+static void zumapro_usbdrd_config_mplla(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+	reg |= ZUMAPRO_USBDP_PHY_CONFIG0_SS_MPLLA_SSC_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+	reg &= ~DP_CONFIG12_TX_MPLL_EN;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+}
+
+static void zumapro_usbdrd_dptx_reset(struct exynos5_usbdrd_phy *phy_drd,
+				      bool assert)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+	reg |= DP_CONFIG13_TX_DISABLE;
+	reg &= ~DP_CONFIG13_TX_RESET;
+	if (assert)
+		reg |= DP_CONFIG13_TX_RESET;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+}
+
+static void zumapro_usbdrd_phy_initiate(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+	reg |= PHY_CONFIG0_PHY0_ANA_PWR_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+
+	/*
+	 * The PCS and PMA power enables are expected to be set already -- the
+	 * vendor driver never writes them, and a device that has run its
+	 * bootloader USB stack comes up with them set. Set them anyway: a
+	 * combo PHY whose PCS is powered down never boots its SRAM, and
+	 * re-asserting an enable that is already asserted costs nothing.
+	 */
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+	reg |= ZUMAPRO_USBDP_PHY_CONFIG2_UPCS_PWR_EN |
+	       ZUMAPRO_USBDP_PHY_CONFIG2_PCS_PWR_EN |
+	       ZUMAPRO_USBDP_PHY_CONFIG2_PMA_PWR_EN;
+	reg &= ~ZUMAPRO_USBDP_PHY_CONFIG2_TEST_POWERDOWN;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+
+	/*
+	 * The two "stable" bits acknowledge to the PHY that the supplies they
+	 * name have settled, so they cannot be asserted in the same write as
+	 * the enables they acknowledge.
+	 */
+	fsleep(10);
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+	reg |= ZUMAPRO_USBDP_PHY_CONFIG0_ANA_PWR_STABLE;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+	reg |= ZUMAPRO_USBDP_PHY_CONFIG2_UPCS_PWR_STABLE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+
+	/* Reach the PHY's internal registers over CR-para, not CR-JTAG. */
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+	reg |= PHY_CR_PARA_CON0_PHY0_CR_PARA_SEL;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CR_PARA_CON0);
+
+	/*
+	 * Boot the PHY in RAM mode: the Raw PCS loads its algorithms into SRAM
+	 * and runs them from there, which is what lets its caller patch them.
+	 * Bypassing the SRAM would run the hard-wired copies instead.
+	 */
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON);
+	reg &= ~(ZUMAPRO_USBDP_PHY_SRAM_EXT_LD_DONE |
+		 ZUMAPRO_USBDP_PHY_SRAM_BYPASS);
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON);
+
+	/*
+	 * Give the reference-resistor calibration a moment before anything
+	 * reads the PHY back. The vendor waits the same 10us here, even though
+	 * its own comment puts the full calibration, shared between PHYs, at
+	 * up to 240us each.
+	 */
+	fsleep(10);
+
+	/*
+	 * Lane flip. The connector's own orientation bit in TCA_TCPC is left
+	 * at normal and the flip applied here instead, because that bit is
+	 * defined relative to this one.
+	 */
+	writel(ZUMAPRO_SS_FLIPPED(phy_drd) ?
+	       ZUMAPRO_USBDP_PHY_TCA_CONFIG_FLIP_INVERT : 0,
+	       reg_pma + ZUMAPRO_USBDP_PHY_TCA_CONFIG);
+}
+
+/*
+ * The Raw PCS reports SRAM-init-done over the CR-para bus, so the bus has to
+ * be clocked for the status to advance.
+ */
+static int zumapro_usbdrd_wait_sram_init(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int retries = 10000;
+
+	do {
+		unsigned int i;
+
+		for (i = 0; i < 10; i++) {
+			zumapro_usbdrd_cr_clk(phy_drd, true);
+			zumapro_usbdrd_cr_clk(phy_drd, false);
+		}
+		if (readl(reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON) &
+		    ZUMAPRO_USBDP_PHY_SRAM_INIT_DONE)
+			return 0;
+		cond_resched();
+	} while (--retries);
+
+	return -ETIMEDOUT;
+}
+
+static void zumapro_usbdrd_sram_ext_ld_done(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int retries = 1000;
+	u32 reg;
+
+	zumapro_usbdrd_cr_clk(phy_drd, true);
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON);
+	reg |= ZUMAPRO_USBDP_PHY_SRAM_EXT_LD_DONE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON);
+	zumapro_usbdrd_cr_clk(phy_drd, false);
+
+	do {
+		unsigned int i;
+
+		for (i = 0; i < 8; i++) {
+			zumapro_usbdrd_cr_clk(phy_drd, true);
+			zumapro_usbdrd_cr_clk(phy_drd, false);
+		}
+		reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_SRAM_CON);
+	} while (!(reg & ZUMAPRO_USBDP_PHY_SRAM_INIT_DONE) && --retries);
+
+	if (!retries)
+		dev_warn(phy_drd->dev,
+			 "SuperSpeed PHY did not restart after the SRAM load\n");
+}
+
+/*
+ * Ask the crossbar for a lane configuration and wait for it to take the
+ * request. VALID is cleared by the arbiter once it has read the request, so
+ * that -- not the acknowledge event, which needs a controller that answers the
+ * Type-C handshake -- is what says the request was consumed.
+ */
+static int zumapro_usbdrd_tca_ctrl_sync(struct exynos5_usbdrd_phy *phy_drd,
+					unsigned int mux, bool low_power)
+{
+	void __iomem *reg_tca = phy_drd->reg_tca;
+	u32 reg;
+	int ret;
+
+	/* Controller-synced mode: the arbiter must not go to safe state. */
+	reg = readl(reg_tca + ZUMAPRO_USBDP_TCA_CTRLSYNCMODE_CFG0);
+	reg &= ~TCA_CTRLSYNCMODE_CFG0_AUTO_SAFE_STATE;
+	writel(reg, reg_tca + ZUMAPRO_USBDP_TCA_CTRLSYNCMODE_CFG0);
+
+	writel(readl(reg_tca + ZUMAPRO_USBDP_TCA_INTR_STS),
+	       reg_tca + ZUMAPRO_USBDP_TCA_INTR_STS);
+
+	reg = readl(reg_tca + ZUMAPRO_USBDP_TCA_INTR_EN);
+	reg |= TCA_INTR_EN_XA_ACK_EVT_EN | TCA_INTR_EN_XA_TIMEOUT_EVT_EN;
+	writel(reg, reg_tca + ZUMAPRO_USBDP_TCA_INTR_EN);
+
+	reg = readl(reg_tca + ZUMAPRO_USBDP_TCA_TCPC);
+	reg &= ~(TCA_TCPC_MUX_CONTROL | TCA_TCPC_CONNECTOR_ORIENTATION |
+		 TCA_TCPC_LOW_POWER_EN);
+	reg |= FIELD_PREP(TCA_TCPC_MUX_CONTROL, mux) | TCA_TCPC_VALID;
+	if (low_power)
+		reg |= TCA_TCPC_LOW_POWER_EN;
+	writel(reg, reg_tca + ZUMAPRO_USBDP_TCA_TCPC);
+
+	/*
+	 * In controller-synced mode the arbiter asks the controller to quiesce
+	 * its lanes before it switches them, and applies the request on its own
+	 * timeout if no answer comes. Do not wait that out here -- the request
+	 * still lands, just later than this returns.
+	 */
+	ret = readl_poll_timeout(reg_tca + ZUMAPRO_USBDP_TCA_TCPC, reg,
+				 !(reg & TCA_TCPC_VALID), 10, 20000);
+	if (ret)
+		dev_warn(phy_drd->dev,
+			 "crossbar has not yet taken the lane request (mux %u)\n",
+			 mux);
+
+	writel(readl(reg_tca + ZUMAPRO_USBDP_TCA_INTR_STS),
+	       reg_tca + ZUMAPRO_USBDP_TCA_INTR_STS);
+
+	reg = readl(reg_tca + ZUMAPRO_USBDP_TCA_INTR_EN);
+	reg &= ~(TCA_INTR_EN_XA_ACK_EVT_EN | TCA_INTR_EN_XA_TIMEOUT_EVT_EN);
+	writel(reg, reg_tca + ZUMAPRO_USBDP_TCA_INTR_EN);
+
+	return ret;
+}
+
+/*
+ * Receiver and transmitter trim, over the CR-para bus, once the PHY is running
+ * its SRAM copy. Values are the vendor's.
+ */
+static int zumapro_usbdrd_cr_tune(struct exynos5_usbdrd_phy *phy_drd)
+{
+	static const u16 lane_term_ctrl[] = { 0x301a, 0x311a, 0x321a, 0x331a };
+	unsigned int i;
+	u16 data;
+	int ret;
+
+	/* Receiver offset calibration has to finish before anything is tuned. */
+	for (i = 0; i < 100; i++) {
+		ret = zumapro_usbdrd_cr_read(phy_drd, CRREG_LANE_RX(phy_drd, 0x303e),
+					     &data);
+		if (ret)
+			return ret;
+		if (data & BIT(1))
+			break;
+		fsleep(1000);
+	}
+	if (i == 100) {
+		dev_err(phy_drd->dev, "receiver calibration did not finish\n");
+		return -ETIMEDOUT;
+	}
+
+	/* LFPS detect threshold */
+	ret = zumapro_usbdrd_cr_update(phy_drd, CRREG_LANE_RX(phy_drd, 0x10f0),
+				       BIT(3), 0);
+	if (ret)
+		return ret;
+
+	/* Transmit swing level 7, overriding the PHY's own choice */
+	ret = zumapro_usbdrd_cr_update(phy_drd, 0x22, GENMASK(6, 4),
+				       BIT(7) | FIELD_PREP(GENMASK(6, 4), 7));
+	if (ret)
+		return ret;
+
+	/* Transmit current and resistance boost */
+	ret = zumapro_usbdrd_cr_update(phy_drd, CRREG_LANE_TX(phy_drd, 0x10eb), 0,
+				       BIT(3) | GENMASK(2, 1));
+	if (ret)
+		return ret;
+
+	/* Per-lane termination, 50 ohms down to 44 */
+	for (i = 0; i < ARRAY_SIZE(lane_term_ctrl); i++) {
+		ret = zumapro_usbdrd_cr_update(phy_drd, lane_term_ctrl[i],
+					       GENMASK(6, 4),
+					       BIT(7) |
+					       FIELD_PREP(GENMASK(6, 4), 5));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void zumapro_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
+{
+	unsigned int i;
+
+	/*
+	 * A device tree that describes no SuperSpeed banks wants the
+	 * high-speed path only; the link has already been told to expect a
+	 * pipe interface, which is all it needs.
+	 */
+	if (!phy_drd->reg_pma || !phy_drd->reg_tca)
+		return;
+
+	zumapro_usbdrd_lane0_reset(phy_drd, true);
+	zumapro_usbdrd_phy_reset(phy_drd, true);
+
+	zumapro_usbdrd_config_mplla(phy_drd);
+
+	zumapro_usbdrd_dptx_reset(phy_drd, true);
+	zumapro_usbdrd_phy_initiate(phy_drd);
+
+	fsleep(20);
+	zumapro_usbdrd_phy_reset(phy_drd, false);
+	zumapro_usbdrd_lane0_reset(phy_drd, false);
+
+	/*
+	 * Everything below reaches the PHY over the CR-para bus, which only
+	 * answers once the Raw PCS is running. Leave SuperSpeed down rather
+	 * than hammer a PHY that never started: high-speed is unaffected,
+	 * because the link and the eUSB2 PHY are already up by this point.
+	 */
+	if (zumapro_usbdrd_wait_sram_init(phy_drd)) {
+		dev_warn(phy_drd->dev, "SuperSpeed PHY did not start\n");
+		return;
+	}
+
+	/* Hold the receiver PLLs at their low-frequency setting. */
+	zumapro_usbdrd_cr_write(phy_drd, 0x31c5, 0x8000, true);
+	zumapro_usbdrd_cr_write(phy_drd, 0x32c5, 0x8000, true);
+
+	/* Skip the transmitter resistance calibration, overridden below. */
+	for (i = 0; i < 4; i++)
+		zumapro_usbdrd_cr_write(phy_drd, 0x402d + (i << 8), BIT(13),
+					true);
+
+	/* Drive the pull-down and pull-up legs from these values instead. */
+	for (i = 0; i < 8; i++) {
+		zumapro_usbdrd_cr_write(phy_drd, 0x2021 + i * 3, 0x0200, true);
+		zumapro_usbdrd_cr_write(phy_drd, 0x2022 + i * 3, 0x0200, true);
+	}
+
+	/*
+	 * Patch the SRAM copy of the algorithms -- one register, doubling the
+	 * charge-pump reference current -- and release the Raw PCS to run it.
+	 */
+	zumapro_usbdrd_cr_write(phy_drd, 0x005c, 0xc0c4, true);
+	zumapro_usbdrd_sram_ext_ld_done(phy_drd);
+
+	if (zumapro_usbdrd_cr_tune(phy_drd))
+		return;
+
+	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
+}
+
+/*
+ * Undo zumapro_usbdrd_pipe3_init() far enough that the block can be isolated:
+ * back into reset, the PCS powered down and the analog supply released. The
+ * vendor's phy_disable() does exactly this, and does it before the PMU cuts
+ * the block off rather than after.
+ */
+static void zumapro_usbdrd_pipe3_exit(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	if (!reg_pma || !phy_drd->reg_tca)
+		return;
+
+	zumapro_usbdrd_lane0_reset(phy_drd, true);
+	zumapro_usbdrd_phy_reset(phy_drd, true);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+	reg |= ZUMAPRO_USBDP_PHY_CONFIG2_TEST_POWERDOWN;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_CONFIG2);
+
+	reg = readl(reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+	reg &= ~PHY_CONFIG0_PHY0_ANA_PWR_EN;
+	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
+}
+
 static const struct exynos5_usbdrd_phy_config phy_cfg_exynos2200[] = {
 	{
 		.id		= EXYNOS5_DRDPHY_UTMI,
 		.phy_isol	= exynos5_usbdrd_phy_isol,
 		.phy_init	= exynos2200_usbdrd_utmi_init,
+	},
+};
+
+static const struct exynos5_usbdrd_phy_config phy_cfg_zumapro[] = {
+	{
+		.id		= EXYNOS5_DRDPHY_UTMI,
+		.phy_isol	= exynos5_usbdrd_phy_isol,
+		.phy_init	= exynos2200_usbdrd_utmi_init,
+	},
+	{
+		.id		= EXYNOS5_DRDPHY_PIPE3,
+		.phy_isol	= exynos5_usbdrd_phy_isol,
+		.phy_init	= zumapro_usbdrd_pipe3_init,
+		.phy_deinit	= zumapro_usbdrd_pipe3_exit,
 	},
 };
 
@@ -2065,6 +2742,17 @@ static const char * const exynos5_clk_names[] = {
 	"phy",
 };
 
+/*
+ * "phy" gates access to the link registers. The rest belong to the SuperSpeed
+ * half: the 40 MHz reference its PLL runs from, and the APB clocks that reach
+ * the USB-DP controller and the Type-C Aggregator. Nothing else claims those
+ * three, so without them here they are gated as unused and the bring-up reads
+ * a dead register bank.
+ */
+static const char * const zumapro_clk_names[] = {
+	"phy", "ss_ref", "ss_apb", "tca_apb",
+};
+
 static const char * const exynos5_core_clk_names[] = {
 	"ref",
 };
@@ -2102,18 +2790,20 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
  * "ungate" is a harmless re-assertion.
  */
 static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
-	.phy_cfg		= phy_cfg_exynos2200,
+	.phy_cfg		= phy_cfg_zumapro,
 	.phy_ops		= &exynos2200_usbdrd_phy_ops,
 	.resume_prepare		= exynos2200_usbdrd_phy_resume_prepare,
 	.pmu_offset_usbdrd0_phy	= GS101_PHY_CTRL_USB20,
-	.clk_names		= exynos5_clk_names,
-	.n_clks			= ARRAY_SIZE(exynos5_clk_names),
+	.pmu_offset_usbdrd0_phy_ss = GS101_PHY_CTRL_USBDP,
+	.clk_names		= zumapro_clk_names,
+	.n_clks			= ARRAY_SIZE(zumapro_clk_names),
 	.core_clk_names		= NULL,
 	.n_core_clks		= 0,
 	.regulator_names	= NULL,
 	.n_regulators		= 0,
 	.flags			= EXYNOS5_DRD_PHY_FULL_LINK_INIT |
-				  EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID,
+				  EXYNOS5_DRD_PHY_EXYNOS2200_SESSION_VALID |
+				  EXYNOS5_DRD_PHY_CLKS_OUTLIVE_INIT,
 };
 
 static const struct exynos5_usbdrd_phy_drvdata exynos5420_usbdrd_phy = {
@@ -3068,15 +3758,31 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 			return PTR_ERR(reg);
 		phy_drd->reg_phy = reg;
 
-		reg = devm_platform_ioremap_resource_byname(pdev, "pcs");
-		if (IS_ERR(reg))
-			return PTR_ERR(reg);
-		phy_drd->reg_pcs = reg;
+		/*
+		 * The SuperSpeed banks are optional: a combo phy whose device
+		 * tree names none of them is describing the high-speed path
+		 * alone, which needs only the link registers above.
+		 */
+		if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "pcs")) {
+			reg = devm_platform_ioremap_resource_byname(pdev, "pcs");
+			if (IS_ERR(reg))
+				return PTR_ERR(reg);
+			phy_drd->reg_pcs = reg;
+		}
 
-		reg = devm_platform_ioremap_resource_byname(pdev, "pma");
-		if (IS_ERR(reg))
-			return PTR_ERR(reg);
-		phy_drd->reg_pma = reg;
+		if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "pma")) {
+			reg = devm_platform_ioremap_resource_byname(pdev, "pma");
+			if (IS_ERR(reg))
+				return PTR_ERR(reg);
+			phy_drd->reg_pma = reg;
+		}
+
+		if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "tca")) {
+			reg = devm_platform_ioremap_resource_byname(pdev, "tca");
+			if (IS_ERR(reg))
+				return PTR_ERR(reg);
+			phy_drd->reg_tca = reg;
+		}
 	} else {
 		/* DTB with just a single region */
 		phy_drd->reg_phy = devm_platform_ioremap_resource(pdev, 0);

@@ -251,6 +251,7 @@ extern struct platform_driver exynos5433_decon_driver;
 extern struct platform_driver decon_driver;
 extern struct platform_driver zumapro_decon_driver;
 extern struct platform_driver zumapro_dpp_driver;
+extern struct platform_driver zumapro_dp_driver;
 extern struct platform_driver dp_driver;
 extern struct platform_driver dsi_driver;
 extern struct platform_driver mixer_driver;

@@ -189,6 +189,15 @@ static struct exynos_drm_driver_info exynos_drm_drivers[] = {
 		DRV_PTR(zumapro_decon_driver, CONFIG_DRM_EXYNOS_ZUMAPRO_DPU),
 		DRM_COMPONENT_DRIVER
 	}, {
+		/*
+		 * Not a component: the DisplayPort link lives in the USB power
+		 * domain and comes up with the connector rather than with the
+		 * display pipeline, so it registers a bridge and waits to be
+		 * attached instead of holding up the DRM device's bind.
+		 */
+		DRV_PTR(zumapro_dp_driver, CONFIG_DRM_EXYNOS_ZUMAPRO_DP),
+		0
+	}, {
 		DRV_PTR(mixer_driver, CONFIG_DRM_EXYNOS_MIXER),
 		DRM_COMPONENT_DRIVER
 	}, {

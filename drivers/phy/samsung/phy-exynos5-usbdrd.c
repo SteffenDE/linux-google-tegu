@@ -484,6 +484,8 @@ struct exynos5_usbdrd_phy_config {
 	void (*phy_init)(struct exynos5_usbdrd_phy *phy_drd);
 	/* Quiesce what phy_init() started, before the block is isolated. */
 	void (*phy_deinit)(struct exynos5_usbdrd_phy *phy_drd);
+	/* Called when the connector reports a new cable orientation. */
+	void (*set_orientation)(struct exynos5_usbdrd_phy *phy_drd);
 	unsigned int (*set_refclk)(struct phy_usb_instance *inst);
 };
 
@@ -533,6 +535,8 @@ struct exynos5_usbdrd_phy_drvdata {
  * @regulators: regulators for phy
  * @sw: TypeC orientation switch handle
  * @orientation: TypeC connector orientation - normal or flipped
+ * @pipe3_ready: the SuperSpeed sub-phy has completed its bring-up, so its
+ *		 register banks answer and its lane routing can be changed
  */
 struct exynos5_usbdrd_phy {
 	struct device *dev;
@@ -557,6 +561,7 @@ struct exynos5_usbdrd_phy {
 
 	struct typec_switch_dev *sw;
 	enum typec_orientation orientation;
+	bool pipe3_ready;
 };
 
 static inline
@@ -2546,6 +2551,24 @@ static void zumapro_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
 		return;
 
 	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
+	phy_drd->pipe3_ready = true;
+}
+
+/*
+ * The cable can be turned over after the phy came up, and the lanes it lands
+ * on are chosen here rather than by the crossbar's own orientation bit. Move
+ * them, and ask the crossbar to route them again so the change takes effect.
+ */
+static void zumapro_usbdrd_pipe3_set_orientation(struct exynos5_usbdrd_phy *phy_drd)
+{
+	if (!phy_drd->pipe3_ready)
+		return;
+
+	writel(ZUMAPRO_SS_FLIPPED(phy_drd) ?
+	       ZUMAPRO_USBDP_PHY_TCA_CONFIG_FLIP_INVERT : 0,
+	       phy_drd->reg_pma + ZUMAPRO_USBDP_PHY_TCA_CONFIG);
+
+	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
 }
 
 /*
@@ -2561,6 +2584,8 @@ static void zumapro_usbdrd_pipe3_exit(struct exynos5_usbdrd_phy *phy_drd)
 
 	if (!reg_pma || !phy_drd->reg_tca)
 		return;
+
+	phy_drd->pipe3_ready = false;
 
 	zumapro_usbdrd_lane0_reset(phy_drd, true);
 	zumapro_usbdrd_phy_reset(phy_drd, true);
@@ -2593,6 +2618,7 @@ static const struct exynos5_usbdrd_phy_config phy_cfg_zumapro[] = {
 		.phy_isol	= exynos5_usbdrd_phy_isol,
 		.phy_init	= zumapro_usbdrd_pipe3_init,
 		.phy_deinit	= zumapro_usbdrd_pipe3_exit,
+		.set_orientation = zumapro_usbdrd_pipe3_set_orientation,
 	},
 };
 
@@ -2600,6 +2626,7 @@ static int exynos5_usbdrd_orien_sw_set(struct typec_switch_dev *sw,
 				       enum typec_orientation orientation)
 {
 	struct exynos5_usbdrd_phy *phy_drd = typec_switch_get_drvdata(sw);
+	unsigned int i;
 	int ret;
 
 	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
@@ -2637,6 +2664,14 @@ static int exynos5_usbdrd_orien_sw_set(struct typec_switch_dev *sw,
 		}
 
 		phy_drd->orientation = orientation;
+
+		for (i = 0; i < EXYNOS5_DRDPHYS_NUM; i++) {
+			const struct exynos5_usbdrd_phy_config *cfg =
+				phy_drd->phys[i].phy_cfg;
+
+			if (cfg && cfg->set_orientation)
+				cfg->set_orientation(phy_drd);
+		}
 	}
 
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);

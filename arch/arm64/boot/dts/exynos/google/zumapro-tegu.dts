@@ -1289,8 +1289,20 @@
 	};
 };
 
+/*
+ * The DisplayPort transmitter, and the combo PHY's mode switch that tells it
+ * which lanes a negotiated alternate mode left for it.  Entering the mode also
+ * needs power delivery on the connector, which the bootloader disables while
+ * its own serial console is on -- so this is described here and reached only
+ * once that console is turned off.
+ */
+&dp {
+	status = "okay";
+};
+
 &usb32drd {
 	orientation-switch;
+	mode-switch;
 
 	port {
 		usb32drd_orien_sw: endpoint {

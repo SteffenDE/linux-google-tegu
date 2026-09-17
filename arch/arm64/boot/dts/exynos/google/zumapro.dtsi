@@ -2652,6 +2652,49 @@
 		};
 
 		/*
+		 * DisplayPort transmitter.  Only the link registers are mapped
+		 * here: the downstream node also claims 0x11130000 and
+		 * 0x11140000, but those are the combo PHY's own banks, which
+		 * the USB32DRD node above already maps and programs.  The lanes
+		 * reach the connector through that PHY and AUX through the
+		 * TCPC's SBU switch; neither is this node's to describe.
+		 *
+		 * DPOSC is the one clock the whole block keeps time by -- AUX
+		 * bit timers, the hotplug deglitch, the millisecond tick -- and
+		 * the vendor specifies 40 MHz for it, which is fout_shared2_d2
+		 * divided by ten.  The APB gate is named as well: the vendor
+		 * node does not, because their register layer reaches it
+		 * through the block's Q-channel, and an unclaimed APB clock
+		 * means the first register access reads a gated block.
+		 */
+		dp: displayport@110f0000 {
+			compatible = "google,zumapro-dp";
+			reg = <0x110f0000 0x6000>;
+
+			interrupts = <GIC_SPI 389 IRQ_TYPE_LEVEL_HIGH 0>;
+
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_DP_LINK_DP_OSC_CLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_DP_LINK_PCLK>;
+			clock-names = "dposc", "pclk";
+
+			assigned-clocks = <&cmu_top CLK_MOUT_CMU_HSI0_DPOSC>,
+					  <&cmu_hsi0 CLK_MOUT_HSI0_DPOSC_USER>,
+					  <&cmu_top CLK_DOUT_CMU_HSI0_DPOSC>;
+			assigned-clock-parents =
+					  <&cmu_top CLK_FOUT_SHARED2_D2>,
+					  <&cmu_top CLK_DOUT_CMU_HSI0_DPOSC>,
+					  <0>;
+			assigned-clock-rates = <0>, <0>, <40000000>;
+
+			phys = <&usb32drd 1>;
+			phy-names = "dp";
+
+			power-domains = <&pd_hsi0>;
+
+			status = "disabled";
+		};
+
+		/*
 		 * Synopsys eUSB2 HS PHY.  The EUSBCON control block is a separate
 		 * MMIO resource at 0x11110000 (downstream reg index 1); its register
 		 * offsets (RST 0x0, COMMON 0x4, PLLCFG0 0x8, PLLCFG1 0xc, TX 0x14,

@@ -5,7 +5,8 @@ config DRM_EXYNOS
 	depends on ARCH_S3C64XX || ARCH_S5PV210 || ARCH_EXYNOS || COMPILE_TEST
 	depends on MMU
 	select DRM_CLIENT_SELECTION
-	select DRM_DISPLAY_HELPER if DRM_EXYNOS_DP
+	select DRM_DISPLAY_HELPER if DRM_EXYNOS_DP || DRM_EXYNOS_ZUMAPRO_DP
+	select DRM_DISPLAY_DP_HELPER if DRM_EXYNOS_ZUMAPRO_DP
 	select DRM_KMS_HELPER
 	select VIDEOMODE_HELPERS
 	select FB_DMAMEM_HELPERS if DRM_FBDEV_EMULATION
@@ -46,6 +47,18 @@ config DRM_EXYNOS_ZUMAPRO_DPU
 	  This is currently a bring-up scaffold.  It validates the Device
 	  Tree topology and exposes an opt-in DECON0 color-map CRTC path for
 	  trace comparison; DPP/RDMA fetch is not programmed.
+
+config DRM_EXYNOS_ZUMAPRO_DP
+	bool "DisplayPort on Google Tensor G4 Zumapro"
+	depends on DRM_EXYNOS_ZUMAPRO_DPU
+	depends on PHY_EXYNOS5_USBDRD
+	help
+	  Choose this option to build the Google Tensor G4 Zumapro
+	  DisplayPort transmitter.
+
+	  The lanes it drives come off the USB-C combo PHY and are shared
+	  with USB3, so this needs that PHY driver for the DisplayPort half
+	  of it.
 
 config DRM_EXYNOS_MIXER
 	bool "Mixer"

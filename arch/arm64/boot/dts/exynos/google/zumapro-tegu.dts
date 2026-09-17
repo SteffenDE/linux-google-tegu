@@ -646,6 +646,82 @@
 				0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00>;
 		};
 	};
+
+	/*
+	 * The charging policy layer, and the last of the stack.  It runs the
+	 * multi CC-CV step charge over google_battery's table, applies the
+	 * charge stop and start levels, and owns the battery defender that
+	 * pauses charging when the pack sits hot and full.
+	 *
+	 * Three of the four supplies it names differ from the vendor's, and
+	 * each difference removes a layer rather than adding one:
+	 *
+	 *   - chg-power-supply names the MAX77779 directly rather than "gccd".
+	 *     google_ccd exists to present several wired chargers as one, and
+	 *     this board describes a single one; the six properties this layer
+	 *     asks of a charger -- constant charge current and voltage, the
+	 *     termination current, taper control, charging-enabled and the
+	 *     GBMS charger state -- are all answered by max77779_charger
+	 *     itself.
+	 *   - usb-power-supply is omitted entirely rather than pointed at the
+	 *     TCPM source supply.  This layer asks a USB supply for PRESENT,
+	 *     which TCPM deliberately does not implement -- naming it would
+	 *     make every read return -EINVAL, which the caller stores as the
+	 *     value, leaving "present" permanently true and the disconnect
+	 *     path unreachable.  Left unnamed, the driver substitutes its
+	 *     online state, which it reads from the TCPM supply named below
+	 *     anyway.  So the vendor's usb_psy.c buys nothing here.
+	 *   - wlc-power-supply is omitted with the rest of the wireless
+	 *     properties.  The P9222 receiver has no driver here, so nothing
+	 *     registers a "wireless" supply; the lookup is optional and the
+	 *     pad still charges, because its power reaches the MAX77779's WCIN
+	 *     input and is reported by that driver's own "dc" supply.
+	 *
+	 * tcpm-power-supply stays a phandle to the TCPC, which is how the PPS
+	 * code reaches the partner's advertised source capabilities.
+	 */
+	google,charger {
+		compatible = "google,charger";
+		#cooling-cells = <0x02>;
+
+		google,chg-power-supply = "main-charger";
+		google,bat-power-supply = "battery";
+		google,tcpm-power-supply = <&usb_typec>;
+
+		google,fv-max-uv = <0x47b760>;
+		google,chg-termination-5v;
+		google,chg-taper-last-tier;
+
+		/*
+		 * Battery defender: stop charging and drain back when the pack
+		 * has been hot and near full for long enough, and resume when
+		 * it cools or falls back.
+		 */
+		google,bd-temp-enable;
+		google,bd-trigger-time = <0x5460>;
+		google,bd-trigger-temp = <0x15e>;
+		google,bd-trigger-voltage = <0x4127b0>;
+		google,bd-recharge-voltage = <0x40d990>;
+		google,bd-drainto-soc = <0x50>;
+		google,bd-recharge-soc = <0x4f>;
+		google,bd-resume-abs-temp = <0x118>;
+		google,bd-resume-soc = <0x32>;
+		google,bd-resume-time = <0x3840>;
+		google,bd-resume-temp = <0x122>;
+
+		/* Charge-current ceilings for the thermal cooling device. */
+		google,thermal-mitigation = <0x4c4b40 0x498c20 0x46cd00 0x440de0
+			0x414ec0 0x3e8fa0 0x3bd080 0x391160 0x365240 0x339320
+			0x30d400 0x2e14e0 0x2b55c0 0x2896a0 0x25d780 0x231860
+			0x205940 0x1d9a20 0x1adb00 0x181be0 0x155cc0 0x129da0
+			0xfde80 0xd1f60 0xa6040 0x7a120>;
+		google,thermal-mitigation-budgets = <0x389c30 0x367d38 0x348938
+			0x324ee8 0x303f90 0x2e6300 0x2c8670 0x2ae090 0x293e98
+			0x27a470 0x260a48 0x238d90 0x2191c0 0x1fbd00 0x1e0780
+			0x1c7528 0x1b0210 0x19b220 0x185678 0x16fad0 0x1608a0
+			0x151670 0x149d58 0x142440 0x136ca8 0x12b128>;
+		google,thermal-stats-lvl-map = <0x00 0x02 0x05 0x08 0x0b>;
+	};
 };
 
 &watchdog_cl0 {

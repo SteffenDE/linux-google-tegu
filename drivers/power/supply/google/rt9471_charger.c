@@ -2178,22 +2178,29 @@ static int rt9471_resume(struct device *dev)
 
 static SIMPLE_DEV_PM_OPS(rt9471_pm_ops, rt9471_suspend, rt9471_resume);
 
+/*
+ * Only "richtek,swchg" here.  Mainline carries its own rt9471 driver, which
+ * matches "richtek,rt9471"; dropping that compatible from this table lets the
+ * two be built together and leaves the device tree to say which one a board
+ * wants.  The driver and i2c-id names are distinguished for the same reason --
+ * two i2c drivers registering the same name makes the second one fail with
+ * -EEXIST.
+ */
 static const struct of_device_id rt9471_of_device_id[] = {
-	{ .compatible = "richtek,rt9471", },
 	{ .compatible = "richtek,swchg", },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, rt9471_of_device_id);
 
 static const struct i2c_device_id rt9471_i2c_device_id[] = {
-	{ "rt9471", 0 },
+	{ "rt9471-gbms", 0 },
 	{ },
 };
 MODULE_DEVICE_TABLE(i2c, rt9471_i2c_device_id);
 
 static struct i2c_driver rt9471_i2c_driver = {
 	.driver = {
-		.name = "rt9471",
+		.name = "rt9471-gbms",
 		.owner = THIS_MODULE,
 		.of_match_table = of_match_ptr(rt9471_of_device_id),
 		.pm = &rt9471_pm_ops,

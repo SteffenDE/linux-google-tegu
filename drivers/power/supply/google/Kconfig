@@ -308,6 +308,24 @@ config CHARGER_RT9471_GBMS
 	  To compile this as a module, choose M here: the module will be
 	  called rt9471_charger.
 
+config GOOGLE_TCPM_BUCK
+	tristate "Google TCPM buck-mode voter"
+	depends on GOOGLE_BMS
+	depends on TYPEC_TCPM
+	help
+	  Votes the MAX77779 charger's USB buck mode from TCPM's sink state.
+
+	  The charger derives its operating mode by arbitration, and the ballot
+	  that enables the buck is cast by the vendor's own Type-C port
+	  controller driver. A board running mainline's TCPM instead has
+	  nothing casting it, and the charger resolves to all-off however much
+	  else is voting. This watches the sink state TCPM already reports and
+	  casts that ballot, so the vendor port controller need not be ported
+	  for charging to work.
+
+	  To compile this as a module, choose M here: the module will be
+	  called google-tcpm-buck.
+
 config CHARGER_P9221
 	tristate "IDT P9221/P9222 wireless power receiver"
 	depends on GOOGLE_BMS

@@ -680,6 +680,25 @@
 	 * tcpm-power-supply stays a phandle to the TCPC, which is how the PPS
 	 * code reaches the partner's advertised source capabilities.
 	 */
+	/*
+	 * The buck-mode ballot mainline's Type-C stack does not cast.
+	 *
+	 * The charger arbitrates its operating mode from the CHARGER_MODE
+	 * election, and google_charger's vote asks only for a charge current
+	 * -- it never says that an input is attached.  The vote that does is
+	 * cast by the vendor's own port controller driver on sink attach, and
+	 * this board runs mainline's tcpci_maxim instead, which knows nothing
+	 * about it.  Without the ballot the charger resolves to all-off and
+	 * switches charging off entirely, so this is not optional.
+	 *
+	 * It watches the ONLINE property of the supply named here, which is
+	 * the sink state TCPM already tracks.
+	 */
+	google,tcpm-buck {
+		compatible = "google,tcpm-buck";
+		google,tcpm-power-supply = <&usb_typec>;
+	};
+
 	google,charger {
 		compatible = "google,charger";
 		#cooling-cells = <0x02>;

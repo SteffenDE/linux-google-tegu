@@ -37,6 +37,11 @@ google-charger-y			+= google_dc_pps.o
 
 obj-$(CONFIG_GOOGLE_CCD)		+= google_ccd.o
 
+# Not a vendor file: local glue, so mainline's TCPM can supply the buck-mode
+# ballot the vendor's port controller driver would have cast.
+obj-$(CONFIG_GOOGLE_TCPM_BUCK)		+= google-tcpm-buck.o
+google-tcpm-buck-y			:= google_tcpm_buck.o
+
 # MAX77779 IF-PMIC: charger, fuel gauge, V/I monitor, scratchpad, I2C master
 # and the PMIC core that owns their shared IRQ.
 obj-$(CONFIG_CHARGER_MAX77779)		+= max77779-charger.o

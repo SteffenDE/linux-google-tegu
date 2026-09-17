@@ -486,6 +486,35 @@
 		mode-shutdown-thermal = <0x80000051>;
 		mode-shutdown-thermal-battery = <0x80000051>;
 	};
+
+	/*
+	 * Where GBMS finds the battery pack EEPROM.  gbms_storage locates this
+	 * by node name -- of_find_node_by_name(NULL, "google_bms") -- so the
+	 * name is the binding and there is no compatible; it reads the pack's
+	 * records through the nvmem device named here, which is the ordinary
+	 * at24 on i2c-10 (research/dumped.dts:20030).
+	 *
+	 * Deliberately no "google,lotr-version", matching downstream.  Absent,
+	 * the layout version defaults to GBMS_LOTR_DEFAULT (0xff), and
+	 * gbms_lotr_update() converts only when the *requested* version is V1 or
+	 * V2 -- so the default cannot reach either migration whatever the pack
+	 * itself holds.  That matters because both migrations are destructive to
+	 * records the Android slot also reads: V1 shifts 900 bytes of history up
+	 * by six and zeroes five bytes at 0x5e, V2 writes 0xff over 0x3e2..0x3fe.
+	 *
+	 * The EEPROM node's "read-only" is a second guard, but not where it
+	 * looks: nvmem_device_write() does not consult nvmem->read_only at all.
+	 * What refuses the write is at24, which leaves write_max at 0 for a
+	 * read-only part, so at24_adjust_write_count() clamps the count to zero
+	 * and regmap returns -EINVAL before any byte is sent.  Effective, and
+	 * thinner than it sounds -- it rests on regmap rejecting a zero-length
+	 * write rather than looping.
+	 */
+	google_bms {
+		nvmem = <&battery_pack_eeprom>;
+		nvmem-names = "bms-pack-eeprom";
+		google,bee-name = "bms-pack-eeprom";
+	};
 };
 
 &watchdog_cl0 {

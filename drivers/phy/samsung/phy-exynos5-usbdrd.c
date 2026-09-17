@@ -537,6 +537,11 @@ struct exynos5_usbdrd_phy_drvdata {
  * @orientation: TypeC connector orientation - normal or flipped
  * @pipe3_ready: the SuperSpeed sub-phy has completed its bring-up, so its
  *		 register banks answer and its lane routing can be changed
+ * @dp_link_rate: the DisplayPort link rate the lanes are configured for, in
+ *		  Mb/s; several later steps depend on which side of the reduced
+ *		  bit rate it falls
+ * @dp_active: DisplayPort holds the lanes. USB must not take them back, and
+ *	       the connector must not reroute them, until it says otherwise
  */
 struct exynos5_usbdrd_phy {
 	struct device *dev;
@@ -562,6 +567,8 @@ struct exynos5_usbdrd_phy {
 	struct typec_switch_dev *sw;
 	enum typec_orientation orientation;
 	bool pipe3_ready;
+	unsigned int dp_link_rate;
+	bool dp_active;
 };
 
 static inline
@@ -2031,6 +2038,8 @@ static int exynos5_usbdrd_phy_clk_handle(struct exynos5_usbdrd_phy *phy_drd)
 
 /* tcpc_mux_control: no connection, USB3.1, DP 4 lanes, USB3.1 + DP lanes 0/1 */
 #define TCA_MUX_CONTROL_USB31				1
+#define TCA_MUX_CONTROL_DP4				2
+#define TCA_MUX_CONTROL_USB31_DP2			3
 
 /*
  * Which of the two lane pairs the cable landed on. The PHY's per-lane
@@ -2582,6 +2591,15 @@ static void zumapro_usbdrd_pipe3_set_orientation(struct exynos5_usbdrd_phy *phy_
 	if (!phy_drd->pipe3_ready)
 		return;
 
+	/*
+	 * While DisplayPort holds the lanes, asking the crossbar for USB would
+	 * take them out from under a live link. A cable that has been turned
+	 * over has been unplugged first, which ends the mode and brings us back
+	 * here with the lanes free.
+	 */
+	if (phy_drd->dp_active)
+		return;
+
 	writel(ZUMAPRO_SS_FLIPPED(phy_drd) ?
 	       ZUMAPRO_USBDP_PHY_TCA_CONFIG_FLIP_INVERT : 0,
 	       phy_drd->reg_pma + ZUMAPRO_USBDP_PHY_TCA_CONFIG);
@@ -2616,6 +2634,595 @@ static void zumapro_usbdrd_pipe3_exit(struct exynos5_usbdrd_phy *phy_drd)
 	reg &= ~PHY_CONFIG0_PHY0_ANA_PWR_EN;
 	writel(reg, reg_pma + EXYNOSAUTOV920_USB31DRD_PHY_CONFIG0);
 }
+
+/*
+ * DisplayPort: the combo PHY's other consumer.
+ *
+ * The same four lanes carry either USB3 or DisplayPort, and the crossbar
+ * decides which. DisplayPort's own half of the PHY has a register block
+ * alongside the SuperSpeed one, and unlike SuperSpeed it is programmed
+ * directly rather than over the CR-para bus: a rate is a set of MPLLB
+ * coefficients, and the drive levels are a board table.
+ */
+#define ZUMAPRO_USBDP_PHY_DP_AUX_CONFIG0		0x200
+#define DP_AUX_CONFIG0_PWDNB				BIT(9)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG1			0x208
+#define DP_CONFIG1_MPLLB_CP_INT				GENMASK(6, 0)
+#define DP_CONFIG1_MPLLB_CP_INT_GS			GENMASK(14, 8)
+#define DP_CONFIG1_MPLLB_CP_PROP			GENMASK(22, 16)
+#define DP_CONFIG1_MPLLB_CP_PROP_GS			GENMASK(30, 24)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG2			0x20c
+#define DP_CONFIG2_MPLLB_DIV5_CLK_EN			BIT(0)
+#define DP_CONFIG2_MPLLB_FRACN_CFG_UPDATE_EN		BIT(14)
+#define DP_CONFIG2_MPLLB_FRACN_EN			BIT(15)
+#define DP_CONFIG2_MPLLB_FRACN_DEN			GENMASK(31, 16)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG3			0x210
+#define DP_CONFIG3_MPLLB_FRACN_QUOT			GENMASK(15, 0)
+#define DP_CONFIG3_MPLLB_FRACN_REM			GENMASK(31, 16)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG4			0x214
+#define DP_CONFIG4_MPLLB_FREQ_VCO			GENMASK(1, 0)
+#define DP_CONFIG4_MPLLB_MULTIPLIER			GENMASK(15, 4)
+#define DP_CONFIG4_MPLLB_PMIX_EN			BIT(16)
+#define DP_CONFIG4_MPLLB_SSC_EN				BIT(17)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG5			0x218
+#define DP_CONFIG5_MPLLB_SSC_PEAK			GENMASK(19, 0)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG6			0x21c
+#define DP_CONFIG6_MPLLB_SSC_STEPSIZE			GENMASK(20, 0)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG7			0x220
+#define DP_CONFIG7_MPLLB_SSC_UP_SPREAD			BIT(0)
+#define DP_CONFIG7_MPLLB_TX_CLK_DIV			GENMASK(3, 1)
+#define DP_CONFIG7_MPLLB_V2I				GENMASK(5, 4)
+#define DP_CONFIG7_MPLLB_WORD_DIV2_EN			BIT(6)
+#define DP_CONFIG7_REF_CLK_EN				BIT(8)
+
+/* One six-bit field per lane, at bits 0, 8, 16 and 24. */
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG8			0x224	/* eq main */
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG9			0x228	/* eq post */
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG10			0x22c	/* eq pre */
+#define DP_CONFIG_EQ_SHIFT(_l)				((_l) * 8)
+#define DP_CONFIG_EQ_MASK				0x3f
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG11			0x230
+/* Two bits per lane; 0b11 is powered down, 0b00 is powered up. */
+#define DP_CONFIG11_TX_PSTATE				GENMASK(11, 4)
+
+/* DP_CONFIG12 and DP_CONFIG13 are shared with the SuperSpeed path above. */
+#define DP_CONFIG12_TX_WIDTH				GENMASK(7, 0)
+#define DP_CONFIG12_TX_REQ				GENMASK(15, 12)
+#define DP_CONFIG12_TX_ACK				GENMASK(19, 16)
+
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG17			0x248
+#define DP_CONFIG17_TX_DCC_BYP_AC_CAP			GENMASK(3, 0)
+
+/*
+ * The MPLLB coefficients for each link rate, from the vendor. They are PLL
+ * solutions rather than anything derivable here, so they are taken verbatim.
+ * The spread-spectrum pair is the maximum down-spread the rate allows.
+ */
+struct zumapro_usbdrd_dp_mpllb {
+	unsigned int link_rate;		/* Mb/s */
+	u8 cp_int_gs;
+	u8 cp_prop;
+	u16 fracn_quot;
+	u8 freq_vco;
+	u16 multiplier;
+	u8 tx_clk_div;
+	u8 v2i;
+	u32 ssc_peak;
+	u32 ssc_stepsize;
+};
+
+static const struct zumapro_usbdrd_dp_mpllb zumapro_dp_mpllb[] = {
+	{ 1620, 0x41, 0x1c, 0xc000, 0x3, 0x130, 0x2, 0x2, 0xd800, 0x16ae1 },
+	{ 2700, 0x43, 0x14, 0xa000, 0x3, 0x0f8, 0x1, 0x3, 0xb400, 0x12e66 },
+	{ 5400, 0x43, 0x14, 0xa000, 0x3, 0x0f8, 0x0, 0x3, 0xb400, 0x12e66 },
+	{ 8100, 0x43, 0x19, 0xf000, 0x2, 0x184, 0x0, 0x3, 0x10e00, 0x1c59a },
+};
+
+/*
+ * Board drive levels, indexed by voltage swing and then by pre-emphasis. The
+ * combinations the DisplayPort specification does not allow are left zero and
+ * never reached, because a sink cannot ask for them. Below HBR2 the receiver
+ * boost is off; at HBR2 and above it is on.
+ */
+struct zumapro_usbdrd_dp_level {
+	u8 eq_main;
+	u8 eq_post;
+};
+
+static const struct zumapro_usbdrd_dp_level
+zumapro_dp_levels[2][4][4] = {
+	{	/* RBR and HBR */
+		{ { 21, 0 }, { 26, 5 }, { 31, 10 }, { 41, 20 } },
+		{ { 31, 0 }, { 38, 7 }, { 46, 15 } },
+		{ { 43, 0 }, { 52, 9 } },
+		{ { 62, 0 } },
+	},
+	{	/* HBR2 and HBR3 */
+		{ { 21, 0 }, { 25, 4 }, { 29, 8 }, { 35, 14 } },
+		{ { 31, 0 }, { 37, 6 }, { 42, 11 } },
+		{ { 43, 0 }, { 51, 8 } },
+		{ { 62, 0 } },
+	},
+};
+
+/*
+ * The drive levels are finished in the PHY's own register space, over the
+ * CR-para bus: a per-lane receiver boost, and three registers the vendor
+ * writes to fixed values whatever the level asked for.
+ */
+#define ZUMAPRO_DP_CR_RBOOST(_l)	(0x1005 + (_l) * 0x100)
+#define ZUMAPRO_DP_CR_RBOOST_HIGH	0x70
+#define ZUMAPRO_DP_CR_RBOOST_LOW	0x40
+#define ZUMAPRO_DP_CR_VSWING		0x22
+#define ZUMAPRO_DP_CR_VSWING_VAL	0xd0
+#define ZUMAPRO_DP_CR_LANE_CTRL		0x1002
+#define ZUMAPRO_DP_CR_LANE_CTRL_VAL	0x180
+#define ZUMAPRO_DP_CR_TX_BOOST		0x10eb
+#define ZUMAPRO_DP_CR_TX_BOOST_VAL	0x0
+
+static void zumapro_usbdrd_dp_aux_enable(struct exynos5_usbdrd_phy *phy_drd,
+					 bool enable)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_AUX_CONFIG0);
+	if (enable)
+		reg |= DP_AUX_CONFIG0_PWDNB;
+	else
+		reg &= ~DP_AUX_CONFIG0_PWDNB;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_AUX_CONFIG0);
+}
+
+/* 0b11 per lane powers it down, 0b00 powers it up. */
+static u32 zumapro_usbdrd_dp_lane_pattern(unsigned int lanes, u32 per_lane_on,
+					  u32 per_lane_off)
+{
+	u32 val = 0;
+	unsigned int i;
+
+	for (i = 0; i < 4; i++)
+		val |= (i < lanes ? per_lane_on : per_lane_off) << (i * 2);
+
+	return val;
+}
+
+/*
+ * Ask the transmitter to adopt what has just been written to its lane
+ * registers, and wait for it to say it has.
+ */
+static int zumapro_usbdrd_dp_tx_update(struct exynos5_usbdrd_phy *phy_drd,
+				       unsigned int lanes)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 mask = GENMASK(lanes - 1, 0);
+	u32 reg;
+	int ret;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+	reg &= ~DP_CONFIG12_TX_REQ;
+	reg |= FIELD_PREP(DP_CONFIG12_TX_REQ, mask);
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+
+	ret = readl_poll_timeout(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12, reg,
+				 !(FIELD_GET(DP_CONFIG12_TX_REQ, reg) & mask),
+				 10, 2000);
+	if (ret) {
+		dev_err(phy_drd->dev, "DP lane request was not taken\n");
+		return ret;
+	}
+
+	ret = readl_poll_timeout(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12, reg,
+				 !(FIELD_GET(DP_CONFIG12_TX_ACK, reg) & mask),
+				 10, 2000);
+	if (ret)
+		dev_err(phy_drd->dev, "DP lane request was not acknowledged\n");
+
+	return ret;
+}
+
+/*
+ * Park every DisplayPort transmitter: drop the lanes out of the PLL, power
+ * them down, pulse their reset and leave them disabled. The vendor runs this
+ * both before it configures a link and when it tears one down, and ends it by
+ * telling the crossbar the DisplayPort side is not holding the lanes.
+ */
+static void zumapro_usbdrd_dp_park_lanes(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+	reg &= ~DP_CONFIG12_TX_MPLL_EN;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+	reg |= DP_CONFIG11_TX_PSTATE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+
+	zumapro_usbdrd_dptx_reset(phy_drd, true);
+	zumapro_usbdrd_dptx_reset(phy_drd, false);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+	reg |= DP_CONFIG13_TX_DISABLE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+
+	/* All four lanes, because all four were just parked. */
+	zumapro_usbdrd_dp_tx_update(phy_drd, 4);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+	reg |= DP_CONFIG19_DPALT_DISABLE_ACK;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+}
+
+static int zumapro_usbdrd_dp_set_rate(struct exynos5_usbdrd_phy *phy_drd,
+				      struct phy_configure_opts_dp *dp)
+{
+	const struct zumapro_usbdrd_dp_mpllb *mpllb = NULL;
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int i;
+	u32 reg;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(zumapro_dp_mpllb); i++)
+		if (zumapro_dp_mpllb[i].link_rate == dp->link_rate)
+			mpllb = &zumapro_dp_mpllb[i];
+	if (!mpllb)
+		return -EINVAL;
+
+	if (dp->lanes != 2 && dp->lanes != 4)
+		return -EINVAL;
+
+	phy_drd->dp_link_rate = dp->link_rate;
+
+	/* Park the lanes and reset them while the PLL beneath is reprogrammed. */
+	zumapro_usbdrd_dp_park_lanes(phy_drd);
+
+	writel(FIELD_PREP(DP_CONFIG1_MPLLB_CP_INT, 0xe) |
+	       FIELD_PREP(DP_CONFIG1_MPLLB_CP_INT_GS, mpllb->cp_int_gs) |
+	       FIELD_PREP(DP_CONFIG1_MPLLB_CP_PROP, mpllb->cp_prop) |
+	       FIELD_PREP(DP_CONFIG1_MPLLB_CP_PROP_GS, 0x7f),
+	       reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG1);
+
+	writel(DP_CONFIG2_MPLLB_DIV5_CLK_EN |
+	       DP_CONFIG2_MPLLB_FRACN_CFG_UPDATE_EN |
+	       DP_CONFIG2_MPLLB_FRACN_EN |
+	       FIELD_PREP(DP_CONFIG2_MPLLB_FRACN_DEN, 1),
+	       reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG2);
+
+	writel(FIELD_PREP(DP_CONFIG3_MPLLB_FRACN_QUOT, mpllb->fracn_quot),
+	       reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG3);
+
+	writel(FIELD_PREP(DP_CONFIG4_MPLLB_FREQ_VCO, mpllb->freq_vco) |
+	       FIELD_PREP(DP_CONFIG4_MPLLB_MULTIPLIER, mpllb->multiplier) |
+	       DP_CONFIG4_MPLLB_PMIX_EN |
+	       (dp->ssc ? DP_CONFIG4_MPLLB_SSC_EN : 0),
+	       reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG4);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG5);
+	reg &= ~DP_CONFIG5_MPLLB_SSC_PEAK;
+	reg |= FIELD_PREP(DP_CONFIG5_MPLLB_SSC_PEAK,
+			  dp->ssc ? mpllb->ssc_peak : 0);
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG5);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG6);
+	reg &= ~DP_CONFIG6_MPLLB_SSC_STEPSIZE;
+	reg |= FIELD_PREP(DP_CONFIG6_MPLLB_SSC_STEPSIZE,
+			  dp->ssc ? mpllb->ssc_stepsize : 0);
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG6);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG7);
+	reg &= ~(DP_CONFIG7_MPLLB_SSC_UP_SPREAD | DP_CONFIG7_MPLLB_TX_CLK_DIV |
+		 DP_CONFIG7_MPLLB_V2I | DP_CONFIG7_MPLLB_WORD_DIV2_EN);
+	reg |= FIELD_PREP(DP_CONFIG7_MPLLB_TX_CLK_DIV, mpllb->tx_clk_div) |
+	       FIELD_PREP(DP_CONFIG7_MPLLB_V2I, mpllb->v2i) |
+	       DP_CONFIG7_REF_CLK_EN;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG7);
+
+	/*
+	 * The AC coupling capacitor is bypassed at RBR; set_lanes takes the
+	 * lanes out of bypass at every higher rate, as the vendor does.
+	 */
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG17);
+	reg |= DP_CONFIG17_TX_DCC_BYP_AC_CAP;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG17);
+
+	/*
+	 * Take the lanes: ask the crossbar for them while the acknowledgement
+	 * still says DisplayPort is not holding them -- that is what lets the
+	 * arbiter complete the switch -- and withdraw it once they are ours.
+	 */
+	ret = zumapro_usbdrd_tca_ctrl_sync(phy_drd,
+					   dp->lanes == 4 ?
+						TCA_MUX_CONTROL_DP4 :
+						TCA_MUX_CONTROL_USB31_DP2,
+					   false);
+	if (ret)
+		dev_warn(phy_drd->dev,
+			 "crossbar has not yet given DisplayPort the lanes\n");
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+	reg &= ~DP_CONFIG13_TX_DISABLE;
+	reg |= FIELD_PREP(DP_CONFIG13_TX_DISABLE,
+			  GENMASK(3, 0) & ~GENMASK(dp->lanes - 1, 0));
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+	reg &= ~DP_CONFIG19_DPALT_DISABLE_ACK;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+
+	phy_drd->dp_active = true;
+
+	/*
+	 * Give the lanes their width and their share of the PLL, but leave
+	 * them powered down: the link has to see the PLL lock before they come
+	 * up, and that status bit lives in the link's own registers rather
+	 * than here, so powering them up is set_lanes' job.
+	 */
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+	reg &= ~(DP_CONFIG12_TX_WIDTH | DP_CONFIG12_TX_MPLL_EN);
+	/* 0b11 is the 20-bit lane width DisplayPort uses. */
+	reg |= FIELD_PREP(DP_CONFIG12_TX_WIDTH,
+			  zumapro_usbdrd_dp_lane_pattern(dp->lanes, 0x3, 0x0));
+	reg |= FIELD_PREP(DP_CONFIG12_TX_MPLL_EN, GENMASK(dp->lanes - 1, 0));
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG12);
+
+	return zumapro_usbdrd_dp_tx_update(phy_drd, dp->lanes);
+}
+
+/*
+ * The second half of the bring-up, which the vendor runs only once the link
+ * has seen the PLL lock: power the lanes up, and above the reduced bit rate
+ * take them out of AC-coupling bypass.
+ */
+static int zumapro_usbdrd_dp_set_lanes(struct exynos5_usbdrd_phy *phy_drd,
+				       struct phy_configure_opts_dp *dp)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	unsigned int lanes = dp->lanes;
+	u32 reg;
+	int ret;
+
+	if (lanes != 2 && lanes != 4)
+		return -EINVAL;
+	if (!phy_drd->dp_link_rate)
+		return -EINVAL;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+	reg &= ~DP_CONFIG11_TX_PSTATE;
+	reg |= FIELD_PREP(DP_CONFIG11_TX_PSTATE,
+			  zumapro_usbdrd_dp_lane_pattern(lanes, 0x0, 0x3));
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+
+	ret = zumapro_usbdrd_dp_tx_update(phy_drd, lanes);
+	if (ret)
+		return ret;
+
+	/*
+	 * At the reduced bit rate the bypass is what the board is tuned for;
+	 * every rate above it wants the capacitor in the path.
+	 */
+	if (phy_drd->dp_link_rate > 1620) {
+		reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG17);
+		reg &= ~DP_CONFIG17_TX_DCC_BYP_AC_CAP;
+		writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG17);
+	}
+
+	return 0;
+}
+
+static int zumapro_usbdrd_dp_set_voltages(struct exynos5_usbdrd_phy *phy_drd,
+					  struct phy_configure_opts_dp *dp)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	bool high_rate = phy_drd->dp_link_rate >= 5400;
+	u32 eq_main, eq_post, eq_pre;
+	unsigned int lane;
+
+	if (dp->lanes != 2 && dp->lanes != 4)
+		return -EINVAL;
+	if (!phy_drd->dp_link_rate)
+		return -EINVAL;
+
+	/*
+	 * Work out every lane before writing anything, so a level the
+	 * specification does not allow cannot leave half of them adjusted.
+	 */
+	eq_main = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG8);
+	eq_post = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG9);
+	eq_pre = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG10);
+
+	for (lane = 0; lane < dp->lanes; lane++) {
+		const struct zumapro_usbdrd_dp_level *level;
+		unsigned int shift = DP_CONFIG_EQ_SHIFT(lane);
+
+		if (dp->voltage[lane] > 3 || dp->pre[lane] > 3)
+			return -EINVAL;
+
+		level = &zumapro_dp_levels[high_rate][dp->voltage[lane]]
+					  [dp->pre[lane]];
+		if (!level->eq_main)
+			return -EINVAL;
+
+		eq_main &= ~(DP_CONFIG_EQ_MASK << shift);
+		eq_main |= (level->eq_main & DP_CONFIG_EQ_MASK) << shift;
+		eq_post &= ~(DP_CONFIG_EQ_MASK << shift);
+		eq_post |= (level->eq_post & DP_CONFIG_EQ_MASK) << shift;
+		/* The board's table has no pre-cursor at any level. */
+		eq_pre &= ~(DP_CONFIG_EQ_MASK << shift);
+	}
+
+	/* The receiver boost is per-lane and it is a whole register. */
+	for (lane = 0; lane < dp->lanes; lane++)
+		zumapro_usbdrd_cr_write(phy_drd, ZUMAPRO_DP_CR_RBOOST(lane),
+					high_rate ? ZUMAPRO_DP_CR_RBOOST_HIGH :
+						    ZUMAPRO_DP_CR_RBOOST_LOW,
+					false);
+
+	writel(eq_main, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG8);
+	writel(eq_post, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG9);
+	writel(eq_pre, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG10);
+
+	/*
+	 * Three registers the vendor writes to the same values whatever level
+	 * was asked for: the swing override, and two that hand lane control
+	 * and the transmitter boost back to the equalisation above.
+	 */
+	zumapro_usbdrd_cr_write(phy_drd, ZUMAPRO_DP_CR_VSWING,
+				ZUMAPRO_DP_CR_VSWING_VAL, false);
+	zumapro_usbdrd_cr_write(phy_drd, ZUMAPRO_DP_CR_LANE_CTRL,
+				ZUMAPRO_DP_CR_LANE_CTRL_VAL, false);
+	zumapro_usbdrd_cr_write(phy_drd, ZUMAPRO_DP_CR_TX_BOOST,
+				ZUMAPRO_DP_CR_TX_BOOST_VAL, false);
+
+	/*
+	 * No transmitter update here: the equalisation registers take effect on
+	 * their own, and link training adjusts these on every loop, so asking
+	 * the transmitter to re-acknowledge each time would put a handshake in
+	 * the middle of training. The vendor does not either.
+	 */
+	return 0;
+}
+
+static int zumapro_usbdrd_phy_configure(struct phy *phy,
+					union phy_configure_opts *opts)
+{
+	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
+	struct phy_configure_opts_dp *dp = &opts->dp;
+	int ret = 0;
+
+	if (inst->phy_cfg->id != EXYNOS5_DRDPHY_PIPE3)
+		return -EINVAL;
+	if (!phy_drd->reg_pma || !phy_drd->reg_tca)
+		return -ENODEV;
+
+	guard(mutex)(&phy_drd->phy_mutex);
+
+	/*
+	 * Nothing here is reachable before the phy has been brought up: its
+	 * banks are gated and its power island isolated until then, and the
+	 * generic phy core does not order configure() after init().
+	 */
+	if (!phy_drd->pipe3_ready)
+		return -EAGAIN;
+
+	if (dp->set_rate)
+		ret = zumapro_usbdrd_dp_set_rate(phy_drd, dp);
+	if (!ret && dp->set_lanes)
+		ret = zumapro_usbdrd_dp_set_lanes(phy_drd, dp);
+	if (!ret && dp->set_voltages)
+		ret = zumapro_usbdrd_dp_set_voltages(phy_drd, dp);
+
+	return ret;
+}
+
+static int zumapro_usbdrd_phy_validate(struct phy *phy, enum phy_mode mode,
+				       int submode,
+				       union phy_configure_opts *opts)
+{
+	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+	struct phy_configure_opts_dp *dp = &opts->dp;
+	unsigned int i;
+
+	if (inst->phy_cfg->id != EXYNOS5_DRDPHY_PIPE3 || mode != PHY_MODE_DP)
+		return -EINVAL;
+
+	/*
+	 * The crossbar routes either all four lanes or the lower pair; a
+	 * single-lane link, which the generic interface allows, has no mux
+	 * setting here.
+	 */
+	if (dp->lanes != 2 && dp->lanes != 4)
+		return -EINVAL;
+
+	if (dp->set_rate) {
+		for (i = 0; i < ARRAY_SIZE(zumapro_dp_mpllb); i++)
+			if (zumapro_dp_mpllb[i].link_rate == dp->link_rate)
+				break;
+		if (i == ARRAY_SIZE(zumapro_dp_mpllb))
+			return -EINVAL;
+	}
+
+	if (dp->set_voltages)
+		for (i = 0; i < dp->lanes; i++)
+			if (dp->voltage[i] > 3 || dp->pre[i] > 3 ||
+			    dp->voltage[i] + dp->pre[i] > 3)
+				return -EINVAL;
+
+	return 0;
+}
+
+/*
+ * AUX is a low-speed block of its own, independent of the link PLL, and it
+ * comes up powered down. A display driver needs it long before it asks for a
+ * rate -- the first thing it does is read the sink's capabilities over it --
+ * so tie it to the phy mode rather than to the rate configuration.
+ *
+ * Only DisplayPort's own transitions are acted on. The USB controller holds
+ * this same phy and sets its mode on every role switch and every resume; those
+ * must not disturb a link DisplayPort has up, so a driver hands the lanes back
+ * by asking for PHY_MODE_INVALID rather than by anyone else asking for USB.
+ */
+static int zumapro_usbdrd_phy_set_mode(struct phy *phy, enum phy_mode mode,
+				       int submode)
+{
+	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
+
+	if (inst->phy_cfg->id != EXYNOS5_DRDPHY_PIPE3)
+		return 0;
+	if (mode != PHY_MODE_DP && mode != PHY_MODE_INVALID)
+		return 0;
+
+	guard(mutex)(&phy_drd->phy_mutex);
+
+	if (!phy_drd->pipe3_ready)
+		return mode == PHY_MODE_DP ? -EAGAIN : 0;
+
+	if (mode == PHY_MODE_DP) {
+		zumapro_usbdrd_dp_aux_enable(phy_drd, true);
+		return 0;
+	}
+
+	zumapro_usbdrd_dp_aux_enable(phy_drd, false);
+
+	if (!phy_drd->dp_active)
+		return 0;
+
+	/*
+	 * Give the lanes back: park the transmitters, which ends by telling the
+	 * crossbar DisplayPort has let go, and then ask for them as USB again.
+	 */
+	phy_drd->dp_active = false;
+	phy_drd->dp_link_rate = 0;
+	zumapro_usbdrd_dp_park_lanes(phy_drd);
+	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
+
+	return 0;
+}
+
+/*
+ * Same link and high-speed handling as exynos2200, plus the DisplayPort half
+ * of the combo: a display driver reaches the lanes it shares with USB3 through
+ * these rather than by mapping the phy itself.
+ */
+static const struct phy_ops zumapro_usbdrd_phy_ops = {
+	.init		= exynos2200_usbdrd_phy_init,
+	.exit		= exynos2200_usbdrd_phy_exit,
+	.set_mode	= zumapro_usbdrd_phy_set_mode,
+	.configure	= zumapro_usbdrd_phy_configure,
+	.validate	= zumapro_usbdrd_phy_validate,
+	.owner		= THIS_MODULE,
+};
 
 static const struct exynos5_usbdrd_phy_config phy_cfg_exynos2200[] = {
 	{
@@ -2844,7 +3451,7 @@ static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
  */
 static const struct exynos5_usbdrd_phy_drvdata zumapro_usb32drd_phy = {
 	.phy_cfg		= phy_cfg_zumapro,
-	.phy_ops		= &exynos2200_usbdrd_phy_ops,
+	.phy_ops		= &zumapro_usbdrd_phy_ops,
 	.resume_prepare		= exynos2200_usbdrd_phy_resume_prepare,
 	.pmu_offset_usbdrd0_phy	= GS101_PHY_CTRL_USB20,
 	.pmu_offset_usbdrd0_phy_ss = GS101_PHY_CTRL_USBDP,

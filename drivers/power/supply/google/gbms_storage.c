@@ -661,7 +661,6 @@ static const struct file_operations gbms_providers_status_ops = {
 static const struct file_operations name = {	\
 	.owner	= THIS_MODULE,			\
 	.open	= simple_open,			\
-	.llseek	= no_llseek,			\
 	.read	= fn_read,			\
 	.write	= fn_write,			\
 }
@@ -1032,7 +1031,7 @@ static int gbms_storage_device_init(struct gbms_storage_device *gdev,
 	if (alloc_chrdev_region(&gdev->hcmajor, 0, 1, name) < 0)
 		goto no_gdev;
 	/* ls /sys/class */
-	gdev->hcclass = class_create(THIS_MODULE, name);
+	gdev->hcclass = class_create(name);
 	if (gdev->hcclass == NULL)
 		goto no_gdev;
 	/* ls /dev/ */

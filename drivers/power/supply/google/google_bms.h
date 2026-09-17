@@ -22,6 +22,7 @@
 #include <linux/usb/pd.h>
 #include <misc/gvotable.h>
 #include <misc/logbuffer.h>
+#include "gbms_compat.h"
 #include "gbms_power_supply.h"
 #include "qmath.h"
 #include "gbms_storage.h"
@@ -141,7 +142,7 @@ typedef struct {
 } aact_limits_profiles_t;
 
 /* the number should be the same as GBMS_AACT_NB_LIMITS_MAX */
-static aact_limits_profiles_t aact_all_limits = {
+static __maybe_unused aact_limits_profiles_t aact_all_limits = {
     .temp_limits = {
         "google,aact-temp-limits",
         "google,aact-temp-limits-1",
@@ -208,7 +209,6 @@ static aact_limits_profiles_t aact_all_limits = {
 #define BATTERY_DEBUG_ATTRIBUTE(name, fn_read, fn_write) \
 static const struct file_operations name = {	\
 	.open	= simple_open,			\
-	.llseek	= no_llseek,			\
 	.read	= fn_read,			\
 	.write	= fn_write,			\
 }
@@ -943,7 +943,6 @@ enum charging_policy_vote {
 #define DEBUG_ATTRIBUTE_WO(name) \
 static const struct file_operations name ## _fops = {	\
 	.open	= simple_open,			\
-	.llseek	= no_llseek,			\
 	.write	= name ## _store,			\
 }
 

@@ -9,7 +9,6 @@
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 #include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/regmap.h>
 
 #include "max77779_pmic.h"
@@ -283,7 +282,7 @@ int max77779_i2cm_init(struct max77779_i2cm_info *info)
 	info->adap.owner   = THIS_MODULE;
 	info->adap.algo    = &max77779_i2cm_algorithm;
 	info->adap.retries = 2;
-	info->adap.class   = I2C_CLASS_HWMON | I2C_CLASS_SPD;
+	info->adap.class   = I2C_CLASS_HWMON;
 	info->adap.dev.of_node = dev->of_node;
 	info->adap.algo_data = info;
 	info->adap.dev.parent = info->dev;

@@ -19,12 +19,12 @@
 #include "clk-exynos-arm64.h"
 
 /* NOTE: Must be equal to the last clock ID in each CMU increased by one. */
-#define CLKS_NR_TOP		(CLK_DOUT_CMU_MFC_MFC + 1)
+#define CLKS_NR_TOP		(CLK_DOUT_CMU_HSI0_DPOSC + 1)
 #define CLKS_NR_PERIC0		(CLK_GOUT_PERIC0_USI6_USI_CLK + 1)
 #define CLKS_NR_PERIC1		(CLK_GOUT_PERIC1_USI9_USI_CLK + 1)
 #define CLKS_NR_HSI2		(CLK_GOUT_HSI2_GPIO_HSI2_QCH + 1)
 #define CLKS_NR_HSI1		(CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK + 1)
-#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_USBDPPHY_TCA_APB_CLK + 1)
+#define CLKS_NR_HSI0		(CLK_GOUT_HSI0_DP_LINK_PCLK + 1)
 #define CLKS_NR_DPUB		(CLK_GOUT_DPUB_DSIM0_OSCCLK + 1)
 #define CLKS_NR_DPUF0		(CLK_GOUT_DPUF0_SRAMC_ACLK + 1)
 #define CLKS_NR_DPUF1		(CLK_GOUT_DPUF1_SRAMC_ACLK + 1)
@@ -81,10 +81,13 @@
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC0_NOC	0x2114
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP	0x2118
 #define CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC	0x211c
+#define CLK_CON_MUX_MUX_CLKCMU_HSI0_DPOSC	0x1090
 #define CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC		0x1094
 #define CLK_CON_MUX_MUX_CLKCMU_HSI0_PERI	0x1098
+#define CLK_CON_DIV_CLKCMU_HSI0_DPOSC		0x1888
 #define CLK_CON_DIV_CLKCMU_HSI0_NOC		0x188c
 #define CLK_CON_DIV_CLKCMU_HSI0_PERI		0x1890
+#define CLK_CON_GAT_GATE_CLKCMU_HSI0_DPOSC	0x20b8
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC	0x20bc
 #define CLK_CON_GAT_GATE_CLKCMU_HSI0_PERI	0x20c0
 #define CLK_CON_MUX_MUX_CLKCMU_MISC_NOC		0x10d0
@@ -153,6 +156,9 @@ static const unsigned long top_clk_regs[] __initconst = {
 	CLK_CON_GAT_GATE_CLKCMU_PERIC0_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP,
 	CLK_CON_GAT_GATE_CLKCMU_PERIC1_NOC,
+	CLK_CON_MUX_MUX_CLKCMU_HSI0_DPOSC,
+	CLK_CON_DIV_CLKCMU_HSI0_DPOSC,
+	CLK_CON_GAT_GATE_CLKCMU_HSI0_DPOSC,
 	CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC,
 	CLK_CON_DIV_CLKCMU_HSI0_NOC,
 	CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
@@ -204,6 +210,7 @@ PNAME(mout_cmu_hsi2_pcie_p) = { "oscclk", "fout_shared2_d2" };
 PNAME(mout_cmu_hsi2_ufs_embd_p) = {
 	"oscclk", "fout_shared0_d4", "fout_shared2_d2", "fout_spare_pll",
 };
+PNAME(mout_cmu_hsi0_dposc_p) = { "oscclk", "fout_shared2_d2" };
 PNAME(mout_cmu_hsi0_noc_p) = {
 	"fout_shared0_d4", "fout_shared1_d4",
 	"fout_shared2_d2", "fout_shared3_d2",
@@ -264,6 +271,13 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    mout_cmu_pericx_p, CLK_CON_MUX_MUX_CLKCMU_PERIC1_NOC, 0, 2),
 	MUX(CLK_MOUT_CMU_PERIC1_IP, "mout_cmu_peric1_ip",
 	    mout_cmu_pericx_p, CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP, 0, 2),
+	/*
+	 * Left NO_REPARENT like the other CMU_TOP muxes: which input the DP
+	 * oscillator takes is a board decision, made once from the device tree,
+	 * not something a rate request should walk into.
+	 */
+	MUX(CLK_MOUT_CMU_HSI0_DPOSC, "mout_cmu_hsi0_dposc",
+	    mout_cmu_hsi0_dposc_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_DPOSC, 0, 1),
 	MUX(CLK_MOUT_CMU_HSI0_NOC, "mout_cmu_hsi0_noc",
 	    mout_cmu_hsi0_noc_p, CLK_CON_MUX_MUX_CLKCMU_HSI0_NOC, 0, 3),
 	MUX(CLK_MOUT_CMU_HSI0_PERI, "mout_cmu_hsi0_peri",
@@ -332,6 +346,9 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	     "mout_cmu_peric1_ip", CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP,
 	     21, 0, 0),
 	/* HSI0 USB fabric (live at fastboot handoff). */
+	GATE(CLK_GOUT_CMU_HSI0_DPOSC, "gout_cmu_hsi0_dposc",
+	     "mout_cmu_hsi0_dposc", CLK_CON_GAT_GATE_CLKCMU_HSI0_DPOSC,
+	     21, 0, 0),
 	GATE(CLK_GOUT_CMU_HSI0_NOC, "gout_cmu_hsi0_noc",
 	     "mout_cmu_hsi0_noc", CLK_CON_GAT_GATE_CLKCMU_HSI0_NOC,
 	     21, 0, 0),
@@ -378,6 +395,8 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    "gout_cmu_peric1_noc", CLK_CON_DIV_CLKCMU_PERIC1_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_PERIC1_IP, "dout_cmu_peric1_ip",
 	    "gout_cmu_peric1_ip", CLK_CON_DIV_CLKCMU_PERIC1_IP, 0, 4),
+	DIV(CLK_DOUT_CMU_HSI0_DPOSC, "dout_cmu_hsi0_dposc",
+	    "gout_cmu_hsi0_dposc", CLK_CON_DIV_CLKCMU_HSI0_DPOSC, 0, 5),
 	DIV(CLK_DOUT_CMU_HSI0_NOC, "dout_cmu_hsi0_noc",
 	    "gout_cmu_hsi0_noc", CLK_CON_DIV_CLKCMU_HSI0_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_HSI0_PERI, "dout_cmu_hsi0_peri",
@@ -1054,6 +1073,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
  * hardware-validated yet (the USB offsets from the same table have been).
  */
 #define CLK_CON_CMU_HSI0_CONTROLLER_OPTION	0x0800
+#define PLL_CON0_MUX_CLKCMU_HSI0_DPOSC_USER	0x0670
 #define PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER	0x0620
 #define PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER	0x0680
 #define CLK_CON_MUX_MUX_CLK_HSI0_USI2		0x101c
@@ -1076,6 +1096,10 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 							0x210c
 #define CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_PCLK \
 							0x2110
+#define CLK_CON_GAT_CLK_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_DP_OSC_CLK \
+							0x2040
+#define CLK_CON_GAT_GOUT_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_PCLK \
+							0x2054
 #define CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40 \
 							0x20ac
 #define CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK \
@@ -1086,6 +1110,7 @@ static const struct samsung_cmu_info hsi2_cmu_info __initconst = {
 
 static const unsigned long hsi0_clk_regs[] __initconst = {
 	CLK_CON_CMU_HSI0_CONTROLLER_OPTION,
+	PLL_CON0_MUX_CLKCMU_HSI0_DPOSC_USER,
 	PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER,
 	PLL_CON0_MUX_CLKCMU_HSI0_PERI_USER,
 	CLK_CON_MUX_MUX_CLK_HSI0_USI2,
@@ -1102,6 +1127,8 @@ static const unsigned long hsi0_clk_regs[] __initconst = {
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI3_HSI0_IPCLKPORT_PCLK,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_IPCLK,
 	CLK_CON_GAT_CLK_BLK_HSI0_UID_USI4_HSI0_IPCLKPORT_PCLK,
+	CLK_CON_GAT_CLK_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_DP_OSC_CLK,
+	CLK_CON_GAT_GOUT_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_PCLK,
 	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40,
 	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK,
 	CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USBDPPHY_TCA_APB_CLK,
@@ -1118,6 +1145,7 @@ static const struct samsung_fixed_rate_clock hsi0_fixed_clks[] __initconst = {
 	FRATE(CLK_FOUT_USB, "fout_usb", NULL, 0, 614400000),
 };
 
+PNAME(mout_hsi0_dposc_user_p) = { "oscclk", "dout_cmu_hsi0_dposc" };
 PNAME(mout_hsi0_noc_user_p) = { "oscclk", "dout_cmu_hsi0_noc" };
 PNAME(mout_hsi0_peri_user_p) = { "oscclk", "dout_cmu_hsi0_peri" };
 PNAME(mout_hsi0_usi2_p) = { "mout_hsi0_peri_user", "oscclk" };
@@ -1125,6 +1153,8 @@ PNAME(mout_hsi0_usi3_p) = { "mout_hsi0_peri_user", "oscclk" };
 PNAME(mout_hsi0_usi4_p) = { "mout_hsi0_peri_user", "oscclk" };
 
 static const struct samsung_mux_clock hsi0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_HSI0_DPOSC_USER, "mout_hsi0_dposc_user",
+	    mout_hsi0_dposc_user_p, PLL_CON0_MUX_CLKCMU_HSI0_DPOSC_USER, 4, 1),
 	MUX(CLK_MOUT_HSI0_NOC_USER, "mout_hsi0_noc_user",
 	    mout_hsi0_noc_user_p, PLL_CON0_MUX_CLKCMU_HSI0_NOC_USER, 4, 1),
 	MUX(CLK_MOUT_HSI0_PERI_USER, "mout_hsi0_peri_user",
@@ -1175,6 +1205,22 @@ static const struct samsung_gate_clock hsi0_gate_clks[] __initconst = {
 	 * clocks, modelled here on the NOC user mux like the other pclk gates
 	 * in this block.
 	 */
+	/*
+	 * The DisplayPort link: the oscillator it derives all of its timing
+	 * from, and the APB gate its registers sit behind. The vendor node
+	 * names only the oscillator because their CAL layer reaches the APB
+	 * through the block's Q-channel, which the common clock framework has
+	 * no equivalent for -- so an unclaimed APB clock means the link's first
+	 * register access reads a gated block.
+	 */
+	GATE(CLK_GOUT_HSI0_DP_LINK_DP_OSC_CLK, "gout_hsi0_dp_link_dp_osc_clk",
+	     "mout_hsi0_dposc_user",
+	     CLK_CON_GAT_CLK_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_DP_OSC_CLK,
+	     21, 0, 0),
+	GATE(CLK_GOUT_HSI0_DP_LINK_PCLK, "gout_hsi0_dp_link_pclk",
+	     "mout_hsi0_noc_user",
+	     CLK_CON_GAT_GOUT_BLK_HSI0_UID_DP_LINK_IPCLKPORT_I_PCLK,
+	     21, 0, 0),
 	GATE(CLK_GOUT_HSI0_USB32DRD_REF_CLK_40, "gout_hsi0_usb32drd_ref_clk_40",
 	     "dout_hsi0_usb",
 	     CLK_CON_GAT_GOUT_BLK_HSI0_UID_USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40,

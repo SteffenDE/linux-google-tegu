@@ -455,39 +455,6 @@
 	};
 
 	/*
-	 * The reboot mode the bootloader reads after a *cold* reset, which
-	 * clears the PMU SYSIP_DAT0 copy that serves the warm case (see the
-	 * syscon-reboot-mode node in zumapro.dtsi).  Both are needed: neither
-	 * store covers both reset types [HW 2026-08-10].
-	 *
-	 * Values are the enum pon_reboot_mode of the downstream
-	 * pixel-zuma-reboot.c or'd with its BMS_RSBM_VALID (BIT(31)) -- the
-	 * same encoding mainline already uses for gs101 in
-	 * gs101-pixel-common.dtsi.  The valid bit earns its keep here and not
-	 * on the PMU side, because battery-backed RAM comes up holding whatever
-	 * it last held, so the bootloader needs to be told the field means
-	 * something.  It clears the field once it has acted on it.
-	 *
-	 * Note this is the bootloader's notion of a reboot mode, not the
-	 * kernel's warm/cold reset type: that one is reboot_mode in the PSCI
-	 * sense, set from the reboot= cmdline parameter.
-	 */
-	reboot-mode {
-		compatible = "nvmem-reboot-mode";
-		nvmem-cells = <&max77779_reboot_mode>;
-		nvmem-cell-names = "reboot-mode";
-		mode-bootloader = <0x800000fc>;
-		mode-charge = <0x8000000a>;
-		mode-dm-verity-device-corrupted = <0x80000050>;
-		mode-fastboot = <0x800000fa>;
-		mode-reboot-ab-update = <0x80000052>;
-		mode-recovery = <0x800000ff>;
-		mode-rescue = <0x800000f9>;
-		mode-shutdown-thermal = <0x80000051>;
-		mode-shutdown-thermal-battery = <0x80000051>;
-	};
-
-	/*
 	 * Where GBMS finds the battery pack EEPROM.  gbms_storage locates this
 	 * by node name -- of_find_node_by_name(NULL, "google_bms") -- so the
 	 * name is the binding and there is no compatible; it reads the pack's
@@ -1392,26 +1359,28 @@
 	};
 
 	/*
-	 * Source: research/dumped.dts:6249 (max77779sp@60).  The scratchpad is
-	 * battery-backed, so unlike the DRAM-resident post-mortem buffers its
-	 * contents outlive a cold reset -- which is what makes it the place the
-	 * bootloader looks for the reboot mode.  Offset 0 is RSBM_ADDR in the
-	 * downstream max77779_sp driver, and 4 bytes wide because
-	 * nvmem-reboot-mode writes an unsigned int.
+	 * The MAX77779's battery-backed scratchpad (research/dumped.dts:6249),
+	 * as a gbms_storage provider rather than as nvmem.  It carries the tags
+	 * the gauge and the battery layer keep across a reboot -- RSOC, MDLV,
+	 * AAWC and the bootloader handshake.
+	 *
+	 * MDLV is why this cannot wait for a later step.  Nothing else serves
+	 * that tag, and without it the gauge reads its stored model version as
+	 * -ENOENT, decides on every boot that the version changed, force-resets
+	 * the gauge and reloads the model -- then loops at 1 Hz because it
+	 * cannot record the version it just wrote [HW 2026-09-17].
+	 *
+	 * These are the same four bytes at offset 0 that nvmem-reboot-mode used
+	 * to write as the cold-reset copy of the bootloader's reboot mode:
+	 * RSBM_ADDR is 0 and RS_TAG_LENGTH is 4.  Both cannot own the device,
+	 * and the gauge needs this one, so that copy is gone.  The PMU
+	 * SYSIP_DAT0 store still covers warm resets, which is what the test
+	 * loop uses (reboot=w); after a battery pull the bootloader is entered
+	 * by hand.
 	 */
-	nvmem@60 {
-		compatible = "maxim,max77779sp";
+	sp@60 {
+		compatible = "maxim,max77779sp-i2c";
 		reg = <0x60>;
-
-		nvmem-layout {
-			compatible = "fixed-layout";
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			max77779_reboot_mode: reboot-mode@0 {
-				reg = <0x0 0x4>;
-			};
-		};
 	};
 
 	/*
@@ -1499,11 +1468,21 @@
 &hsi2c_10 {
 	status = "okay";
 
-	/* Battery pack ID EEPROM (downstream battery_pack_eeprom). */
+	/*
+	 * Battery pack ID EEPROM (downstream battery_pack_eeprom), writable as
+	 * downstream has it.  The gauge saves its model state here (GMSR) and
+	 * records the pack's cycle count, and both fail with -ETIMEDOUT against
+	 * a read-only at24 [HW 2026-09-17].
+	 *
+	 * This holds the pairing and health history the Android slot reads too,
+	 * so what keeps it safe is no longer that the driver cannot write: it
+	 * is that gbms_lotr_update() reaches neither of its destructive layout
+	 * migrations while the google_bms node omits "google,lotr-version".
+	 * See the comment there.
+	 */
 	battery_pack_eeprom: eeprom@50 {
 		compatible = "atmel,24c08";
 		reg = <0x50>;
-		read-only;
 	};
 };
 

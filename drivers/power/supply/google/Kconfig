@@ -83,6 +83,7 @@ config GOOGLE_BATTERY
 config GOOGLE_CHARGER
 	tristate "Google Multi Step Charging"
 	depends on GOOGLE_BMS
+	depends on TYPEC_TCPM
 	help
 	  The charging policy layer. It runs a multi CC-CV step charge using
 	  the battery temperature and voltage to pick the charger's constant

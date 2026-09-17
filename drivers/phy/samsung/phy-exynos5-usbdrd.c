@@ -2005,6 +2005,14 @@ static int exynos5_usbdrd_phy_clk_handle(struct exynos5_usbdrd_phy *phy_drd)
 #define DP_CONFIG13_TX_RESET				GENMASK(7, 4)
 #define DP_CONFIG13_TX_DISABLE				GENMASK(3, 0)
 
+#define ZUMAPRO_USBDP_PHY_DP_CONFIG19			0x250
+/*
+ * Set while the DisplayPort side is *not* holding the lanes. The crossbar
+ * will not complete a switch until it is, so whoever takes the lanes away
+ * from DisplayPort has to say so.
+ */
+#define DP_CONFIG19_DPALT_DISABLE_ACK			BIT(1)
+
 #define PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_DATA		GENMASK(31, 16)
 #define PHY_CR_PARA_CON1_PHY0_CR_PARA_RD_EN		BIT(0)
 
@@ -2493,6 +2501,7 @@ static int zumapro_usbdrd_cr_tune(struct exynos5_usbdrd_phy *phy_drd)
 static void zumapro_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
 {
 	unsigned int i;
+	u32 reg;
 
 	/*
 	 * A device tree that describes no SuperSpeed banks wants the
@@ -2549,6 +2558,15 @@ static void zumapro_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
 
 	if (zumapro_usbdrd_cr_tune(phy_drd))
 		return;
+
+	/*
+	 * Tell the crossbar the DisplayPort side is not holding the lanes,
+	 * which is the acknowledgement it waits for before it will hand them
+	 * to anyone else. Out of reset nothing has said so.
+	 */
+	reg = readl(phy_drd->reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+	reg |= DP_CONFIG19_DPALT_DISABLE_ACK;
+	writel(reg, phy_drd->reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
 
 	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
 	phy_drd->pipe3_ready = true;

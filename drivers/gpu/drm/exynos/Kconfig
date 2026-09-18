@@ -40,6 +40,8 @@ config DRM_EXYNOS7_DECON
 config DRM_EXYNOS_ZUMAPRO_DPU
 	bool "DPU on Google Tensor G4 Zumapro"
 	depends on ARM64 || COMPILE_TEST
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_DISPLAY_HELPER
 	help
 	  Choose this option if you want to build the Google Tensor G4
 	  Zumapro DECON/DPP display pipeline support.

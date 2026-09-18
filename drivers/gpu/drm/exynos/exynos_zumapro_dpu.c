@@ -26,6 +26,10 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
+#include <drm/drm_bridge.h>
+#include <drm/drm_bridge_connector.h>
+#include <drm/drm_of.h>
+#include <drm/drm_simple_kms_helper.h>
 #include "exynos_drm_crtc.h"
 #include "exynos_drm_drv.h"
 #include "exynos_drm_fb.h"
@@ -54,6 +58,7 @@ struct zumapro_decon {
 	struct device *dev;
 	struct drm_device *drm_dev;
 	struct exynos_drm_crtc *crtc;
+	struct drm_encoder encoder;
 	struct exynos_drm_plane plane;
 	struct exynos_drm_plane_config plane_config;
 	void __iomem *main_regs;
@@ -688,6 +693,16 @@ static const struct zumapro_panel_pipeline zumapro_decon0_tg4c_pipeline = {
 	.non_continuous_clock = true,
 };
 
+/*
+ * The DisplayPort head. Unlike a panel it brings no modes of its own -- they
+ * come from whatever sink is plugged in -- no compression, and no DSI
+ * interface to select.
+ */
+static const struct zumapro_panel_pipeline zumapro_decon_dp_pipeline = {
+	.data_path = ZUMAPRO_DPATH_NOCOMP_OF0_DPIF,
+	.out_type = ZUMAPRO_DECON_OUT_DP0,
+};
+
 static const struct zumapro_decon_desc *zumapro_decon_desc_by_id(u32 id)
 {
 	unsigned int i;
@@ -866,6 +881,27 @@ static void zumapro_decon_program_dsc(struct zumapro_decon *decon,
 	u32 outfifo_width;
 	u8 i;
 
+	/*
+	 * An uncompressed stream -- which is what DisplayPort carries here --
+	 * has no encoder to configure and no slices to divide the output fifo
+	 * into: it is as wide as the picture.
+	 */
+	/*
+	 * An uncompressed stream -- which is what DisplayPort carries here --
+	 * has no encoder to configure and no slices to divide the output fifo
+	 * into: it is as wide as the picture, and the registers describing the
+	 * second fifo and the compressed slice size do not apply. The second
+	 * fifo does not exist outside the first DECON at all.
+	 */
+	if (!dsc) {
+		writel(ZUMAPRO_DECON_OF_HEIGHT(mode->vdisplay) |
+		       ZUMAPRO_DECON_OF_WIDTH(mode->hdisplay),
+		       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_0);
+		writel(ZUMAPRO_DECON_OF_TH_1H,
+		       decon->main_regs + ZUMAPRO_DECON_OF_TH_TYPE);
+		return;
+	}
+
 	for (i = 0; i < pipeline->dsc_count; i++) {
 		writel(0x222, decon->sub_regs + ZUMAPRO_DSC_CONTROL1(i));
 		writel(0x30b4, decon->sub_regs + ZUMAPRO_DSC_CONTROL3(i));
@@ -896,13 +932,40 @@ static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
 
 	zumapro_decon_program_outfifo(decon);
 
-	writel(ZUMAPRO_DSIMIF_SEL_DSIM(pipeline->dsimif_fifo),
-	       decon->sub_regs + ZUMAPRO_DSIMIF_SEL(pipeline->dsimif));
+	if (pipeline->out_type == ZUMAPRO_DECON_OUT_DP0)
+		zumapro_dpu_update_bits(decon->sub_regs, ZUMAPRO_DPIF_SEL(0),
+					ZUMAPRO_DPIF_SEL_MASK,
+					ZUMAPRO_DPIF_SEL_DECON(decon->id));
+	else
+		writel(ZUMAPRO_DSIMIF_SEL_DSIM(pipeline->dsimif_fifo),
+		       decon->sub_regs + ZUMAPRO_DSIMIF_SEL(pipeline->dsimif));
+
 	writel(pipeline->data_path,
 	       decon->main_regs + ZUMAPRO_DECON_DATA_PATH_CON_0);
 
 	zumapro_decon_program_dqe(decon, mode);
 	zumapro_decon_program_dsc(decon, mode);
+
+	if (pipeline->out_type == ZUMAPRO_DECON_OUT_DP0) {
+		/*
+		 * A DisplayPort stream is paced by the transmitter's own timing
+		 * generator, not by a panel asking for a frame, and there is no
+		 * tearing-effect signal to trigger on. Select video mode and
+		 * point the hardware trigger at nothing, with it disabled and
+		 * masked: armed and pointing at its reset value it would be
+		 * waiting on the panel's own tearing-effect line.
+		 */
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_GLOBAL_CON,
+					ZUMAPRO_DECON_GLOBAL_CON_CMD_MODE, 0);
+		zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
+					ZUMAPRO_DECON_HW_TRIG_SEL_MASK |
+					ZUMAPRO_DECON_HW_TRIG_EN |
+					ZUMAPRO_DECON_HW_TRIG_MASK,
+					ZUMAPRO_DECON_HW_TRIG_SEL_NONE |
+					ZUMAPRO_DECON_HW_TRIG_MASK);
+		return;
+	}
 
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
 				  ZUMAPRO_DECON_GLOBAL_CON_CMD_MODE,
@@ -1063,10 +1126,17 @@ static void zumapro_decon_start(struct zumapro_decon *decon)
 	 * atomic_begin re-masks it before reprogramming.
 	 */
 	spin_lock_irqsave(&decon->slock, flags);
-	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
-				  ZUMAPRO_DECON_HW_TRIG_EN |
-				  ZUMAPRO_DECON_HW_TRIG_MASK,
-				  ZUMAPRO_DECON_HW_TRIG_EN);
+	/*
+	 * Only a panel's trigger is armed. An output that generates its own
+	 * frame timing has no trigger source, and enabling one would leave it
+	 * waiting on a signal that never comes.
+	 */
+	if (decon->pipeline->out_type != ZUMAPRO_DECON_OUT_DP0)
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_TRIG_CON,
+					ZUMAPRO_DECON_HW_TRIG_EN |
+					ZUMAPRO_DECON_HW_TRIG_MASK,
+					ZUMAPRO_DECON_HW_TRIG_EN);
 	spin_unlock_irqrestore(&decon->slock, flags);
 }
 
@@ -1171,6 +1241,13 @@ zumapro_decon_mode_valid(struct exynos_drm_crtc *crtc,
 	struct zumapro_decon *decon = crtc->ctx;
 	const struct zumapro_panel_pipeline *pipeline = decon->pipeline;
 	unsigned int i;
+
+	/*
+	 * A head with no modes of its own takes whatever the sink offers; the
+	 * bridge below it is what knows whether its link can carry one.
+	 */
+	if (!pipeline->num_modes)
+		return MODE_OK;
 
 	for (i = 0; i < pipeline->num_modes; i++) {
 		const struct zumapro_panel_mode *panel_mode = &pipeline->modes[i];
@@ -1400,11 +1477,14 @@ static void zumapro_decon_atomic_flush(struct exynos_drm_crtc *crtc)
 				 "DECON%u did not enter run state: %d\n",
 				 decon->id, ret);
 
-		spin_lock_irqsave(&decon->slock, flags);
-		zumapro_dpu_update_bits(decon->main_regs,
-					ZUMAPRO_DECON_TRIG_CON,
-					ZUMAPRO_DECON_HW_TRIG_MASK, 0);
-		spin_unlock_irqrestore(&decon->slock, flags);
+		/* Again, only a panel has a trigger worth unmasking. */
+		if (decon->pipeline->out_type != ZUMAPRO_DECON_OUT_DP0) {
+			spin_lock_irqsave(&decon->slock, flags);
+			zumapro_dpu_update_bits(decon->main_regs,
+						ZUMAPRO_DECON_TRIG_CON,
+						ZUMAPRO_DECON_HW_TRIG_MASK, 0);
+			spin_unlock_irqrestore(&decon->slock, flags);
+		}
 		decon->win_dirty = false;
 		frame_expected = true;
 	}
@@ -1616,6 +1696,45 @@ static void __iomem *zumapro_decon_map_shared(struct platform_device *pdev,
 	       IOMEM_ERR_PTR(-ENOMEM);
 }
 
+static int zumapro_decon_attach_bridge(struct zumapro_decon *decon)
+{
+	struct drm_connector *connector;
+	struct drm_bridge *bridge;
+	int ret;
+
+	/*
+	 * This runs from a component bind, so failing here fails the whole DRM
+	 * device -- including the head that drives the panel. A DisplayPort
+	 * output that cannot find its bridge is worth a message and nothing
+	 * more: the CRTC stays, with nothing attached to it, and the panel
+	 * comes up regardless.
+	 */
+	bridge = devm_drm_of_get_bridge(decon->dev, decon->dev->of_node, 0, 0);
+	if (IS_ERR(bridge)) {
+		dev_warn(decon->dev,
+			 "no bridge on the DisplayPort output (%pe), leaving it dark\n",
+			 bridge);
+		return 0;
+	}
+
+	ret = drm_simple_encoder_init(decon->drm_dev, &decon->encoder,
+				      DRM_MODE_ENCODER_TMDS);
+	if (ret)
+		return ret;
+
+	decon->encoder.possible_crtcs = drm_crtc_mask(&decon->crtc->base);
+
+	ret = drm_bridge_attach(&decon->encoder, bridge, NULL,
+				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+	if (ret)
+		return ret;
+
+	/* This attaches the connector to the encoder for us. */
+	connector = drm_bridge_connector_init(decon->drm_dev, &decon->encoder);
+
+	return PTR_ERR_OR_ZERO(connector);
+}
+
 static int zumapro_decon_bind(struct device *dev, struct device *master,
 			      void *data)
 {
@@ -1641,13 +1760,40 @@ static int zumapro_decon_bind(struct device *dev, struct device *master,
 		return ret;
 
 	decon->crtc = exynos_drm_crtc_create(drm_dev, &decon->plane.base,
-					     EXYNOS_DISPLAY_TYPE_LCD,
+					     decon->pipeline->out_type ==
+						ZUMAPRO_DECON_OUT_DP0 ?
+						EXYNOS_DISPLAY_TYPE_HDMI :
+						EXYNOS_DISPLAY_TYPE_LCD,
 					     &zumapro_decon_crtc_ops,
 					     decon);
 	if (IS_ERR(decon->crtc))
 		return PTR_ERR(decon->crtc);
 
-	return exynos_drm_register_dma(drm_dev, dev, &decon->dma_priv);
+	ret = exynos_drm_register_dma(drm_dev, dev, &decon->dma_priv);
+	if (ret)
+		return ret;
+
+	/*
+	 * A panel arrives with its own encoder, from the DSI host. A
+	 * DisplayPort bridge has none, so this head brings one and hands the
+	 * connector to drm_bridge_connector, which is what delivers the
+	 * out-of-band hotplug the alternate mode raises.
+	 */
+	if (decon->pipeline->out_type == ZUMAPRO_DECON_OUT_DP0) {
+		ret = zumapro_decon_attach_bridge(decon);
+		if (ret) {
+			/*
+			 * The component core does not unbind a component whose
+			 * bind failed, so the DMA registration above has to be
+			 * undone here or nothing ever will.
+			 */
+			exynos_drm_unregister_dma(drm_dev, dev,
+						  &decon->dma_priv);
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 static void zumapro_decon_unbind(struct device *dev, struct device *master,
@@ -1918,8 +2064,15 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "unsupported DECON%u\n",
 				     decon->id);
 
+	/*
+	 * Which head this is decides what it drives: DECON0 carries the panel
+	 * whose timing is described here, DECON1 carries whatever DisplayPort
+	 * sink is plugged into the connector.
+	 */
 	if (decon->id == 0)
 		decon->pipeline = &zumapro_decon0_tg4c_pipeline;
+	else if (decon->id == 1)
+		decon->pipeline = &zumapro_decon_dp_pipeline;
 
 	if (desc->has_cgc_dma) {
 		ret = zumapro_read_u32_optional_compat(dev,

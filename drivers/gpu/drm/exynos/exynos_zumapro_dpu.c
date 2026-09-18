@@ -63,6 +63,9 @@ struct zumapro_decon {
 	void __iomem *dqe_regs;
 	u32 id;
 	u32 cgc_dma_id;
+	/* This DECON's own share of the window bank every DECON shares */
+	u32 win;
+	u32 win_count;
 	u32 max_windows;
 	const struct zumapro_panel_pipeline *pipeline;
 	struct zumapro_dpp *dpp;
@@ -906,17 +909,17 @@ static void zumapro_decon_program_colormap_window(struct zumapro_decon *decon,
 	end_pos = ZUMAPRO_DECON_WIN_POS_Y(mode->vdisplay - 1) |
 		  ZUMAPRO_DECON_WIN_POS_X(mode->hdisplay - 1);
 
-	writel(blend_func, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_0(0));
-	writel(blend_coeff, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_1(0));
-	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_POSITION(0));
-	writel(end_pos, decon->win_regs + ZUMAPRO_DECON_WIN_END_POSITION(0));
-	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_TIME_CON(0));
+	writel(blend_func, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_0(decon->win));
+	writel(blend_coeff, decon->win_regs + ZUMAPRO_DECON_WIN_FUNC_CON_1(decon->win));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_POSITION(decon->win));
+	writel(end_pos, decon->win_regs + ZUMAPRO_DECON_WIN_END_POSITION(decon->win));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_START_TIME_CON(decon->win));
 	writel(ZUMAPRO_DECON_WIN_MAPCOLOR_EN,
-	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
-	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_0(0));
-	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_1(0));
+	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(decon->win));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_0(decon->win));
+	writel(0, decon->win_regs + ZUMAPRO_DECON_WIN_COLORMAP_1(decon->win));
 	writel(ZUMAPRO_DECON_WIN_MAPCOLOR_EN | ZUMAPRO_DECON_WIN_EN,
-	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(0));
+	       decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(decon->win));
 }
 
 /*
@@ -941,6 +944,12 @@ static void zumapro_decon_handover(struct zumapro_decon *decon)
 	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
 	spin_unlock_irqrestore(&decon->slock, flags);
 
+	/*
+	 * The window control block is this DECON's own, unlike the geometry
+	 * bank the split below shares out, so clearing all of it disturbs no
+	 * other head -- and it is what drops whatever the bootloader left
+	 * enabled on a live display.
+	 */
 	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
 	for (win = 0; win < win_count; win++)
 		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
@@ -1051,6 +1060,12 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 	       decon->main_regs + ZUMAPRO_DECON_INT_PEND_EXTRA);
 	spin_unlock_irqrestore(&decon->slock, flags);
 
+	/*
+	 * The window control block is this DECON's own, unlike the geometry
+	 * bank the split below shares out, so clearing all of it disturbs no
+	 * other head -- and it is what drops whatever the bootloader left
+	 * enabled on a live display.
+	 */
 	win_count = min_t(u32, decon->max_windows, ZUMAPRO_DPU_MAX_WINDOWS);
 	for (win = 0; win < win_count; win++)
 		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
@@ -1593,7 +1608,7 @@ static int zumapro_decon_bind(struct device *dev, struct device *master,
 	decon->plane_config.zpos = 0;
 	decon->plane_config.type = DRM_PLANE_TYPE_PRIMARY;
 
-	ret = exynos_plane_init(drm_dev, &decon->plane, 0,
+	ret = exynos_plane_init(drm_dev, &decon->plane, decon->win,
 				&decon->plane_config);
 	if (ret)
 		return ret;
@@ -1943,6 +1958,27 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 		if (IS_ERR(decon->dqe_regs))
 			return PTR_ERR(decon->dqe_regs);
 	}
+
+	/*
+	 * The window registers are one bank indexed by window, not by DECON --
+	 * WIN_OFFSET counts windows -- so two DECONs driving the same window
+	 * write each other's geometry, and the second one to be configured
+	 * blanks whatever the first was showing. Give each instance its own
+	 * contiguous share.
+	 *
+	 * The vendor hands windows out dynamically from a driver-wide mask; a
+	 * static split is enough for the two heads this SoC wires up, and it
+	 * needs no allocator to reason about.
+	 */
+	decon->win_count = min_t(u32, decon->max_windows,
+				 ZUMAPRO_DPU_MAX_WINDOWS) /
+			   ARRAY_SIZE(zumapro_decon_descs);
+	decon->win = decon->id * decon->win_count;
+	if (!decon->win_count ||
+	    decon->win + decon->win_count > ZUMAPRO_DPU_MAX_WINDOWS)
+		return dev_err_probe(dev, -EINVAL,
+				     "DECON%u has no room in the window bank\n",
+				     decon->id);
 
 	decon->dpp_count = of_count_phandle_with_args(dev->of_node, "dpps",
 						      NULL);

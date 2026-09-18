@@ -171,6 +171,19 @@ static void zumapro_dp_update(struct zumapro_dp *dp, u32 offset, u32 mask,
 }
 
 /*
+ * The video function is what runs the single-stream block. The vendor enables
+ * it at link-up, before a link is even trained, so that everything later
+ * written about a stream lands in a block that is running -- and so the
+ * timing generator is switched on inside a running block, rather than starting
+ * from wherever the function's release happens to find it.
+ */
+static void zumapro_dp_video_func_enable(struct zumapro_dp *dp)
+{
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			  SST1_VIDEO_FUNC_EN, SST1_VIDEO_FUNC_EN);
+}
+
+/*
  * The reset bit does not clear itself. Writing it and polling for it to go
  * away leaves the block held in reset with everything after it reading back
  * as though it had never been programmed.
@@ -818,6 +831,8 @@ static int zumapro_dp_train_link(struct zumapro_dp *dp, unsigned int rate,
 
 	dp->enhanced_framing = drm_dp_enhanced_frame_cap(dp->dpcd);
 
+	zumapro_dp_video_func_enable(dp);
+
 	buf[0] = drm_dp_link_rate_to_bw_code(rate);
 	buf[1] = lanes;
 	if (dp->enhanced_framing)
@@ -973,6 +988,19 @@ done:
 #define ZUMAPRO_DP_SST1_INFOFRAME_SPD_DATA	0x5c60
 
 /*
+ * The stream's framing. Enhanced framing has to match what the sink was told
+ * when the lane count went out, or the two disagree about every frame
+ * boundary; the vendor sets it at link-up, next to the video function, and
+ * this block generates the timing rather than following anything upstream.
+ */
+static void zumapro_dp_set_framing(struct zumapro_dp *dp)
+{
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_MAIN_CONTROL,
+			  SST1_VIDEO_MODE_SLAVE | SST1_ENHANCED_MODE,
+			  dp->enhanced_framing ? SST1_ENHANCED_MODE : 0);
+}
+
+/*
  * The transfer unit: how much of each 64-symbol window carries pixels. It is
  * the ratio of what the mode needs to what the lanes can carry, and getting it
  * wrong is not a link failure -- the sink locks symbols and aligns lanes on a
@@ -1050,6 +1078,15 @@ static void zumapro_dp_set_video_config(struct zumapro_dp *dp,
 	u32 val;
 
 	/*
+	 * Both already set at link-up. Training writes the function enable
+	 * outside the lock, so a disable racing a retrain can lose either
+	 * side's write; repeating them before the stream is described is what
+	 * makes that harmless.
+	 */
+	zumapro_dp_video_func_enable(dp);
+	zumapro_dp_set_framing(dp);
+
+	/*
 	 * Only three depths exist in the register, so the bits per pixel the
 	 * transfer unit is sized from have to come from the one written rather
 	 * than from what was asked for -- a sink offering twelve would
@@ -1115,17 +1152,6 @@ static void zumapro_dp_set_video_config(struct zumapro_dp *dp,
 	/* The transmitter generates the timing; nothing upstream paces it. */
 	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN,
 			  VIDEO_MASTER_TIMING_GEN, VIDEO_MASTER_TIMING_GEN);
-
-	/*
-	 * Enhanced framing has to match what the sink was told when the lane
-	 * count went out, or the two disagree about every frame boundary.
-	 */
-	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_MAIN_CONTROL,
-			  SST1_VIDEO_MODE_SLAVE | SST1_ENHANCED_MODE,
-			  dp->enhanced_framing ? SST1_ENHANCED_MODE : 0);
-
-	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
-			  SST1_VIDEO_FUNC_EN, SST1_VIDEO_FUNC_EN);
 }
 
 static void zumapro_dp_write_infoframe(struct zumapro_dp *dp, u32 offset,
@@ -1292,8 +1318,8 @@ static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 	 * reported as present -- the connector says it is -- with no usable
 	 * link rate, and no mode will then validate.
 	 */
-	if (present)
-		zumapro_dp_train(dp);
+	if (present && !zumapro_dp_train(dp))
+		zumapro_dp_set_framing(dp);
 }
 
 static enum drm_connector_status zumapro_dp_detect(struct drm_bridge *bridge,

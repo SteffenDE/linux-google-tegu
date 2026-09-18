@@ -24,9 +24,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/units.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/hdmi.h>
+#include <linux/math64.h>
 
 #include <drm/display/drm_dp_helper.h>
 #include <drm/drm_bridge.h>
+#include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_print.h>
 
@@ -49,6 +52,11 @@
 
 #define ZUMAPRO_DP_SYSTEM_SW_FUNCTION_ENABLE	0x0014
 #define SW_FUNC_EN				BIT(0)
+
+#define ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE	0x001c
+#define SST1_LH_PWR_ON_STATUS			BIT(5)
+#define SST1_LH_PWR_ON				BIT(4)
+#define SST1_VIDEO_FUNC_EN			BIT(0)
 
 #define ZUMAPRO_DP_SYSTEM_COMMON_FUNCTION_ENABLE 0x0018
 #define HDCP22_FUNC_EN				BIT(4)
@@ -144,6 +152,7 @@ struct zumapro_dp {
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
 	unsigned int link_rate;
 	unsigned int link_lanes;
+	bool enhanced_framing;
 };
 
 static inline struct zumapro_dp *bridge_to_dp(struct drm_bridge *bridge)
@@ -159,6 +168,19 @@ static void zumapro_dp_update(struct zumapro_dp *dp, u32 offset, u32 mask,
 	reg &= ~mask;
 	reg |= val & mask;
 	writel(reg, dp->regs + offset);
+}
+
+/*
+ * The video function is what runs the single-stream block. The vendor enables
+ * it at link-up, before a link is even trained, so that everything later
+ * written about a stream lands in a block that is running -- and so the
+ * timing generator is switched on inside a running block, rather than starting
+ * from wherever the function's release happens to find it.
+ */
+static void zumapro_dp_video_func_enable(struct zumapro_dp *dp)
+{
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			  SST1_VIDEO_FUNC_EN, SST1_VIDEO_FUNC_EN);
 }
 
 /*
@@ -807,9 +829,13 @@ static int zumapro_dp_train_link(struct zumapro_dp *dp, unsigned int rate,
 			   DP_SET_ANSI_8B10B);
 	drm_dp_dpcd_writeb(&dp->aux, DP_DOWNSPREAD_CTRL, 0);
 
+	dp->enhanced_framing = drm_dp_enhanced_frame_cap(dp->dpcd);
+
+	zumapro_dp_video_func_enable(dp);
+
 	buf[0] = drm_dp_link_rate_to_bw_code(rate);
 	buf[1] = lanes;
-	if (drm_dp_enhanced_frame_cap(dp->dpcd))
+	if (dp->enhanced_framing)
 		buf[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
 	ret = drm_dp_dpcd_write(&dp->aux, DP_LINK_BW_SET, buf, sizeof(buf));
 	if (ret < 0)
@@ -908,6 +934,407 @@ done:
 	return ret;
 }
 
+/* Single-stream transport: the video path proper */
+#define ZUMAPRO_DP_SST1_MAIN_CONTROL		0x5000
+#define SST1_VIDEO_MODE_SLAVE			BIT(6)
+#define SST1_ENHANCED_MODE			BIT(5)
+
+#define ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL	0x5004
+#define CLEAR_PIXEL_MAPPING_FIFO		BIT(2)
+#define CLEAR_MAPI_FIFO				BIT(1)
+#define CLEAR_GL_DATA_FIFO			BIT(0)
+
+/* Write one to clear */
+#define ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0	0x5024
+#define SST1_MAPI_FIFO_UNDER_FLOW		BIT(8)
+#define SST1_VSYNC_DET				BIT(7)
+
+#define ZUMAPRO_DP_SST1_MVID_MASTER_MODE	0x5044
+#define ZUMAPRO_DP_SST1_NVID_MASTER_MODE	0x5048
+#define ZUMAPRO_DP_SST1_MVID_SFR_CONFIGURE	0x504c
+#define ZUMAPRO_DP_SST1_NVID_SFR_CONFIGURE	0x5050
+#define MNVID_SFR_CONFIG			GENMASK(23, 0)
+
+#define ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_INTEGER	0x5080
+#define ACTIVE_SYMBOL_INTEGER			GENMASK(5, 0)
+#define ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_FRACTION	0x5084
+#define ACTIVE_SYMBOL_FRACTION			GENMASK(29, 0)
+#define ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_THRESHOLD	0x5088
+#define ACTIVE_SYMBOL_THRESHOLD			GENMASK(3, 0)
+#define ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_THRESHOLD_SEL 0x508c
+#define ACTIVE_SYMBOL_THRESHOLD_SEL		BIT(0)
+
+#define ZUMAPRO_DP_SST1_VIDEO_CONTROL		0x5400
+#define VIDEO_DYNAMIC_RANGE_CEA			BIT(7)
+#define VIDEO_BPC				GENMASK(6, 4)
+#define VIDEO_BPC_6				0
+#define VIDEO_BPC_8				1
+#define VIDEO_BPC_10				2
+#define VIDEO_COLOR_FORMAT			GENMASK(3, 2)
+#define VIDEO_COLOR_FORMAT_RGB			0
+#define VIDEO_VSYNC_POLARITY			BIT(1)
+#define VIDEO_HSYNC_POLARITY			BIT(0)
+
+#define ZUMAPRO_DP_SST1_VIDEO_ENABLE		0x5404
+#define VIDEO_EN				BIT(0)
+
+#define ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN	0x5408
+#define VIDEO_MASTER_TIMING_GEN			BIT(0)
+
+#define ZUMAPRO_DP_SST1_VIDEO_HTOTAL		0x5414
+#define ZUMAPRO_DP_SST1_VIDEO_VTOTAL		0x5418
+#define ZUMAPRO_DP_SST1_VIDEO_HFP		0x541c
+#define ZUMAPRO_DP_SST1_VIDEO_HBP		0x5420
+#define ZUMAPRO_DP_SST1_VIDEO_HACTIVE		0x5424
+#define ZUMAPRO_DP_SST1_VIDEO_VFP		0x5428
+#define ZUMAPRO_DP_SST1_VIDEO_VBP		0x542c
+#define ZUMAPRO_DP_SST1_VIDEO_VACTIVE		0x5430
+
+#define ZUMAPRO_DP_SST1_INFOFRAME_UPDATE	0x5c04
+#define ZUMAPRO_DP_SST1_INFOFRAME_SEND		0x5c08
+#define INFOFRAME_AVI				BIT(2)
+#define INFOFRAME_SPD				BIT(0)
+#define ZUMAPRO_DP_SST1_INFOFRAME_AVI_DATA	0x5c40
+#define ZUMAPRO_DP_SST1_INFOFRAME_SPD_DATA	0x5c60
+
+/*
+ * The stream's framing. Enhanced framing has to match what the sink was told
+ * when the lane count went out, or the two disagree about every frame
+ * boundary; the vendor sets it at link-up, next to the video function, and
+ * this block generates the timing rather than following anything upstream.
+ */
+static void zumapro_dp_set_framing(struct zumapro_dp *dp)
+{
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_MAIN_CONTROL,
+			  SST1_VIDEO_MODE_SLAVE | SST1_ENHANCED_MODE,
+			  dp->enhanced_framing ? SST1_ENHANCED_MODE : 0);
+}
+
+/*
+ * The transfer unit: how much of each 64-symbol window carries pixels. It is
+ * the ratio of what the mode needs to what the lanes can carry, and getting it
+ * wrong is not a link failure -- the sink locks symbols and aligns lanes on a
+ * stream stuffed at the wrong rate exactly as it does on a correct one, and
+ * simply never reports video.
+ */
+static void zumapro_dp_set_active_symbol(struct zumapro_dp *dp,
+					 const struct drm_display_mode *mode,
+					 unsigned int bpp)
+{
+	/*
+	 * The link symbol rate, which is what this block counts in and
+	 * also the unit the DisplayPort helpers keep a link rate in: one
+	 * symbol carries eight bits of the ten on the wire, so 5.4 Gbps
+	 * is 540000 either way.
+	 */
+	unsigned int ls_clk = dp->link_rate;
+	u32 integer, fraction, threshold;
+	u64 tu, rem;
+
+	/*
+	 * How many symbols of each 64-symbol window carry pixels, scaled by
+	 * 10^10 so the integer and fractional halves come out of one division.
+	 *
+	 * Both clocks are in kHz here. The vendor rounds them to MHz first,
+	 * which leaves the integer part right and the fraction short -- a
+	 * 1920x1080-60 link over two lanes at HBR wants 26 and 4e8, and the
+	 * rounded arithmetic gives 26 and 3.1e8. Keeping the kHz is both
+	 * closer and no harder.
+	 */
+	tu = (u64)mode->clock * bpp * 32 * 10000000000ULL;
+	do_div(tu, dp->link_lanes * ls_clk * 8);
+
+	integer = div64_u64_rem(tu, 10000000000ULL, &rem);
+	fraction = div_u64(rem, 10);
+
+	if (integer <= 2)
+		threshold = 7;
+	else if (integer <= 5)
+		threshold = 8;
+	else
+		threshold = 9;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_INTEGER,
+			  ACTIVE_SYMBOL_INTEGER,
+			  FIELD_PREP(ACTIVE_SYMBOL_INTEGER, integer));
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_FRACTION,
+			  ACTIVE_SYMBOL_FRACTION,
+			  FIELD_PREP(ACTIVE_SYMBOL_FRACTION, fraction));
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_THRESHOLD,
+			  ACTIVE_SYMBOL_THRESHOLD,
+			  FIELD_PREP(ACTIVE_SYMBOL_THRESHOLD, threshold));
+
+	/*
+	 * Without the select the hardware ignores the threshold just written
+	 * and stuffs the transfer units on a boundary of its own choosing.
+	 */
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_ACTIVE_SYMBOL_THRESHOLD_SEL,
+			  ACTIVE_SYMBOL_THRESHOLD_SEL,
+			  ACTIVE_SYMBOL_THRESHOLD_SEL);
+}
+
+static void zumapro_dp_set_video_config(struct zumapro_dp *dp,
+					const struct drm_display_mode *mode,
+					unsigned int bpc)
+{
+	/*
+	 * The link symbol rate, which is what this block counts in and
+	 * also the unit the DisplayPort helpers keep a link rate in: one
+	 * symbol carries eight bits of the ten on the wire, so 5.4 Gbps
+	 * is 540000 either way.
+	 */
+	unsigned int ls_clk = dp->link_rate;
+	unsigned int bpp;
+	u32 val;
+
+	/*
+	 * Both already set at link-up. Training writes the function enable
+	 * outside the lock, so a disable racing a retrain can lose either
+	 * side's write; repeating them before the stream is described is what
+	 * makes that harmless.
+	 */
+	zumapro_dp_video_func_enable(dp);
+	zumapro_dp_set_framing(dp);
+
+	/*
+	 * Only three depths exist in the register, so the bits per pixel the
+	 * transfer unit is sized from have to come from the one written rather
+	 * than from what was asked for -- a sink offering twelve would
+	 * otherwise be sent eight and stuffed for twelve.
+	 */
+	val = FIELD_PREP(VIDEO_COLOR_FORMAT, VIDEO_COLOR_FORMAT_RGB);
+	switch (bpc) {
+	case 6:
+		val |= FIELD_PREP(VIDEO_BPC, VIDEO_BPC_6);
+		bpp = 18;
+		break;
+	case 10:
+		val |= FIELD_PREP(VIDEO_BPC, VIDEO_BPC_10);
+		bpp = 30;
+		break;
+	default:
+		val |= FIELD_PREP(VIDEO_BPC, VIDEO_BPC_8);
+		bpp = 24;
+		break;
+	}
+
+	/* A set bit is a negative sync, not a positive one. */
+	if (mode->flags & DRM_MODE_FLAG_NVSYNC)
+		val |= VIDEO_VSYNC_POLARITY;
+	if (mode->flags & DRM_MODE_FLAG_NHSYNC)
+		val |= VIDEO_HSYNC_POLARITY;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_CONTROL,
+			  VIDEO_DYNAMIC_RANGE_CEA | VIDEO_BPC |
+			  VIDEO_COLOR_FORMAT | VIDEO_VSYNC_POLARITY |
+			  VIDEO_HSYNC_POLARITY, val);
+
+	writel(mode->htotal, dp->regs + ZUMAPRO_DP_SST1_VIDEO_HTOTAL);
+	writel(mode->vtotal, dp->regs + ZUMAPRO_DP_SST1_VIDEO_VTOTAL);
+	writel(mode->hsync_start - mode->hdisplay,
+	       dp->regs + ZUMAPRO_DP_SST1_VIDEO_HFP);
+	writel(mode->htotal - mode->hsync_end,
+	       dp->regs + ZUMAPRO_DP_SST1_VIDEO_HBP);
+	writel(mode->hdisplay, dp->regs + ZUMAPRO_DP_SST1_VIDEO_HACTIVE);
+	writel(mode->vsync_start - mode->vdisplay,
+	       dp->regs + ZUMAPRO_DP_SST1_VIDEO_VFP);
+	writel(mode->vtotal - mode->vsync_end,
+	       dp->regs + ZUMAPRO_DP_SST1_VIDEO_VBP);
+	writel(mode->vdisplay, dp->regs + ZUMAPRO_DP_SST1_VIDEO_VACTIVE);
+
+	/*
+	 * The sink recovers its pixel clock from the link rate scaled by M/N.
+	 * The master value is a quarter of the stream clock because the lanes
+	 * come off a Synopsys PHY, which this register layer -- written for a
+	 * generation that paired the link with a Samsung one -- does not know.
+	 */
+	writel(mode->clock / 4, dp->regs + ZUMAPRO_DP_SST1_MVID_MASTER_MODE);
+	writel(ls_clk, dp->regs + ZUMAPRO_DP_SST1_NVID_MASTER_MODE);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_MVID_SFR_CONFIGURE,
+			  MNVID_SFR_CONFIG,
+			  FIELD_PREP(MNVID_SFR_CONFIG, mode->clock));
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_NVID_SFR_CONFIGURE,
+			  MNVID_SFR_CONFIG,
+			  FIELD_PREP(MNVID_SFR_CONFIG, ls_clk));
+
+	zumapro_dp_set_active_symbol(dp, mode, bpp);
+
+	/* The transmitter generates the timing; nothing upstream paces it. */
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN,
+			  VIDEO_MASTER_TIMING_GEN, VIDEO_MASTER_TIMING_GEN);
+}
+
+static void zumapro_dp_write_infoframe(struct zumapro_dp *dp, u32 offset,
+				       const u8 *data, size_t len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i += 4) {
+		u32 word = 0;
+		unsigned int j;
+
+		for (j = 0; j < 4 && i + j < len; j++)
+			word |= (u32)data[i + j] << (j * 8);
+
+		writel(word, dp->regs + offset + i);
+	}
+}
+
+/*
+ * A sink that bridges DisplayPort to HDMI builds its outgoing infoframe from
+ * ours, and without one it has nothing to describe the picture with and
+ * produces no output. This is the kind of gap a register-by-register
+ * comparison cannot find: not a value written wrongly, a packet never sent.
+ */
+static void zumapro_dp_send_infoframes(struct zumapro_dp *dp,
+				       struct drm_connector *connector,
+				       const struct drm_display_mode *mode)
+{
+	union hdmi_infoframe frame;
+	u8 buf[HDMI_INFOFRAME_SIZE(AVI)];
+	ssize_t len;
+
+	if (drm_hdmi_avi_infoframe_from_display_mode(&frame.avi, connector,
+						     mode))
+		return;
+
+	len = hdmi_infoframe_pack(&frame, buf, sizeof(buf));
+	if (len < HDMI_INFOFRAME_HEADER_SIZE)
+		return;
+
+	/*
+	 * The hardware supplies the header and the checksum, so only the body
+	 * goes in. The packed buffer's first four bytes are type, version,
+	 * length and checksum -- which is the whole of the header size, the
+	 * checksum included.
+	 */
+	zumapro_dp_write_infoframe(dp, ZUMAPRO_DP_SST1_INFOFRAME_AVI_DATA,
+				   buf + HDMI_INFOFRAME_HEADER_SIZE,
+				   len - HDMI_INFOFRAME_HEADER_SIZE);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_INFOFRAME_UPDATE, INFOFRAME_AVI,
+			  INFOFRAME_AVI);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_INFOFRAME_SEND, INFOFRAME_AVI,
+			  INFOFRAME_AVI);
+}
+
+/*
+ * The long-hop channel carries the pixels from the transmitter to the lanes.
+ * A transmitter generating pixels it cannot put on the wire looks exactly like
+ * a link that trained and shows nothing, so its power-up is waited for and a
+ * failure is not proceeded past.
+ */
+static int zumapro_dp_video_enable(struct zumapro_dp *dp)
+{
+	u32 reg;
+	int ret;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			  SST1_LH_PWR_ON, SST1_LH_PWR_ON);
+
+	ret = readl_poll_timeout(dp->regs +
+				 ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+				 reg, reg & SST1_LH_PWR_ON_STATUS, 10, 2000);
+	if (ret) {
+		dev_err(dp->dev, "the pixel channel did not power up\n");
+		return ret;
+	}
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_ENABLE, VIDEO_EN, VIDEO_EN);
+
+	return 0;
+}
+
+/*
+ * Whether a stop takes the stream down on a frame boundary and clears the
+ * block behind it, or only drops the video enable and the pixel channel as
+ * the vendor generation this block came from does. Settable at runtime so the
+ * two can be compared without a rebuild.
+ */
+static bool dp_stream_reset = true;
+module_param(dp_stream_reset, bool, 0644);
+MODULE_PARM_DESC(dp_stream_reset,
+		 "stop the DisplayPort stream on a frame boundary and clear its fifos (default on)");
+
+static void zumapro_dp_wait_vsync(struct zumapro_dp *dp)
+{
+	u32 val;
+
+	/* Drop a stale detect before waiting for a live one. */
+	writel(SST1_VSYNC_DET,
+	       dp->regs + ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0);
+
+	if (readl_poll_timeout(dp->regs +
+			       ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0,
+			       val, val & SST1_VSYNC_DET, 100, 50000))
+		dev_warn(dp->dev, "no vsync before stopping the stream\n");
+}
+
+/*
+ * Bring the stream down the way the earlier generation of the vendor driver
+ * does, rather than the bare "video off, channel off" of the one this block
+ * came from: stop on a frame boundary, halt the raster, wait for the pixel
+ * channel to actually power down, then clear the three fifos between the
+ * pixel input and the lanes, and whatever interrupt the stop left pending.
+ *
+ * What that buys is a block that goes into its next enable holding nothing
+ * from this one. The bare stop leaves the timing generator free-running
+ * through the blank, and leaves whatever DECON pushed after the channel closed
+ * sitting in the fifos -- and DECON does push, because the bridge stops taking
+ * pixels before the CRTC stops sending them. The next enable then starts a
+ * fresh raster against that residue, and where the picture lands is decided
+ * by how much of it there was.
+ */
+static void zumapro_dp_video_disable(struct zumapro_dp *dp)
+{
+	/*
+	 * A stream whose raster is not running has no vsync to wait for and no
+	 * channel to watch: the link is gone, because the sink was unplugged
+	 * and the connector's own teardown ran before this commit reached us,
+	 * or the block was reset under it by a replug in the same window. The
+	 * writes still go in, so the block is left the same way either way;
+	 * only the waiting is skipped.
+	 */
+	bool live = dp->link_rate &&
+		    (readl(dp->regs + ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN) &
+		     VIDEO_MASTER_TIMING_GEN);
+	u32 reg;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_ENABLE, VIDEO_EN, 0);
+
+	if (!dp_stream_reset) {
+		zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+				  SST1_LH_PWR_ON, 0);
+		return;
+	}
+
+	if (live)
+		zumapro_dp_wait_vsync(dp);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN,
+			  VIDEO_MASTER_TIMING_GEN, 0);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_ENABLE, VIDEO_EN, 0);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			  SST1_LH_PWR_ON, 0);
+	if (live &&
+	    readl_poll_timeout(dp->regs +
+			       ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			       reg, !(reg & SST1_LH_PWR_ON_STATUS), 10, 2000))
+		dev_warn(dp->dev, "the pixel channel did not power down\n");
+
+	/*
+	 * The MAPI fifo is the one the reference clears; the two beside it on
+	 * the pixel path are cleared with it. Written and then withdrawn:
+	 * whether the hardware takes these as a pulse or as a level, the fifos
+	 * end up cleared and released.
+	 */
+	writel(CLEAR_PIXEL_MAPPING_FIFO | CLEAR_MAPI_FIFO | CLEAR_GL_DATA_FIFO,
+	       dp->regs + ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL);
+	writel(0, dp->regs + ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL);
+
+	writel(~0, dp->regs + ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0);
+}
+
 /*
  * Undo what training moved onto the transmit clock.
  *
@@ -996,8 +1423,8 @@ static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 	 * reported as present -- the connector says it is -- with no usable
 	 * link rate, and no mode will then validate.
 	 */
-	if (present)
-		zumapro_dp_train(dp);
+	if (present && !zumapro_dp_train(dp))
+		zumapro_dp_set_framing(dp);
 }
 
 static enum drm_connector_status zumapro_dp_detect(struct drm_bridge *bridge,
@@ -1057,11 +1484,99 @@ static int zumapro_dp_attach(struct drm_bridge *bridge,
 					&dp->aux);
 }
 
+static enum drm_mode_status
+zumapro_dp_mode_valid(struct drm_bridge *bridge,
+		      const struct drm_display_info *info,
+		      const struct drm_display_mode *mode)
+{
+	struct zumapro_dp *dp = bridge_to_dp(bridge);
+	unsigned int bpp, rate, lanes;
+
+	scoped_guard(mutex, &dp->lock) {
+		rate = dp->link_rate;
+		lanes = dp->link_lanes;
+	}
+
+	if (!rate)
+		return MODE_NOCLOCK;
+
+	/*
+	 * The trained link carries a fixed number of bits per second, and a
+	 * mode that needs more than that cannot be sent however it is timed.
+	 */
+	bpp = max(info->bpc, 8U) * 3;
+	if ((u64)mode->clock * bpp > (u64)rate * lanes * 8)
+		return MODE_CLOCK_HIGH;
+
+	return MODE_OK;
+}
+
+static void zumapro_dp_atomic_enable(struct drm_bridge *bridge,
+				     struct drm_atomic_commit *state)
+{
+	struct zumapro_dp *dp = bridge_to_dp(bridge);
+	const struct drm_display_mode *mode;
+	struct drm_connector_state *conn_state;
+	struct drm_connector *connector;
+	struct drm_crtc_state *crtc_state;
+	unsigned int bpc;
+
+	connector = drm_atomic_get_new_connector_for_encoder(state,
+							     bridge->encoder);
+	if (!connector)
+		return;
+
+	conn_state = drm_atomic_get_new_connector_state(state, connector);
+	if (!conn_state || !conn_state->crtc)
+		return;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
+	if (!crtc_state)
+		return;
+
+	mode = &crtc_state->adjusted_mode;
+
+	guard(mutex)(&dp->lock);
+
+	if (!dp->link_rate) {
+		dev_err(dp->dev, "no trained link to put a picture on\n");
+		return;
+	}
+
+	/*
+	 * The depth is the lesser of what the sink offers and what the
+	 * connector's own property allows, so a user capping it is honoured.
+	 */
+	bpc = connector->display_info.bpc ? : 8;
+	if (conn_state->max_bpc)
+		bpc = min(bpc, conn_state->max_bpc);
+
+	zumapro_dp_set_video_config(dp, mode, bpc);
+	zumapro_dp_send_infoframes(dp, connector, mode);
+	zumapro_dp_video_enable(dp);
+}
+
+static void zumapro_dp_atomic_disable(struct drm_bridge *bridge,
+				      struct drm_atomic_commit *state)
+{
+	struct zumapro_dp *dp = bridge_to_dp(bridge);
+
+	guard(mutex)(&dp->lock);
+
+	zumapro_dp_video_disable(dp);
+}
+
 static const struct drm_bridge_funcs zumapro_dp_bridge_funcs = {
-	.attach		= zumapro_dp_attach,
-	.detect		= zumapro_dp_detect,
-	.edid_read	= zumapro_dp_edid_read,
-	.hpd_notify	= zumapro_dp_hpd_notify,
+	.attach			= zumapro_dp_attach,
+	.detect			= zumapro_dp_detect,
+	.edid_read		= zumapro_dp_edid_read,
+	.hpd_notify		= zumapro_dp_hpd_notify,
+	.mode_valid		= zumapro_dp_mode_valid,
+	.atomic_enable		= zumapro_dp_atomic_enable,
+	.atomic_disable		= zumapro_dp_atomic_disable,
+	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,
+	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
+	.atomic_reset		= drm_atomic_helper_bridge_reset,
 };
 
 static int zumapro_dp_probe(struct platform_device *pdev)

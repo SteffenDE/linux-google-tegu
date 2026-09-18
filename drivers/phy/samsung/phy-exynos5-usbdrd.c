@@ -2871,6 +2871,37 @@ static void zumapro_usbdrd_dp_park_lanes(struct exynos5_usbdrd_phy *phy_drd)
 	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
 }
 
+/*
+ * Give the lanes back, without asking the transmitters for anything.
+ *
+ * The full park above ends in a request the transmitters have to acknowledge.
+ * They can, while a link is being set up and their clocks are running; they
+ * cannot once the link is gone, and then that request times out two
+ * milliseconds at a time inside a teardown that the Type-C port is waiting on.
+ * A crossbar left mid-switch by that is not a quiet failure: the next access
+ * anywhere in this block can take an external abort.
+ *
+ * So on the way out, only the writes that need no answer -- disable the lanes,
+ * park them, and tell the crossbar DisplayPort has let go.
+ */
+static void zumapro_usbdrd_dp_release_lanes(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *reg_pma = phy_drd->reg_pma;
+	u32 reg;
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+	reg |= DP_CONFIG13_TX_DISABLE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG13);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+	reg |= DP_CONFIG11_TX_PSTATE;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG11);
+
+	reg = readl(reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+	reg |= DP_CONFIG19_DPALT_DISABLE_ACK;
+	writel(reg, reg_pma + ZUMAPRO_USBDP_PHY_DP_CONFIG19);
+}
+
 static int zumapro_usbdrd_dp_set_rate(struct exynos5_usbdrd_phy *phy_drd,
 				      struct phy_configure_opts_dp *dp)
 {
@@ -3220,7 +3251,7 @@ static int zumapro_usbdrd_phy_set_mode(struct phy *phy, enum phy_mode mode,
 	 */
 	phy_drd->dp_active = false;
 	phy_drd->dp_link_rate = 0;
-	zumapro_usbdrd_dp_park_lanes(phy_drd);
+	zumapro_usbdrd_dp_release_lanes(phy_drd);
 	zumapro_usbdrd_tca_ctrl_sync(phy_drd, TCA_MUX_CONTROL_USB31, false);
 
 	return 0;

@@ -1220,6 +1220,31 @@ static void zumapro_dp_video_disable(struct zumapro_dp *dp)
  * Hotplug comes from the connector, over the configuration channel, so all the
  * bridge has to do is tell the link what the connector saw.
  */
+/*
+ * Undo what training moved onto the transmit clock.
+ *
+ * When the link trained, the block's clock mux was switched from its own
+ * oscillator to the PHY's transmit clock, and the coding sublayer was enabled
+ * behind it. That clock stops existing the moment the PHY leaves DisplayPort
+ * mode, and a block still selected on it cannot answer a register access at
+ * all: the read does not fail, it never completes, and the interconnect
+ * eventually reports the stall. The next plug is what walks into it.
+ *
+ * So this has to run while the transmit clock is still there -- before the PHY
+ * is told to leave -- and the mux has to go first, because everything after it
+ * is clocked by whatever it selects.
+ */
+static void zumapro_dp_link_stop(struct zumapro_dp *dp)
+{
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_CLK_CONTROL,
+			  GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20, 0);
+
+	writel(0, dp->regs + ZUMAPRO_DP_PCS_SNPS_DATAPATH_CONTROL);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_COMMON_FUNCTION_ENABLE,
+			  PCS_FUNC_EN, 0);
+}
+
 static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 				  struct drm_connector *connector,
 				  enum drm_connector_status status)
@@ -1249,6 +1274,7 @@ static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 			}
 			zumapro_dp_aux_init(dp);
 		} else {
+			zumapro_dp_link_stop(dp);
 			dp->link_rate = 0;
 			dp->link_lanes = 0;
 			phy_set_mode(dp->phy, PHY_MODE_INVALID);

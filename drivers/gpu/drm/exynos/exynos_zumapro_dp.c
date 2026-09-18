@@ -1589,9 +1589,42 @@ static int zumapro_dp_runtime_resume(struct device *dev)
 	return ret;
 }
 
+/*
+ * The reverse of zumapro_dp_link_init(), in the order the vendor's
+ * dp_hw_deinit() does it: mask the interrupts, stop the software functions,
+ * put the block back on its own oscillator, drop the module functions, and
+ * only then release the Q-channel.
+ *
+ * The order is not decorative. Everything after the clock mux is clocked by
+ * whatever it selects, and the Q-channel is the answer this block gives the
+ * power controller when asked whether it is idle -- so it goes last, once
+ * nothing is left running to make it busy.
+ *
+ * Leaving any of it set does not show up here. It shows up as the whole HSI0
+ * domain refusing to power down, a secure write that never completes, and a
+ * system suspend that does not return.
+ */
+static void zumapro_dp_link_deinit(struct zumapro_dp *dp)
+{
+	writel(0, dp->regs + ZUMAPRO_DP_SYSTEM_IRQ_COMMON_STATUS_MASK);
+
+	writel(0, dp->regs + ZUMAPRO_DP_SYSTEM_SW_FUNCTION_ENABLE);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_CLK_CONTROL,
+			  GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20, 0);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_COMMON_FUNCTION_ENABLE,
+			  HDCP22_FUNC_EN | HDCP13_FUNC_EN | GTC_FUNC_EN |
+			  PCS_FUNC_EN | AUX_FUNC_EN, 0);
+
+	writel(0, dp->regs + ZUMAPRO_DP_SYSTEM_OSCLK_QCH_FUNC_EN);
+}
+
 static int zumapro_dp_runtime_suspend(struct device *dev)
 {
 	struct zumapro_dp *dp = dev_get_drvdata(dev);
+
+	zumapro_dp_link_deinit(dp);
 
 	clk_bulk_disable_unprepare(dp->num_clks, dp->clks);
 

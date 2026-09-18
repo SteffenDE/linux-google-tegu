@@ -810,17 +810,44 @@ static void zumapro_decon_program_dqe(struct zumapro_decon *decon,
 	writel(0, decon->dqe_regs + ZUMAPRO_DQE_DISP_DITHER_V4);
 }
 
+/*
+ * The output fifo's SRAM is a pool of instances shared by every DECON, and each
+ * one has to own its instances outright: two heads claiming the same SRAM is
+ * the resource conflict the block reports an interrupt for, and in practice it
+ * is whatever is already scanning out that loses. The vendor gives the first
+ * two heads eleven instances each.
+ *
+ * Each register holds eight instances, a nibble apiece, so a run of them
+ * becomes a nibble mask across up to two registers.
+ */
+#define ZUMAPRO_DECON_SRAM_PER_REG		8
+#define ZUMAPRO_DECON_SRAM_PER_DECON		11
+
+static u32 zumapro_decon_sram_word(u32 first, u32 count, unsigned int reg)
+{
+	u32 lo = reg * ZUMAPRO_DECON_SRAM_PER_REG;
+	u32 hi = lo + ZUMAPRO_DECON_SRAM_PER_REG;
+	u32 val = 0;
+	u32 i;
+
+	for (i = max(first, lo); i < min(first + count, hi); i++)
+		val |= 1u << ((i - lo) * 4);
+
+	return val;
+}
+
 static void zumapro_decon_program_outfifo(struct zumapro_decon *decon)
 {
-	/* Downstream DECON0 primary OUTFIFO owns SRAM banks 0..10. */
-	writel(0x11111111, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(0));
-	writel(0x00000111, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(1));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(2));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(3));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(0));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(1));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(2));
-	writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(3));
+	u32 first = decon->id * ZUMAPRO_DECON_SRAM_PER_DECON;
+	unsigned int i;
+
+	for (i = 0; i < 4; i++)
+		writel(zumapro_decon_sram_word(first,
+					       ZUMAPRO_DECON_SRAM_PER_DECON, i),
+		       decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_PRI(i));
+	/* Nothing here writes back, so the secondary path claims nothing. */
+	for (i = 0; i < 4; i++)
+		writel(0, decon->main_regs + ZUMAPRO_DECON_SRAM_EN_OF_SEC(i));
 
 	writel(0, decon->main_regs + ZUMAPRO_DECON_OF_PIXEL_ORDER);
 	writel(0x1, decon->main_regs + ZUMAPRO_DECON_OF_URGENT_EN);

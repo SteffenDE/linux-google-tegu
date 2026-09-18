@@ -50,6 +50,13 @@ static int drm_iommu_attach_device(struct drm_device *drm_dev,
 	struct exynos_drm_private *priv = drm_dev->dev_private;
 	int ret = 0;
 
+	/*
+	 * Nothing has been moved yet. Say so before any path can return, so
+	 * that a detach after a failed or skipped attach undoes nothing, and
+	 * cannot act on what a previous bind left here.
+	 */
+	*dma_priv = NULL;
+
 	if (get_dma_ops(drm_dev_dma_dev(drm_dev)) != get_dma_ops(subdrv_dev)) {
 		DRM_DEV_ERROR(subdrv_dev, "Device %s lacks support for IOMMU\n",
 			  dev_name(subdrv_dev));
@@ -70,7 +77,22 @@ static int drm_iommu_attach_device(struct drm_device *drm_dev,
 
 		ret = arm_iommu_attach_device(subdrv_dev, priv->mapping);
 	} else if (IS_ENABLED(CONFIG_IOMMU_DMA)) {
-		ret = iommu_attach_device(priv->mapping, subdrv_dev);
+		/*
+		 * Components can share an IOMMU group, and on some SoCs the
+		 * device tree asks for exactly that -- both display heads of
+		 * Google's Zumapro name one group between them. A group has a
+		 * single domain covering every device in it, so a component
+		 * already sitting in the mapping has nothing to attach, and
+		 * iommu_attach_device() refuses a group holding more than one
+		 * device because attaching a single member of one is not a
+		 * meaningful request. Record whether there was anything to do,
+		 * so the detach can match.
+		 */
+		if (iommu_get_domain_for_dev(subdrv_dev) != priv->mapping) {
+			ret = iommu_attach_device(priv->mapping, subdrv_dev);
+			if (!ret)
+				*dma_priv = priv->mapping;
+		}
 	}
 
 	return ret;
@@ -93,8 +115,11 @@ static void drm_iommu_detach_device(struct drm_device *drm_dev,
 	if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU)) {
 		arm_iommu_detach_device(subdrv_dev);
 		arm_iommu_attach_device(subdrv_dev, *dma_priv);
-	} else if (IS_ENABLED(CONFIG_IOMMU_DMA))
-		iommu_detach_device(priv->mapping, subdrv_dev);
+	} else if (IS_ENABLED(CONFIG_IOMMU_DMA)) {
+		/* Only what the attach actually moved. */
+		if (*dma_priv)
+			iommu_detach_device(priv->mapping, subdrv_dev);
+	}
 }
 
 int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,

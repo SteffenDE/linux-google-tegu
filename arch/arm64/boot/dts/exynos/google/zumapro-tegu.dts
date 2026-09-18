@@ -9,6 +9,7 @@
 /dts-v1/;
 
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/usb/pd.h>
 
 #include "zumapro.dtsi"
 
@@ -1218,11 +1219,60 @@
 		connector {
 			compatible = "usb-c-connector";
 			label = "USB-C";
-			data-role = "device";
+			/*
+			 * Dual data role, because the alternate mode driver
+			 * will only drive a port that can be the host: it is
+			 * the DisplayPort source, and it refuses a port stuck
+			 * as a device. Power stays sink-only -- nothing here
+			 * sources VBUS.
+			 */
+			data-role = "dual";
 			power-role = "sink";
 			self-powered;
-			pd-disable;
 			typec-power-opmode = "default";
+
+			/*
+			 * One fixed 5 V capability and nothing above it. Power
+			 * delivery is described because an alternate mode needs
+			 * a contract to be negotiated over, not because anything
+			 * here knows how to charge faster yet: the vendor also
+			 * offers 9 V and a 5-21 V programmable supply, and
+			 * asking for either would put VBUS somewhere this
+			 * board's charging has never been told to expect.
+			 */
+			sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_HIGHER_CAP |
+						PDO_FIXED_USB_COMM |
+						PDO_FIXED_DATA_SWAP)>;
+			op-sink-microwatt = <2600000>;
+
+			/*
+			 * Where the hotplug an entered alternate mode reports
+			 * has to land. The alternate mode driver resolves this
+			 * to a DRM connector's fwnode, and drm_bridge_connector
+			 * takes that fwnode from the last bridge's node, so it
+			 * has to name the transmitter.
+			 */
+			displayport = <&dp>;
+
+			altmodes {
+				displayport {
+					svid = /bits/ 16 <0xff01>;
+					/*
+					 * dp_altmode_probe() intersects this
+					 * against the partner's assignments and
+					 * refuses the mode if nothing overlaps,
+					 * so the port has to name its own:
+					 * DFP_D, DisplayPort 1.3 rates, on a
+					 * receptacle, assignments C (four DP
+					 * lanes) and D (two, with USB3
+					 * alongside) -- the two the combo PHY's
+					 * crossbar can route. The vendor also
+					 * lists E, which belongs to a plug
+					 * rather than a receptacle.
+					 */
+					vdo = <0x00000c46>;
+				};
+			};
 
 			ports {
 				#address-cells = <1>;
@@ -1250,9 +1300,24 @@
 				/* takes the connector orientation.           */
 				port@1 {
 					reg = <1>;
+					#address-cells = <1>;
+					#size-cells = <0>;
 
-					usbc0_orien_sw: endpoint {
+					usbc0_orien_sw: endpoint@0 {
+						reg = <0>;
 						remote-endpoint = <&usb32drd_orien_sw>;
+					};
+
+					/*
+					 * The transmitter takes the orientation
+					 * too: the pair the plug landed on
+					 * decides which way round AUX is, and
+					 * this TCPC's SBU crossbar has one
+					 * setting rather than one per polarity.
+					 */
+					usbc0_dp_orien_sw: endpoint@1 {
+						reg = <1>;
+						remote-endpoint = <&dp_orien_sw>;
 					};
 				};
 			};
@@ -1292,12 +1357,26 @@
 /*
  * The DisplayPort transmitter, and the combo PHY's mode switch that tells it
  * which lanes a negotiated alternate mode left for it.  Entering the mode also
- * needs power delivery on the connector, which the bootloader disables while
- * its own serial console is on -- so this is described here and reached only
- * once that console is turned off.
+ * needs power delivery on the connector, which is described above.
  */
 &dp {
+	/*
+	 * The plug orientation decides which way round AUX is, and this TCPC's
+	 * SBU crossbar has one setting rather than one per polarity -- so the
+	 * link is what has to invert, and it has to be told.
+	 */
+	orientation-switch;
 	status = "okay";
+
+	ports {
+		port@1 {
+			reg = <1>;
+
+			dp_orien_sw: endpoint {
+				remote-endpoint = <&usbc0_dp_orien_sw>;
+			};
+		};
+	};
 };
 
 /*

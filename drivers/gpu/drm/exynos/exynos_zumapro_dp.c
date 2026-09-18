@@ -939,6 +939,16 @@ done:
 #define SST1_VIDEO_MODE_SLAVE			BIT(6)
 #define SST1_ENHANCED_MODE			BIT(5)
 
+#define ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL	0x5004
+#define CLEAR_PIXEL_MAPPING_FIFO		BIT(2)
+#define CLEAR_MAPI_FIFO				BIT(1)
+#define CLEAR_GL_DATA_FIFO			BIT(0)
+
+/* Write one to clear */
+#define ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0	0x5024
+#define SST1_MAPI_FIFO_UNDER_FLOW		BIT(8)
+#define SST1_VSYNC_DET				BIT(7)
+
 #define ZUMAPRO_DP_SST1_MVID_MASTER_MODE	0x5044
 #define ZUMAPRO_DP_SST1_NVID_MASTER_MODE	0x5048
 #define ZUMAPRO_DP_SST1_MVID_SFR_CONFIGURE	0x504c
@@ -1235,11 +1245,94 @@ static int zumapro_dp_video_enable(struct zumapro_dp *dp)
 	return 0;
 }
 
+/*
+ * Whether a stop takes the stream down on a frame boundary and clears the
+ * block behind it, or only drops the video enable and the pixel channel as
+ * the vendor generation this block came from does. Settable at runtime so the
+ * two can be compared without a rebuild.
+ */
+static bool dp_stream_reset = true;
+module_param(dp_stream_reset, bool, 0644);
+MODULE_PARM_DESC(dp_stream_reset,
+		 "stop the DisplayPort stream on a frame boundary and clear its fifos (default on)");
+
+static void zumapro_dp_wait_vsync(struct zumapro_dp *dp)
+{
+	u32 val;
+
+	/* Drop a stale detect before waiting for a live one. */
+	writel(SST1_VSYNC_DET,
+	       dp->regs + ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0);
+
+	if (readl_poll_timeout(dp->regs +
+			       ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0,
+			       val, val & SST1_VSYNC_DET, 100, 50000))
+		dev_warn(dp->dev, "no vsync before stopping the stream\n");
+}
+
+/*
+ * Bring the stream down the way the earlier generation of the vendor driver
+ * does, rather than the bare "video off, channel off" of the one this block
+ * came from: stop on a frame boundary, halt the raster, wait for the pixel
+ * channel to actually power down, then clear the three fifos between the
+ * pixel input and the lanes, and whatever interrupt the stop left pending.
+ *
+ * What that buys is a block that goes into its next enable holding nothing
+ * from this one. The bare stop leaves the timing generator free-running
+ * through the blank, and leaves whatever DECON pushed after the channel closed
+ * sitting in the fifos -- and DECON does push, because the bridge stops taking
+ * pixels before the CRTC stops sending them. The next enable then starts a
+ * fresh raster against that residue, and where the picture lands is decided
+ * by how much of it there was.
+ */
 static void zumapro_dp_video_disable(struct zumapro_dp *dp)
 {
+	/*
+	 * A stream whose raster is not running has no vsync to wait for and no
+	 * channel to watch: the link is gone, because the sink was unplugged
+	 * and the connector's own teardown ran before this commit reached us,
+	 * or the block was reset under it by a replug in the same window. The
+	 * writes still go in, so the block is left the same way either way;
+	 * only the waiting is skipped.
+	 */
+	bool live = dp->link_rate &&
+		    (readl(dp->regs + ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN) &
+		     VIDEO_MASTER_TIMING_GEN);
+	u32 reg;
+
 	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_ENABLE, VIDEO_EN, 0);
+
+	if (!dp_stream_reset) {
+		zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+				  SST1_LH_PWR_ON, 0);
+		return;
+	}
+
+	if (live)
+		zumapro_dp_wait_vsync(dp);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_MASTER_TIMING_GEN,
+			  VIDEO_MASTER_TIMING_GEN, 0);
+	zumapro_dp_update(dp, ZUMAPRO_DP_SST1_VIDEO_ENABLE, VIDEO_EN, 0);
+
 	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
 			  SST1_LH_PWR_ON, 0);
+	if (live &&
+	    readl_poll_timeout(dp->regs +
+			       ZUMAPRO_DP_SYSTEM_SST1_FUNCTION_ENABLE,
+			       reg, !(reg & SST1_LH_PWR_ON_STATUS), 10, 2000))
+		dev_warn(dp->dev, "the pixel channel did not power down\n");
+
+	/*
+	 * The MAPI fifo is the one the reference clears; the two beside it on
+	 * the pixel path are cleared with it. Written and then withdrawn:
+	 * whether the hardware takes these as a pulse or as a level, the fifos
+	 * end up cleared and released.
+	 */
+	writel(CLEAR_PIXEL_MAPPING_FIFO | CLEAR_MAPI_FIFO | CLEAR_GL_DATA_FIFO,
+	       dp->regs + ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL);
+	writel(0, dp->regs + ZUMAPRO_DP_SST1_MAIN_FIFO_CONTROL);
+
+	writel(~0, dp->regs + ZUMAPRO_DP_SST1_INTERRUPT_STATUS_SET0);
 }
 
 /*

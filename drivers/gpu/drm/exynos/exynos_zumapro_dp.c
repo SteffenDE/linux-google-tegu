@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/units.h>
+#include <linux/usb/typec_mux.h>
 #include <linux/hdmi.h>
 #include <linux/math64.h>
 
@@ -146,6 +147,8 @@ struct zumapro_dp {
 	/* Serialises AUX against the connector telling us the sink changed */
 	struct mutex lock;
 	bool sink_present;
+	struct typec_switch_dev *orien_sw;
+	enum typec_orientation orientation;
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
 	unsigned int link_rate;
 	unsigned int link_lanes;
@@ -215,13 +218,52 @@ static void zumapro_dp_set_osc_divs(struct zumapro_dp *dp)
 			  FIELD_PREP(AUX_10US_OSC_CLK_COUNT, mhz * 10));
 }
 
+/*
+ * AUX rides the connector's SBU pair, so which of the two wires carries the
+ * positive half depends on which way up the plug went in. Some parts correct
+ * that in the crossbar the pins pass through; the one on this board has a
+ * single DisplayPort setting and no polarity to it, so the link has to invert
+ * instead. Getting it wrong is not subtle and not gradual: the sink answers
+ * nothing at all, and half of all cable insertions are the wrong way up.
+ */
 static void zumapro_dp_aux_init(struct zumapro_dp *dp)
 {
+	bool flipped = dp->orientation == TYPEC_ORIENTATION_REVERSE;
+
 	zumapro_dp_update(dp, ZUMAPRO_DP_AUX_CONTROL,
 			  AUX_POWER_DOWN | AUX_REPLY_TIMER_MODE | AUX_PN_INV |
 			  AUX_REG_MODE_MANCHESTER,
 			  FIELD_PREP(AUX_REPLY_TIMER_MODE,
-				     AUX_REPLY_TIMER_MODE_1800US));
+				     AUX_REPLY_TIMER_MODE_1800US) |
+			  (flipped ? AUX_PN_INV : 0));
+}
+
+static void zumapro_dp_switch_unregister(void *sw)
+{
+	typec_switch_unregister(sw);
+}
+
+static int zumapro_dp_orientation_set(struct typec_switch_dev *sw,
+				      enum typec_orientation orientation)
+{
+	struct zumapro_dp *dp = typec_switch_get_drvdata(sw);
+
+	guard(mutex)(&dp->lock);
+
+	if (dp->orientation == orientation)
+		return 0;
+
+	dp->orientation = orientation;
+
+	/*
+	 * A live AUX has to be told. The connector settles the orientation
+	 * before it reports a sink, so in practice this arrives first, but
+	 * nothing in the ordering guarantees it.
+	 */
+	if (dp->sink_present)
+		zumapro_dp_aux_init(dp);
+
+	return 0;
 }
 
 /*
@@ -1382,6 +1424,7 @@ static const struct drm_bridge_funcs zumapro_dp_bridge_funcs = {
 
 static int zumapro_dp_probe(struct platform_device *pdev)
 {
+	struct typec_switch_desc sw_desc = { };
 	struct device *dev = &pdev->dev;
 	struct zumapro_dp *dp;
 	int ret;
@@ -1433,6 +1476,28 @@ static int zumapro_dp_probe(struct platform_device *pdev)
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to power the link\n");
+
+	/*
+	 * The connector reports which way up the plug went in. Registering
+	 * this is also what lets the Type-C port find us: the port defers
+	 * until every switch its graph names has appeared.
+	 */
+	sw_desc.drvdata = dp;
+	sw_desc.fwnode = dev_fwnode(dev);
+	sw_desc.set = zumapro_dp_orientation_set;
+	sw_desc.name = NULL;
+
+	dp->orien_sw = typec_switch_register(dev, &sw_desc);
+	if (IS_ERR(dp->orien_sw)) {
+		ret = dev_err_probe(dev, PTR_ERR(dp->orien_sw),
+				    "failed to register the orientation switch\n");
+		goto err_pm;
+	}
+
+	ret = devm_add_action_or_reset(dev, zumapro_dp_switch_unregister,
+				       dp->orien_sw);
+	if (ret)
+		goto err_pm;
 
 	dp->aux.name = "zumapro-dp";
 	dp->aux.dev = dev;

@@ -1300,9 +1300,24 @@
 				/* takes the connector orientation.           */
 				port@1 {
 					reg = <1>;
+					#address-cells = <1>;
+					#size-cells = <0>;
 
-					usbc0_orien_sw: endpoint {
+					usbc0_orien_sw: endpoint@0 {
+						reg = <0>;
 						remote-endpoint = <&usb32drd_orien_sw>;
+					};
+
+					/*
+					 * The transmitter takes the orientation
+					 * too: the pair the plug landed on
+					 * decides which way round AUX is, and
+					 * this TCPC's SBU crossbar has one
+					 * setting rather than one per polarity.
+					 */
+					usbc0_dp_orien_sw: endpoint@1 {
+						reg = <1>;
+						remote-endpoint = <&dp_orien_sw>;
 					};
 				};
 			};
@@ -1342,12 +1357,26 @@
 /*
  * The DisplayPort transmitter, and the combo PHY's mode switch that tells it
  * which lanes a negotiated alternate mode left for it.  Entering the mode also
- * needs power delivery on the connector, which the bootloader disables while
- * its own serial console is on -- so this is described here and reached only
- * once that console is turned off.
+ * needs power delivery on the connector, which is described above.
  */
 &dp {
+	/*
+	 * The plug orientation decides which way round AUX is, and this TCPC's
+	 * SBU crossbar has one setting rather than one per polarity -- so the
+	 * link is what has to invert, and it has to be told.
+	 */
+	orientation-switch;
 	status = "okay";
+
+	ports {
+		port@1 {
+			reg = <1>;
+
+			dp_orien_sw: endpoint {
+				remote-endpoint = <&usbc0_dp_orien_sw>;
+			};
+		};
+	};
 };
 
 /*

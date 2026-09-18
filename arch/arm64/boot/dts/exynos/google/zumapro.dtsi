@@ -2768,10 +2768,24 @@
 
 			status = "disabled";
 
-			port {
-				dp_in: endpoint {
-					remote-endpoint = <&decon1_out>;
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* The display head that feeds this link. */
+				port@0 {
+					reg = <0>;
+
+					dp_in: endpoint {
+						remote-endpoint = <&decon1_out>;
+					};
 				};
+
+				/*
+				 * port@1 is the connector the lanes come out
+				 * on, which is a board matter: the link takes
+				 * the plug orientation from it.
+				 */
 			};
 		};
 

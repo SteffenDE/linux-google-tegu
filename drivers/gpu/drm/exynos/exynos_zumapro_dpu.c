@@ -921,6 +921,24 @@ static void zumapro_decon_program_dsc(struct zumapro_decon *decon,
 	       decon->main_regs + ZUMAPRO_DECON_OF_SIZE_2);
 }
 
+/*
+ * What the trigger control holds on a DisplayPort head: the raw enable,
+ * source-select and mask bits. Video-mode frames are paced by the output
+ * interface rather than by a trigger. The vendor leaves the trigger disabled,
+ * pointed at no source, and masked (HW_TRIG_SEL_NONE | HW_TRIG_MASK,
+ * 0x03000010) and never touches it again in video mode. The sibling port
+ * writes the register to zero for such a head, after a DECON left with the
+ * trigger both armed and masked reached run state and emitted nothing while
+ * the transmitter's timing generator ran and its input fifo underflowed;
+ * whether the mask on its own does anything in video mode is not
+ * established. Default to the sibling's value, settable at runtime so the two
+ * can be compared without a rebuild.
+ */
+static unsigned int dp_trig_con;
+module_param(dp_trig_con, uint, 0644);
+MODULE_PARM_DESC(dp_trig_con,
+		 "TRIG_CON enable/select/mask bits on a DisplayPort head (0: all clear, as the sibling port; 0x03000010: vendor)");
+
 static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
 				      const struct drm_display_mode *mode)
 {
@@ -951,9 +969,9 @@ static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
 		 * A DisplayPort stream is paced by the transmitter's own timing
 		 * generator, not by a panel asking for a frame, and there is no
 		 * tearing-effect signal to trigger on. Select video mode and
-		 * point the hardware trigger at nothing, with it disabled and
-		 * masked: armed and pointing at its reset value it would be
-		 * waiting on the panel's own tearing-effect line.
+		 * write the trigger control the way the knob above says; armed
+		 * and pointing at its reset value it would be waiting on the
+		 * panel's own tearing-effect line.
 		 */
 		zumapro_dpu_update_bits(decon->main_regs,
 					ZUMAPRO_DECON_GLOBAL_CON,
@@ -962,8 +980,7 @@ static void zumapro_decon_program_lcd(struct zumapro_decon *decon,
 					ZUMAPRO_DECON_HW_TRIG_SEL_MASK |
 					ZUMAPRO_DECON_HW_TRIG_EN |
 					ZUMAPRO_DECON_HW_TRIG_MASK,
-					ZUMAPRO_DECON_HW_TRIG_SEL_NONE |
-					ZUMAPRO_DECON_HW_TRIG_MASK);
+					dp_trig_con);
 		return;
 	}
 
@@ -1167,12 +1184,16 @@ static void zumapro_decon_stop(struct zumapro_decon *decon)
 	for (win = 0; win < win_count; win++)
 		writel(0, decon->wincon_regs + ZUMAPRO_DECON_CON_WIN(win));
 
-	spin_lock_irqsave(&decon->slock, flags);
-	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,
-				  ZUMAPRO_DECON_HW_TRIG_EN |
-				  ZUMAPRO_DECON_HW_TRIG_MASK,
-				  ZUMAPRO_DECON_HW_TRIG_MASK);
-	spin_unlock_irqrestore(&decon->slock, flags);
+	/* The vendor's stop never touches the trigger on a DisplayPort head. */
+	if (decon->pipeline->out_type != ZUMAPRO_DECON_OUT_DP0) {
+		spin_lock_irqsave(&decon->slock, flags);
+		zumapro_dpu_update_bits(decon->main_regs,
+					ZUMAPRO_DECON_TRIG_CON,
+					ZUMAPRO_DECON_HW_TRIG_EN |
+					ZUMAPRO_DECON_HW_TRIG_MASK,
+					ZUMAPRO_DECON_HW_TRIG_MASK);
+		spin_unlock_irqrestore(&decon->slock, flags);
+	}
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
 				  ZUMAPRO_DECON_GLOBAL_CON_EN_F, 0);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_SHD_REG_UP_REQ,
@@ -1365,6 +1386,14 @@ static void zumapro_decon_atomic_begin(struct exynos_drm_crtc *crtc)
 		dev_warn(decon->dev,
 			 "DECON%u shadow update not consumed: %#x\n",
 			 decon->id, val);
+
+	/*
+	 * A DisplayPort head is not trigger-driven, and the vendor's own
+	 * per-commit masking is skipped in video mode; its trigger control
+	 * stays what program_lcd wrote.
+	 */
+	if (decon->pipeline->out_type == ZUMAPRO_DECON_OUT_DP0)
+		return;
 
 	spin_lock_irqsave(&decon->slock, flags);
 	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_TRIG_CON,

@@ -1720,6 +1720,33 @@
 			status = "disabled";
 		};
 
+		/*
+		 * The fetch channel behind DECON1. Two DECONs cannot share one:
+		 * disabling an unused plane on the second would stop the fetch
+		 * feeding the first. GF1 is the second graphics channel, which
+		 * is what the downstream device tree gives the second head.
+		 */
+		dpp1: dpp@19904000 {
+			compatible = "google,zumapro-dpp";
+			reg = <0x19904000 0x1000>,
+			      <0x19934000 0x1000>,
+			      <0x19940000 0x4000>,
+			      <0x19954000 0x1000>,
+			      <0x19964000 0x1000>,
+			      <0x19984000 0x1000>;
+			reg-names = "dma", "dpp", "scl_coef", "sramc",
+				    "hdr_comm", "hdr";
+			interrupts = <GIC_SPI 260 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 269 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "dma", "dpp";
+			google,dpp-attributes = <0x6d0867>; /* downstream attr */
+			google,axi-port = <1>; /* downstream port */
+			google,scale-down = <4>; /* downstream scale_down */
+			google,scale-up = <8>; /* downstream scale_up */
+			google,dpp-id = <4>; /* downstream dpp,id */
+			status = "disabled";
+		};
+
 		decon0: display-controller@19470000 {
 			compatible = "google,zumapro-decon";
 			reg = <0x19470000 0x6000>,
@@ -1759,6 +1786,54 @@
 
 					decon0_out: endpoint {
 						remote-endpoint = <&dsi0_in>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * The second display head, which drives the DisplayPort
+		 * transmitter rather than a panel.  The window and sub blocks
+		 * in its reg list are the same ones DECON0 names: there is one
+		 * copy of each, shared, and the driver maps them without
+		 * claiming them for that reason.
+		 */
+		decon1: display-controller@19471000 {
+			compatible = "google,zumapro-decon";
+			reg = <0x19471000 0x6000>,
+			      <0x19480000 0xe000>,
+			      <0x19490000 0x10000>,
+			      <0x194b0000 0xe000>,
+			      <0x194e0000 0xf000>,
+			      <0x19500000 0x10000>,
+			      <0x19d0e000 0x1000>;
+			reg-names = "main", "win", "sub", "wincon", "dqe",
+				    "dqe-cgc", "cgc-dma";
+			interrupts = <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 246 IRQ_TYPE_LEVEL_HIGH 0>,
+				     <GIC_SPI 282 IRQ_TYPE_LEVEL_HIGH 0>;
+			interrupt-names = "frame_start", "frame_done", "extra",
+					  "cgc-dma";
+			google,decon-id = <1>; /* downstream decon,id */
+			google,cgc-dma-id = <19>; /* downstream cgc-dma,id */
+			iommus = <&sysmmu_dpuf0>, <&sysmmu_dpuf1>;
+			samsung,iommu-group = <&iommu_group_dpu>;
+			samsung,tzmp;
+			power-domains = <&pd_dpuf0>, <&pd_dpuf1>;
+			google,max-windows = <14>; /* downstream max_win */
+			dpps = <&dpp1>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					decon1_out: endpoint {
+						remote-endpoint = <&dp_in>;
 					};
 				};
 			};
@@ -2692,6 +2767,12 @@
 			power-domains = <&pd_hsi0>;
 
 			status = "disabled";
+
+			port {
+				dp_in: endpoint {
+					remote-endpoint = <&decon1_out>;
+				};
+			};
 		};
 
 		/*

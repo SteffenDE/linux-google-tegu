@@ -1557,6 +1557,23 @@ static const struct exynos_drm_crtc_ops zumapro_decon_crtc_ops = {
 	.disable_plane = zumapro_decon_disable_plane,
 };
 
+/*
+ * Map a register block without requesting it, for the blocks no DECON can
+ * claim on its own.
+ */
+static void __iomem *zumapro_decon_map_shared(struct platform_device *pdev,
+					      const char *name)
+{
+	struct resource *res;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+	if (!res)
+		return IOMEM_ERR_PTR(-ENOENT);
+
+	return devm_ioremap(&pdev->dev, res->start, resource_size(res)) ? :
+	       IOMEM_ERR_PTR(-ENOMEM);
+}
+
 static int zumapro_decon_bind(struct device *dev, struct device *master,
 			      void *data)
 {
@@ -1886,15 +1903,32 @@ static int zumapro_decon_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	decon->main_regs = devm_platform_ioremap_resource_byname(pdev, "main");
+	/*
+	 * The main block is per-instance, but the windows describing it are
+	 * not disjoint: the instances sit 0x1000 apart and each window is
+	 * declared long enough to cover the ones above it, so DECON0's runs
+	 * through DECON1's and DECON2's registers. That is the vendor's own
+	 * description, and it is the right one -- the block holds registers
+	 * that belong to no single instance, CLOCK_CON among them.
+	 */
+	decon->main_regs = zumapro_decon_map_shared(pdev, "main");
 	if (IS_ERR(decon->main_regs))
 		return PTR_ERR(decon->main_regs);
 
-	decon->win_regs = devm_platform_ioremap_resource_byname(pdev, "win");
+	/*
+	 * The window bank and the sub block are one copy each, shared by every
+	 * DECON -- which is why both appear in every DECON's reg list. Claiming
+	 * any of these exclusively means whichever instance probes second fails
+	 * with the region already taken, and on this SoC that would be the
+	 * panel losing to a second head or the other way round. The exclusivity
+	 * was never buying anything: the instance index already selects the
+	 * right registers inside them.
+	 */
+	decon->win_regs = zumapro_decon_map_shared(pdev, "win");
 	if (IS_ERR(decon->win_regs))
 		return PTR_ERR(decon->win_regs);
 
-	decon->sub_regs = devm_platform_ioremap_resource_byname(pdev, "sub");
+	decon->sub_regs = zumapro_decon_map_shared(pdev, "sub");
 	if (IS_ERR(decon->sub_regs))
 		return PTR_ERR(decon->sub_regs);
 

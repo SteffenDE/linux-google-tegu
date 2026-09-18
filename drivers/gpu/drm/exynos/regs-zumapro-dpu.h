@@ -63,6 +63,8 @@
 #define ZUMAPRO_DECON_HW_TRIG_SEL(_v)		((_v) << 24)
 #define ZUMAPRO_DECON_HW_TRIG_SEL_MASK		GENMASK(25, 24)
 #define ZUMAPRO_DECON_HW_TRIG_SEL_DDI0		0
+/* No trigger source at all, for an output that paces its own frames */
+#define ZUMAPRO_DECON_HW_TRIG_SEL_NONE		GENMASK(25, 24)
 #define ZUMAPRO_DECON_HW_TRIG_SKIP(_v)		((_v) << 16)
 #define ZUMAPRO_DECON_HW_TRIG_SKIP_MASK		GENMASK(23, 16)
 #define ZUMAPRO_DECON_HW_TRIG_ACTIVE_HIGH	BIT(13)
@@ -186,6 +188,12 @@
 #define ZUMAPRO_DECON_OUT_DP0			BIT(4)
 #define ZUMAPRO_DECON_OUT_WB			BIT(8)
 
+/*
+ * The low nibble picks the output interface: bit 0 is the first DSI, bit 3 is
+ * DisplayPort. A DisplayPort stream is not compressed, so it takes the one
+ * output fifo and no encoder.
+ */
+#define ZUMAPRO_DPATH_NOCOMP_OF0_DPIF		0x008
 #define ZUMAPRO_DPATH_NOCOMP_OF0_DSIMIF0	0x001
 #define ZUMAPRO_DPATH_DSC0_OF0_DSIMIF0		0x011
 #define ZUMAPRO_DPATH_DSCC_DSC01_OF01_DSIMIF0	0x0b1
@@ -246,6 +254,16 @@ enum zumapro_decon_fifo {
 #define ZUMAPRO_DSC_PPS92_95(_id)		(ZUMAPRO_DSC_OFFSET(_id) + 0x0098)
 #define ZUMAPRO_DSC_PPS96_99(_id)		(ZUMAPRO_DSC_OFFSET(_id) + 0x009c)
 #define ZUMAPRO_DSC_PPS100_103(_id)		(ZUMAPRO_DSC_OFFSET(_id) + 0x00a4)
+
+/*
+ * The DisplayPort interface, alongside the DSI ones in the sub block. The low
+ * bit of its selection is the output path, which DisplayPort always takes from
+ * output zero, so only the DECON index is written.
+ */
+#define ZUMAPRO_DPIF_OFFSET(_id)		(0xc000 + 0x1000 * (_id))
+#define ZUMAPRO_DPIF_SEL(_id)			(ZUMAPRO_DPIF_OFFSET(_id) + 0x0000)
+#define ZUMAPRO_DPIF_SEL_DECON(_v)		((_v) << 1)
+#define ZUMAPRO_DPIF_SEL_MASK			GENMASK(3, 0)
 
 #define ZUMAPRO_DSIMIF_SEL(_id)			(ZUMAPRO_DSIMIF_OFFSET(_id) + 0x0000)
 #define ZUMAPRO_DSIMIF_SEL_DSIM(_v)		((_v) << 0)

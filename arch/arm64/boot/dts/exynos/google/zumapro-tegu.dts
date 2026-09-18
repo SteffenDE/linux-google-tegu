@@ -1302,12 +1302,20 @@
 
 /*
  * The second display head and its fetch channel carry the picture to the
- * transmitter above, and the SoC device tree leaves both off.  Turning them on
- * is what makes an external display something the phone can draw on rather
- * than only talk to -- and it is the first time two DECONs have run here, and
- * the first time anything shares the window bank with the head driving this
- * phone's own panel.  So that stays a deliberate act rather than a default.
+ * transmitter above, which is what makes an external display something the
+ * phone can draw on rather than only talk to.  The SoC device tree leaves both
+ * off, because this is the first board to run two of these heads at once: they
+ * share the window bank, the output-FIFO SRAM and an IOMMU group with the head
+ * driving the phone's own panel, and each of those had to be divided before
+ * either could be enabled.
  */
+&dpp1 {
+	status = "okay";
+};
+
+&decon1 {
+	status = "okay";
+};
 
 &usb32drd {
 	orientation-switch;

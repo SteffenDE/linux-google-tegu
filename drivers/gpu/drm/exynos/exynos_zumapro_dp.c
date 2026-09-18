@@ -43,6 +43,9 @@
 #define ZUMAPRO_DP_SYSTEM_MAIN_LINK_LANE_COUNT	0x0010
 #define LANE_COUNT				GENMASK(2, 0)
 
+#define ZUMAPRO_DP_SYSTEM_PLL_LOCK_CONTROL	0x002c
+#define PLL_LOCK_STATUS				BIT(4)
+
 #define ZUMAPRO_DP_SYSTEM_SW_FUNCTION_ENABLE	0x0014
 #define SW_FUNC_EN				BIT(0)
 
@@ -135,6 +138,9 @@ struct zumapro_dp {
 	/* Serialises AUX against the connector telling us the sink changed */
 	struct mutex lock;
 	bool sink_present;
+	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	unsigned int link_rate;
+	unsigned int link_lanes;
 };
 
 static inline struct zumapro_dp *bridge_to_dp(struct drm_bridge *bridge)
@@ -404,6 +410,453 @@ static ssize_t zumapro_dp_aux_transfer(struct drm_dp_aux *aux,
 	return len;
 }
 
+/* Physical coding sublayer */
+#define ZUMAPRO_DP_PCS_CONTROL			0x3000
+#define PCS_LINK_TRAINING_PATTERN		GENMASK(6, 4)
+#define PCS_BIT_SWAP				BIT(2)
+#define PCS_SCRAMBLE_BYPASS			BIT(0)
+
+/*
+ * The block's own numbering for the training patterns, which is not the one
+ * DisplayPort puts in the DPCD: pattern 4 is 5 here.
+ */
+#define PCS_PATTERN_NORMAL_DATA			0
+#define PCS_PATTERN_TPS1			1
+#define PCS_PATTERN_TPS2			2
+#define PCS_PATTERN_TPS3			3
+#define PCS_PATTERN_TPS4			5
+
+#define ZUMAPRO_DP_PCS_LANE_CONTROL		0x3004
+#define PCS_LANE_MAP(_l)			(GENMASK(1, 0) << ((_l) * 4))
+#define PCS_LANE_MAP_ALL			(PCS_LANE_MAP(0) | \
+						 PCS_LANE_MAP(1) | \
+						 PCS_LANE_MAP(2) | \
+						 PCS_LANE_MAP(3))
+
+#define ZUMAPRO_DP_PCS_TEST_PATTERN_CONTROL	0x3008
+#define PCS_LINK_QUALITY_PATTERN		GENMASK(2, 0)
+
+/*
+ * The handshake between this coding sublayer and the Synopsys transmitters in
+ * the combo PHY. Without it the lanes stay quiet whatever the PHY is doing,
+ * because the generation this register layer came from drove a PHY that needed
+ * no such handshake.
+ */
+#define ZUMAPRO_DP_PCS_SNPS_DATAPATH_CONTROL	0x3200
+#define SNPS_TX_DATA_EN				GENMASK(19, 16)
+#define SNPS_TX_CLK_RDY				GENMASK(11, 8)
+#define SNPS_TX_CLK_EN				GENMASK(3, 0)
+
+/*
+ * Link rates are kept in the unit the DisplayPort helpers use, kHz, because
+ * most of what touches them is those helpers. The PHY interface counts in
+ * Mb/s, so the conversion happens at that boundary and nowhere else.
+ */
+static unsigned int zumapro_dp_phy_rate(unsigned int link_rate_khz)
+{
+	return link_rate_khz / 100;
+}
+
+static void zumapro_dp_set_pattern(struct zumapro_dp *dp, unsigned int pattern)
+{
+	u32 val = FIELD_PREP(PCS_LINK_TRAINING_PATTERN, pattern);
+
+	/*
+	 * Scrambling belongs to the pattern rather than to the caller: the
+	 * training patterns run unscrambled, real data and pattern 4 scrambled.
+	 * Leaving it bypassed for real data gives a sink nothing its
+	 * descrambler can recover, which looks like a link that trained and
+	 * then showed nothing.
+	 */
+	if (pattern != PCS_PATTERN_NORMAL_DATA && pattern != PCS_PATTERN_TPS4)
+		val |= PCS_SCRAMBLE_BYPASS;
+
+	/*
+	 * The bit swap is set on every pattern change and never cleared. It
+	 * cannot be seen during training -- those patterns are symmetric under
+	 * bit reversal -- only afterwards, on scrambled data.
+	 */
+	val |= PCS_BIT_SWAP;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_PCS_TEST_PATTERN_CONTROL,
+			  PCS_LINK_QUALITY_PATTERN, 0);
+	zumapro_dp_update(dp, ZUMAPRO_DP_PCS_CONTROL,
+			  PCS_LINK_TRAINING_PATTERN | PCS_BIT_SWAP |
+			  PCS_SCRAMBLE_BYPASS, val);
+}
+
+/*
+ * Hand the lanes to the transmitters and bring them up. The clocks go first and
+ * the data enable last, with the power-up in between, because a transmitter
+ * will not acknowledge a power-state request without a clock already running.
+ */
+static int zumapro_dp_set_data_path(struct zumapro_dp *dp, unsigned int lanes)
+{
+	struct phy_configure_opts_dp opts = {
+		.lanes = lanes,
+		.set_lanes = 1,
+	};
+	u32 mask = GENMASK(lanes - 1, 0);
+	int ret;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_PCS_SNPS_DATAPATH_CONTROL,
+			  SNPS_TX_CLK_RDY | SNPS_TX_CLK_EN,
+			  FIELD_PREP(SNPS_TX_CLK_RDY, mask) |
+			  FIELD_PREP(SNPS_TX_CLK_EN, mask));
+
+	ret = phy_configure(dp->phy, (union phy_configure_opts *)&opts);
+	if (ret)
+		return ret;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_PCS_SNPS_DATAPATH_CONTROL,
+			  SNPS_TX_DATA_EN, FIELD_PREP(SNPS_TX_DATA_EN, mask));
+
+	return 0;
+}
+
+/*
+ * Bring the lanes up at a rate: the PHY programmes its own loop, the link
+ * waits for it to lock, and only then does the link stop running from its
+ * oscillator and start running from the transmit clock. Doing that in the
+ * other order clocks the coding sublayer at the oscillator's rate while it is
+ * asked to emit multi-gigabit symbols, which locks clock recovery and then
+ * fails equalisation with the error counters saturated.
+ */
+static int zumapro_dp_set_link_rate(struct zumapro_dp *dp, unsigned int rate,
+				    unsigned int lanes)
+{
+	struct phy_configure_opts_dp opts = {
+		.link_rate = zumapro_dp_phy_rate(rate),
+		.lanes = lanes,
+		.set_rate = 1,
+	};
+	u32 reg;
+	int ret;
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_CLK_CONTROL,
+			  GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20, 0);
+
+	ret = phy_configure(dp->phy, (union phy_configure_opts *)&opts);
+	if (ret)
+		return ret;
+
+	ret = readl_poll_timeout(dp->regs + ZUMAPRO_DP_SYSTEM_PLL_LOCK_CONTROL,
+				 reg, reg & PLL_LOCK_STATUS, 10, 2000);
+	if (ret) {
+		dev_err(dp->dev, "the link PLL did not lock at %u Mb/s\n", rate);
+		return ret;
+	}
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_CLK_CONTROL,
+			  GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20,
+			  GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20);
+
+	/*
+	 * Only now can the coding sublayer run: it is clocked from the transmit
+	 * clock the mux above has just selected, which does not exist until the
+	 * PLL has locked.
+	 */
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_COMMON_FUNCTION_ENABLE,
+			  PCS_FUNC_EN, PCS_FUNC_EN);
+
+	zumapro_dp_update(dp, ZUMAPRO_DP_SYSTEM_MAIN_LINK_LANE_COUNT,
+			  LANE_COUNT, FIELD_PREP(LANE_COUNT, lanes));
+
+	/* Identity lane map: any reordering is the crossbar's, in the PHY. */
+	zumapro_dp_update(dp, ZUMAPRO_DP_PCS_LANE_CONTROL, PCS_LANE_MAP_ALL,
+			  FIELD_PREP(PCS_LANE_MAP(0), 0) |
+			  FIELD_PREP(PCS_LANE_MAP(1), 1) |
+			  FIELD_PREP(PCS_LANE_MAP(2), 2) |
+			  FIELD_PREP(PCS_LANE_MAP(3), 3));
+
+	return zumapro_dp_set_data_path(dp, lanes);
+}
+
+/*
+ * What the sink last asked for, clamped to what the board's table can drive.
+ * A level the specification does not allow has no entry, so a request beyond
+ * the pair's limit becomes the most that pairing permits, and the sink is told
+ * the transmitter has nothing further to give.
+ */
+static void zumapro_dp_adjust_levels(unsigned int lanes,
+				     const u8 link_status[DP_LINK_STATUS_SIZE],
+				     u8 train_set[4])
+{
+	unsigned int i;
+
+	for (i = 0; i < lanes; i++) {
+		u8 v = drm_dp_get_adjust_request_voltage(link_status, i) >>
+			DP_TRAIN_VOLTAGE_SWING_SHIFT;
+		u8 p = drm_dp_get_adjust_request_pre_emphasis(link_status, i) >>
+			DP_TRAIN_PRE_EMPHASIS_SHIFT;
+		bool clamped = false;
+
+		if (v > 3) {
+			v = 3;
+			clamped = true;
+		}
+		if (v + p > 3) {
+			p = 3 - v;
+			clamped = true;
+		}
+
+		train_set[i] = (v << DP_TRAIN_VOLTAGE_SWING_SHIFT) |
+			       (p << DP_TRAIN_PRE_EMPHASIS_SHIFT);
+		if (v == 3 || clamped)
+			train_set[i] |= DP_TRAIN_MAX_SWING_REACHED;
+		if (p == 3 || clamped)
+			train_set[i] |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
+	}
+}
+
+/* Put the levels the sink asked for onto the lanes. */
+static int zumapro_dp_set_levels(struct zumapro_dp *dp, unsigned int lanes,
+				 const u8 train_set[4])
+{
+	struct phy_configure_opts_dp opts = {
+		.lanes = lanes,
+		.set_voltages = 1,
+	};
+	unsigned int i;
+
+	for (i = 0; i < lanes; i++) {
+		opts.voltage[i] = (train_set[i] &
+				   DP_TRAIN_VOLTAGE_SWING_MASK) >>
+					DP_TRAIN_VOLTAGE_SWING_SHIFT;
+		opts.pre[i] = (train_set[i] & DP_TRAIN_PRE_EMPHASIS_MASK) >>
+				DP_TRAIN_PRE_EMPHASIS_SHIFT;
+	}
+
+	return phy_configure(dp->phy, (union phy_configure_opts *)&opts);
+}
+
+/*
+ * One pass of clock recovery, then one of channel equalisation, as the
+ * specification lays them out. The block is told which pattern to emit and the
+ * sink is told the same over DPCD; what comes back is the sink's opinion of the
+ * lanes, which decides the drive levels for the next attempt.
+ */
+static int zumapro_dp_train_pattern(struct zumapro_dp *dp, unsigned int lanes,
+				    unsigned int pcs_pattern, u8 dpcd_pattern,
+				    bool eq, u8 train_set[4])
+{
+	unsigned int tries, max_tries = eq ? 5 : 10;
+	u8 status[DP_LINK_STATUS_SIZE];
+	u8 last_set[4] = { };
+	unsigned int same = 0;
+	int ret;
+
+	zumapro_dp_set_pattern(dp, pcs_pattern);
+
+	/*
+	 * Pattern 4 is a scrambled pattern and the transmitter leaves its
+	 * scrambler on for it, so the sink must not be told otherwise. Every
+	 * other training pattern runs unscrambled at both ends.
+	 */
+	if (dpcd_pattern != DP_TRAINING_PATTERN_4)
+		dpcd_pattern |= DP_LINK_SCRAMBLING_DISABLE;
+
+	ret = drm_dp_dpcd_writeb(&dp->aux, DP_TRAINING_PATTERN_SET,
+				 dpcd_pattern);
+	if (ret < 0)
+		return ret;
+
+	for (tries = 0; tries < max_tries; tries++) {
+		/*
+		 * Put the levels on the lanes before telling the sink what to
+		 * expect, so the two agree from the first attempt rather than
+		 * from the second.
+		 */
+		ret = zumapro_dp_set_levels(dp, lanes, train_set);
+		if (ret)
+			return ret;
+
+		ret = drm_dp_dpcd_write(&dp->aux, DP_TRAINING_LANE0_SET,
+					train_set, lanes);
+		if (ret < 0)
+			return ret;
+
+		if (eq)
+			drm_dp_link_train_channel_eq_delay(&dp->aux, dp->dpcd);
+		else
+			drm_dp_link_train_clock_recovery_delay(&dp->aux,
+							       dp->dpcd);
+
+		ret = drm_dp_dpcd_read_link_status(&dp->aux, status);
+		if (ret < 0)
+			return ret;
+
+		if (eq) {
+			/*
+			 * Losing clock recovery during equalisation is not
+			 * something more equalising fixes; the answer is a
+			 * slower link.
+			 */
+			if (!drm_dp_clock_recovery_ok(status, lanes))
+				return -EIO;
+			if (drm_dp_channel_eq_ok(status, lanes))
+				return 0;
+		} else {
+			if (drm_dp_clock_recovery_ok(status, lanes))
+				return 0;
+
+			/*
+			 * A sink that has asked for the same levels five times
+			 * running is not going to change its mind.
+			 */
+			if (!memcmp(last_set, train_set, lanes)) {
+				if (++same >= 4)
+					return -EIO;
+			} else {
+				same = 0;
+			}
+			memcpy(last_set, train_set, lanes);
+
+			/* Nor is one already being driven as hard as we can. */
+			if (train_set[0] & DP_TRAIN_MAX_SWING_REACHED)
+				return -EIO;
+		}
+
+		zumapro_dp_adjust_levels(lanes, status, train_set);
+	}
+
+	return -EIO;
+}
+
+/*
+ * Train at one rate and lane count. Everything the sink is told about the link
+ * has to match what the transmitter was just set to, so the rate and lane
+ * count go out first and the patterns follow.
+ */
+static int zumapro_dp_train_link(struct zumapro_dp *dp, unsigned int rate,
+				 unsigned int lanes)
+{
+	u8 train_set[4] = { };
+	u8 buf[2];
+	int ret;
+
+	/*
+	 * The PHY knows what the connector negotiated and refuses a lane count
+	 * the pin assignment did not leave for DisplayPort, so an attempt at
+	 * four lanes on a two-lane contract fails here and falls back rather
+	 * than taking lanes USB3 is still using.
+	 */
+	ret = phy_validate(dp->phy, PHY_MODE_DP, 0,
+			   (union phy_configure_opts *)&(struct phy_configure_opts_dp){
+				.link_rate = zumapro_dp_phy_rate(rate),
+				.lanes = lanes,
+				.set_rate = 1,
+				.set_lanes = 1,
+			   });
+	if (ret)
+		return ret;
+
+	ret = zumapro_dp_set_link_rate(dp, rate, lanes);
+	if (ret)
+		return ret;
+
+	/*
+	 * Tell the sink what kind of link this is before asking it to train
+	 * on one: eight-to-ten bit coding, no spread spectrum -- the PHY is
+	 * not asked for any -- and awake, because a sink in a low power state
+	 * will not train at all.
+	 */
+	drm_dp_dpcd_writeb(&dp->aux, DP_MAIN_LINK_CHANNEL_CODING_SET,
+			   DP_SET_ANSI_8B10B);
+	drm_dp_dpcd_writeb(&dp->aux, DP_DOWNSPREAD_CTRL, 0);
+
+	buf[0] = drm_dp_link_rate_to_bw_code(rate);
+	buf[1] = lanes;
+	if (drm_dp_enhanced_frame_cap(dp->dpcd))
+		buf[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
+	ret = drm_dp_dpcd_write(&dp->aux, DP_LINK_BW_SET, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	ret = zumapro_dp_train_pattern(dp, lanes, PCS_PATTERN_TPS1,
+				       DP_TRAINING_PATTERN_1, false, train_set);
+	if (ret)
+		return ret;
+
+	/*
+	 * Equalise on the best pattern both ends have. Pattern 4 is scrambled,
+	 * and the block numbers it differently from the DPCD, so the two
+	 * encodings are kept apart.
+	 */
+	if (drm_dp_tps4_supported(dp->dpcd))
+		ret = zumapro_dp_train_pattern(dp, lanes, PCS_PATTERN_TPS4,
+					       DP_TRAINING_PATTERN_4, true,
+					       train_set);
+	else if (drm_dp_tps3_supported(dp->dpcd))
+		ret = zumapro_dp_train_pattern(dp, lanes, PCS_PATTERN_TPS3,
+					       DP_TRAINING_PATTERN_3, true,
+					       train_set);
+	else
+		ret = zumapro_dp_train_pattern(dp, lanes, PCS_PATTERN_TPS2,
+					       DP_TRAINING_PATTERN_2, true,
+					       train_set);
+
+	return ret;
+}
+
+/*
+ * Train, falling back through the rates and lane counts the sink and the board
+ * have in common. Whether it succeeds or not the transmitter stops sending a
+ * training pattern: leaving one on means the sink has been told to expect real
+ * data while the lanes still carry the pattern, which is indistinguishable
+ * from a dead link.
+ */
+static int zumapro_dp_train(struct zumapro_dp *dp)
+{
+	static const unsigned int rates[] = { 810000, 540000, 270000, 162000 };
+	static const unsigned int lane_counts[] = { 4, 2 };
+	unsigned int i, j;
+	int ret;
+
+	ret = drm_dp_read_dpcd_caps(&dp->aux, dp->dpcd);
+	if (ret < 0)
+		return ret;
+
+	/* A sink asleep answers DPCD and will not train. */
+	drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, DP_SET_POWER_D0);
+	usleep_range(1000, 2000);
+
+	ret = -EINVAL;
+	for (j = 0; j < ARRAY_SIZE(lane_counts); j++) {
+		if (lane_counts[j] > drm_dp_max_lane_count(dp->dpcd))
+			continue;
+
+		for (i = 0; i < ARRAY_SIZE(rates); i++) {
+			if (rates[i] > drm_dp_max_link_rate(dp->dpcd))
+				continue;
+
+			ret = zumapro_dp_train_link(dp, rates[i],
+						    lane_counts[j]);
+			if (!ret) {
+				dp->link_rate = rates[i];
+				dp->link_lanes = lane_counts[j];
+				goto done;
+			}
+		}
+	}
+
+done:
+	zumapro_dp_set_pattern(dp, PCS_PATTERN_NORMAL_DATA);
+	drm_dp_dpcd_writeb(&dp->aux, DP_TRAINING_PATTERN_SET,
+			   DP_TRAINING_PATTERN_DISABLE);
+
+	if (ret) {
+		dev_err(dp->dev, "the link did not train\n");
+		dp->link_rate = 0;
+		dp->link_lanes = 0;
+	} else {
+		dev_info(dp->dev, "link trained: %u kHz on %u lanes\n",
+			 dp->link_rate, dp->link_lanes);
+	}
+
+	return ret;
+}
+
 /*
  * Hotplug comes from the connector, over the configuration channel, so all the
  * bridge has to do is tell the link what the connector saw.
@@ -416,31 +869,46 @@ static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 	bool present = status == connector_status_connected;
 	int ret;
 
-	guard(mutex)(&dp->lock);
-
-	if (present == dp->sink_present)
-		return;
-
-	if (present) {
-		/*
-		 * The lanes and the AUX front end belong to the combo PHY, and
-		 * AUX has to be awake before the sink can be asked anything.
-		 * The PHY refuses while USB has not brought it up, in which
-		 * case there is nothing to talk to a sink with.
-		 */
-		ret = phy_set_mode(dp->phy, PHY_MODE_DP);
-		if (ret) {
-			dev_err(dp->dev,
-				"cannot reach the sink: the PHY is not up (%d)\n",
-				ret);
+	scoped_guard(mutex, &dp->lock) {
+		if (present == dp->sink_present)
 			return;
+
+		if (present) {
+			/*
+			 * The lanes and the AUX front end belong to the combo
+			 * PHY, and AUX has to be awake before the sink can be
+			 * asked anything. The PHY refuses while USB has not
+			 * brought it up, in which case there is nothing to
+			 * talk to a sink with.
+			 */
+			ret = phy_set_mode(dp->phy, PHY_MODE_DP);
+			if (ret) {
+				dev_err(dp->dev,
+					"cannot reach the sink: the PHY is not up (%d)\n",
+					ret);
+				return;
+			}
+			zumapro_dp_aux_init(dp);
+		} else {
+			dp->link_rate = 0;
+			dp->link_lanes = 0;
+			phy_set_mode(dp->phy, PHY_MODE_INVALID);
 		}
-		zumapro_dp_aux_init(dp);
-	} else {
-		phy_set_mode(dp->phy, PHY_MODE_INVALID);
+
+		dp->sink_present = present;
 	}
 
-	dp->sink_present = present;
+	/*
+	 * Train outside the lock: it talks to the sink over AUX, and AUX takes
+	 * the same one.
+	 *
+	 * Train here rather than at modeset, because what the link will carry
+	 * decides which modes can be offered at all. A failure leaves the sink
+	 * reported as present -- the connector says it is -- with no usable
+	 * link rate, and no mode will then validate.
+	 */
+	if (present)
+		zumapro_dp_train(dp);
 }
 
 static enum drm_connector_status zumapro_dp_detect(struct drm_bridge *bridge,
@@ -607,6 +1075,13 @@ static int zumapro_dp_runtime_resume(struct device *dev)
 		 * just come back. Read the rate rather than assume it: every
 		 * timer in the block is derived from this number.
 		 */
+		/*
+		 * The block has been reset, so whatever was trained is gone.
+		 * Say so, or a mode will be put on a link that is not there.
+		 */
+		dp->link_rate = 0;
+		dp->link_lanes = 0;
+
 		ret = zumapro_dp_read_osc_rate(dp);
 		if (!ret)
 			ret = zumapro_dp_link_init(dp);

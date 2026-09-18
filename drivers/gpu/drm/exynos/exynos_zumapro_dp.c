@@ -1391,7 +1391,19 @@ static void zumapro_dp_hpd_notify(struct drm_bridge *bridge,
 					ret);
 				return;
 			}
-			zumapro_dp_aux_init(dp);
+
+			/*
+			 * The vendor brings the block up from a soft reset on
+			 * every plug, and the bring-up the driver runs when its
+			 * domain comes back is the right one for a new sink too:
+			 * nothing a previous sink left in the block survives
+			 * into this one, and AUX comes up as part of it.
+			 */
+			ret = zumapro_dp_link_init(dp);
+			if (ret) {
+				phy_set_mode(dp->phy, PHY_MODE_INVALID);
+				return;
+			}
 		} else {
 			zumapro_dp_link_stop(dp);
 			dp->link_rate = 0;

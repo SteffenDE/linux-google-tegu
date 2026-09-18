@@ -825,8 +825,17 @@ static int zumapro_dp_train(struct zumapro_dp *dp)
 	int ret;
 
 	ret = drm_dp_read_dpcd_caps(&dp->aux, dp->dpcd);
-	if (ret < 0)
+	if (ret < 0) {
+		/*
+		 * The first thing this asks the sink, so the first place a
+		 * dead AUX shows up. Say so: without it a sink that cannot be
+		 * reached is indistinguishable from one that was never
+		 * plugged in, because everything downstream of here is quiet
+		 * about a link that was never attempted.
+		 */
+		dev_err(dp->dev, "the sink did not answer DPCD (%d)\n", ret);
 		return ret;
+	}
 
 	/* A sink asleep answers DPCD and will not train. */
 	drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, DP_SET_POWER_D0);

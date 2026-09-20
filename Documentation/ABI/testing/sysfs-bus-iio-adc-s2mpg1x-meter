@@ -1,0 +1,34 @@
+What:		/sys/bus/iio/devices/iio:deviceX/in_powerY_energy
+KernelVersion:	7.3
+Contact:	linux-iio@vger.kernel.org
+Description:
+		Energy in microjoules accumulated by the rail on channel Y since
+		the driver last started the meter, as an unsigned 64-bit count.
+
+		The meter integrates in hardware, and the driver carries the
+		total across the latches it performs, so the difference between
+		two reads is the energy the rail used in between however long
+		that was and however few times it was read. Reading this
+		attribute latches the meter, which is what keeps the total
+		current; the total only ever grows, so concurrent readers do
+		not take measurements away from one another.
+
+		A window whose sample count is not consistent with the time it
+		spanned is not added to the total, and is counted in
+		lost_windows instead.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lost_windows
+KernelVersion:	7.3
+Contact:	linux-iio@vger.kernel.org
+Description:
+		Number of measurement windows the driver discarded because they
+		could not be trusted, as an unsigned count.
+
+		A window is discarded when its sample count disagrees with the
+		time the window spanned, which happens when the meter's counter
+		has saturated -- it spans about 2.3 hours at the programmed
+		sample rate and cannot be restarted once full -- or when reading
+		the accumulators failed part way through. The meter is restarted
+		when this happens, so the counter advancing across an interval
+		means that interval's energy is incomplete and should be shown
+		as a gap rather than as a low number.

@@ -92,8 +92,13 @@ struct s2mpg1x_meter {
 	/* chan[] and energy_nj[] are indexed by hardware channel. */
 	struct s2mpg1x_meter_chan chan[S2MPG14_METER_CHANNELS];
 	u64 energy_nj[S2MPG14_METER_CHANNELS];
+	u64 suspend_energy_nj[S2MPG14_METER_CHANNELS];
+	u64 suspend_time_us;
 	unsigned int lost_windows;
 	ktime_t last_refresh;	/* boottime, so a sleep is inside a window */
+	ktime_t suspend_boot;	/* both clocks as the system suspended, so */
+	ktime_t suspend_mono;	/* their divergence says whether it slept */
+	bool in_suspend;	/* the open window is a sleep, and only that */
 	bool valid;
 	bool stopping;		/* gates the self-rearming refresh work */
 	struct delayed_work refresh_work;
@@ -392,8 +397,21 @@ static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m, bool force)
 						   USEC_PER_SEC);
 	}
 
-	for (i = 0; i < m->n; i++)
-		m->energy_nj[m->hw_idx[i]] += window_nj[i];
+	for (i = 0; i < m->n; i++) {
+		u8 hw = m->hw_idx[i];
+
+		m->energy_nj[hw] += window_nj[i];
+		if (m->in_suspend)
+			m->suspend_energy_nj[hw] += window_nj[i];
+	}
+
+	/*
+	 * The suspend total carries its own elapsed time, so that a reader
+	 * divides an energy by exactly the interval it was measured over
+	 * rather than by a sleep length measured somewhere else.
+	 */
+	if (m->in_suspend)
+		m->suspend_time_us += delta_us;
 
 	m->last_refresh = now;
 	return 0;
@@ -415,7 +433,15 @@ static void s2mpg1x_meter_refresh_work(struct work_struct *work)
 					     m->last_refresh);
 		unsigned long delay;
 
-		if (idle_ms >= S2MPG1X_METER_REFRESH_MS) {
+		if (m->in_suspend) {
+			/*
+			 * The window open across a sleep belongs to the PM
+			 * callbacks; latching it here would spend part of it
+			 * on whichever moment of the suspend sequence this
+			 * runs in.
+			 */
+			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS);
+		} else if (idle_ms >= S2MPG1X_METER_REFRESH_MS) {
 			s2mpg1x_meter_refresh(m, false);
 			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS);
 		} else {
@@ -455,6 +481,24 @@ static ssize_t s2mpg1x_meter_read_energy(struct iio_dev *indio_dev,
 }
 
 /*
+ * The suspend total moves only at a resume boundary, so reading it does not
+ * latch: a latch here would fold awake time into the answer to "what did this
+ * rail use while the system was asleep".
+ */
+static ssize_t s2mpg1x_meter_read_suspend_energy(struct iio_dev *indio_dev,
+						 uintptr_t private,
+						 const struct iio_chan_spec *chan,
+						 char *buf)
+{
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+
+	guard(mutex)(&m->lock);
+
+	return sysfs_emit(buf, "%llu\n",
+			  m->suspend_energy_nj[chan->address] / NSEC_PER_USEC);
+}
+
+/*
  * Energy is carried per channel rather than as an IIO_ENERGY channel of its
  * own: a second channel set would double every label and index for a quantity
  * that is the same rail, and the suspend total below has no channel type to be.
@@ -465,8 +509,26 @@ static const struct iio_chan_spec_ext_info s2mpg1x_meter_ext_info[] = {
 		.read = s2mpg1x_meter_read_energy,
 		.shared = IIO_SEPARATE,
 	},
+	{
+		.name = "suspend_energy",
+		.read = s2mpg1x_meter_read_suspend_energy,
+		.shared = IIO_SEPARATE,
+	},
 	{ }
 };
+
+static ssize_t suspend_time_us_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+
+	guard(mutex)(&m->lock);
+
+	return sysfs_emit(buf, "%llu\n", m->suspend_time_us);
+}
+
+static IIO_DEVICE_ATTR_RO(suspend_time_us, 0);
 
 static ssize_t lost_windows_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
@@ -483,6 +545,7 @@ static IIO_DEVICE_ATTR_RO(lost_windows, 0);
 
 static struct attribute *s2mpg1x_meter_attrs[] = {
 	&iio_dev_attr_lost_windows.dev_attr.attr,
+	&iio_dev_attr_suspend_time_us.dev_attr.attr,
 	NULL,
 };
 
@@ -787,22 +850,85 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 }
 
 /*
- * The deadline work cannot run while the system is suspended, but the always-on
- * PMIC keeps the firmware meter accumulating, so a long suspend can saturate the
- * counter with nothing able to refresh it.  Re-init on resume (soft-reset +
- * reconfigure) so the stale suspend window is discarded before userspace reads.
+ * The always-on PMIC keeps the meter accumulating while the AP sleeps, so the
+ * window left open here holds what the sleep cost.  Close the awake window so
+ * that it holds the sleep and as little else as possible, and remember both
+ * clocks: their divergence by the time we resume is the time actually spent
+ * suspended.
+ *
+ * A failure leaves the window open unattributed rather than claiming a sleep it
+ * cannot bound, and never vetoes the suspend: this driver measures the system,
+ * and stopping it from sleeping would be the worse error by far.
+ */
+static int s2mpg1x_meter_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+	int ret;
+
+	guard(mutex)(&m->lock);
+	ret = s2mpg1x_meter_refresh(m, true);
+	if (ret) {
+		dev_warn(dev, "meter not closed before suspend: %d\n", ret);
+		return 0;
+	}
+
+	m->suspend_boot = ktime_get_boottime();
+	m->suspend_mono = ktime_get();
+	m->in_suspend = true;
+	return 0;
+}
+
+/*
+ * Close the window the sleep ran in.  BOOTTIME advances across a sleep and
+ * MONOTONIC does not, so their divergence over these two callbacks is the time
+ * the system was actually suspended.  A cycle that aborted -- a wakeup arriving
+ * during device suspend, or a later device refusing -- still runs this callback
+ * for every device that suspended, and has no such divergence: its window is
+ * ordinary awake time and is not attributed to sleep.
+ *
+ * This window is bounded by the callbacks, not by the sleep, so it also holds
+ * the device suspend and resume either side of it. The suspend total therefore
+ * comes with the elapsed time of the windows that make it up, so that what a
+ * reader divides by is the interval the energy was actually measured over.
+ *
+ * Errors are reported and swallowed. A driver that fails to resume is recorded
+ * as the device that broke the cycle, and a metering driver claiming that about
+ * a bus hiccup would mislead exactly the tooling that reads these counters.
  */
 static int s2mpg1x_meter_resume(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+	s64 slept_ns;
+	int ret;
 
 	guard(mutex)(&m->lock);
-	m->valid = false;
-	return s2mpg1x_meter_hw_init(m);
+
+	slept_ns = ktime_to_ns(ktime_sub(ktime_sub(ktime_get_boottime(),
+						   m->suspend_boot),
+					 ktime_sub(ktime_get(),
+						   m->suspend_mono)));
+	if (slept_ns <= 0)
+		m->in_suspend = false;
+
+	ret = s2mpg1x_meter_refresh(m, true);
+	m->in_suspend = false;
+	if (ret) {
+		/*
+		 * A meter that will not latch cannot be recovered by reading
+		 * it, and a saturated counter is one reason it might not, so
+		 * put it back to a known state here rather than leaving every
+		 * later read to fail the same way.
+		 */
+		dev_warn(dev, "meter not closed after resume: %d\n", ret);
+		s2mpg1x_meter_restart(m);
+	}
+
+	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(s2mpg1x_meter_pm_ops, NULL,
+static DEFINE_SIMPLE_DEV_PM_OPS(s2mpg1x_meter_pm_ops, s2mpg1x_meter_suspend,
 				s2mpg1x_meter_resume);
 
 static const struct platform_device_id s2mpg1x_meter_id[] = {

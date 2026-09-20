@@ -7,10 +7,20 @@
  * channel accumulates the power of a muxed rail into a 41-bit accumulator
  * alongside a shared 20-bit sample counter.
  *
- * Writing CTRL2.ASYNC_RD copies the accumulators into the readable registers
- * and restarts accumulation, so a read returns the average power over the
- * window since the previous read: ACC_DATA / ACC_COUNT scaled by the rail's
- * per-LSB resolution.  We never change a rail's power state: the only writes
+ * The block reports each channel twice.  LPF_DATA holds a low-pass-filtered
+ * instantaneous power, which is a plain read: nothing is consumed and no
+ * control write is needed, so it is what in_powerN_input returns.  The
+ * accumulator holds the summed power of a window; writing CTRL2.ASYNC_RD
+ * copies it into the readable registers and restarts it, which is a
+ * measurement a reader takes away from every other reader and so is not done
+ * on their behalf.
+ *
+ * The filter's per-channel coefficients are left as found.  The always-on PMIC
+ * keeps them across boots and another operating system can program them, so
+ * the time constant behind in_powerN_input is whatever was last written to
+ * LPF_C0_0; the vendor driver does not program them either.
+ *
+ * We never change a rail's power state: the only writes
  * are to the meter's own mux/enable registers (the measurement selector), so
  * the driver is read-only with respect to the regulators.  The mux is
  * programmed from DT rather than inherited, because the always-on PMIC keeps
@@ -21,6 +31,7 @@
 #include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/sysfs.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/mfd/samsung/core.h>
@@ -35,20 +46,36 @@
 #include <linux/workqueue.h>
 
 /*
- * Re-latch at most this often, so that reading all channels back-to-back
- * (e.g. "cat in_power*_input") shares one coherent measurement window and the
- * reported power is the average since the previous read pass.
+ * Re-latch at most this often.  A latch waits for ASYNC_RD to self-clear, so
+ * sweeping every channel back-to-back does the transfer once and answers the
+ * rest of the sweep from the same window.  The totals it feeds are cumulative,
+ * so the only cost is that a reader can be this far behind.
  */
 #define S2MPG1X_METER_MIN_REFRESH_MS	100
 
 /*
  * The 20-bit ACC_COUNT saturates after ~2.3 h at the 125 Hz internal rate, and
  * once saturated the accumulator is stuck (ASYNC_RD can no longer restart it).
- * A deadline timer re-latches once the meter has gone unread this long, so an
- * idle meter never reaches saturation; active readers keep pushing the deadline
- * out and so never trigger a redundant latch.
+ * A deadline timer re-latches once the meter has gone this long unlatched, so
+ * an idle meter does not reach saturation while the system runs.  It gives no
+ * protection across a system sleep -- the work is not run and the deadline does
+ * not advance -- which is the one interval long enough to saturate, so the
+ * window that spans a sleep is checked rather than assumed.
  */
 #define S2MPG1X_METER_REFRESH_MS	(60 * 60 * 1000)
+
+/*
+ * The internal sample rate hw_init() programs, in hertz.  It is nominal: the
+ * meter's own oscillator is untrimmed, so it is used to judge whether a
+ * window's sample count is plausible, never to convert one into energy.
+ */
+#define S2MPG1X_METER_SAMP_RATE_HZ	125
+
+/*
+ * Tolerance on that nominal rate, as a reciprocal.  The vendor driver allows
+ * the same +-12.5% before it stops believing the counter.
+ */
+#define S2MPG1X_METER_RATE_TOLERANCE	8
 
 struct s2mpg1x_meter_chan {
 	u8 muxsel;	/* rail mux selection */
@@ -62,10 +89,11 @@ struct s2mpg1x_meter {
 	unsigned long dev_type;	/* enum sec_device_type */
 	unsigned int n;
 	u8 hw_idx[S2MPG14_METER_CHANNELS];	/* enabled channels, in IIO order */
-	/* chan[] and cache_uw[] are indexed by hardware channel (MUXSEL index). */
+	/* chan[] and energy_nj[] are indexed by hardware channel. */
 	struct s2mpg1x_meter_chan chan[S2MPG14_METER_CHANNELS];
-	s64 cache_uw[S2MPG14_METER_CHANNELS];
-	ktime_t last_refresh;
+	u64 energy_nj[S2MPG14_METER_CHANNELS];
+	unsigned int lost_windows;
+	ktime_t last_refresh;	/* boottime, so a sleep is inside a window */
 	bool valid;
 	bool stopping;		/* gates the self-rearming refresh work */
 	struct delayed_work refresh_work;
@@ -193,6 +221,27 @@ static int s2mpg1x_meter_read_acc(struct s2mpg1x_meter *m, u8 hw, u64 *out)
 	return 0;
 }
 
+/*
+ * The filtered power of one channel.  A plain register read: the LPF bank runs
+ * continuously and reading it neither latches nor restarts anything.
+ */
+static int s2mpg1x_meter_read_lpf(struct s2mpg1x_meter *m, u8 hw, u32 *out)
+{
+	u8 buf[S2MPG14_METER_LPF_DATA_BYTES];
+	int ret;
+
+	ret = regmap_bulk_read(m->regmap,
+			       S2MPG14_METER_LPF_DATA_CH0_1 +
+			       hw * S2MPG14_METER_LPF_DATA_BYTES,
+			       buf, sizeof(buf));
+	if (ret)
+		return ret;
+
+	*out = (buf[0] | buf[1] << 8 | buf[2] << 16) &
+	       GENMASK(S2MPG14_METER_LPF_DATA_BITS - 1, 0);
+	return 0;
+}
+
 static int s2mpg1x_meter_read_count(struct s2mpg1x_meter *m, u32 *out)
 {
 	u8 buf[S2MPG14_METER_ACC_COUNT_BYTES];
@@ -208,52 +257,145 @@ static int s2mpg1x_meter_read_count(struct s2mpg1x_meter *m, u32 *out)
 	return 0;
 }
 
+static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m);
+
 /*
- * Caller holds m->lock.  Latches the accumulators (which restarts the window)
- * and recomputes per-rail power as ACC_DATA / ACC_COUNT for the elapsed
- * window.  Reads within MIN_REFRESH_MS reuse the cached window.
+ * Caller holds m->lock.  Start a window here and now, discarding whatever the
+ * accumulators hold.  Used after a window turns out not to be a measurement.
  */
-static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m)
+static int s2mpg1x_meter_restart(struct s2mpg1x_meter *m)
 {
-	ktime_t now = ktime_get();
-	u32 count;
-	unsigned int i;
 	int ret;
 
-	if (m->valid &&
-	    ktime_before(now, ktime_add_ms(m->last_refresh,
-					   S2MPG1X_METER_MIN_REFRESH_MS)))
+	m->valid = false;
+	ret = s2mpg1x_meter_hw_init(m);
+	if (ret)
+		return ret;
+
+	m->last_refresh = ktime_get_boottime();
+	m->valid = true;
+	return 0;
+}
+
+/*
+ * Is a window of @delta_us plausibly described by @count samples?
+ *
+ * More samples than the elapsed time can hold means the counter is not
+ * measuring this window at all -- saturated and frozen, or restarted
+ * underneath us -- and that is worth catching at any window length, because a
+ * frozen accumulator would otherwise be added to the totals again and again.
+ * Fewer samples than expected only means something once the window is long
+ * enough that the count's own quantisation is small, so the lower bound waits
+ * for that.
+ */
+static bool s2mpg1x_meter_count_plausible(u32 count, u64 delta_us)
+{
+	u64 expected = mul_u64_u64_div_u64(delta_us,
+					   S2MPG1X_METER_SAMP_RATE_HZ,
+					   USEC_PER_SEC);
+	u64 margin = expected / S2MPG1X_METER_RATE_TOLERANCE;
+
+	if (count > expected + margin)
+		return false;
+
+	if (delta_us >= S2MPG1X_METER_MIN_REFRESH_MS * USEC_PER_MSEC &&
+	    count + margin < expected)
+		return false;
+
+	return true;
+}
+
+/*
+ * Caller holds m->lock.  Latches the accumulators, which restarts the window,
+ * and adds the closed window's energy to the running per-rail totals.  A call
+ * within MIN_REFRESH_MS of the last one does nothing unless @force says to
+ * close the window exactly here, which is what the suspend boundaries need.
+ *
+ * Energy is the window's mean power times the time the AP measured, not the
+ * accumulator's sample count times a nominal sample period: the count cancels
+ * out of the arithmetic and the CPU's clock is the better of the two
+ * references.  The count is then free to be what says whether the window is a
+ * measurement at all.
+ */
+static int s2mpg1x_meter_refresh(struct s2mpg1x_meter *m, bool force)
+{
+	u64 window_nj[S2MPG14_METER_CHANNELS];
+	unsigned int i;
+	u64 delta_us;
+	ktime_t now;
+	u32 count;
+	int ret;
+
+	if (!force && m->valid &&
+	    ktime_before(ktime_get_boottime(),
+			 ktime_add_ms(m->last_refresh,
+				      S2MPG1X_METER_MIN_REFRESH_MS)))
 		return 0;
 
 	ret = s2mpg1x_meter_latch(m);
 	if (ret)
 		return ret;
 
+	/* Sampled after the latch: it is the latch that ends the window. */
+	now = ktime_get_boottime();
+
 	ret = s2mpg1x_meter_read_count(m, &count);
 	if (ret)
 		return ret;
 
-	for (i = 0; i < m->n; i++) {
-		u8 hw = m->hw_idx[i];
-		u64 acc, avg;
-
-		ret = s2mpg1x_meter_read_acc(m, hw, &acc);
-		if (ret)
-			return ret;
-
-		avg = count ? div64_u64(acc, count) : 0;
-		/*
-		 * The per-sample code cannot exceed the accumulator's structural
-		 * full scale (41-bit ACC over a 20-bit count); a larger value
-		 * means a corrupt latch, so keep the previous reading.
-		 */
-		if (avg < S2MPG14_METER_MAX_SAMPLE_CODE)
-			m->cache_uw[hw] = div64_u64(avg * m->chan[hw].res_pw,
-						    1000000);
+	if (!m->valid) {
+		/* No window is open yet; this latch opens the first one. */
+		m->last_refresh = now;
+		m->valid = true;
+		return 0;
 	}
 
+	delta_us = ktime_us_delta(now, m->last_refresh);
+	if (!s2mpg1x_meter_count_plausible(count, delta_us)) {
+		m->lost_windows++;
+		return s2mpg1x_meter_restart(m);
+	}
+
+	for (i = 0; i < m->n; i++) {
+		u8 hw = m->hw_idx[i];
+		u64 acc, power_nw;
+
+		ret = s2mpg1x_meter_read_acc(m, hw, &acc);
+		if (ret) {
+			/*
+			 * The latch already closed the window, so it is gone
+			 * for every rail. Report the loss rather than commit
+			 * it to some rails and not others.
+			 */
+			m->lost_windows++;
+			m->last_refresh = now;
+			return ret;
+		}
+
+		/*
+		 * A per-sample code cannot exceed the accumulator's structural
+		 * full scale (41-bit ACC over a 20-bit count), so an
+		 * accumulator above that ceiling times the count is a corrupt
+		 * read rather than a rail, and is dropped like any other
+		 * window that is not a measurement.
+		 */
+		if (count && acc >= (u64)count * S2MPG14_METER_MAX_SAMPLE_CODE) {
+			m->lost_windows++;
+			m->last_refresh = now;
+			return -EIO;
+		}
+
+		/* res_pw is picowatts per accumulated LSB. */
+		power_nw = count ? mul_u64_u64_div_u64(acc, m->chan[hw].res_pw,
+						       (u64)count * 1000) : 0;
+		window_nj[i] = mul_u64_u64_div_u64(power_nw, delta_us,
+						   USEC_PER_SEC);
+	}
+
+	for (i = 0; i < m->n; i++)
+		m->energy_nj[m->hw_idx[i]] += window_nj[i];
+
 	m->last_refresh = now;
-	m->valid = true;
 	return 0;
 }
 
@@ -269,11 +411,12 @@ static void s2mpg1x_meter_refresh_work(struct work_struct *work)
 					       struct s2mpg1x_meter, refresh_work);
 
 	scoped_guard(mutex, &m->lock) {
-		s64 idle_ms = ktime_ms_delta(ktime_get(), m->last_refresh);
+		s64 idle_ms = ktime_ms_delta(ktime_get_boottime(),
+					     m->last_refresh);
 		unsigned long delay;
 
 		if (idle_ms >= S2MPG1X_METER_REFRESH_MS) {
-			s2mpg1x_meter_refresh(m);
+			s2mpg1x_meter_refresh(m, false);
 			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS);
 		} else {
 			delay = msecs_to_jiffies(S2MPG1X_METER_REFRESH_MS - idle_ms);
@@ -294,6 +437,59 @@ static void s2mpg1x_meter_stop(void *data)
 	cancel_delayed_work_sync(&m->refresh_work);
 }
 
+static ssize_t s2mpg1x_meter_read_energy(struct iio_dev *indio_dev,
+					 uintptr_t private,
+					 const struct iio_chan_spec *chan,
+					 char *buf)
+{
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+	int ret;
+
+	guard(mutex)(&m->lock);
+	ret = s2mpg1x_meter_refresh(m, false);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%llu\n",
+			  m->energy_nj[chan->address] / NSEC_PER_USEC);
+}
+
+/*
+ * Energy is carried per channel rather than as an IIO_ENERGY channel of its
+ * own: a second channel set would double every label and index for a quantity
+ * that is the same rail, and the suspend total below has no channel type to be.
+ */
+static const struct iio_chan_spec_ext_info s2mpg1x_meter_ext_info[] = {
+	{
+		.name = "energy",
+		.read = s2mpg1x_meter_read_energy,
+		.shared = IIO_SEPARATE,
+	},
+	{ }
+};
+
+static ssize_t lost_windows_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct s2mpg1x_meter *m = iio_priv(indio_dev);
+
+	guard(mutex)(&m->lock);
+
+	return sysfs_emit(buf, "%u\n", m->lost_windows);
+}
+
+static IIO_DEVICE_ATTR_RO(lost_windows, 0);
+
+static struct attribute *s2mpg1x_meter_attrs[] = {
+	&iio_dev_attr_lost_windows.dev_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group s2mpg1x_meter_attr_group = {
+	.attrs = s2mpg1x_meter_attrs,
+};
+
 static int s2mpg1x_meter_read_raw(struct iio_dev *indio_dev,
 				  struct iio_chan_spec const *chan,
 				  int *val, int *val2, long mask)
@@ -304,12 +500,28 @@ static int s2mpg1x_meter_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_PROCESSED: {
+		u8 hw = chan->address;
+		u64 uw;
+		u32 lpf;
+
+		/*
+		 * Held across the read because hw_init() reconfigures the block
+		 * -- soft reset, mux, mode -- and a read landing inside that
+		 * returns a settling filter as a plausible number.
+		 */
 		guard(mutex)(&m->lock);
-		ret = s2mpg1x_meter_refresh(m);
+		ret = s2mpg1x_meter_read_lpf(m, hw, &lpf);
 		if (ret)
 			return ret;
-		/* cache is in microwatts; IIO power base unit is milliwatts */
-		*val = div_u64_rem(m->cache_uw[chan->address], 1000, &rem);
+
+		/*
+		 * A filtered sample carries the same per-LSB power as one of
+		 * the accumulator's samples; res_pw is in picowatts.
+		 */
+		uw = div_u64((u64)lpf * m->chan[hw].res_pw, 1000000);
+
+		/* IIO's power base unit is milliwatts. */
+		*val = div_u64_rem(uw, 1000, &rem);
 		*val2 = rem * 1000;
 		return IIO_VAL_INT_PLUS_MICRO;
 	}
@@ -330,6 +542,7 @@ static int s2mpg1x_meter_read_label(struct iio_dev *indio_dev,
 static const struct iio_info s2mpg1x_meter_info = {
 	.read_raw = s2mpg1x_meter_read_raw,
 	.read_label = s2mpg1x_meter_read_label,
+	.attrs = &s2mpg1x_meter_attr_group,
 };
 
 static int s2mpg1x_meter_parse_channels(struct device *dev,
@@ -436,6 +649,18 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 		return ret;
 
 	/*
+	 * Report power (not current) in the filtered data registers too.  Only
+	 * the mode is programmed; the filter coefficients are left as found.
+	 */
+	ret = regmap_write(m->regmap, S2MPG14_METER_CTRL6, 0x00);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(m->regmap, S2MPG14_METER_CTRL7,
+				 S2MPG14_METER_LPF_MODE_HI_MASK, 0x00);
+	if (ret)
+		return ret;
+
+	/*
 	 * Enable current sensing for all bucks: BUCKEN1 covers BUCK1..8,
 	 * BUCKEN2 the rest.  Enable BUCK9 (bit0) and BUCK12 (bit3) -- the
 	 * highest-numbered bucks either PMIC meters (s2mpg15 BUCK12S = AUR).
@@ -533,12 +758,15 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 		channels[i].channel = m->hw_idx[i];
 		channels[i].address = m->hw_idx[i];
 		channels[i].info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED);
+		channels[i].ext_info = s2mpg1x_meter_ext_info;
 	}
 
 	/* Latch once to start a clean measurement window. */
 	scoped_guard(mutex, &m->lock) {
-		if (!s2mpg1x_meter_latch(m))
-			m->last_refresh = ktime_get();
+		if (!s2mpg1x_meter_latch(m)) {
+			m->last_refresh = ktime_get_boottime();
+			m->valid = true;
+		}
 	}
 
 	/* Keep the accumulator from saturating while userspace is not reading. */

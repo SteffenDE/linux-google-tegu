@@ -124,6 +124,8 @@ enum s2mpg14_meter_reg {
 	S2MPG14_METER_CTRL2 = 0x09,
 	S2MPG14_METER_CTRL4 = 0x0b,
 	S2MPG14_METER_CTRL5 = 0x0c,
+	S2MPG14_METER_CTRL6 = 0x0d,
+	S2MPG14_METER_CTRL7 = 0x0e,
 	S2MPG14_METER_BUCKEN1 = 0x0f,
 	S2MPG14_METER_BUCKEN2 = 0x10,
 	S2MPG14_METER_MUXSEL0 = 0x11,
@@ -166,12 +168,21 @@ enum s2mpg14_meter_reg {
 /* METER_CTRL5 bit 6: soft-reset the accumulators (clears ACC_DATA/ACC_COUNT). */
 #define S2MPG14_METER_SOFT_RST_MASK	BIT(6)
 
+/*
+ * METER_CTRL6 (channels 0-7) + METER_CTRL7[3:0] (channels 8-11): per-channel
+ * mode for the low-pass-filtered data registers, 0 = power, 1 = current.  It
+ * selects what LPF_DATA reports and is independent of the accumulator mode.
+ */
+#define S2MPG14_METER_LPF_MODE_HI_MASK	0x0f
+
 /* The meter exposes 12 channels; data is accumulated and low-pass filtered. */
 #define S2MPG14_METER_CHANNELS		12
 #define S2MPG14_METER_ACC_DATA_BYTES	6
 #define S2MPG14_METER_ACC_COUNT_BYTES	3
 #define S2MPG14_METER_ACC_DATA_BITS	41
 #define S2MPG14_METER_ACC_COUNT_BITS	20
+#define S2MPG14_METER_LPF_DATA_BYTES	3
+#define S2MPG14_METER_LPF_DATA_BITS	21
 /* ACC is 41-bit over a 20-bit count, so a valid per-sample code is < 2^21. */
 #define S2MPG14_METER_MAX_SAMPLE_CODE	BIT(S2MPG14_METER_ACC_DATA_BITS - \
 					    S2MPG14_METER_ACC_COUNT_BITS)

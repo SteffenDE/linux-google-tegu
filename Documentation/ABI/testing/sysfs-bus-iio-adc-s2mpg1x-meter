@@ -32,3 +32,33 @@ Description:
 		when this happens, so the counter advancing across an interval
 		means that interval's energy is incomplete and should be shown
 		as a gap rather than as a low number.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_powerY_suspend_energy
+KernelVersion:	7.3
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The part of in_powerY_energy that was measured across a system
+		sleep, in microjoules.
+
+		The driver closes the measurement window as the system suspends
+		and again as it resumes, and adds the window in between to this
+		total only if the system did suspend: a cycle that aborted
+		before sleeping is ordinary awake time and is left out.
+
+		The window is bounded by the driver's own suspend and resume
+		callbacks rather than by the sleep, so it also contains the
+		device suspend and resume either side of it. Divide by
+		suspend_time_us, which counts the elapsed time of exactly these
+		windows, rather than by a sleep length measured elsewhere.
+		Subtracting this total from in_powerY_energy over an interval
+		leaves what the rail used while the system was running.
+
+What:		/sys/bus/iio/devices/iio:deviceX/suspend_time_us
+KernelVersion:	7.3
+Contact:	linux-iio@vger.kernel.org
+Description:
+		Total elapsed time, in microseconds, of the windows counted in
+		in_powerY_suspend_energy. It is the denominator that belongs
+		with that numerator: their ratio is a true mean power, where a
+		sleep duration measured elsewhere would not cover the same
+		interval.

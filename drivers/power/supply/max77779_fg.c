@@ -21,10 +21,12 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/cleanup.h>
 #include <linux/i2c.h>
 #include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
@@ -45,6 +47,7 @@
 #define MAX77779_FG_DEVNAME_RADIX	GENMASK(15, 8)
 #define MAX77779_FG_FSTAT		0x3d
 #define MAX77779_FG_FSTAT_DNR		BIT(0)	/* data not ready */
+#define MAX77779_FG_QH			0x4d
 
 #define MAX77779_FG_MAX_REG		0xff
 
@@ -54,6 +57,11 @@
 struct max77779_fg {
 	struct regmap *regmap;
 	int rsense;	/* micro-ohms; 0 = unknown -> current/charge disabled */
+	struct mutex lock;	/* serialises the QH accumulator below */
+	s64 qh_lsb;		/* unwrapped QH total, in register LSB */
+	u16 qh_prev;
+	bool qh_seeded;
+	bool qh_por;		/* Status.POR as of the previous reading */
 };
 
 static bool max77779_fg_devname_valid(unsigned int devname)
@@ -108,10 +116,75 @@ static int max77779_fg_uamp(struct max77779_fg *fg, unsigned int reg)
 	return div_s64((s64)(s16)reg * 1562500, fg->rsense);
 }
 
-static int max77779_fg_uah(struct max77779_fg *fg, unsigned int reg)
+static int max77779_fg_uah(struct max77779_fg *fg, s64 lsb)
 {
 	/* 5.0 uVh / Rsense per LSB */
-	return div_s64((s64)reg * 5000000, fg->rsense);
+	return div_s64(lsb * 5000000, fg->rsense);
+}
+
+/*
+ * QH is the gauge's own coulomb counter: a two's-complement accumulator that
+ * grows as the battery charges and shrinks as it discharges, integrating in
+ * hardware and so continuing to count while the AP is asleep.  Alone among the
+ * charge readings here it owes nothing to the battery model, so it stays
+ * meaningful when the model does not -- which is the whole reason to report it.
+ * It is therefore not gated on the model being loaded.
+ *
+ * The register is 16-bit and wraps.  Take the difference between consecutive
+ * reads in 16-bit two's complement, which is the wrap-correct distance as long
+ * as less than half the register's span passes between two of them -- over
+ * 80 Ah at this board's sense resistor, many full cycles of the cell -- and
+ * keep the running total, so a reader sees one counter rather than a value it
+ * has to unwrap without knowing the per-LSB charge.
+ *
+ * Reported relative to the first reading, per the power_supply description of
+ * CHARGE_COUNTER: a counter with no empty or full value, useful for
+ * differences rather than as a level.  It goes negative on net discharge.
+ *
+ * A power-on reset restarts the gauge's counter, so a total spanning one would
+ * contain a step the battery never took.  Status.POR latches and only a model
+ * load clears it, which this read-only driver never performs: were the level
+ * tested, a phone that booted once with the bit set would never report the
+ * counter again.  Test the edge instead, and drop the total only when a reset
+ * appears that was not there at the previous reading.
+ */
+static int max77779_fg_charge_counter(struct max77779_fg *fg,
+				      union power_supply_propval *val)
+{
+	unsigned int status, reg;
+	bool por;
+	int ret;
+
+	/*
+	 * Both reads are inside the lock: a reset landing between them would
+	 * otherwise let one reader seed the total from the other's pre-reset
+	 * register value, which is the one way the unwrap can be wrong by more
+	 * than a sample.
+	 */
+	guard(mutex)(&fg->lock);
+
+	ret = regmap_read(fg->regmap, MAX77779_FG_STATUS, &status);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(fg->regmap, MAX77779_FG_QH, &reg);
+	if (ret)
+		return ret;
+
+	por = status & MAX77779_FG_STATUS_POR;
+	if (por && !fg->qh_por)
+		fg->qh_seeded = false;
+	fg->qh_por = por;
+
+	if (fg->qh_seeded)
+		fg->qh_lsb += (s16)((u16)reg - fg->qh_prev);
+	else
+		fg->qh_lsb = 0;
+
+	fg->qh_prev = reg;
+	fg->qh_seeded = true;
+	val->intval = max77779_fg_uah(fg, fg->qh_lsb);
+	return 0;
 }
 
 static int max77779_fg_status(struct max77779_fg *fg,
@@ -220,6 +293,10 @@ static int max77779_fg_get_property(struct power_supply *psy,
 			return ret;
 		val->intval = max77779_fg_uah(fg, reg);
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+		if (!fg->rsense)
+			return -ENODATA;
+		return max77779_fg_charge_counter(fg, val);
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		if (!fg->rsense)
 			return -ENODATA;
@@ -256,6 +333,7 @@ static const enum power_supply_property max77779_fg_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_AVG,
 	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
@@ -291,6 +369,10 @@ static int max77779_fg_probe(struct i2c_client *client)
 	fg = devm_kzalloc(dev, sizeof(*fg), GFP_KERNEL);
 	if (!fg)
 		return -ENOMEM;
+
+	ret = devm_mutex_init(dev, &fg->lock);
+	if (ret)
+		return ret;
 
 	fg->regmap = devm_regmap_init_i2c(client, &max77779_fg_regmap_cfg);
 	if (IS_ERR(fg->regmap))

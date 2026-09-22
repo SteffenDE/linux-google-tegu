@@ -162,6 +162,45 @@ clear:
 	return clear_err ? clear_err : ret;
 }
 
+static int brcmf_vndr_cmd_apf_read_filter_data(struct wiphy *wiphy,
+					       struct wireless_dev *wdev,
+					       const void *data, int len)
+{
+	struct brcmf_cfg80211_vif *vif = wdev_to_vif(wdev);
+	struct sk_buff *reply;
+	u32 ram_len;
+	u8 *ram;
+	int err;
+
+	if (wdev->iftype != NL80211_IFTYPE_STATION || vif->ifp->bsscfgidx != 0)
+		return -EOPNOTSUPP;
+
+	err = brcmf_get_apf_program(vif->ifp, &ram, &ram_len);
+	if (err)
+		return err;
+
+	reply = cfg80211_vendor_cmd_alloc_reply_skb(wiphy,
+						    nla_total_size(sizeof(u32)) +
+						    nla_total_size(ram_len));
+	if (!reply) {
+		err = -ENOMEM;
+		goto free;
+	}
+
+	if (nla_put_u32(reply, BRCMF_APF_ATTR_PROGRAM_LEN, ram_len) ||
+	    nla_put(reply, BRCMF_APF_ATTR_PROGRAM, ram_len, ram)) {
+		kfree_skb(reply);
+		err = -ENOBUFS;
+		goto free;
+	}
+
+	err = cfg80211_vendor_cmd_reply(reply);
+
+free:
+	kfree(ram);
+	return err;
+}
+
 const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 	{
 		{
@@ -184,6 +223,17 @@ const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 		.policy = brcmf_apf_policy,
 		.maxattr = BRCMF_APF_ATTR_MAX,
 		.doit = brcmf_vndr_cmd_apf_set_filter
+	},
+	{
+		{
+			.vendor_id = GOOGLE_OUI,
+			.subcmd = BRCMF_APF_SUBCMD_READ_FILTER_DATA
+		},
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_NETDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.policy = VENDOR_CMD_RAW_DATA,
+		.doit = brcmf_vndr_cmd_apf_read_filter_data
 	},
 };
 

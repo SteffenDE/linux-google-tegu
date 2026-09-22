@@ -46,6 +46,7 @@
 #define BRCMF_PKT_FILTER_TYPE_APF_MATCH		4
 #define BRCMF_PKT_FILTER_MODE_FORWARD_ON_MATCH	1
 #define BRCMF_APF_INTERNAL_VERSION		1
+#define BRCMF_APF_BUF_GET			"apf_buf_get"
 
 #define WPA_OUI				"\x00\x50\xF2"	/* WPA OUI */
 #define WPA_OUI_TYPE			1
@@ -1419,6 +1420,81 @@ static int brcmf_clear_apf_program(struct brcmf_cfg80211_vif *vif,
 	brcmf_free_apf_program_locked(vif);
 	mutex_unlock(&vif->apf_mutex);
 
+	return err;
+}
+
+/**
+ * brcmf_get_apf_program() - read filter 200's APF memory back from firmware
+ * @ifp: interface the filter belongs to
+ * @ram: receives a kmalloc'd copy of the APF memory, freed by the caller
+ * @ram_len: receives its length
+ *
+ * Reading the memory back is the only way to tell a program the firmware
+ * accepted from one it rejected, and it is where an APF program keeps its
+ * counters, which is the only account of what a program did rather than what
+ * it was expected to do.
+ *
+ * The firmware wants the filter id as a single byte following the iovar name
+ * and answers into the same buffer, behind a header describing the program.
+ * The header is consumed here -- its version is the reply's only integrity
+ * check -- so what comes back is the memory image alone, which is what the
+ * Android command this serves defines its payload to be.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int brcmf_get_apf_program(struct brcmf_if *ifp, u8 **ram, u32 *ram_len)
+{
+	u32 header_len = offsetof(struct brcmf_apf_program_le, instrs);
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	struct brcmf_apf_program_le *reply;
+	u32 max_len;
+	u32 len;
+	u8 *buf;
+	int err;
+
+	mutex_lock(&vif->apf_mutex);
+
+	err = brcmf_fil_iovar_int_get(ifp, "apf_size_limit", &max_len);
+	if (err)
+		goto unlock;
+
+	/* The iovar name is prepended to the request, so it has to fit as
+	 * well as the reply.
+	 */
+	if (!max_len ||
+	    max_len > BRCMF_DCMD_MAXLEN - header_len - sizeof(BRCMF_APF_BUF_GET)) {
+		err = -EINVAL;
+		goto unlock;
+	}
+
+	len = header_len + max_len;
+	buf = kzalloc(len, GFP_KERNEL);
+	if (!buf) {
+		err = -ENOMEM;
+		goto unlock;
+	}
+
+	buf[0] = BRCMF_APF_FILTER_ID;
+	err = brcmf_fil_iovar_data_get(ifp, BRCMF_APF_BUF_GET, buf, len);
+	if (err)
+		goto free;
+
+	reply = (struct brcmf_apf_program_le *)buf;
+	if (le16_to_cpu(reply->version) != BRCMF_APF_INTERNAL_VERSION) {
+		err = -EPROTO;
+		goto free;
+	}
+
+	memmove(buf, buf + header_len, max_len);
+	*ram = buf;
+	*ram_len = max_len;
+	mutex_unlock(&vif->apf_mutex);
+	return 0;
+
+free:
+	kfree(buf);
+unlock:
+	mutex_unlock(&vif->apf_mutex);
 	return err;
 }
 

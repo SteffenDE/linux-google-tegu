@@ -1400,6 +1400,8 @@ static int brcmf_set_pmk(struct brcmf_if *ifp, const u8 *pmk_data, u16 pmk_len)
 
 static int brcmf_apf_cleanup_locked(struct brcmf_cfg80211_vif *vif,
 				    bool firmware_available);
+static int brcmf_apf_arm_locked(struct brcmf_cfg80211_vif *vif);
+static int brcmf_apf_config_filter(struct brcmf_if *ifp, bool enable);
 
 static void brcmf_free_apf_program_locked(struct brcmf_cfg80211_vif *vif)
 {
@@ -1447,6 +1449,7 @@ int brcmf_get_apf_program(struct brcmf_if *ifp, u8 **ram, u32 *ram_len)
 	u32 header_len = offsetof(struct brcmf_apf_program_le, instrs);
 	struct brcmf_cfg80211_vif *vif = ifp->vif;
 	struct brcmf_apf_program_le *reply;
+	bool armed;
 	u32 max_len;
 	u32 len;
 	u8 *buf;
@@ -1475,7 +1478,28 @@ int brcmf_get_apf_program(struct brcmf_if *ifp, u8 **ram, u32 *ram_len)
 	}
 
 	buf[0] = BRCMF_APF_FILTER_ID;
+
+	/* The counters in the memory are coherent only while the program is not
+	 * running, so reading an armed program stops it for the length of the
+	 * read. The vendor driver does the same, and only has to do it during
+	 * suspend because that is the only time it keeps a program armed.
+	 */
+	armed = vif->apf_filter_enabled;
+	if (armed) {
+		err = brcmf_apf_config_filter(ifp, false);
+		if (err)
+			goto free;
+		vif->apf_filter_enabled = false;
+	}
+
 	err = brcmf_fil_iovar_data_get(ifp, BRCMF_APF_BUF_GET, buf, len);
+
+	/* Re-arm before reporting the read's outcome: a diagnostic that could
+	 * not answer must not also be what leaves the phone unfiltered.
+	 */
+	if (armed && !brcmf_apf_config_filter(ifp, true))
+		vif->apf_filter_enabled = true;
+
 	if (err)
 		goto free;
 
@@ -1504,6 +1528,7 @@ int brcmf_set_apf_program(struct brcmf_if *ifp, const u8 *program,
 	struct brcmf_cfg80211_vif *vif = ifp->vif;
 	u8 *program_copy = NULL;
 	bool firmware_available;
+	int cleanup_err;
 	u32 max_len;
 	int err;
 
@@ -1543,7 +1568,23 @@ int brcmf_set_apf_program(struct brcmf_if *ifp, const u8 *program,
 
 	vif->apf_program = program_copy;
 	vif->apf_program_len = program_len;
-	err = 0;
+
+	/* A program is live from the moment it is installed rather than from
+	 * the next suspend. Arming it here is what the Android command this
+	 * serves already promises, and it lets the caller choose how long the
+	 * program runs for: a phone that suspends every few seconds otherwise
+	 * rebuilds the firmware filter on every cycle and leaves the radio
+	 * unfiltered for the whole of each wake, when what it wants is one
+	 * program held across the entire screen-off period.
+	 */
+	err = brcmf_apf_arm_locked(vif);
+	if (!err)
+		goto out;
+
+	cleanup_err = brcmf_apf_cleanup_locked(vif, firmware_available);
+	if (cleanup_err)
+		err = cleanup_err;
+	brcmf_free_apf_program_locked(vif);
 
 out:
 	mutex_unlock(&vif->apf_mutex);
@@ -4288,17 +4329,6 @@ static int brcmf_apf_cleanup_locked(struct brcmf_cfg80211_vif *vif,
 	return err;
 }
 
-static int brcmf_apf_disable(struct brcmf_cfg80211_vif *vif)
-{
-	int err;
-
-	mutex_lock(&vif->apf_mutex);
-	err = brcmf_apf_disable_locked(vif);
-	mutex_unlock(&vif->apf_mutex);
-
-	return err;
-}
-
 static int brcmf_apf_download(struct brcmf_if *ifp, const u8 *data, u32 len)
 {
 	struct brcmf_dload_data_le *chunk_buf;
@@ -4379,44 +4409,59 @@ static int brcmf_apf_install_locked(struct brcmf_if *ifp)
 	return err;
 }
 
-static int brcmf_apf_arm(struct brcmf_cfg80211_vif *vif, bool *armed)
+/* Arm the stored program. The caller has already cleaned up whatever the
+ * firmware held, so this only downloads and enables.
+ */
+static int brcmf_apf_arm_locked(struct brcmf_cfg80211_vif *vif)
 {
-	int cleanup_err;
 	int err;
 
-	*armed = false;
+	lockdep_assert_held(&vif->apf_mutex);
 
-	mutex_lock(&vif->apf_mutex);
-
-	err = brcmf_apf_cleanup_locked(vif, true);
-	if (err || !vif->apf_program)
-		goto out;
-
-	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
-		err = -ENOTCONN;
-		goto out;
-	}
-
+	/* Both steps are indeterminate on failure: a download that stopped part
+	 * way and an enable that was not acknowledged each leave firmware this
+	 * host has to assume is holding something, so the cleanup which follows
+	 * a failure has to be told to delete it.
+	 */
+	vif->apf_filter_installed = true;
 	err = brcmf_apf_install_locked(vif->ifp);
 	if (err)
-		goto cleanup;
-	vif->apf_filter_installed = true;
+		return err;
 
-	/* Treat an enable error as indeterminate and force cleanup. */
 	vif->apf_filter_enabled = true;
 	err = brcmf_apf_config_filter(vif->ifp, true);
-	if (!err) {
-		*armed = true;
-		goto out;
-	}
+	if (err)
+		return err;
 
-cleanup:
-	cleanup_err = brcmf_apf_cleanup_locked(vif, true);
-	if (cleanup_err)
-		err = cleanup_err;
-out:
+	/* The mode is global and is otherwise written only on the way into a
+	 * wake-on-any suspend. A program armed before the first such suspend of
+	 * a boot would run under whatever disposition the firmware powered up
+	 * with, which is not this driver's to assume.
+	 */
+	return brcmf_fil_iovar_int_set(vif->ifp, "pkt_filter_mode",
+				       BRCMF_PKT_FILTER_MODE_FORWARD_ON_MATCH);
+}
+
+/* Whether a program is armed, retrying a cleanup that cannot have worked.
+ *
+ * A cleanup which failed both its disable and its delete leaves the flags
+ * describing a filter for a program this host no longer holds. Arming used to
+ * happen on every suspend and began by cleaning up, so that state could not
+ * outlive one cycle; nothing retried it once arming moved to install time, and
+ * suspend would go on disabling the fallback filter on the strength of a
+ * program which is gone.
+ */
+static bool brcmf_apf_is_armed(struct brcmf_cfg80211_vif *vif)
+{
+	bool armed;
+
+	mutex_lock(&vif->apf_mutex);
+	if (vif->apf_filter_enabled && !vif->apf_program)
+		brcmf_apf_cleanup_locked(vif, true);
+	armed = vif->apf_filter_enabled;
 	mutex_unlock(&vif->apf_mutex);
-	return err;
+
+	return armed;
 }
 
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
@@ -4447,14 +4492,10 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 					      cfg->wowl.pre_pmmode);
 			cfg->wowl.active = false;
 		} else {
-			pm_err = brcmf_apf_disable(ifp->vif);
-			if (pm_err) {
-				bphy_err(cfg->pub,
-					 "failed to disable APF packet filter: %d\n",
-					 pm_err);
-				err = pm_err;
-			}
-
+			/* An armed program is not disarmed here. It belongs to
+			 * whoever installed it, for as long as they leave it
+			 * installed; a resume is not the end of that.
+			 */
 			if (cfg->wowl.any_filter_enabled) {
 				pm_err = brcmf_fil_iovar_data_set(ifp,
 								  "pkt_filter_enable",
@@ -4564,7 +4605,6 @@ static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
 		.enable = cpu_to_le32(1),
 	};
 	bool apf_armed;
-	int apf_err;
 	int err;
 
 	brcmf_dbg(TRACE, "Suspend, wake on any traffic.\n");
@@ -4584,17 +4624,7 @@ static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
 	 * can check. The unicast filter stays the fallback for a suspend with
 	 * no program to arm.
 	 */
-	apf_err = brcmf_apf_arm(ifp->vif, &apf_armed);
-	if (apf_err) {
-		bphy_err(cfg->pub, "failed to arm APF packet filter: %d\n",
-			 apf_err);
-		apf_err = brcmf_apf_disable(ifp->vif);
-		if (apf_err) {
-			bphy_err(cfg->pub, "failed to clean up APF packet filter: %d\n",
-				 apf_err);
-			return apf_err;
-		}
-	}
+	apf_armed = brcmf_apf_is_armed(ifp->vif);
 
 	if (!apf_armed && !cfg->wowl.any_filter_set) {
 		filter_buf.filter.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID);
@@ -4611,7 +4641,7 @@ static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
 		if (err) {
 			bphy_err(cfg->pub, "failed to install wake-on-any packet filter: %d\n",
 				 err);
-			goto disable_apf;
+			return err;
 		}
 		cfg->wowl.any_filter_set = true;
 	}
@@ -4626,7 +4656,7 @@ static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
 		if (err) {
 			bphy_err(cfg->pub, "failed to %s wake-on-any packet filter: %d\n",
 				 apf_armed ? "disable" : "enable", err);
-			goto disable_apf;
+			return err;
 		}
 		cfg->wowl.any_filter_enabled = !apf_armed;
 	}
@@ -4665,11 +4695,6 @@ disable_filter:
 					      sizeof(enable)))
 			cfg->wowl.any_filter_enabled = false;
 	}
-disable_apf:
-	apf_err = brcmf_apf_disable(ifp->vif);
-	if (apf_err)
-		bphy_err(cfg->pub, "failed to disable APF packet filter: %d\n",
-			 apf_err);
 	return err;
 }
 

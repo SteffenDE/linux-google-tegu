@@ -26,6 +26,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/hdmi.h>
 #include <linux/math64.h>
+#include <linux/media-bus-format.h>
 
 #include <drm/display/drm_dp_helper.h>
 #include <drm/drm_bridge.h>
@@ -1484,13 +1485,53 @@ static int zumapro_dp_attach(struct drm_bridge *bridge,
 					&dp->aux);
 }
 
+/*
+ * Whether a mode at a given depth fits the trained link: the link carries a
+ * fixed number of bits per second, and a mode that needs more than that
+ * cannot be sent however it is timed.
+ */
+static bool zumapro_dp_mode_fits(const struct drm_display_mode *mode,
+				 unsigned int bpc, unsigned int rate,
+				 unsigned int lanes)
+{
+	return (u64)mode->clock * bpc * 3 <= (u64)rate * lanes * 8;
+}
+
+/*
+ * The depth the link runs at: the sink's own, capped at the ten bits the
+ * transmitter has, and dropped to eight when ten does not fit the link. Six is
+ * honoured for a sink that asks for it. Read from the display info rather than
+ * the connector state's max_bpc, which is only recomputed for a connector the
+ * commit named, and so is stale across a hotplug for one it did not.
+ */
+static unsigned int zumapro_dp_link_bpc(struct zumapro_dp *dp,
+					const struct drm_connector *connector,
+					const struct drm_display_mode *mode)
+{
+	unsigned int bpc = connector->display_info.bpc ? : 8;
+	unsigned int rate, lanes;
+
+	if (bpc < 8)
+		return 6;
+
+	scoped_guard(mutex, &dp->lock) {
+		rate = dp->link_rate;
+		lanes = dp->link_lanes;
+	}
+
+	if (bpc >= 10 && zumapro_dp_mode_fits(mode, 10, rate, lanes))
+		return 10;
+
+	return 8;
+}
+
 static enum drm_mode_status
 zumapro_dp_mode_valid(struct drm_bridge *bridge,
 		      const struct drm_display_info *info,
 		      const struct drm_display_mode *mode)
 {
 	struct zumapro_dp *dp = bridge_to_dp(bridge);
-	unsigned int bpp, rate, lanes;
+	unsigned int rate, lanes;
 
 	scoped_guard(mutex, &dp->lock) {
 		rate = dp->link_rate;
@@ -1501,14 +1542,48 @@ zumapro_dp_mode_valid(struct drm_bridge *bridge,
 		return MODE_NOCLOCK;
 
 	/*
-	 * The trained link carries a fixed number of bits per second, and a
-	 * mode that needs more than that cannot be sent however it is timed.
+	 * A deeper sink falls back to eight bits when its depth does not fit,
+	 * so a mode is carried if it fits at eight -- or at six, for a sink
+	 * that never offers more.
 	 */
-	bpp = max(info->bpc, 8U) * 3;
-	if ((u64)mode->clock * bpp > (u64)rate * lanes * 8)
+	if (!zumapro_dp_mode_fits(mode, info->bpc == 6 ? 6 : 8, rate, lanes))
 		return MODE_CLOCK_HIGH;
 
 	return MODE_OK;
+}
+
+/*
+ * What the DECON has to send the link. With no DQE in its path, as on this
+ * head, the vendor runs the DECON at eight bits only when the link runs at
+ * eight; for any other depth it runs it at ten and the transmitter converts,
+ * and a DECON left at eight under a ten-bit link puts a column pattern over
+ * the whole picture.
+ */
+static u32 *
+zumapro_dp_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+				     struct drm_bridge_state *bridge_state,
+				     struct drm_crtc_state *crtc_state,
+				     struct drm_connector_state *conn_state,
+				     u32 output_fmt,
+				     unsigned int *num_input_fmts)
+{
+	struct zumapro_dp *dp = bridge_to_dp(bridge);
+	u32 *fmts;
+
+	*num_input_fmts = 0;
+
+	fmts = kmalloc_obj(*fmts);
+	if (!fmts)
+		return NULL;
+
+	if (zumapro_dp_link_bpc(dp, conn_state->connector,
+				&crtc_state->adjusted_mode) == 8)
+		fmts[0] = MEDIA_BUS_FMT_RGB888_1X24;
+	else
+		fmts[0] = MEDIA_BUS_FMT_RGB101010_1X30;
+	*num_input_fmts = 1;
+
+	return fmts;
 }
 
 static void zumapro_dp_atomic_enable(struct drm_bridge *bridge,
@@ -1517,6 +1592,7 @@ static void zumapro_dp_atomic_enable(struct drm_bridge *bridge,
 	struct zumapro_dp *dp = bridge_to_dp(bridge);
 	const struct drm_display_mode *mode;
 	struct drm_connector_state *conn_state;
+	struct drm_bridge_state *bridge_state;
 	struct drm_connector *connector;
 	struct drm_crtc_state *crtc_state;
 	unsigned int bpc;
@@ -1536,20 +1612,26 @@ static void zumapro_dp_atomic_enable(struct drm_bridge *bridge,
 
 	mode = &crtc_state->adjusted_mode;
 
+	/*
+	 * The depth was settled at check time and the DECON is already set up
+	 * for it, so read it back from what was negotiated rather than ask the
+	 * link again: a retrain in between must not split the two.
+	 */
+	bridge_state = drm_atomic_get_new_bridge_state(state, bridge);
+	if (!bridge_state)
+		return;
+
+	if (bridge_state->input_bus_cfg.format == MEDIA_BUS_FMT_RGB101010_1X30)
+		bpc = connector->display_info.bpc == 6 ? 6 : 10;
+	else
+		bpc = 8;
+
 	guard(mutex)(&dp->lock);
 
 	if (!dp->link_rate) {
 		dev_err(dp->dev, "no trained link to put a picture on\n");
 		return;
 	}
-
-	/*
-	 * The depth is the lesser of what the sink offers and what the
-	 * connector's own property allows, so a user capping it is honoured.
-	 */
-	bpc = connector->display_info.bpc ? : 8;
-	if (conn_state->max_bpc)
-		bpc = min(bpc, conn_state->max_bpc);
 
 	zumapro_dp_set_video_config(dp, mode, bpc);
 	zumapro_dp_send_infoframes(dp, connector, mode);
@@ -1572,6 +1654,7 @@ static const struct drm_bridge_funcs zumapro_dp_bridge_funcs = {
 	.edid_read		= zumapro_dp_edid_read,
 	.hpd_notify		= zumapro_dp_hpd_notify,
 	.mode_valid		= zumapro_dp_mode_valid,
+	.atomic_get_input_bus_fmts = zumapro_dp_atomic_get_input_bus_fmts,
 	.atomic_enable		= zumapro_dp_atomic_enable,
 	.atomic_disable		= zumapro_dp_atomic_disable,
 	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,

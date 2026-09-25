@@ -42,6 +42,11 @@ obj-$(CONFIG_GOOGLE_CCD)		+= google_ccd.o
 obj-$(CONFIG_GOOGLE_TCPM_BUCK)		+= google-tcpm-buck.o
 google-tcpm-buck-y			:= google_tcpm_buck.o
 
+# Not a vendor file: the scratchpad half of the vendor's pixel-zuma-reboot.c,
+# as a reboot-mode driver; the PMU half is syscon-reboot-mode.
+obj-$(CONFIG_GOOGLE_GBMS_REBOOT_MODE)	+= gbms-reboot-mode.o
+gbms-reboot-mode-y			:= gbms_reboot_mode.o
+
 # MAX77779 IF-PMIC: charger, fuel gauge, V/I monitor, scratchpad, I2C master
 # and the PMIC core that owns their shared IRQ.
 obj-$(CONFIG_CHARGER_MAX77779)		+= max77779-charger.o

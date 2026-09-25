@@ -326,6 +326,24 @@ config GOOGLE_TCPM_BUCK
 	  To compile this as a module, choose M here: the module will be
 	  called google-tcpm-buck.
 
+config GOOGLE_GBMS_REBOOT_MODE
+	tristate "Reboot mode in the Google BMS storage"
+	depends on GOOGLE_BMS
+	depends on POWER_RESET && OF
+	select REBOOT_MODE
+	help
+	  Stores the reboot mode as the GBMS_TAG_RSBM storage tag, which on
+	  MAX77779 boards is the battery-backed scratchpad the bootloader reads
+	  after a cold reset. The PMU copy syscon-reboot-mode writes does not
+	  survive one.
+
+	  The scratchpad belongs to the BMS storage layer, which also keeps
+	  battery state in the same page, so the mode is written through it
+	  rather than through a second owner of the device.
+
+	  To compile this as a module, choose M here: the module will be
+	  called gbms-reboot-mode.
+
 config CHARGER_P9221
 	tristate "IDT P9221/P9222 wireless power receiver"
 	depends on GOOGLE_BMS

@@ -3657,7 +3657,7 @@
 			 * a *warm* reset, same node and offset as gs101.  A cold
 			 * reset clears this register, and then the bootloader
 			 * reads the MAX77779 battery-backed scratchpad instead
-			 * (nvmem-reboot-mode, see zumapro-tegu.dts) -- so the
+			 * (the gbms-reboot-mode node in zumapro-tegu.dts) -- so the
 			 * two stores are not redundant, they cover different
 			 * reset types, which is why downstream's
 			 * pixel-zuma-reboot.c writes both [HW 2026-08-10].  The

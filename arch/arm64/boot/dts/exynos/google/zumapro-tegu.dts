@@ -845,6 +845,34 @@
 			0x151670 0x149d58 0x142440 0x136ca8 0x12b128>;
 		google,thermal-stats-lvl-map = <0x00 0x02 0x05 0x08 0x0b>;
 	};
+
+	/*
+	 * The reboot mode the bootloader reads after a *cold* reset, which
+	 * clears the PMU SYSIP_DAT0 copy that serves the warm case (see the
+	 * syscon-reboot-mode node in zumapro.dtsi).  Both are needed: neither
+	 * store covers both reset types [HW 2026-08-10].  This one lives in the
+	 * scratchpad below as its GBMS_TAG_RSBM, and is written through the
+	 * storage layer that owns the page.
+	 *
+	 * Values are the enum pon_reboot_mode of the downstream
+	 * pixel-zuma-reboot.c or'd with its BMS_RSBM_VALID (BIT(31)), which
+	 * is the value that driver hands the same tag.  The valid bit earns its
+	 * keep here and not on the PMU side, because battery-backed RAM comes
+	 * up holding whatever it last held.  The bootloader clears the field
+	 * once it has acted on it.
+	 */
+	reboot-mode {
+		compatible = "google,gbms-reboot-mode";
+		mode-bootloader = <0x800000fc>;
+		mode-charge = <0x8000000a>;
+		mode-dm-verity-device-corrupted = <0x80000050>;
+		mode-fastboot = <0x800000fa>;
+		mode-reboot-ab-update = <0x80000052>;
+		mode-recovery = <0x800000ff>;
+		mode-rescue = <0x800000f9>;
+		mode-shutdown-thermal = <0x80000051>;
+		mode-shutdown-thermal-battery = <0x80000051>;
+	};
 };
 
 &watchdog_cl0 {
@@ -1855,13 +1883,9 @@
 	 * the gauge and reloads the model -- then loops at 1 Hz because it
 	 * cannot record the version it just wrote [HW 2026-09-17].
 	 *
-	 * These are the same four bytes at offset 0 that nvmem-reboot-mode used
-	 * to write as the cold-reset copy of the bootloader's reboot mode:
-	 * RSBM_ADDR is 0 and RS_TAG_LENGTH is 4.  Both cannot own the device,
-	 * and the gauge needs this one, so that copy is gone.  The PMU
-	 * SYSIP_DAT0 store still covers warm resets, which is what the test
-	 * loop uses (reboot=w); after a battery pull the bootloader is entered
-	 * by hand.
+	 * The bootloader handshake includes the cold-reset copy of the reboot
+	 * mode, RSBM at offset 0 for four bytes; the reboot-mode node writes it
+	 * as a tag through this provider rather than owning the device itself.
 	 */
 	sp@60 {
 		compatible = "maxim,max77779sp-i2c";

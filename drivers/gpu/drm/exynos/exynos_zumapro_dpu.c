@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/media-bus-format.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
 #include <drm/display/drm_dsc.h>
@@ -26,8 +27,10 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
+#include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_of.h>
 #include <drm/drm_simple_kms_helper.h>
 #include "exynos_drm_crtc.h"
@@ -80,6 +83,12 @@ struct zumapro_decon {
 	spinlock_t slock;
 	bool enabled;
 	bool start_pending;
+	/*
+	 * Ten bits a component through the DPP and the DECON, set by the
+	 * DisplayPort head when the link it feeds runs at more or less than
+	 * eight; the panel's head never changes it.
+	 */
+	bool ten_bpc;
 	bool win_dirty;
 	/* gates frame_start vblank delivery; the HW interrupt stays enabled */
 	bool vblank_enabled;
@@ -468,7 +477,8 @@ static void zumapro_dpp_init(struct zumapro_dpp *dpp)
 }
 
 static void zumapro_dpp_update(struct zumapro_dpp *dpp,
-			       const struct exynos_drm_plane_state *state)
+			       const struct exynos_drm_plane_state *state,
+			       bool ten_bpc)
 {
 	const struct drm_framebuffer *fb = state->base.fb;
 	const struct zumapro_dpp_format *format =
@@ -522,9 +532,15 @@ static void zumapro_dpp_update(struct zumapro_dpp *dpp,
 				ZUMAPRO_RDMA_IMG_FORMAT_MASK,
 				ZUMAPRO_RDMA_IMG_FORMAT(format->dma_format));
 
+	/*
+	 * The depth here is the DECON's, not the framebuffer's: the vendor
+	 * sets both from the CRTC and lets the DPP widen an eight-bit buffer.
+	 */
 	io_con = ZUMAPRO_DPP_IMG_FORMAT(format->dpp_format);
 	if (fb->format->has_alpha)
 		io_con |= ZUMAPRO_DPP_ALPHA_SEL_PER_PIXEL;
+	if (ten_bpc)
+		io_con |= ZUMAPRO_DPP_BPC_MODE_10BIT;
 	zumapro_dpu_update_bits(dpp->dpp_regs, ZUMAPRO_DPP_COM_IO_CON,
 				ZUMAPRO_DPP_ALPHA_SEL_PER_PIXEL |
 				ZUMAPRO_DPP_BPC_MODE_10BIT |
@@ -532,7 +548,8 @@ static void zumapro_dpp_update(struct zumapro_dpp *dpp,
 	zumapro_dpu_update_bits(dpp->hdr_comm_regs, ZUMAPRO_LSI_COMM_IO_CON,
 				ZUMAPRO_COMM_BPC_MODE_10BIT |
 				ZUMAPRO_COMM_IMG_FORMAT_MASK,
-				ZUMAPRO_COMM_IMG_FORMAT(format->dpp_format));
+				ZUMAPRO_COMM_IMG_FORMAT(format->dpp_format) |
+				(ten_bpc ? ZUMAPRO_COMM_BPC_MODE_10BIT : 0));
 
 	/*
 	 * No rotation, no block crop, no compression.  These must be written
@@ -1653,7 +1670,7 @@ static void zumapro_decon_update_plane(struct exynos_drm_crtc *crtc,
 		dpp->initialized = true;
 	}
 
-	zumapro_dpp_update(dpp, state);
+	zumapro_dpp_update(dpp, state, decon->ten_bpc);
 
 	blend_func = ZUMAPRO_DECON_WIN_FUNC(ZUMAPRO_DECON_WIN_FUNC_USER_DEFINED) |
 		     ZUMAPRO_DECON_WIN_ALPHA_MULT_SRC_SEL(
@@ -1725,6 +1742,37 @@ static void __iomem *zumapro_decon_map_shared(struct platform_device *pdev,
 	       IOMEM_ERR_PTR(-ENOMEM);
 }
 
+/*
+ * The DisplayPort head's depth, taken from the format its bridge negotiated.
+ * This runs after the CRTC is enabled and before the bridge is enabled and the
+ * first plane update, and the DECON does not start until the flush, so the
+ * whole pipeline is set before a pixel moves.
+ */
+static void zumapro_decon_encoder_atomic_enable(struct drm_encoder *encoder,
+						struct drm_atomic_commit *state)
+{
+	struct zumapro_decon *decon =
+		container_of(encoder, struct zumapro_decon, encoder);
+	struct drm_bridge *bridge __free(drm_bridge_put) =
+		drm_bridge_chain_get_first_bridge(encoder);
+	struct drm_bridge_state *bridge_state;
+
+	bridge_state = bridge ? drm_atomic_get_new_bridge_state(state, bridge) :
+				NULL;
+	decon->ten_bpc = bridge_state &&
+		bridge_state->input_bus_cfg.format ==
+			MEDIA_BUS_FMT_RGB101010_1X30;
+
+	zumapro_dpu_update_bits(decon->main_regs, ZUMAPRO_DECON_GLOBAL_CON,
+				ZUMAPRO_DECON_GLOBAL_CON_10BPC,
+				decon->ten_bpc ?
+					ZUMAPRO_DECON_GLOBAL_CON_10BPC : 0);
+}
+
+static const struct drm_encoder_helper_funcs zumapro_decon_encoder_helper_funcs = {
+	.atomic_enable = zumapro_decon_encoder_atomic_enable,
+};
+
 static int zumapro_decon_attach_bridge(struct zumapro_decon *decon)
 {
 	struct drm_connector *connector;
@@ -1752,6 +1800,8 @@ static int zumapro_decon_attach_bridge(struct zumapro_decon *decon)
 		return ret;
 
 	decon->encoder.possible_crtcs = drm_crtc_mask(&decon->crtc->base);
+	drm_encoder_helper_add(&decon->encoder,
+			       &zumapro_decon_encoder_helper_funcs);
 
 	ret = drm_bridge_attach(&decon->encoder, bridge, NULL,
 				DRM_BRIDGE_ATTACH_NO_CONNECTOR);

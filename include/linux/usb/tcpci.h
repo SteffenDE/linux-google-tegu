@@ -208,6 +208,11 @@ struct tcpci;
  * @set_orientation:
  *		Optional; Enable setting the connector orientation
  *		CONFIG_STANDARD_OUTPUT (0x18) bit0.
+ * @get_current_limit:
+ *		Optional; Called by the TCPM when the port is a sink and the
+ *		partner advertises Rp-default, for a current limit detected by
+ *		other means, such as the TCPC's BC1.2 charger detection. Returns
+ *		the limit in mA, or 0 when none is known.
  */
 struct tcpci_data {
 	struct regmap *regmap;
@@ -228,6 +233,7 @@ struct tcpci_data {
 					     bool capable);
 	void (*check_contaminant)(struct tcpci *tcpci, struct tcpci_data *data);
 	bool (*attempt_vconn_swap_discovery)(struct tcpci *tcpci, struct tcpci_data *data);
+	int (*get_current_limit)(struct tcpci *tcpci, struct tcpci_data *data);
 };
 
 struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data);

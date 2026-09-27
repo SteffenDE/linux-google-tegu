@@ -457,10 +457,48 @@ static const struct regmap_config s2mpg14_regmap_config_meter = {
 
 /*
  * s2mpg15 (zumapro sub PMIC): same uncached, permissive style as s2mpg14.
- * The meter block is register-identical to the s2mpg14, so it reuses that
- * regmap config (s2mpg14_regmap_config_meter) below; only the common/pmic
- * blocks have a different register extent and need their own configs.
+ *
+ * Its meter is the s2mpg14's with a thermistor ADC added: eight NTC inputs,
+ * enabled in CTRL3, with their own filter coefficients, over/under
+ * temperature thresholds and data registers in the gaps the s2mpg14's map
+ * leaves.  So it gets its own map; everything the s2mpg14 map covers is
+ * covered the same way, PWR_HYS included, which the vendor's s2mpg15 register
+ * list omits.
  */
+static const struct regmap_range s2mpg15_meter_registers[] = {
+	regmap_reg_range(0x00, 0x01), /* INT1, INT2 */
+	regmap_reg_range(0x04, 0x05), /* INT1M, INT2M */
+	regmap_reg_range(0x08, 0x5a), /* CTRL, BUCKEN, MUXSEL, LPF + NTC coeff,
+				       * PWR_WARN, NTC thresholds, PWR_HYS */
+	regmap_reg_range(0x63, 0xe5), /* ACC, LPF, VBAT, NTC, EXT data */
+};
+
+static const struct regmap_range s2mpg15_meter_ro_registers[] = {
+	regmap_reg_range(0x00, 0x01), /* INT1, INT2 */
+	regmap_reg_range(0x63, 0xe5), /* Meter data */
+};
+
+static const struct regmap_access_table s2mpg15_meter_wr_table = {
+	.yes_ranges = s2mpg15_meter_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_meter_registers),
+	.no_ranges = s2mpg15_meter_ro_registers,
+	.n_no_ranges = ARRAY_SIZE(s2mpg15_meter_ro_registers),
+};
+
+static const struct regmap_access_table s2mpg15_meter_rd_table = {
+	.yes_ranges = s2mpg15_meter_registers,
+	.n_yes_ranges = ARRAY_SIZE(s2mpg15_meter_registers),
+};
+
+static const struct regmap_config s2mpg15_regmap_config_meter = {
+	.name = "meter",
+	.reg_bits = ACPM_ADDR_BITS,
+	.val_bits = 8,
+	.max_register = S2MPG14_METER_EXT_SIGNED_DATA_2,
+	.wr_table = &s2mpg15_meter_wr_table,
+	.rd_table = &s2mpg15_meter_rd_table,
+};
+
 static const struct regmap_config s2mpg15_regmap_config_common = {
 	.name = "common",
 	.reg_bits = ACPM_ADDR_BITS,
@@ -707,8 +745,7 @@ static const struct sec_pmic_acpm_platform_data s2mpg15_data = {
 	.speedy_channel = 1,
 	.regmap_cfg_common = &s2mpg15_regmap_config_common,
 	.regmap_cfg_pmic = &s2mpg15_regmap_config_pmic,
-	/* The s2mpg15 meter block is register-identical to the s2mpg14. */
-	.regmap_cfg_meter = &s2mpg14_regmap_config_meter,
+	.regmap_cfg_meter = &s2mpg15_regmap_config_meter,
 };
 
 static const struct of_device_id sec_pmic_acpm_of_match[] = {

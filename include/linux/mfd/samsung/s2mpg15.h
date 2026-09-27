@@ -5,10 +5,10 @@
  * Samsung S2MPG15 PMIC (Google Tensor G4 "zumapro" sub PMIC).
  *
  * Like s2mpg14.h, the regulator block describes every rail while the other
- * blocks cover only what the mainline driver uses.  The meter block is
- * register-identical to the S2MPG14 and is shared from s2mpg14.h
- * (S2MPG14_METER_*) by the common s2mpg1x meter driver, so it is not
- * repeated here.
+ * blocks cover only what the mainline driver uses.  The meter block is the
+ * S2MPG14's, described by s2mpg14.h (S2MPG14_METER_*) for the common s2mpg1x
+ * meter driver, plus a thermistor ADC the S2MPG14 does not have; only that
+ * addition is described here.
  */
 
 #ifndef __LINUX_MFD_S2MPG15_H
@@ -165,5 +165,28 @@ enum s2mpg15_regulators {
 	S2MPG15_BUCKBOOST,
 	S2MPG15_REGULATOR_MAX,
 };
+
+/*
+ * Meter registers (type 0x00a) beyond the S2MPG14's: the thermistor ADC.
+ * CTRL3 enables its inputs, one bit each; each input's filtered 12-bit
+ * reading is two bytes, low byte first, the upper nibble in the second.
+ */
+enum s2mpg15_meter_reg {
+	S2MPG15_METER_CTRL3 = 0x0a,
+	S2MPG15_METER_NTC_LPF_C0_0 = 0x29,
+	S2MPG15_METER_LPF_DATA_NTC0_1 = 0xd4,
+};
+
+#define S2MPG15_METER_NTC_CHANNELS	8
+#define S2MPG15_METER_NTC_DATA_BYTES	2
+#define S2MPG15_METER_NTC_DATA_BITS	12
+
+/* NTC_LPF_C0_n: the reset value, which the vendor restores around a reset */
+#define S2MPG15_METER_NTC_LPF_C0_RESET	0x80
+
+/* METER_CTRL1[7:5]: the thermistor ADC's sample rate */
+#define S2MPG15_METER_NTC_SAMP_RATE_SHIFT	5
+#define S2MPG15_METER_NTC_SAMP_RATE_MASK	(0x7 << S2MPG15_METER_NTC_SAMP_RATE_SHIFT)
+#define S2MPG15_METER_NTC_SAMP_RATE_0P15625HZ	1
 
 #endif /* __LINUX_MFD_S2MPG15_H */

@@ -139,9 +139,9 @@ enum s2mpg14_meter_reg {
 };
 
 /*
- * The S2MPG14 and S2MPG15 share an identical meter block; these
- * S2MPG14_METER_* definitions describe both and are used by the common
- * s2mpg1x meter driver for either PMIC.
+ * The S2MPG15's meter block is the S2MPG14's plus a thermistor ADC (see
+ * s2mpg15.h); these S2MPG14_METER_* definitions describe the part they share
+ * and are used by the common s2mpg1x meter driver for either PMIC.
  */
 
 /* METER_CTRL1 */

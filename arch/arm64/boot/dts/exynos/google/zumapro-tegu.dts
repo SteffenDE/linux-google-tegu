@@ -13,6 +13,33 @@
 
 #include "zumapro.dtsi"
 
+/*
+ * The board thermistors' curve: the S2MPG15 ADC's 12-bit code against
+ * millidegrees Celsius, temperature ascending, as generic-adc-thermal wants
+ * it.  It is the vendor driver's table (s2mpg15_spmic_thermal.c), which the
+ * vendor itself marks as not yet confirmed.  Every input shares it: the curve
+ * is the thermistor part and its divider, not where it sits.
+ */
+#define TEGU_NTC_TABLE \
+	(-26428) 0xf8d  (-21922) 0xf6a  (-15958) 0xf29 \
+	(-11060) 0xee4  (-6890) 0xe9d  (-2264) 0xe3f \
+	2961 0xdbf  7818 0xd33  12525 0xc97 \
+	16945 0xbf5  21623 0xb3a  27431 0xa42 \
+	40631 0x7f1  44960 0x734  49757 0x66b \
+	54854 0x5a3  59898 0x4ee  65076 0x446 \
+	65779 0x43a  65856 0x430  69654 0x3c3 \
+	69873 0x3bd  74910 0x33b  80691 0x2bb \
+	85844 0x259  90915 0x206  94873 0x1ce \
+	99720 0x191  104216 0x160  109531 0x12e \
+	116445 0x0f9  121600 0x0d7  131839 0x09f
+
+#define TEGU_NTC(_input) \
+	compatible = "generic-adc-thermal"; \
+	#thermal-sensor-cells = <0>; \
+	io-channels = <&s2mpg15_meter _input>; \
+	io-channel-names = "sensor-channel"; \
+	temperature-lookup-table = <TEGU_NTC_TABLE>
+
 / {
 	/*
 	 * Source: model and downstream compatible strings are from
@@ -487,6 +514,78 @@
 		mode-shutdown-thermal = <0x80000051>;
 		mode-shutdown-thermal-battery = <0x80000051>;
 	};
+
+	/*
+	 * The board thermistors on the S2MPG15's ADC, one sensor per input,
+	 * named after the vendor's zones for them; soc is a thermistor on the
+	 * board near the SoC, not a die sensor.  Here they are sensors only.
+	 *
+	 * The vendor gives each zone a passive trip under the user_space
+	 * governor, for Android's thermal HAL to act on.  north also carries
+	 * two shutdowns: a critical trip at 64.7 degC and a hot trip at
+	 * 66.7 degC that the vendor driver programs into the PMIC as a
+	 * hardware shutdown threshold.  Neither is reproduced until the curve
+	 * above has been checked against the hardware: a wrong one would turn
+	 * the phone off.
+	 */
+	ntc_rfpa: thermal-sensor-rfpa { TEGU_NTC(0); };
+	ntc_quiet: thermal-sensor-quiet { TEGU_NTC(1); };
+	ntc_charging: thermal-sensor-charging { TEGU_NTC(2); };
+	ntc_usb_pwr: thermal-sensor-usb-pwr { TEGU_NTC(3); };
+	ntc_btmspkr: thermal-sensor-btmspkr { TEGU_NTC(4); };
+	ntc_disp: thermal-sensor-disp { TEGU_NTC(5); };
+	ntc_north: thermal-sensor-north { TEGU_NTC(6); };
+	ntc_soc: thermal-sensor-soc { TEGU_NTC(7); };
+
+	thermal-zones {
+		rfpa-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_rfpa>;
+		};
+
+		quiet-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_quiet>;
+		};
+
+		charging-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_charging>;
+		};
+
+		usb-pwr-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_usb_pwr>;
+		};
+
+		btmspkr-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_btmspkr>;
+		};
+
+		disp-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_disp>;
+		};
+
+		north-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_north>;
+		};
+
+		soc-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ntc_soc>;
+		};
+	};
 };
 
 &watchdog_cl0 {
@@ -775,10 +874,17 @@
 			};
 		};
 
-		meter {
+		s2mpg15_meter: meter {
 			compatible = "samsung,s2mpg15-meter";
 			#address-cells = <1>;
 			#size-cells = <0>;
+			#io-channel-cells = <1>;
+
+			/*
+			 * Every thermistor input is wired on this board; the
+			 * vendor enables all eight (adc_chan_en = 0xff).
+			 */
+			samsung,ntc-channels = <0 1 2 3 4 5 6 7>;
 
 			channel@0 {
 				reg = <0>;

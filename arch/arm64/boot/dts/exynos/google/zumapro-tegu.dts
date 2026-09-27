@@ -788,10 +788,16 @@
 	 *
 	 * It watches the ONLINE property of the supply named here, which is
 	 * the sink state TCPM already tracks.
+	 *
+	 * The same driver owns the USB_ICL election, the other thing the
+	 * vendor's USB stack provides: it votes TCPM's current into it and
+	 * writes the result to the charger supply named here as its input
+	 * limit.  google_charger suspends the USB input by voting 0 into it.
 	 */
 	google,tcpm-buck {
 		compatible = "google,tcpm-buck";
 		google,tcpm-power-supply = <&usb_typec>;
+		google,chg-power-supply = "main-charger";
 	};
 
 	google,charger {
@@ -1985,8 +1991,8 @@
 	 *   - wlc-spoof-vbyp and wlc_notify_charge_disable belong to the same
 	 *     wireless path.
 	 *   - rx-to-rx-otg-en and ext-otg-only describe OTG through that
-	 *     external boost.  The connector here is sink and device only with
-	 *     PD disabled, so no OTG use case is reachable to begin with.
+	 *     external boost.  The connector here is a sink only, so no OTG
+	 *     use case is reachable to begin with.
 	 *   - chg-term-voltage is dead in the vendor tree too: this driver
 	 *     version never reads it, taking the termination voltage from the
 	 *     charger layer instead.

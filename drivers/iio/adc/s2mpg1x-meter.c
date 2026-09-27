@@ -25,6 +25,12 @@
  * the driver is read-only with respect to the regulators.  The mux is
  * programmed from DT rather than inherited, because the always-on PMIC keeps
  * whatever the previous boot left in these registers.
+ *
+ * The S2MPG15's meter also carries a thermistor ADC: eight NTC inputs, each
+ * converted to a filtered 12-bit code of the divider the board wires it into.
+ * The inputs the board uses are enabled from DT and reported as raw voltage
+ * channels, for a consumer that knows the board's thermistor curve -- the
+ * code means nothing without it.
  */
 
 #include <linux/bitops.h>
@@ -36,6 +42,7 @@
 #include <linux/math64.h>
 #include <linux/mfd/samsung/core.h>
 #include <linux/mfd/samsung/s2mpg14.h>
+#include <linux/mfd/samsung/s2mpg15.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -77,6 +84,13 @@
  */
 #define S2MPG1X_METER_RATE_TOLERANCE	8
 
+/*
+ * How long after a reset a thermistor input may still read zero because it has
+ * not been converted: the vendor driver waits this long for its inputs.  An
+ * input still at zero after it is an input that does not convert.
+ */
+#define S2MPG15_METER_NTC_SETTLE_MS	64000
+
 struct s2mpg1x_meter_chan {
 	u8 muxsel;	/* rail mux selection */
 	u32 res_pw;	/* power resolution, pW per accumulator LSB */
@@ -91,6 +105,8 @@ struct s2mpg1x_meter {
 	u8 hw_idx[S2MPG14_METER_CHANNELS];	/* enabled channels, in IIO order */
 	/* chan[] and energy_nj[] are indexed by hardware channel. */
 	struct s2mpg1x_meter_chan chan[S2MPG14_METER_CHANNELS];
+	u8 ntc_mask;		/* S2MPG15 thermistor inputs to enable */
+	ktime_t ntc_settled;	/* boottime by which inputs have converted */
 	u64 energy_nj[S2MPG14_METER_CHANNELS];
 	u64 suspend_energy_nj[S2MPG14_METER_CHANNELS];
 	u64 suspend_time_us;
@@ -562,6 +578,39 @@ static int s2mpg1x_meter_read_raw(struct iio_dev *indio_dev,
 	int ret;
 
 	switch (mask) {
+	case IIO_CHAN_INFO_RAW: {
+		u8 buf[S2MPG15_METER_NTC_DATA_BYTES];
+		unsigned int code;
+
+		if (chan->type != IIO_VOLTAGE)
+			return -EINVAL;
+
+		/* Also held against hw_init(), which can reset the block. */
+		guard(mutex)(&m->lock);
+		ret = regmap_bulk_read(m->regmap,
+				       S2MPG15_METER_LPF_DATA_NTC0_1 +
+				       chan->address * sizeof(buf),
+				       buf, sizeof(buf));
+		if (ret)
+			return ret;
+
+		/*
+		 * Zero until an enabled input has been converted, which at
+		 * the rate hw_init() sets can take several seconds after a
+		 * reset: ask again then.  Past the settle time a zero is an
+		 * input that does not convert -- shorted or not wired -- and
+		 * is reported as the error it is, so that a consumer stops
+		 * asking rather than retrying it for ever.
+		 */
+		code = (buf[0] | buf[1] << 8) &
+		       GENMASK(S2MPG15_METER_NTC_DATA_BITS - 1, 0);
+		if (!code)
+			return ktime_before(ktime_get_boottime(),
+					    m->ntc_settled) ? -EAGAIN : -EIO;
+
+		*val = code;
+		return IIO_VAL_INT;
+	}
 	case IIO_CHAN_INFO_PROCESSED: {
 		u8 hw = chan->address;
 		u64 uw;
@@ -599,12 +648,36 @@ static int s2mpg1x_meter_read_label(struct iio_dev *indio_dev,
 {
 	struct s2mpg1x_meter *m = iio_priv(indio_dev);
 
+	if (chan->type == IIO_VOLTAGE)
+		return sysfs_emit(label, "ntc%lu\n", chan->address);
+
 	return sysfs_emit(label, "%s\n", m->chan[chan->address].label);
+}
+
+/* A consumer names a thermistor input by its number, not by channel order. */
+static int s2mpg1x_meter_fwnode_xlate(struct iio_dev *indio_dev,
+				      const struct fwnode_reference_args *iiospec)
+{
+	unsigned int i;
+
+	if (iiospec->nargs != 1)
+		return -EINVAL;
+
+	for (i = 0; i < indio_dev->num_channels; i++) {
+		const struct iio_chan_spec *chan = &indio_dev->channels[i];
+
+		if (chan->type == IIO_VOLTAGE &&
+		    chan->channel == iiospec->args[0])
+			return i;
+	}
+
+	return -EINVAL;
 }
 
 static const struct iio_info s2mpg1x_meter_info = {
 	.read_raw = s2mpg1x_meter_read_raw,
 	.read_label = s2mpg1x_meter_read_label,
+	.fwnode_xlate = s2mpg1x_meter_fwnode_xlate,
 	.attrs = &s2mpg1x_meter_attr_group,
 };
 
@@ -674,13 +747,85 @@ static int s2mpg1x_meter_parse_channels(struct device *dev,
 	return 0;
 }
 
+/*
+ * The thermistor inputs the board wires, as a list of input numbers.  Only the
+ * S2MPG15 has them; an input the board leaves floating would convert noise.
+ */
+static int s2mpg1x_meter_parse_ntc(struct device *dev, struct s2mpg1x_meter *m)
+{
+	u32 inputs[S2MPG15_METER_NTC_CHANNELS];
+	int n, i, ret;
+
+	n = device_property_count_u32(dev, "samsung,ntc-channels");
+	if (n == -EINVAL)
+		return 0;	/* absent */
+	if (n <= 0 || n > S2MPG15_METER_NTC_CHANNELS)
+		return dev_err_probe(dev, -EINVAL, "bad samsung,ntc-channels\n");
+	if (m->dev_type != S2MPG15)
+		return dev_err_probe(dev, -EINVAL,
+				     "samsung,ntc-channels: no thermistor ADC\n");
+
+	ret = device_property_read_u32_array(dev, "samsung,ntc-channels",
+					     inputs, n);
+	if (ret)
+		return dev_err_probe(dev, ret, "bad samsung,ntc-channels\n");
+
+	for (i = 0; i < n; i++) {
+		if (inputs[i] >= S2MPG15_METER_NTC_CHANNELS)
+			return dev_err_probe(dev, -EINVAL,
+					     "thermistor input %u out of range\n",
+					     inputs[i]);
+		m->ntc_mask |= BIT(inputs[i]);
+	}
+
+	return 0;
+}
+
 /* Program the mux for the configured channels and enable the meter. */
 static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 {
 	unsigned int ctrl1_mask, ctrl1_val;
+	bool set_ntc = false;
 	u8 ext_ch_mask = 0;
 	unsigned int i;
 	int ret;
+
+	/*
+	 * A change to the thermistor inputs only takes across a soft reset,
+	 * with the inputs cleared before it and set again once it is asserted
+	 * -- the sequence the vendor driver applies for the same reason.  The
+	 * reset below is that reset.  Inputs already as wanted, which a warm
+	 * reboot from this driver leaves, are not cycled.
+	 *
+	 * The vendor also puts every input's filter coefficient back to its
+	 * reset value before a soft reset, so that no filter restarts from
+	 * zero with a slow coefficient another boot left behind and climbs
+	 * through plausible-looking temperatures.  It is the value Android
+	 * runs with on this board, so the inputs run unfiltered here too.
+	 */
+	if (m->ntc_mask) {
+		unsigned int ctrl3;
+
+		for (i = 0; i < S2MPG15_METER_NTC_CHANNELS; i++) {
+			ret = regmap_write(m->regmap,
+					   S2MPG15_METER_NTC_LPF_C0_0 + i,
+					   S2MPG15_METER_NTC_LPF_C0_RESET);
+			if (ret)
+				return ret;
+		}
+
+		ret = regmap_read(m->regmap, S2MPG15_METER_CTRL3, &ctrl3);
+		if (ret)
+			return ret;
+
+		set_ntc = ctrl3 != m->ntc_mask;
+		if (set_ntc) {
+			ret = regmap_write(m->regmap, S2MPG15_METER_CTRL3, 0);
+			if (ret)
+				return ret;
+			usleep_range(100, 1000);
+		}
+	}
 
 	/*
 	 * The main PMIC is always-on and powers the SoC, so its meter keeps
@@ -697,6 +842,20 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 	if (ret)
 		return ret;
 	usleep_range(2, 102);
+
+	if (set_ntc) {
+		/* The vendor's spacing: 100 us between steps, 50 ms to settle */
+		usleep_range(100, 1000);
+		ret = regmap_write(m->regmap, S2MPG15_METER_CTRL3, m->ntc_mask);
+		if (ret)
+			return ret;
+		msleep(50);
+	}
+
+	/* Whether or not the inputs were cycled, the reset may clear them. */
+	if (m->ntc_mask)
+		m->ntc_settled = ktime_add_ms(ktime_get_boottime(),
+					      S2MPG15_METER_NTC_SETTLE_MS);
 
 	/*
 	 * Accumulate power (not current) on all 12 channels; the same write
@@ -776,6 +935,15 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 		ctrl1_mask |= S2MPG14_METER_EXT_EN_MASK;
 		ctrl1_val |= S2MPG14_METER_EXT_EN_MASK;
 	}
+	/*
+	 * The thermistors at the vendor's rate: a board's temperatures move
+	 * over seconds, and each conversion costs the PMIC a divider current.
+	 */
+	if (m->ntc_mask) {
+		ctrl1_mask |= S2MPG15_METER_NTC_SAMP_RATE_MASK;
+		ctrl1_val |= S2MPG15_METER_NTC_SAMP_RATE_0P15625HZ <<
+			     S2MPG15_METER_NTC_SAMP_RATE_SHIFT;
+	}
 
 	return regmap_update_bits(m->regmap, S2MPG14_METER_CTRL1, ctrl1_mask,
 				  ctrl1_val);
@@ -784,10 +952,11 @@ static int s2mpg1x_meter_hw_init(struct s2mpg1x_meter *m)
 static int s2mpg1x_meter_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	unsigned int i, ntc, num_channels;
 	struct iio_chan_spec *channels;
+	unsigned long ntc_mask;
 	struct s2mpg1x_meter *m;
 	struct iio_dev *indio_dev;
-	unsigned int i;
 	int ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*m));
@@ -807,11 +976,18 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = s2mpg1x_meter_parse_ntc(dev, m);
+	if (ret)
+		return ret;
+
 	ret = s2mpg1x_meter_hw_init(m);
 	if (ret)
 		return dev_err_probe(dev, ret, "meter init failed\n");
 
-	channels = devm_kcalloc(dev, m->n, sizeof(*channels), GFP_KERNEL);
+	ntc_mask = m->ntc_mask;
+	num_channels = m->n + hweight8(m->ntc_mask);
+	channels = devm_kcalloc(dev, num_channels, sizeof(*channels),
+				GFP_KERNEL);
 	if (!channels)
 		return -ENOMEM;
 
@@ -822,6 +998,15 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 		channels[i].address = m->hw_idx[i];
 		channels[i].info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED);
 		channels[i].ext_info = s2mpg1x_meter_ext_info;
+	}
+
+	for_each_set_bit(ntc, &ntc_mask, S2MPG15_METER_NTC_CHANNELS) {
+		channels[i].type = IIO_VOLTAGE;
+		channels[i].indexed = 1;
+		channels[i].channel = ntc;
+		channels[i].address = ntc;
+		channels[i].info_mask_separate = BIT(IIO_CHAN_INFO_RAW);
+		i++;
 	}
 
 	/* Latch once to start a clean measurement window. */
@@ -844,7 +1029,7 @@ static int s2mpg1x_meter_probe(struct platform_device *pdev)
 	indio_dev->info = &s2mpg1x_meter_info;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->channels = channels;
-	indio_dev->num_channels = m->n;
+	indio_dev->num_channels = num_channels;
 
 	return devm_iio_device_register(dev, indio_dev);
 }

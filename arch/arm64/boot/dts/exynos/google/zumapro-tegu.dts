@@ -1653,6 +1653,18 @@
 			op-sink-microwatt = <2600000>;
 
 			/*
+			 * Report pSnkStby (500 mA) from attach until the PD
+			 * contract's PS_RDY, or for a source without PD until
+			 * it settles, when TCPM reads the current again -- for
+			 * Rp-default by asking the TCPC, which is the ask that
+			 * finds BC1.2 finished. google,tcpm-buck programs the
+			 * charger's input limit from this current, and cannot
+			 * drop it within the 15 ms PD allows. The vendor sets
+			 * the property too.
+			 */
+			slow-charger-loop;
+
+			/*
 			 * Where the hotplug an entered alternate mode reports
 			 * has to land. The alternate mode driver resolves this
 			 * to a DRM connector's fwnode, and drm_bridge_connector

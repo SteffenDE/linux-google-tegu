@@ -5,6 +5,7 @@
  * MAXIM TCPCI based TCPC driver
  */
 
+#include <linux/bitfield.h>
 #include <linux/interrupt.h>
 #include <linux/i2c.h>
 #include <linux/kernel.h>
@@ -36,6 +37,18 @@
  */
 #define TCPC_VENDOR_SBUSW_CTRL				0x94
 #define TCPC_VENDOR_SBUSW_CTRL_DP_AUX			0x9
+
+/*
+ * The TCPC's BC1.2 detector. It runs by itself whenever VBUS comes up
+ * (VENDOR_BC_CTRL1.CHGDETEN is set out of reset) and latches what it found
+ * here; nothing needs starting for a result to appear.
+ */
+#define TCPC_VENDOR_BC_STATUS1				0x87
+#define TCPC_VENDOR_BC_STATUS1_CHGTYP			GENMASK(1, 0)
+#define TCPC_VENDOR_BC_STATUS1_CHGTYPRUN		BIT(6)
+#define CHGTYP_SDP					0x1
+#define CHGTYP_CDP					0x2
+#define CHGTYP_DCP					0x3
 
 /* What the AUX receiver needs on the pull-up rail while a link is up. */
 #define VOLTAGE_DP_AUX_UV				3300000
@@ -618,6 +631,44 @@ static bool max_tcpci_attempt_vconn_swap_discovery(struct tcpci *tcpci, struct t
 	return true;
 }
 
+/*
+ * What a partner advertising Rp-default can supply, from the BC1.2 result.
+ * TCPM asks from its state machine: at attach, which is usually before
+ * detection has finished, and, with slow-charger-loop, once more when a
+ * source without PD settles. So this only reads what the detector has
+ * latched and never waits for it, which would stall the port. The cost is
+ * that a detection still running at the last ask -- a data-contact timeout
+ * takes up to two seconds -- is answered with 0 for that attach. The
+ * vendor's driver instead reacts to the detector's interrupt.
+ *
+ * 1.5 A for a charging port, dedicated or downstream, is BC1.2's. A
+ * standard port gets the USB 2.0 configured maximum, where the vendor
+ * starts at 100 mA and raises it once the gadget is configured.
+ */
+static int max_tcpci_get_current_limit(struct tcpci *tcpci, struct tcpci_data *tdata)
+{
+	struct max_tcpci_chip *chip = tdata_to_max_tcpci(tdata);
+	u8 status;
+	int ret;
+
+	ret = max_tcpci_read8(chip, TCPC_VENDOR_BC_STATUS1, &status);
+	if (ret < 0)
+		return 0;
+
+	if (status & TCPC_VENDOR_BC_STATUS1_CHGTYPRUN)
+		return 0;
+
+	switch (FIELD_GET(TCPC_VENDOR_BC_STATUS1_CHGTYP, status)) {
+	case CHGTYP_SDP:
+		return 500;
+	case CHGTYP_CDP:
+	case CHGTYP_DCP:
+		return 1500;
+	default:
+		return 0;
+	}
+}
+
 static void max_tcpci_unregister_tcpci_port(void *tcpci)
 {
 	tcpci_unregister_port(tcpci);
@@ -705,6 +756,7 @@ static int max_tcpci_probe(struct i2c_client *client)
 	chip->data.check_contaminant = max_tcpci_check_contaminant;
 	chip->data.cable_comm_capable = true;
 	chip->data.attempt_vconn_swap_discovery = max_tcpci_attempt_vconn_swap_discovery;
+	chip->data.get_current_limit = max_tcpci_get_current_limit;
 
 	max_tcpci_init_regs(chip);
 

@@ -708,6 +708,7 @@ struct s5300_modem {
 	unsigned long		fmt_busy_until;	/* inhibit park during an FMT transfer (jiffies) */
 	struct delayed_work	park_work;	/* deferred-park re-check (queues pm_work) */
 	unsigned int		park_retries;	/* deferred-park retries this idle cycle (pm_work only) */
+	unsigned int		relink_failures; /* consecutive failed relinks (pm_work only) */
 
 	/* EXYNOS link-header sequence counters (reset per boot). */
 	u16			frame_seq;
@@ -1084,6 +1085,17 @@ static void s5300_relink_restore(struct s5300_modem *sm)
 #define S5300_PARK_DRAIN_MS	100	/* CP wake + ring drain after a nudge */
 
 /*
+ * Consecutive failed relinks before the CP is declared dead.  A CP can stay
+ * alive (cp_act and ps_hold high) yet stop answering AP2CP_WAKEUP and link
+ * training, so the crash IRQ never fires and the relinks would repeat for as
+ * long as anything transmits.  Downstream forces a CP crash after 10 link-down
+ * retries (s51xx_pcie_event_cb()); borrow that budget.  Each relink already
+ * makes PCIE_LINK_TRAIN_RETRIES training attempts, and any success restarts the
+ * count.
+ */
+#define S5300_RELINK_FAIL_LIMIT	10
+
+/*
  * The CP idle-parks its PCIe link aggressively (CP2AP_WAKEUP low ~1 s after it
  * goes quiet).  A oem/GEMS file fetch, though, streams ~50 back-to-back 4 KB
  * chunks over the FMT ring, and each chunk fills the 4 KB ring -- so if the CP
@@ -1302,12 +1314,29 @@ static void s5300_pm_work(struct work_struct *work)
 			spin_unlock_irqrestore(&sm->lock, flags);
 			/* Fresh wake session: new deferred-park retry budget. */
 			sm->park_retries = 0;
+			sm->relink_failures = 0;
 			dev_dbg(sm->dev, "%s: link up\n",
 				want_up ? "CP wakeup" :
 				ld ? "AP relink (linkdown)" : "AP relink (tx pending)");
 		} else {
 			sm->relink_requested = false;
-			dev_err(sm->dev, "relink failed\n");
+			if (++sm->relink_failures < S5300_RELINK_FAIL_LIMIT) {
+				dev_err(sm->dev, "relink failed\n");
+			} else {
+				/*
+				 * Hand the CP to the recovery path the same way
+				 * the crash IRQ does: userspace sees it leave
+				 * ONLINE and resets and re-boots it, and the
+				 * cleared online stops further relinks here.
+				 */
+				dev_err(sm->dev,
+					"relink failed %u times, taking the CP offline\n",
+					sm->relink_failures);
+				s5300_log_cp_alive(sm, "relink escalation");
+				WRITE_ONCE(sm->online, false);
+				sm->cp_status = S5300_STATE_OFFLINE;
+				schedule_work(&sm->ports_work);
+			}
 		}
 	} else if (!want_up && sm->link_up) {
 		bool park;
@@ -2197,6 +2226,7 @@ static irqreturn_t s5300_irq_handler(int irq, void *data)
 	case S5300_CMD_PHONE_START:
 		dev_info(sm->dev, "CP PHONE_START\n");
 		if (!READ_ONCE(sm->online)) {
+			sm->relink_failures = 0;
 			s5300_check_cp_capabilities(sm);
 			s5300_pktproc_ul_activate(sm);
 			s5300_init_ipc_queues(sm);

@@ -312,6 +312,8 @@ config GOOGLE_TCPM_BUCK
 	tristate "Google TCPM buck-mode and input-limit voter"
 	depends on GOOGLE_BMS
 	depends on TYPEC_TCPM
+	depends on REGULATOR
+	depends on CHARGER_MAX77779
 	help
 	  Votes the MAX77779 charger's USB buck mode and input current limit
 	  from TCPM's sink state.
@@ -327,6 +329,10 @@ config GOOGLE_TCPM_BUCK
 	  It also creates the "USB_ICL" election the vendor's USB stack owns,
 	  votes TCPM's current into it and programs the charger's input limit
 	  from the result, which is also how google_charger suspends the input.
+
+	  For sourcing, it registers the 5 V "vbus" regulator the port
+	  controller turns VBUS on through, and casts the charger's OTG ballot
+	  in place of the buck one while it is enabled.
 
 	  To compile this as a module, choose M here: the module will be
 	  called google-tcpm-buck.

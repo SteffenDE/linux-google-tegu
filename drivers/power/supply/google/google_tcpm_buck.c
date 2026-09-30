@@ -48,11 +48,18 @@
  * protocol, thermal and dead-battery layers under that are not reproduced;
  * the one ballot is what they reduce to while nothing else votes.
  *
- * Only the sink half of the vendor's buck behaviour is reproduced. It also
- * casts GBMS_USB_OTG_ON and GBMS_USB_OTG_FRS_ON when the port sources VBUS,
- * and those cannot come from this supply, because ONLINE is sink-only by
- * construction. The connector here is sink-only, so no OTG use case is
- * reachable; enabling one means adding the other half here.
+ * The source half is a regulator. TCPM turns VBUS on through the TCPC's
+ * "vbus" supply, and the vendor's port controller does it by casting
+ * GBMS_USB_OTG_ON under the same voter it casts GBMS_USB_BUCK_ON under, so
+ * that sourcing replaces sinking in one ballot: the charger refuses every
+ * OTG use case while buck_on is set. So both come from the one function,
+ * under the one lock -- the regulator's enable and disable and the sink
+ * state's work item each recompute the ballot rather than cast their own.
+ * With no external boost described on the charger, the OTG ballot selects
+ * its internal reverse boost, CHG_CNFG_00 mode OTG_BOOST_ON, at the
+ * current limit CHG_CNFG_05 already holds.
+ *
+ * GBMS_USB_OTG_FRS_ON, the fast role swap, is not reproduced.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -64,14 +71,19 @@
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/printk.h>
+#include <linux/regulator/driver.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
 #include "gbms_compat.h"
 #include "google_bms.h"
+#include "max77779.h"
 
 /* The name the vendor's port controller votes under; see the note above. */
 #define GTB_VOTER	"TCPCI"
+
+/* The mode the charger's election resolves to for its internal boost. */
+#define GTB_MODE_OTG	MAX77779_CHGR_MODE_OTG_BOOST_ON
 
 /* The election google_charger looks up by name to suspend the input. */
 #define GTB_ICL_ELECTION	"USB_ICL"
@@ -91,11 +103,16 @@ struct gtb_drv {
 	struct device *dev;
 	struct power_supply *tcpm_psy;
 	struct power_supply *chg_psy;
+	struct device *chg_dev;		/* the MAX77779 behind chg_psy, or NULL */
 	struct notifier_block psy_nb;
 	struct work_struct vote_work;
 	struct mutex lock;
-	bool online;
-	bool online_valid;
+	bool online;		/* TCPM's sink state, as last read */
+	bool sourcing;		/* the vbus regulator is enabled */
+
+	int cast_vote;		/* the "TCPCI" ballot as last cast */
+	bool cast_enabled;
+	bool cast_valid;
 
 	struct gvotable_election *icl_el;
 	struct delayed_work icl_work;
@@ -125,11 +142,25 @@ static int gtb_read_prop(struct gtb_drv *gtb, enum power_supply_property psp,
 	return 0;
 }
 
-/* requires gtb->lock */
-static void gtb_cast(struct gtb_drv *gtb, bool online)
+/*
+ * Cast the one "TCPCI" ballot from the state as it stands: the OTG boost while
+ * the port sources, the buck while it sinks, nothing otherwise.  A sink state
+ * that says online while the port sources is TCPM's own lag -- a swap to
+ * source clears vbus_charge before it enables the supply, and the change
+ * reaches the work item later -- so sourcing wins.
+ *
+ * requires gtb->lock
+ */
+static int gtb_recompute_mode(struct gtb_drv *gtb)
 {
+	const int vote = gtb->sourcing ? GBMS_USB_OTG_ON : GBMS_USB_BUCK_ON;
+	const bool enabled = gtb->sourcing || gtb->online;
 	struct gvotable_election *el;
 	int ret;
+
+	if (gtb->cast_valid && gtb->cast_vote == vote &&
+	    gtb->cast_enabled == enabled)
+		return 0;
 
 	/*
 	 * Looked up per vote rather than cached: the handle carries no
@@ -141,22 +172,51 @@ static void gtb_cast(struct gtb_drv *gtb, bool online)
 	el = gvotable_election_get_handle(GBMS_MODE_VOTABLE);
 	if (IS_ERR_OR_NULL(el)) {
 		dev_err_ratelimited(gtb->dev, "charger mode election is gone\n");
-		gtb->online_valid = false;
-		return;
+		gtb->cast_valid = false;
+		return -ENODEV;
 	}
 
-	ret = gvotable_cast_long_vote(el, GTB_VOTER, GBMS_USB_BUCK_ON, online);
+	/* runs the charger's mode callback before it returns */
+	ret = gvotable_cast_long_vote(el, GTB_VOTER, vote, enabled);
 	if (ret < 0) {
-		dev_err(gtb->dev, "cannot vote buck %s (%d)\n",
-			online ? "on" : "off", ret);
-		gtb->online_valid = false;
-		return;
+		dev_err(gtb->dev, "cannot vote %s %s (%d)\n",
+			gtb->sourcing ? "otg" : "buck", enabled ? "on" : "off",
+			ret);
+		gtb->cast_valid = false;
+		return ret;
 	}
 
-	gtb->online = online;
-	gtb->online_valid = true;
-	dev_info(gtb->dev, "sink %s, buck vote %s\n",
-		 online ? "attached" : "detached", online ? "on" : "off");
+	gtb->cast_vote = vote;
+	gtb->cast_enabled = enabled;
+	gtb->cast_valid = true;
+	if (gtb->sourcing)
+		dev_info(gtb->dev, "sourcing, otg vote on\n");
+	else
+		dev_info(gtb->dev, "sink %s, buck vote %s\n",
+			 enabled ? "attached" : "detached", enabled ? "on" : "off");
+
+	return 0;
+}
+
+/*
+ * The mode CHG_CNFG_00 holds, read from the chip.  Not the election's
+ * result: the election installs its head ballot, or its default with none
+ * enabled, as the result before the charger's callback runs, and the
+ * callback overwrites that only when it writes the register.  So a callback
+ * that returns early -- with no ballot enabled it writes nothing at all --
+ * leaves a result that says nothing about the register.
+ */
+static int gtb_charger_mode(struct gtb_drv *gtb)
+{
+	u8 reg;
+	int ret;
+
+	ret = max77779_external_chg_reg_read(gtb->chg_dev, MAX77779_CHG_CNFG_00,
+					     &reg);
+	if (ret < 0)
+		return ret;
+
+	return _max77779_chg_cnfg_00_mode_get(reg);
 }
 
 /* requires gtb->lock */
@@ -197,9 +257,10 @@ static void gtb_vote_work(struct work_struct *work)
 		 * charger bucking with nothing tracking the port -- so retract
 		 * instead.
 		 */
-		if (ret == -ENODEV && gtb->online_valid && gtb->online) {
+		if (ret == -ENODEV && gtb->online) {
 			dev_warn(gtb->dev, "sink state gone, retracting\n");
-			gtb_cast(gtb, false);
+			gtb->online = false;
+			gtb_recompute_mode(gtb);
 		} else {
 			dev_err_ratelimited(gtb->dev,
 					    "cannot read sink state (%d)\n", ret);
@@ -207,8 +268,8 @@ static void gtb_vote_work(struct work_struct *work)
 		goto unlock;
 	}
 
-	if (!gtb->online_valid || gtb->online != !!online)
-		gtb_cast(gtb, online);
+	gtb->online = online;
+	gtb_recompute_mode(gtb);
 
 	/* the notifier can run this before probe has created the election */
 	if (!gtb->icl_el)
@@ -335,6 +396,109 @@ static int gtb_create_icl(struct gtb_drv *gtb)
 	return 0;
 }
 
+/*
+ * TCPM calls these from its state machine, which waits for the TCPC to see
+ * VBUS after an enable -- so the enable must not return before the charger
+ * has switched.  The charger's callback writes CHG_CNFG_00 inside the cast,
+ * and the register is read back to confirm the boost.  A failure retracts
+ * the ballot, and TCPM falls back to unattached and tries again -- also what
+ * happens to an attach during the charger's resume, when it refuses both.
+ */
+static int gtb_vbus_enable(struct regulator_dev *rdev)
+{
+	struct gtb_drv *gtb = rdev_get_drvdata(rdev);
+	int mode, ret;
+
+	mutex_lock(&gtb->lock);
+
+	gtb->sourcing = true;
+	ret = gtb_recompute_mode(gtb);
+	if (ret < 0)
+		goto fail;
+
+	mode = gtb_charger_mode(gtb);
+	if (mode != GTB_MODE_OTG) {
+		dev_err(gtb->dev, "charger did not start the boost (mode %#x)\n",
+			mode);
+		ret = mode < 0 ? mode : -EIO;
+		goto fail;
+	}
+
+	mutex_unlock(&gtb->lock);
+	return 0;
+
+fail:
+	/* do not leave a ballot behind for a later election to act on */
+	gtb->sourcing = false;
+	gtb_recompute_mode(gtb);
+	mutex_unlock(&gtb->lock);
+	return ret;
+}
+
+static int gtb_vbus_disable(struct regulator_dev *rdev)
+{
+	struct gtb_drv *gtb = rdev_get_drvdata(rdev);
+	int mode;
+
+	mutex_lock(&gtb->lock);
+
+	/*
+	 * Nothing here fails the disable.  The regulator core keeps its use
+	 * count on a failed one while is_enabled already says off, and the
+	 * TCPC then enables by count alone -- without calling in here -- for
+	 * as long as the phone is up.  A ballot that could not be retracted
+	 * stays invalid and is retried at the next sink state change.
+	 */
+	gtb->sourcing = false;
+	if (gtb_recompute_mode(gtb) < 0)
+		goto unlock;
+
+	/*
+	 * With no ballot left enabled the charger's callback returns before
+	 * writing anything, and CHG_CNFG_00 keeps the boost running.  That is
+	 * only reachable when nothing else -- google_charger's standby vote,
+	 * this driver's own buck vote -- is standing, but VBUS left on after a
+	 * detach must not pass silently.
+	 */
+	mode = gtb_charger_mode(gtb);
+	if (mode == GTB_MODE_OTG)
+		dev_err(gtb->dev, "charger left the boost on\n");
+	else if (mode < 0)
+		dev_err(gtb->dev, "cannot read the charger mode (%d)\n", mode);
+
+unlock:
+	mutex_unlock(&gtb->lock);
+	return 0;
+}
+
+static int gtb_vbus_is_enabled(struct regulator_dev *rdev)
+{
+	struct gtb_drv *gtb = rdev_get_drvdata(rdev);
+	bool sourcing;
+
+	mutex_lock(&gtb->lock);
+	sourcing = gtb->sourcing;
+	mutex_unlock(&gtb->lock);
+
+	return sourcing;
+}
+
+static const struct regulator_ops gtb_vbus_ops = {
+	.enable = gtb_vbus_enable,
+	.disable = gtb_vbus_disable,
+	.is_enabled = gtb_vbus_is_enabled,
+};
+
+static const struct regulator_desc gtb_vbus_desc = {
+	.name = "vbus",
+	.of_match = "vbus-regulator",
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.ops = &gtb_vbus_ops,
+	.n_voltages = 1,
+	.fixed_uV = 5000000,
+};
+
 static void gtb_put_supplies(struct gtb_drv *gtb)
 {
 	power_supply_put(gtb->chg_psy);
@@ -344,7 +508,9 @@ static void gtb_put_supplies(struct gtb_drv *gtb)
 static int google_tcpm_buck_probe(struct platform_device *pdev)
 {
 	struct power_supply *psy[1] = { NULL };
+	struct regulator_config reg_cfg = { };
 	struct device *dev = &pdev->dev;
+	struct regulator_dev *rdev;
 	struct power_supply *chg_psy;
 	struct gvotable_election *el;
 	const char *chg_name;
@@ -396,6 +562,14 @@ static int google_tcpm_buck_probe(struct platform_device *pdev)
 	gtb->dev = dev;
 	gtb->tcpm_psy = psy[0];
 	gtb->chg_psy = chg_psy;
+	/*
+	 * Confirming the boost reads the charger's own register, through an
+	 * export that takes its device's driver data on trust.
+	 */
+	if (chg_psy->dev.parent &&
+	    of_device_is_compatible(chg_psy->dev.parent->of_node,
+				    "maxim,max77779chrg-i2c"))
+		gtb->chg_dev = chg_psy->dev.parent;
 	ret = devm_mutex_init(dev, &gtb->lock);
 	if (ret) {
 		gtb_put_supplies(gtb);
@@ -425,12 +599,30 @@ static int google_tcpm_buck_probe(struct platform_device *pdev)
 		power_supply_unreg_notifier(&gtb->psy_nb);
 		cancel_work_sync(&gtb->vote_work);
 		mutex_lock(&gtb->lock);
-		if (gtb->online_valid && gtb->online)
-			gtb_cast(gtb, false);
+		gtb->online = false;
+		if (gtb->cast_valid && gtb->cast_enabled)
+			gtb_recompute_mode(gtb);
 		mutex_unlock(&gtb->lock);
 		gtb_put_supplies(gtb);
 		return dev_err_probe(dev, ret, "cannot create %s\n",
 				     GTB_ICL_ELECTION);
+	}
+
+	/*
+	 * After the election, and not fatal: the TCPC looks the regulator up
+	 * at any set_vbus from now on, and one it holds must not be
+	 * unregistered under it by a failure further down.  Without it the
+	 * port still sinks; TCPM's source path fails its enable instead.
+	 */
+	if (gtb->chg_dev) {
+		reg_cfg.dev = dev;
+		reg_cfg.driver_data = gtb;
+		rdev = devm_regulator_register(dev, &gtb_vbus_desc, &reg_cfg);
+		if (IS_ERR(rdev))
+			dev_err(dev, "cannot register the vbus regulator (%pe)\n",
+				rdev);
+	} else {
+		dev_err(dev, "%s is not a MAX77779, not sourcing\n", chg_name);
 	}
 
 	/* Cast the state as it stands: the cable may already be in. */
@@ -463,6 +655,6 @@ static struct platform_driver google_tcpm_buck_driver = {
  */
 builtin_platform_driver(google_tcpm_buck_driver);
 
-MODULE_DESCRIPTION("Vote the charger's USB buck mode and input limit from TCPM sink state");
+MODULE_DESCRIPTION("Vote the charger's USB mode and input limit for TCPM");
 MODULE_AUTHOR("Steffen Deusch <steffen@deusch.me>");
 MODULE_LICENSE("GPL");

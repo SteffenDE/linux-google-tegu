@@ -793,11 +793,22 @@
 	 * vendor's USB stack provides: it votes TCPM's current into it and
 	 * writes the result to the charger supply named here as its input
 	 * limit.  google_charger suspends the USB input by voting 0 into it.
+	 *
+	 * The regulator is the source half.  Enabling it casts the charger's
+	 * OTG ballot in place of the buck one, which with no external boost on
+	 * the charger node starts the MAX77779's own reverse boost; the TCPC
+	 * names it as its VBUS supply.
 	 */
 	google,tcpm-buck {
 		compatible = "google,tcpm-buck";
 		google,tcpm-power-supply = <&usb_typec>;
 		google,chg-power-supply = "main-charger";
+
+		usb_vbus: vbus-regulator {
+			regulator-name = "usb-vbus";
+			regulator-min-microvolt = <5000000>;
+			regulator-max-microvolt = <5000000>;
+		};
 	};
 
 	google,charger {
@@ -1600,9 +1611,8 @@
 	status = "okay";
 
 	/*
-	 * MAX77759 TCPC at the downstream address and gpa8-3 interrupt.  Keep
-	 * this first event-path port sink/device-only with PD disabled: source,
-	 * charging and regulator control remain deliberately out of scope.
+	 * MAX77759 TCPC at the downstream address and gpa8-3 interrupt.  VBUS
+	 * comes from the charger through google,tcpm-buck's regulator.
 	 */
 	usb_typec: usb-typec@25 {
 		compatible = "maxim,max77759-tcpci", "maxim,max33359";
@@ -1610,6 +1620,7 @@
 		interrupts-extended = <&gpa8 3 IRQ_TYPE_LEVEL_LOW>;
 		pinctrl-0 = <&usb_pd_irq>;
 		pinctrl-names = "default";
+		vbus-supply = <&usb_vbus>;
 
 		/*
 		 * The vendor D+/D- switch is inside this TCPC, so the connector
@@ -1630,11 +1641,17 @@
 			 * Dual data role, because the alternate mode driver
 			 * will only drive a port that can be the host: it is
 			 * the DisplayPort source, and it refuses a port stuck
-			 * as a device. Power stays sink-only -- nothing here
-			 * sources VBUS.
+			 * as a device.
+			 *
+			 * Dual power role, trying sink first as the vendor
+			 * does, so that an unpowered hub or accessory is
+			 * powered from the phone while a charger or a
+			 * computer still charges it. As source the port is
+			 * also the host from attach.
 			 */
 			data-role = "dual";
-			power-role = "sink";
+			power-role = "dual";
+			try-power-role = "sink";
 			self-powered;
 			typec-power-opmode = "default";
 
@@ -1647,10 +1664,20 @@
 			 * asking for either would put VBUS somewhere this
 			 * board's charging has never been told to expect.
 			 */
-			sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_HIGHER_CAP |
+			sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE |
+						PDO_FIXED_HIGHER_CAP |
 						PDO_FIXED_USB_COMM |
 						PDO_FIXED_DATA_SWAP)>;
 			op-sink-microwatt = <2600000>;
+
+			/*
+			 * The vendor's one source capability: 5 V at 900 mA,
+			 * under the internal boost's 1000 mA current limit.
+			 */
+			source-pdos = <PDO_FIXED(5000, 900, PDO_FIXED_DUAL_ROLE |
+						 PDO_FIXED_SUSPEND |
+						 PDO_FIXED_USB_COMM |
+						 PDO_FIXED_DATA_SWAP)>;
 
 			/*
 			 * Report pSnkStby (500 mA) from attach until the PD
@@ -2003,8 +2030,8 @@
 	 *   - wlc-spoof-vbyp and wlc_notify_charge_disable belong to the same
 	 *     wireless path.
 	 *   - rx-to-rx-otg-en and ext-otg-only describe OTG through that
-	 *     external boost.  The connector here is a sink only, so no OTG
-	 *     use case is reachable to begin with.
+	 *     external boost.  Without extbst-ctl, OTG here runs on this
+	 *     charger's internal boost.
 	 *   - chg-term-voltage is dead in the vendor tree too: this driver
 	 *     version never reads it, taking the termination voltage from the
 	 *     charger layer instead.

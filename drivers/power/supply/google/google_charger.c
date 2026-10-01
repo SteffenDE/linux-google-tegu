@@ -328,6 +328,8 @@ struct chg_drv {
 
 	int charge_stop_level;		/* retail, userspace bd config */
 	int charge_start_level;		/* retail, userspace bd config */
+	struct work_struct charge_level_work;
+	bool bat_psy_ext_registered;
 
 	/* pps charging */
 	bool pps_enable;
@@ -3135,6 +3137,104 @@ static ssize_t set_charge_start_level(struct device *dev,
 
 static DEVICE_ATTR(charge_start_level, 0660,
 		   show_charge_start_level, set_charge_start_level);
+
+/*
+ * charge_stop_level and charge_start_level as the standard
+ * charge_control_{end,start}_threshold on the battery power supply.
+ *
+ * The extension callbacks run under the battery's extensions_sem, and
+ * chg_run_defender() reads the battery, so the update runs from a work item.
+ */
+static void chg_charge_level_work(struct work_struct *work)
+{
+	struct chg_drv *chg_drv = container_of(work, struct chg_drv,
+					       charge_level_work);
+
+	/* Force update charging state vote */
+	chg_run_defender(chg_drv);
+
+	power_supply_changed(chg_drv->bat_psy);
+}
+
+static const enum power_supply_property chg_bat_psy_ext_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static int chg_bat_psy_ext_get_prop(struct power_supply *psy,
+				    const struct power_supply_ext *ext,
+				    void *data,
+				    enum power_supply_property psp,
+				    union power_supply_propval *val)
+{
+	struct chg_drv *chg_drv = data;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		val->intval = chg_drv->charge_start_level;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		val->intval = chg_drv->charge_stop_level;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int chg_bat_psy_ext_set_prop(struct power_supply *psy,
+				    const struct power_supply_ext *ext,
+				    void *data,
+				    enum power_supply_property psp,
+				    const union power_supply_propval *val)
+{
+	struct chg_drv *chg_drv = data;
+	const int level = val->intval;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		if (level == chg_drv->charge_start_level)
+			return 0;
+		if (level < DEFAULT_CHARGE_START_LEVEL ||
+		    level >= chg_drv->charge_stop_level)
+			return -EINVAL;
+		pr_info("charge_start_level: %d -> %d\n",
+			chg_drv->charge_start_level, level);
+		chg_drv->charge_start_level = level;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		if (level == chg_drv->charge_stop_level)
+			return 0;
+		if (level > DEFAULT_CHARGE_STOP_LEVEL ||
+		    level <= chg_drv->charge_start_level)
+			return -EINVAL;
+		pr_info("charge_stop_level: %d -> %d\n",
+			chg_drv->charge_stop_level, level);
+		chg_drv->charge_stop_level = level;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	schedule_work(&chg_drv->charge_level_work);
+	return 0;
+}
+
+static int chg_bat_psy_ext_is_writeable(struct power_supply *psy,
+					const struct power_supply_ext *ext,
+					void *data,
+					enum power_supply_property psp)
+{
+	return 1;
+}
+
+static const struct power_supply_ext chg_bat_psy_ext = {
+	.name			= "google-charger",
+	.properties		= chg_bat_psy_ext_props,
+	.num_properties		= ARRAY_SIZE(chg_bat_psy_ext_props),
+	.get_property		= chg_bat_psy_ext_get_prop,
+	.set_property		= chg_bat_psy_ext_set_prop,
+	.property_is_writeable	= chg_bat_psy_ext_is_writeable,
+};
 
 static ssize_t
 show_bd_temp_enable(struct device *dev,
@@ -5949,6 +6049,15 @@ static void google_charger_init_work(struct work_struct *work)
 		pr_err("Cannot register power supply notifer, ret=%d\n", ret);
 
 	chg_drv->init_done = true;
+
+	ret = power_supply_register_extension(chg_drv->bat_psy, &chg_bat_psy_ext,
+					      chg_drv->device, chg_drv);
+	if (ret < 0)
+		pr_err("Cannot add charge thresholds to %s, ret=%d\n",
+		       chg_drv->bat_psy_name, ret);
+	else
+		chg_drv->bat_psy_ext_registered = true;
+
 	pr_info("google_charger chg=%d bat=%d wlc=%d usb=%d ext=%d tcpm=%d init_work done\n",
 		!!chg_drv->chg_psy, !!chg_drv->bat_psy, !!chg_drv->wlc_psy,
 		!!chg_drv->usb_psy, !!chg_drv->ext_psy, !!chg_drv->tcpm_psy);
@@ -6111,6 +6220,7 @@ static int google_charger_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&chg_drv->init_work, google_charger_init_work);
 	INIT_DELAYED_WORK(&chg_drv->chg_work, chg_work);
 	INIT_WORK(&chg_drv->chg_psy_work, chg_psy_work);
+	INIT_WORK(&chg_drv->charge_level_work, chg_charge_level_work);
 	platform_set_drvdata(pdev, chg_drv);
 
 	alarm_init(&chg_drv->chg_wakeup_alarm, ALARM_BOOTTIME,
@@ -6145,7 +6255,15 @@ static void google_charger_remove(struct platform_device *pdev)
 	struct chg_drv *chg_drv = (struct chg_drv *)platform_get_drvdata(pdev);
 
 	if (chg_drv) {
+		/* init_work registers the battery extension */
+		cancel_delayed_work_sync(&chg_drv->init_work);
+
 		power_supply_unreg_notifier(&chg_drv->psy_nb);
+
+		if (chg_drv->bat_psy_ext_registered)
+			power_supply_unregister_extension(chg_drv->bat_psy,
+							  &chg_bat_psy_ext);
+		cancel_work_sync(&chg_drv->charge_level_work);
 
 		if (chg_drv->chg_term.enable) {
 			alarm_cancel(&chg_drv->chg_term.alarm);

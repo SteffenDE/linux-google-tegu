@@ -327,8 +327,14 @@ static void max_tcpci_set_partner_usb_comm_capable(struct tcpci *tcpci, struct t
  * partner's USB_COMM bit.  That bit only arrives with a PD contract, so on a
  * pd-disable port the switches would be turned off at port reset and never
  * turned back on.  TCPM drives TYPEC_STATE_USB from tcpm_set_roles() on every
- * attach and TYPEC_STATE_SAFE from tcpm_reset_port() on every detach,
- * independently of PD, which is the signal a non-PD port does get.
+ * attach, independently of PD, which is the signal a non-PD port does get.
+ *
+ * Only that state closes them here.  TYPEC_STATE_SAFE does not open them: it
+ * arrives on every alternate mode entry, exit and reconfiguration as well as
+ * on detach, and no alternate mode takes over D+/D-, so opening them there
+ * cuts USB 2.0 off for as long as the mode lasts.  Detach needs no help, because
+ * tcpm_reset_port() turns them off through set_partner_usb_comm_capable(),
+ * with or without PD.
  */
 /*
  * Route the SBU pins to the DisplayPort AUX channel, or back to whatever they
@@ -420,21 +426,19 @@ static int max_tcpci_mux_set(struct typec_mux_dev *mux,
 	}
 
 	/*
-	 * Leave the USB data switches alone for alternate and accessory modes:
-	 * they arrive only through PD, where set_partner_usb_comm_capable()
-	 * above already owns them, and a DP pin assignment may keep USB data
-	 * connected alongside.
+	 * Leave the USB data switches alone for every state but USB: during an
+	 * alternate mode set_partner_usb_comm_capable() owns them, an accessory
+	 * mode finds them already opened by the port reset before its attach,
+	 * and SAFE is not a detach (see the note above
+	 * max_tcpci_set_dp_aux()).
 	 */
-	if (state->mode != TYPEC_STATE_USB && state->mode != TYPEC_STATE_SAFE)
+	if (state->mode != TYPEC_STATE_USB)
 		return 0;
 
 	ret = max_tcpci_write8(chip, TCPC_VENDOR_USBSW_CTRL,
-			       state->mode == TYPEC_STATE_USB ?
-			       TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA :
-			       TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA);
+			       TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA);
 	if (ret < 0)
-		dev_err(chip->dev, "Failed to set USB switches for mode %lu\n",
-			state->mode);
+		dev_err(chip->dev, "Failed to enable USB switches\n");
 
 	return ret;
 }
